@@ -14,7 +14,8 @@ byte-exact parity tests against dae's Go rule compiler and a netns test lab.*
   （ADR-0026 / ADR-0027）。
 - **lab**：netns 拓扑（标准 + 单臂）、`verify` 9 用例、DNS / 转发面 / 协议梯 / 运维专项、
   soak、与 dae 原版 Go 规则编译器的**逐字节对拍**、真实 Go 客户端跨实现联调、
-  双内核矩阵（宿主 + QEMU 第二内核）。
+  双内核矩阵（宿主 + QEMU 第二内核）；**本地 SOCKS5 入口**（`--listen-socks`，零 root/零 eBPF，
+  浏览器可直接指向验证真实节点，ADR-0028）。
 
 最新一轮完整回归（唯一 Rust 数据面，2026-10-04）：
 

@@ -50,6 +50,7 @@ mod outbound;
 mod quicsock;
 mod rules;
 mod socks5;
+mod socksin;
 mod ss;
 mod status;
 mod tls;
@@ -351,6 +352,8 @@ struct Args {
     relay_idle_timeout: Option<u64>,
     /// P11：relay 拨号超时秒数（默认 5；真实节点慢首连可调大）
     dial_timeout: Option<u64>,
+    /// P12：本地 SOCKS5 入口（如 127.0.0.1:11080）；开启后不加载 eBPF、不需要 root
+    listen_socks: Option<String>,
     /// P4：UDP NAT 会话空闲秒数（默认 60）
     udp_idle_timeout: Option<u64>,
     /// K3 过渡一跳：等价的旧写法（`--forward socks5://…` = `--dialer socks5://…`）
@@ -433,7 +436,8 @@ fn usage() -> ! {
            --log-file <path>     P6：日志写文件（默认 stdout；SIGHUP 时 reopen，轮转友好）\n\
            --dialer <url>        P4：代理出口拨号器（direct 或 socks5://host:port）\n\
            --relay-idle-timeout <s> P4：relay 空闲回收秒数（默认 300）
-           --dial-timeout <s>       P11：relay 拨号超时秒数（默认 5；真实节点慢首连可调大）\n\
+           --dial-timeout <s>       P11：relay 拨号超时秒数（默认 5；真实节点慢首连可调大）
+           --listen-socks <addr>    P12：本地 SOCKS5 入口（浏览器测试用；不加载 eBPF、不需 root）\n\
            --udp-idle-timeout <s>   P4：UDP NAT 会话空闲秒数（默认 60）\n\
            --forward <url>       旧写法：等价于 --dialer socks5://host:port\n\
            --offload             P4c：启用 TCP relay offload（内核对拼，需 --dialer）\n\
@@ -476,6 +480,7 @@ fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
         dialer: None,
         relay_idle_timeout: None,
         dial_timeout: None,
+        listen_socks: None,
         udp_idle_timeout: None,
         forward: None,
         offload: false,
@@ -505,6 +510,7 @@ fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
             "--dialer" => args.dialer = Some(next()?),
             "--relay-idle-timeout" => args.relay_idle_timeout = Some(next()?.parse()?),
             "--dial-timeout" => args.dial_timeout = Some(next()?.parse()?),
+            "--listen-socks" => args.listen_socks = Some(next()?),
             "--udp-idle-timeout" => args.udp_idle_timeout = Some(next()?.parse()?),
             "--forward" => args.forward = Some(next()?),
             "--offload" => args.offload = true,
@@ -1026,6 +1032,118 @@ fn drain_prefix(
     ok
 }
 
+/// P12：本地 SOCKS5 入口循环（不加载 eBPF；浏览器/桌面测试用）。
+fn run_socks_server(listen: &str) -> Result<(), Box<dyn std::error::Error>> {
+    use std::net::ToSocketAddrs as _;
+    let addr: SocketAddr = listen
+        .to_socket_addrs()
+        .map_err(|e| format!("解析 --listen-socks {listen}: {e}"))?
+        .next()
+        .ok_or_else(|| format!("--listen-socks {listen} 无解析结果"))?;
+    let Some(dialer) = OUTBOUND.get() else {
+        return Err("--listen-socks 需要 --dialer <url>（如 anytls://…）".into());
+    };
+    let listener = std::net::TcpListener::bind(addr).map_err(|e| format!("bind {addr}: {e}"))?;
+    log(&format!(
+        "SOCKS5 listening on {addr}（dialer: {}；CONNECT only、无认证）",
+        dialer.name()
+    ));
+    for conn in listener.incoming() {
+        match conn {
+            Ok(c) => {
+                std::thread::spawn(move || handle_socks_conn(c));
+            }
+            Err(e) => log(&format!("socks: accept 失败: {e}")),
+        }
+    }
+    Ok(())
+}
+
+/// 处理一条 SOCKS5 CONNECT：握手 → 本地解析（域名）→ 拨号 → 回复 → 双向泵。
+fn handle_socks_conn(mut client: TcpStream) {
+    let Some(dialer) = OUTBOUND.get() else {
+        return;
+    };
+    let _ = client.set_read_timeout(Some(Duration::from_secs(10)));
+    let _ = client.set_write_timeout(Some(Duration::from_secs(10)));
+    let target = match socksin::server_handshake(&mut client) {
+        Ok(t) => t,
+        Err(e) => {
+            log(&format!("socks: 握手失败: {e}"));
+            let _ = client.shutdown(std::net::Shutdown::Both);
+            return;
+        }
+    };
+    let tname = target.display();
+    let resolved = match target.resolve() {
+        Ok(a) => a,
+        Err(e) => {
+            let _ = socksin::reply(&mut client, socksin::REP_GENERAL);
+            log(&format!("socks: 解析 {tname} 失败: {e}"));
+            let _ = client.shutdown(std::net::Shutdown::Both);
+            return;
+        }
+    };
+    let dial_timeout = Duration::from_millis(RELAY_DIAL_TIMEOUT_MS.load(Ordering::Relaxed));
+    let dialed = match dialer.dial_tcp(resolved, dial_timeout) {
+        Ok(d) => d,
+        Err(e) => {
+            let _ = socksin::reply(&mut client, socksin::REP_GENERAL);
+            log(&format!(
+                "socks: dial {tname} 失败（{}）: {e}",
+                dialer.name()
+            ));
+            let _ = client.shutdown(std::net::Shutdown::Both);
+            return;
+        }
+    };
+    if socksin::reply(&mut client, socksin::REP_SUCCEEDED).is_err() {
+        let _ = client.shutdown(std::net::Shutdown::Both);
+        return;
+    }
+    // 进入长连接阶段：清掉握手超时（浏览器连接可能长时间空闲）。
+    let _ = client.set_read_timeout(None);
+    let _ = client.set_write_timeout(None);
+    log(&format!("SOCKS {tname} established（{}）", dialer.name()));
+
+    let outbound::DialedStream {
+        from_remote,
+        to_remote,
+        socket: _,
+    } = dialed;
+    let last_ns = Arc::new(AtomicU64::new(monotonic_now_ns()));
+    let up = Arc::new(AtomicU64::new(0));
+    let down = Arc::new(AtomicU64::new(0));
+    let Ok(c_read) = client.try_clone() else {
+        let _ = client.shutdown(std::net::Shutdown::Both);
+        return;
+    };
+    let (last2, up2) = (last_ns.clone(), up.clone());
+    std::thread::spawn(move || {
+        pump(
+            Box::new(c_read),
+            to_remote,
+            last2.as_ref(),
+            up2.as_ref(),
+            false,
+            None,
+        );
+    });
+    pump(
+        from_remote,
+        Box::new(client),
+        last_ns.as_ref(),
+        down.as_ref(),
+        false,
+        None,
+    );
+    log(&format!(
+        "SOCKS {tname} closed（up={}B down={}B）",
+        up.load(Ordering::Relaxed),
+        down.load(Ordering::Relaxed)
+    ));
+}
+
 /// relay 一条连接：按 dialer 拨号到 orig_dst，双向转发（含半关闭）。
 fn handle_relay_conn(mut client: TcpStream) {
     let Ok(target) = client.local_addr() else {
@@ -1522,6 +1640,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         print!("{}", compiled.dump_parity());
         let _ = std::io::stdout().flush();
         return Ok(());
+    }
+
+    // P12：本地 SOCKS5 入口模式（浏览器/桌面测试；不加载 eBPF、不需要 root）。
+    if let Some(listen) = args.listen_socks.clone() {
+        return run_socks_server(&listen);
     }
 
     // P3a：DNS 上游 socket 必须在 host ns 创建（上游查询走宿主路由，

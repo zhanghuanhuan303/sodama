@@ -819,11 +819,20 @@ pub fn parse(url: &str) -> Result<Outbound, String> {
 }
 
 fn resolve(hostport: &str) -> Result<SocketAddr, String> {
-    hostport
+    let mut addrs = hostport
         .to_socket_addrs()
-        .map_err(|e| format!("解析 {hostport} 失败: {e}"))?
+        .map_err(|e| format!("解析 {hostport} 失败: {e}"))?;
+    let first = addrs
         .next()
-        .ok_or_else(|| format!("解析 {hostport} 无结果"))
+        .ok_or_else(|| format!("解析 {hostport} 无结果"))?;
+    if first.is_ipv4() {
+        return Ok(first);
+    }
+    // 数据面协议只吃 IPv4：节点域名常同时有 AAAA（双栈 VPS），v6 优先会导致误拒。
+    match addrs.find(|a| a.is_ipv4()) {
+        Some(v4) => Ok(v4),
+        None => Ok(first), // v6-only：交给下游协议给出明确错误
+    }
 }
 
 /// `anytls://password@host:port?sni=...&insecure=1`（anytls-go 协议，见 `anytls.rs`）。

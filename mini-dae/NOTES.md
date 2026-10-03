@@ -779,6 +779,19 @@ P4 稳定性 → P3 内核矩阵）：
   `REAL_NODE_URL=anytls://… lab/real-node-e2e.sh`：真实节点 gstatic **204**，
   relay up 1981B/down 4713B、dial_errors=0；标准 verify 9/9。
 
+### 11.19 P12（本地 SOCKS5 入口 / 浏览器验收）已验收的行为
+
+（决策与取舍见 ADR-0028；实现 `loader/src/socksin.rs` + `main.rs` 的 socks 模式。）
+
+- **入口**：`--listen-socks <addr> --dialer <anytls|vless|…>`：不加载 eBPF、不需 root；
+  CONNECT、无认证；IPv4/域名目标（域名本地解析）；UDP/BIND/IPv6 显式拒绝；
+- **实现要点**：hello→request 解析纯函数（可测）；拨号成功后才回 `REP_SUCCEEDED`；
+  进长连接前**清掉握手超时**（否则浏览器空闲连接 10s 被误断）；泵直接复用 relay `pump`；
+- **实测坑**：节点域名双栈时 `getaddrinfo` 可能 AAAA 优先 → “只有 IPv4”误拒；
+  `resolve()` 改为优先 IPv4（v6-only 才回落）；
+- **验收**：`cargo test` 95/95；真机跑订阅#2 anytls 节点：gstatic 204（域名/本地两种
+  socks 形态）、YouTube 200（relay down 918KB）；日志 `/tmp/mini-dae-socks.log`。
+
 ## 12. 用 Rust 重写这套东西的可行性
 
 已验证（本仓库 mini-dae，实测跑通）：

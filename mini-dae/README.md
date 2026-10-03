@@ -56,6 +56,9 @@ P6（suspend/reload/metrics/sysdump/日志轮转/整配置热重载）已完成*
   默认 paddingScheme 逐字节对齐 + UpdatePaddingScheme 即时生效）；单 Stream；
   跨实现测试对 sing-box 服务端，真实节点 e2e gstatic 204（ADR-0027）；
   同批：`--dial-timeout`（默认 5s）可配，lab 用 `USE_DIAL_TIMEOUT` 透传
+- **P12 本地 SOCKS5 入口（浏览器验收）**：`--listen-socks 127.0.0.1:11080 --dialer anytls://…`
+  ——不加载 eBPF、不需 root，浏览器直接指 socks5 即可走真实节点（ADR-0028）；
+  DNS 本地解析为 v1 边界；`resolve()` 已改为优先 IPv4（双栈节点域名踩坑）
 - **P5-G3a QUIC（tuic v5）**：惰性 tokio 运行时 + quinn（阻塞 relay 用 block_on 桥接）；
   认证 token = TLS exporter（label=uuid 裸字节、context=password）；TCP 每条中继一条 QUIC
   双向流，UDP 走 QUIC DATAGRAM（含分片/重组）；上游 socket 用自建 `Endpoint` 打 `SO_MARK`；
@@ -252,6 +255,9 @@ sudo lab/lab.sh hy2-brutal-up    # P5-G3b+：cc_override=brutal + 带宽声明
 sudo lab/lab.sh test-hy2-brutal  # 512KB（Brutal 近似路径）
 sudo lab/lab.sh hy2-hop-up  # P5-G3b+：udphop（端口并集 + 5s 跳端口 + 多端口 mux）
 sudo lab/lab.sh test-hy2-hop     # 两轮 512KB 跨跳存活
+# P12：本地 SOCKS5 入口（浏览器验收；不加载 eBPF、不需 root）：
+# target/release/mini-dae --listen-socks 127.0.0.1:11080 --dialer 'anytls://…' --dial-timeout 15
+# 浏览器：SOCKS5 127.0.0.1:11080（Firefox 勾“SOCKS v5 时代理 DNS”）；停止：pkill -f listen-socks
 # P10：真实节点端到端（节点 URL 只经环境变量传入，不落盘）：
 #   REAL_NODE_URL='vless://…type=ws…' 或 'anytls://…' 或 'socks5://…'（桥接） \
 #     sudo lab/real-node-e2e.sh    # client ns → tproxy → relay → 真实节点 → gstatic 204
