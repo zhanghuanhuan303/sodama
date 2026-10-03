@@ -104,6 +104,10 @@ P6（suspend/reload/metrics/sysdump/日志轮转/整配置热重载）已完成*
   （每行一条、`#` 注释、默认 suffix、行首 `full:/keyword:/regex:`、相对路径按规则文件目录、
   缺失硬失败）；`dns.routing.upstream_hits` per-tag 计数；真网关默认
   国内域→本地明文 / 其余→DoH / 名单+geosite 广告域→reject（ADR-0037、NOTES §11.28）
+- **P18c 实用化：ECS 注入 + `sip()` 客户端网段路由**（mini 扩展）：上游 URL
+  `ecs=auto|<CIDR>`（v4 /24、v6 /56，已带 OPT 透传，缓存按子网分域）；请求函数
+  `sip(...)`（CIDR/geoip/ext，可与 qname/qtype 同链）；真网关国内域走 DoH+ECS
+  （ADR-0038、NOTES §11.29）
 - **P5-G3a QUIC（tuic v5）**：惰性 tokio 运行时 + quinn（阻塞 relay 用 block_on 桥接）；
   认证 token = TLS exporter（label=uuid 裸字节、context=password）；TCP 每条中继一条 QUIC
   双向流，UDP 走 QUIC DATAGRAM（含分片/重组）；上游 socket 用自建 `Endpoint` 打 `SO_MARK`；
@@ -175,8 +179,8 @@ loader/src/hysteria2.rs hysteria2（QUIC：h3 认证、0x401 TCP 流帧、Sessio
 loader/src/hpack.rs HPACK Huffman 解码 + QPACK 静态表编解码（h3 认证用）
 loader/src/huffman_table.rs 生成表：HPACK Huffman 256 项 + QPACK 静态表 99 项
 loader/src/dns.rs    DNS wire 解析/构造、域名匹配（suffix/full/keyword/regex）、位图计算、正负缓存
-loader/src/dnsup.rs  P18a/b DNS 上游抽象/传输：udp/tcp/tcp+udp/tls(DoT)/https(DoH)/quic(DoQ)，持久连接 + 失败重连
-loader/src/dnsroute.rs  P18c dns.routing：请求/应答分流编译与匹配（qname/qtype/upstream/ip；reject/asis/accept/tag 重查；qname(file:) 自定义名单）
+loader/src/dnsup.rs  P18a/b DNS 上游抽象/传输：udp/tcp/tcp+udp/tls(DoT)/https(DoH)/quic(DoQ)，持久连接 + 失败重连；URL 参数 sni/insecure/ecs（ECS 注入模式）
+loader/src/dnsroute.rs  P18c dns.routing：请求/应答分流编译与匹配（qname/qtype/sip/upstream/ip；reject/asis/accept/tag 重查；qname(file:) 自定义名单）
 lab/real-user.dae    真实用户风格配置（0640；含可编译规则与 deferred 示例）
 lab/socks5_echo.py   最小 SOCKS5 后端（socks5 dialer 对端，从 host ns 可达）
 lab/ss_server.py     P5-G1：独立实现的 shadowsocks 服务端（Python cryptography，TCP+UDP）

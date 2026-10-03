@@ -2865,9 +2865,10 @@ enum Selected {
     Up(Arc<dnsup::Upstream>, String, dnsroute::ReqOut),
 }
 
-/// P18c：请求路由选择上游（asis / tag / legacy）。
+/// P18c：请求路由选择上游（asis / tag / legacy）；`client` 供 `sip()` 匹配。
 fn select_request_upstream(
     q: &dns::Question,
+    client: Option<std::net::IpAddr>,
     orig_dst: Option<SocketAddr>,
 ) -> Result<Selected, String> {
     let set = upstreams().ok_or("DNS 上游未初始化")?;
@@ -2881,7 +2882,7 @@ fn select_request_upstream(
             dnsroute::ReqOut::Tag("default".into()),
         ));
     };
-    match router.request_select(q) {
+    match router.request_select_for(q, client) {
         dnsroute::ReqOut::Reject => {
             note_tag_hit("reject");
             Ok(Selected::Reject)
@@ -2924,6 +2925,7 @@ fn select_request_upstream(
 fn resolve_dns(
     query: &[u8],
     proto: ClientProto,
+    client: Option<std::net::IpAddr>,
     orig_dst: Option<SocketAddr>,
     tx: &std::sync::mpsc::Sender<status::MainMsg>,
 ) -> Option<Vec<u8>> {
@@ -2931,7 +2933,7 @@ fn resolve_dns(
     let edns = dns::query_edns(query);
     // 1) 请求路由（reject 先于缓存；对照 dae「Route request first, then check cache」）
     let selected = match &parsed {
-        Some(q) => match select_request_upstream(q, orig_dst) {
+        Some(q) => match select_request_upstream(q, client, orig_dst) {
             Ok(s) => s,
             Err(e) => {
                 DNS_STATS.upstream_errors.fetch_add(1, Ordering::Relaxed);
@@ -2960,11 +2962,23 @@ fn resolve_dns(
         }
         return Some(serve_response(query, resp, proto));
     }
-    let (mut up, scope, mut served) = match selected {
+    let (mut up, mut scope, mut served) = match selected {
         Selected::Up(u, scope, s) => (u, scope, s),
         Selected::Reject => unreachable!(),
     };
-    // 2) 缓存（按作用域）
+    // 2a) ECS 注入（mini 扩展；上游 URL `ecs=auto|<CIDR>`）：
+    //     客户端自带 OPT 时不动（透传）；注入后缓存作用域加前缀（不同子网不串答）。
+    let ecs_prefix = match up.spec.ecs {
+        Some(dnsup::EcsMode::Auto) => client.map(dns::ecs_auto_prefix),
+        Some(dnsup::EcsMode::Prefix(ip, p)) => Some((ip, p)),
+        None => None,
+    };
+    let ecs_query = ecs_prefix.and_then(|p| dns::add_ecs(query, p));
+    if let (Some((ip, p)), Some(_)) = (ecs_prefix, ecs_query.as_ref()) {
+        scope.push_str(&format!("|ecs={ip}/{p}"));
+    }
+    let query_send: &[u8] = ecs_query.as_deref().unwrap_or(query);
+    // 2b) 缓存（按作用域）
     if let Some(q) = &parsed {
         let hit = DNS_CACHE
             .lock()
@@ -2978,7 +2992,7 @@ fn resolve_dns(
     }
     // 3) 上游 + 应答路由（对照 dae resolveDNSUpstream 的递归重查；深度上限 3）
     let router = dns_router();
-    let mut resp = match up.exchange(query) {
+    let mut resp = match up.exchange(query_send) {
         Ok(r) => r,
         Err(e) => {
             DNS_STATS.upstream_errors.fetch_add(1, Ordering::Relaxed);
@@ -3015,7 +3029,14 @@ fn resolve_dns(
                 };
                 up = next;
                 served = dnsroute::ReqOut::Tag(t);
-                resp = match up.exchange(query) {
+                // 重查也按新上游的 ECS 配置注入
+                let ecs_query2 = match up.spec.ecs {
+                    Some(dnsup::EcsMode::Auto) => client.map(dns::ecs_auto_prefix),
+                    Some(dnsup::EcsMode::Prefix(ip, p)) => Some((ip, p)),
+                    None => None,
+                }
+                .and_then(|p| dns::add_ecs(query, p));
+                resp = match up.exchange(ecs_query2.as_deref().unwrap_or(query)) {
                     Ok(r) => r,
                     Err(e) => {
                         DNS_STATS.upstream_errors.fetch_add(1, Ordering::Relaxed);
@@ -3067,7 +3088,13 @@ fn dns_loop(listener: OwnedFd, tx: std::sync::mpsc::Sender<status::MainMsg>) {
         DNS_STATS.queries.fetch_add(1, Ordering::Relaxed);
         // panic 隔离：单次查询（含第三方 QUIC 栈）出 panic 不应杀死整个 DNS 线程
         let resolved = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            resolve_dns(&buf[..n], ClientProto::Udp, Some(orig_dst), &tx)
+            resolve_dns(
+                &buf[..n],
+                ClientProto::Udp,
+                Some(client.ip()),
+                Some(orig_dst),
+                &tx,
+            )
         }));
         let resp = match resolved {
             Ok(Some(r)) => r,
@@ -3102,8 +3129,9 @@ fn tcp_dns_loop(
 fn handle_tcp_dns_conn(mut stream: TcpStream, tx: std::sync::mpsc::Sender<status::MainMsg>) {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
-    // P18c：透明 socket 的 local_addr = 客户端原始目的地址（asis 用）
+    // P18c：透明 socket 的 local_addr = 客户端原始目的地址（asis 用）；peer = 客户端地址（sip 用）
     let orig_dst = stream.local_addr().ok();
+    let peer_ip = stream.peer_addr().ok().map(|a| a.ip());
     loop {
         let mut lb = [0u8; 2];
         if stream.read_exact(&mut lb).is_err() {
@@ -3119,7 +3147,7 @@ fn handle_tcp_dns_conn(mut stream: TcpStream, tx: std::sync::mpsc::Sender<status
         }
         DNS_STATS.tcp_queries.fetch_add(1, Ordering::Relaxed);
         let resolved = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            resolve_dns(&query, ClientProto::Tcp, orig_dst, &tx)
+            resolve_dns(&query, ClientProto::Tcp, peer_ip, orig_dst, &tx)
         }));
         let resp = match resolved {
             Ok(Some(r)) => r,

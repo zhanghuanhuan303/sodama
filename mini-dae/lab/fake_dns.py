@@ -55,6 +55,9 @@ TABLE = {
     "asis.test": "10.9.10.44",
     "tcp.asis.test": "10.9.10.46",
     "x.fullblocked.test": "10.9.10.47",
+    # P18c+：ECS 注入 / 客户端网段路由夹具
+    "ecsroute.test": "10.9.10.48",
+    "viacli.test": "10.9.10.49",
 }
 
 # P3b-2a：大应答（60 条 A ≈ 990 字节 > 512，用于验证 UDP 截断/EDNS）
@@ -74,13 +77,57 @@ def parse_qname(buf):
     return ".".join(labels).lower(), off
 
 
+def ecs_of(query):
+    """提取 OPT(41) 里的 ECS(8) 选项（仅处理无 answer/authority 的无压缩形态；
+    mini-dae 注入的 ECS 即尾插 OPT，正好命中）。返回 "1/24/10.0.0"（地址按前缀截断）或 None。"""
+    try:
+        qd, an, ns, ar = struct.unpack("!HHHH", query[4:12])
+        if an or ns:
+            return None
+        off = 12
+        for _ in range(qd):
+            while query[off] != 0:
+                off += 1 + query[off]
+            off += 5  # 0 + qtype + qclass
+        for _ in range(ar):
+            if query[off] != 0:
+                return None
+            off += 1
+            rtype, _rclass, _ttl, rdlen = struct.unpack("!HHIH", query[off : off + 10])
+            off += 10
+            rdata = query[off : off + rdlen]
+            off += rdlen
+            if rtype != 41:
+                continue
+            p = 0
+            while p + 4 <= len(rdata):
+                code, ln = struct.unpack("!HH", rdata[p : p + 4])
+                p += 4
+                if code == 8 and ln >= 4:
+                    body = rdata[p : p + ln]
+                    fam, src, _scope = struct.unpack("!HBB", body[:4])
+                    addr = body[4:]
+                    if fam == 1:
+                        return "1/%d/%s" % (src, ".".join(str(b) for b in addr))
+                    return "2/%d/%s" % (src, addr.hex())
+                p += ln
+    except Exception:
+        return None
+    return None
+
+
 def respond(query, proto="UDP"):
     if len(query) < 12:
         return None
     qname, off = parse_qname(query)
     qtype = struct.unpack("!H", query[off : off + 2])[0]
+    ecs = ecs_of(query)
     with open(LOG, "a") as f:
-        f.write(f"QUERY{'-TCP' if proto == 'TCP' else ''} {qname} type={qtype}\n")
+        f.write(
+            f"QUERY{'-TCP' if proto == 'TCP' else ''} {qname} type={qtype}"
+            + (f" ecs={ecs}" if ecs else "")
+            + "\n"
+        )
     # 复制 header + question（含压缩指针可用性：此处直接原样拼接）
     resp = bytearray(query[: off + 4])
     resp[2] |= 0x80

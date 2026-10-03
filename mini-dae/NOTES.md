@@ -1092,6 +1092,27 @@ Selected/应答重查循环；夹具 `lab/dnsroute.dae`、假 DNS 支持 bind �
   0 错误、`upstream_hits {alidns: 92, router: 13}`；名单热加载：加 `example.com`
   → reload → 拦截（rejects+2）→ 移除 → reload → 恢复。
 
+### 11.29 上游 ECS 注入 + 客户端网段路由（真网关精细策略）
+
+（决策与边界见 ADR-0038；实现 `dns.rs::add_ecs/ecs_auto_prefix`、`dnsup.rs` 的
+`ecs=` 解析与 `EcsMode`、`dnsroute.rs` 的 `sip`、`main.rs` 的 client/ECS 转发；
+夹具 `fake_dns.py` 的 ECS 日志、`lab/dnsroute.dae`/`lab/gateway.dae`。）
+
+- ECS（mini 扩展，上游 URL 参数）：`ecs=auto`（发起方归整 v4 /24、v6 /56）或
+  `ecs=<IP>/<prefix>`；发送前尾插 OPT + ECS option 8（地址按前缀截断、
+  RDLEN/option-length 分列）；客户端已带 OPT 时透传不注入；注入时缓存作用域
+  追加 `|ecs=<前缀>`；应答重查也按新上游重新注入。
+- `sip(...)`（mini 扩展，请求函数）：值与 `ip()` 同（CIDR/geoip/ext，支持 `!`）；
+  与 qname/qtype 同链；无客户端信息时不命中（`!sip` 命中）；UDP 取 recvmsg
+  源地址、TCP 取 peer_addr。
+- 真网关：`alidns_ecs: 'https://223.5.5.5/dns-query?sni=dns.alidns.com&ecs=auto'`，
+  `qname(geosite:cn) -> alidns_ecs`（router 保留一键可切）。
+- 实测：`cargo test` **145/145**（ECS 编码/截断/已带 OPT、`ecs=` 解析、
+  `sip` 正/反例）；lab `test-dnsroute`：假上游收到 `ecs=1/24/10.0.0`（客户端
+  10.0.0.2）、`qname && sip(10.0.0.0/24)` 命中 up2，7/3 规则矩阵 +
+  `upstream_hits` 全断言；真机：`upstream_hits {alidns: 78, alidns_ecs: 8}`、
+  86 查询 0 错误。
+
 ## 12. 用 Rust 重写这套东西的可行性
 
 已验证（本仓库 mini-dae，实测跑通）：

@@ -21,6 +21,7 @@
 
 pub use crate::rules::DomainSetSpec;
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::time::Instant;
 
 // ---------------------------------------------------------------- DNS wire
@@ -269,6 +270,69 @@ pub fn client_udp_size(query: &[u8]) -> usize {
     } else {
         e.udp_size.max(512) as usize
     }
+}
+
+/// 自动 ECS 前缀（RFC 7871 常见实践）：v4 /24、v6 /56（本机/客户端地址归整）。
+pub fn ecs_auto_prefix(client: IpAddr) -> (IpAddr, u8) {
+    match client {
+        IpAddr::V4(a) => {
+            let o = a.octets();
+            (IpAddr::V4(std::net::Ipv4Addr::new(o[0], o[1], o[2], 0)), 24)
+        }
+        IpAddr::V6(a) => {
+            let mut o = a.octets();
+            for b in o.iter_mut().skip(7) {
+                *b = 0;
+            }
+            (IpAddr::V6(std::net::Ipv6Addr::from(o)), 56)
+        }
+    }
+}
+
+/// 给查询追加 EDNS Client Subnet 选项（RFC 7871）：尾插一个 OPT RR（UDP 尺寸 4096），
+/// RDATA 为 ECS（family/source-prefix/scope=0/地址截断到前缀字节）。
+/// 查询已带 OPT 时返回 `None`（不改客户端自己的 EDNS，ECS 交由客户端/上游协商）。
+pub fn add_ecs(query: &[u8], prefix: (IpAddr, u8)) -> Option<Vec<u8>> {
+    if query.len() < 12 || query_edns(query).present {
+        return None;
+    }
+    let (ip, plen) = prefix;
+    let (family, addr): (u16, Vec<u8>) = match ip {
+        IpAddr::V4(a) => (1, a.octets().to_vec()),
+        IpAddr::V6(a) => (2, a.octets().to_vec()),
+    };
+    let max = if family == 1 { 32 } else { 128 };
+    if plen == 0 || plen > max {
+        return None;
+    }
+    let nbytes = (plen as usize).div_ceil(8);
+    let mut addr = addr[..nbytes].to_vec();
+    let rem = plen as usize % 8;
+    if rem != 0 {
+        if let Some(last) = addr.last_mut() {
+            *last &= 0xFFu8 << (8 - rem);
+        }
+    }
+    // ECS option data = FAMILY(2) + SOURCE-PREFIX(1) + SCOPE(1) + ADDRESS；
+    // OPT RDATA = OPTION-CODE(2) + OPTION-LENGTH(2) + ECS option data。
+    let opt_data_len = 4 + addr.len();
+    let rdata_len = 4 + opt_data_len;
+    let mut out = Vec::with_capacity(query.len() + 11 + rdata_len);
+    out.extend_from_slice(query);
+    let arcount = u16::from_be_bytes([query[10], query[11]]).saturating_add(1);
+    out[10..12].copy_from_slice(&arcount.to_be_bytes());
+    out.push(0); // root name
+    out.extend_from_slice(&RR_OPT.to_be_bytes());
+    out.extend_from_slice(&4096u16.to_be_bytes()); // class = UDP payload size
+    out.extend_from_slice(&0u32.to_be_bytes()); // ext-rcode/flags
+    out.extend_from_slice(&(rdata_len as u16).to_be_bytes()); // RDLEN
+    out.extend_from_slice(&8u16.to_be_bytes()); // OPTION-CODE = ECS
+    out.extend_from_slice(&(opt_data_len as u16).to_be_bytes()); // OPTION-LENGTH
+    out.extend_from_slice(&family.to_be_bytes());
+    out.push(plen);
+    out.push(0); // SCOPE PREFIX-LENGTH（请求端置 0）
+    out.extend_from_slice(&addr);
+    Some(out)
 }
 
 /// UDP 截断：超过客户端公布尺寸时丢弃 answer/authority/additional、置 TC=1；
@@ -991,6 +1055,43 @@ mod tests {
                 t0 + Duration::from_secs(21)
             )
             .is_none());
+    }
+
+    #[test]
+    fn ecs_injection_shape_and_auto_prefix() {
+        let q = query("ecs.test", 1);
+        assert!(!query_edns(&q).present);
+        let (ip, plen) = ecs_auto_prefix("192.0.2.254".parse().unwrap());
+        assert_eq!(plen, 24);
+        let out = add_ecs(&q, (ip, plen)).unwrap();
+        // OPT 固定 11B + RDATA（option-code/len 4B + ECS 4B + 3 字节地址）
+        assert_eq!(out.len(), q.len() + 11 + 8 + 3);
+        let e = query_edns(&out);
+        assert!(e.present && e.has_options);
+        // 尾部结构：family=1, prefix=24, scope=0, addr=192.0.2.0
+        assert_eq!(&out[out.len() - 7..], &[0, 1, 24, 0, 192, 168, 5]);
+        // 已带 OPT 的查询不动
+        let q2 = {
+            let mut x = q.clone();
+            x[10..12].copy_from_slice(&1u16.to_be_bytes());
+            x.push(0);
+            put_u16(&mut x, RR_OPT);
+            put_u16(&mut x, 512);
+            x.extend_from_slice(&0u32.to_be_bytes());
+            put_u16(&mut x, 0);
+            x
+        };
+        assert!(add_ecs(&q2, (ip, plen)).is_none());
+        // RDATA 与 RDLEN 一致（parse_rrs 能完整遍历）
+        let parsed = parse_rrs(&out).unwrap();
+        let opt = parsed.iter().find(|r| r.rtype == RR_OPT).unwrap();
+        assert_eq!(opt.rdlen, 11);
+        assert_eq!(opt.rdata_off + opt.rdlen as usize, out.len());
+        // v6 → /56，地址截断到 7 字节
+        let (ip6, plen6) = ecs_auto_prefix("2001:db8:1:2:3:4:5:6".parse().unwrap());
+        assert_eq!(plen6, 56);
+        let out6 = add_ecs(&q, (ip6, plen6)).unwrap();
+        assert_eq!(out6.len(), q.len() + 11 + 8 + 7);
     }
 
     #[test]

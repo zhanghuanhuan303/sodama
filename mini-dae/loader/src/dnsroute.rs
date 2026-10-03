@@ -58,6 +58,8 @@ enum Chain {
 enum ReqKind {
     QName(usize),
     QType(u16),
+    /// 客户端源地址（mini 扩展；无客户端信息时不命中）
+    Sip(usize),
 }
 
 #[derive(Debug, Clone)]
@@ -86,6 +88,7 @@ struct RespEntry {
 pub struct DnsRouter {
     req: Vec<ReqEntry>,
     req_domains: Vec<DomainSetSpec>,
+    req_ips: Vec<Vec<Cidr>>,
     req_out: Vec<ReqOut>, // 与 req 等长；仅 Tail 项有效
     pub req_fallback: ReqOut,
     pub request_rule_lines: usize,
@@ -101,8 +104,15 @@ pub struct DnsRouter {
 }
 
 impl DnsRouter {
-    /// 请求分流；不会失败（未命中 → fallback）。
+    /// 请求分流（无客户端地址；测试/兼容用）。生产走 `request_select_for`。
+    #[allow(dead_code)]
     pub fn request_select(&self, q: &Question) -> ReqOut {
+        self.request_select_for(q, None)
+    }
+
+    /// 请求分流；`client` 为查询发起方地址（`sip()` 匹配用）。
+    /// 不会失败（未命中 → fallback）。
+    pub fn request_select_for(&self, q: &Question, client: Option<IpAddr>) -> ReqOut {
         let mut good = false;
         let mut bad = false;
         for (i, e) in self.req.iter().enumerate() {
@@ -112,6 +122,9 @@ impl DnsRouter {
                         dns::domain_set_matches(&self.req_domains[*idx], &q.qname)
                     }
                     ReqKind::QType(t) => q.qtype == *t,
+                    ReqKind::Sip(idx) => client
+                        .map(|ip| ip_hits(&self.req_ips[*idx], ip))
+                        .unwrap_or(false),
                 };
                 if hit {
                     good = true;
@@ -542,6 +555,7 @@ pub fn compile(
         return Ok(Some(DnsRouter {
             req: Vec::new(),
             req_domains: Vec::new(),
+            req_ips: Vec::new(),
             req_out: Vec::new(),
             req_fallback: ReqOut::AsIs,
             request_rule_lines: 0,
@@ -555,7 +569,7 @@ pub fn compile(
         }));
     };
     let mut notes = Vec::new();
-    let (req, req_domains, req_out, req_fb, lines) =
+    let (req, req_domains, req_ips, req_out, req_fb, lines) =
         compile_request(sec, tags, geo, &cfg.files, &mut notes)?;
     let (resp, resp_domains, resp_ips, resp_out, resp_fb, rlines) =
         match routing.items.iter().find_map(|i| match i {
@@ -575,6 +589,7 @@ pub fn compile(
     Ok(Some(DnsRouter {
         req,
         req_domains,
+        req_ips,
         req_out,
         req_fallback: req_fb,
         request_rule_lines: lines,
@@ -591,6 +606,7 @@ pub fn compile(
 type RequestParts = (
     Vec<ReqEntry>,
     Vec<DomainSetSpec>,
+    Vec<Vec<Cidr>>,
     Vec<ReqOut>,
     ReqOut,
     usize,
@@ -613,6 +629,7 @@ fn compile_request(
 ) -> Result<RequestParts, String> {
     let mut entries: Vec<ReqEntry> = Vec::new();
     let mut domains: Vec<DomainSetSpec> = Vec::new();
+    let mut ipsets: Vec<Vec<Cidr>> = Vec::new();
     let mut outs: Vec<ReqOut> = Vec::new();
     let mut fallback: Option<ReqOut> = None;
     let mut lines = 0usize;
@@ -674,9 +691,23 @@ fn compile_request(
                                 ));
                             }
                         }
+                        "sip" => {
+                            // mini 扩展：客户端源地址匹配（裸 CIDR / geoip / ext）
+                            let set = ip_set(f, geo, notes)?;
+                            let idx = ipsets.len();
+                            ipsets.push(set);
+                            rule_entries.push((
+                                ReqEntry {
+                                    kind: ReqKind::Sip(idx),
+                                    not: f.not,
+                                    chain: Chain::Or,
+                                },
+                                None,
+                            ));
+                        }
                         other => {
                             return Err(format!(
-                                "dns.routing.request 不支持函数 {other}（可用 qname/qtype/sub/node/subnode）"
+                                "dns.routing.request 不支持函数 {other}（可用 qname/qtype/sip/sub/node/subnode）"
                             ))
                         }
                     }
@@ -722,6 +753,7 @@ fn compile_request(
     Ok((
         entries,
         domains,
+        ipsets,
         outs,
         fallback.unwrap_or(ReqOut::AsIs),
         lines,
@@ -1034,6 +1066,35 @@ mod tests {
             "dns {\n upstream {\n  up1: 'udp://127.0.0.1:5353'\n }\n routing {\n  request {\n   qname(file: '/nonexistent/dnsroute-blocklist.txt') -> reject\n   fallback: up1\n  }\n }\n}\n",
         );
         assert!(compile(&cfg, &tags(), None).is_err());
+    }
+
+    #[test]
+    fn request_sip_client_subnet() {
+        use std::net::IpAddr;
+        let cfg = cfg_with(
+            "dns {\n upstream {\n  up1: 'udp://127.0.0.1:5353'\n  up2: 'udp://127.0.0.1:5354'\n }\n routing {\n  request {\n   qname(full: b.test) && sip(10.0.0.0/8) -> reject\n   qname(full: b.test) && !sip(10.0.0.0/8) -> up2\n   fallback: up1\n  }\n }\n}\n",
+        );
+        let r = compile(&cfg, &tags(), None).unwrap().unwrap();
+        let lan: IpAddr = "10.0.0.2".parse().unwrap();
+        let wan: IpAddr = "192.0.2.254".parse().unwrap();
+        assert_eq!(
+            r.request_select_for(&q("b.test", 1), Some(lan)),
+            ReqOut::Reject
+        );
+        assert_eq!(
+            r.request_select_for(&q("b.test", 1), Some(wan)),
+            ReqOut::Tag("up2".into())
+        );
+        // 无客户端信息：sip 不命中、!sip 命中 → up2（负向规则命中）
+        assert_eq!(
+            r.request_select_for(&q("b.test", 1), None),
+            ReqOut::Tag("up2".into())
+        );
+        // 无关域名走 fallback
+        assert_eq!(
+            r.request_select_for(&q("other.test", 1), Some(lan)),
+            ReqOut::Tag("up1".into())
+        );
     }
 
     #[test]

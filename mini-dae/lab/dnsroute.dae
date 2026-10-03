@@ -13,14 +13,19 @@ dns {
     upstream {
         up1: 'udp://127.0.0.1:5353'
         up2: 'udp://127.0.0.1:5354'
+        # mini 扩展：注入 ECS（auto = 按查询发起方地址归整 v4 /24、v6 /56）
+        up2ecs: 'udp://127.0.0.1:5354?ecs=auto'
     }
     routing {
         request {
             qname(full: blocked.test) -> reject
             qname(file: 'blocklist.test.txt') -> reject
             qname(suffix: via2.test) -> up2
+            qname(suffix: ecsroute.test) -> up2ecs
             qtype(https) -> reject
             qname(suffix: asis.test) -> asis
+            # mini 扩展：按客户端源网段分流
+            qname(suffix: viacli.test) && sip(10.0.0.0/24) -> up2
             fallback: up1
         }
         response {

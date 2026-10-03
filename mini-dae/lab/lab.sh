@@ -1487,6 +1487,22 @@ test_dnsroute() {
     echo "FAIL: 名单拦截的查询不应到上游"; exit 1
   fi
   echo "route: qname(file:) 自定义名单（suffix/full/注释，拦截不上行）"
+  # 1c) ECS 注入（upstream URL ecs=auto）：客户端 10.0.0.2 → /24 → 10.0.0（截断到前缀字节，RFC 7871）
+  out="$(ip netns exec "$CLIENT_NS" timeout 8 python3 "$HERE/dns_probe.py" 9.9.9.9 ecsroute.test 2>&1 || true)"
+  echo "$out"
+  printf '%s\n' "$out" | grep -q '^answer=10.9.10.48' || { echo "FAIL: ecsroute.test 未解析"; exit 1; }
+  grep -q '^QUERY ecsroute.test .*ecs=1/24/10\.0\.0$' "$FAKE_DNS_B_LOG" \
+    || { echo "FAIL: 上游未收到注入的 ECS（期望 ecs=1/24/10.0.0）"; cat "$FAKE_DNS_B_LOG"; exit 1; }
+  echo "route: ECS 注入（ecs=auto -> 1/24/10.0.0）"
+  # 1d) 客户端网段路由（sip）：客户端在 10.0.0.0/24 → up2
+  out="$(ip netns exec "$CLIENT_NS" timeout 8 python3 "$HERE/dns_probe.py" 9.9.9.9 viacli.test 2>&1 || true)"
+  echo "$out"
+  printf '%s\n' "$out" | grep -q '^answer=10.9.10.49' || { echo "FAIL: viacli.test 未解析"; exit 1; }
+  grep -q '^QUERY viacli.test ' "$FAKE_DNS_B_LOG" || { echo "FAIL: sip 未命中（up2 未收到 viacli.test）"; exit 1; }
+  if grep -q '^QUERY viacli.test ' "$FAKE_DNS_LOG" 2>/dev/null; then
+    echo "FAIL: sip 命中后不应到 up1"; exit 1
+  fi
+  echo "route: sip(10.0.0.0/24) -> up2（客户端网段匹配）"
   # 2) qtype(https)=65 -> reject
   out="$(ip netns exec "$CLIENT_NS" timeout 8 python3 "$HERE/dns_probe.py" 9.9.9.9 q65.test 65 2>&1 || true)"
   echo "$out"
@@ -1567,10 +1583,11 @@ import json
 v = json.load(open("/tmp/mini-dae-status.json"))
 d = v["dns"]
 r = d["routing"]
-assert r["request_rules"] == 5 and r["response_rules"] == 3, r
+assert r["request_rules"] == 7 and r["response_rules"] == 3, r
 assert r["rejects"] >= 5 and r["response_rejects"] >= 1 and r["relookups"] >= 1, r
-assert set(d["upstreams"].keys()) == {"up1", "up2"}, d["upstreams"]
+assert set(d["upstreams"].keys()) == {"up1", "up2", "up2ecs"}, d["upstreams"]
 assert r["upstream_hits"].get("up1", 0) >= 1 and r["upstream_hits"].get("up2", 0) >= 1, r["upstream_hits"]
+assert r["upstream_hits"].get("up2ecs", 0) >= 1, r["upstream_hits"]
 print("dnsroute: rules=%d/%d rejects=%d resp_rejects=%d relookups=%d hits=%s" % (
     r["request_rules"], r["response_rules"], r["rejects"], r["response_rejects"], r["relookups"], r["upstream_hits"]))
 PY

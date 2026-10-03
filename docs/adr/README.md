@@ -62,6 +62,7 @@
 | [0035](./ADR-0035-p18b-doq.md) | P18b DoQ（RFC 9250）：quinn 连接复用 + 每查询一条双向流、ID 置 0/恢复、FIN 后读、取消码 0x3；锁中毒恢复 + 单查询 panic 隔离；quic-go 参考服务端交叉验证 + AliDNS 真实 DoQ | 已采纳 | —（P18b 执行；对标表缺口 #5） |
 | [0036](./ADR-0036-p18c-dns-routing.md) | P18c `dns.routing` 请求/应答分流 + 多上游：qname/qtype→reject/asis/tag（asis 回客户端原目的，UDP/TCP 两路径）、应答 qname/qtype/upstream/ip→accept/reject/换上游重查（深度 3）；路由先于缓存 + 按上游作用域缓存；dae 链编码/默认 fallback 对齐；sub/node/subnode 以 note 跳过 | 已采纳 | —（P18c 执行；对标表缺口 #5 收尾） |
 | [0037](./ADR-0037-dns-file-blocklist.md) | `qname(file:)` 自定义域名名单（mini 扩展：文本名单、默认 suffix、full:/keyword:/regex: 前缀、相对路径按规则文件目录、缺失硬失败）+ `upstream_hits` 分流命中观测；真网关默认国内→本地明文/其余→DoH/名单拦截 | 已采纳 | —（P18c 实用化扩展） |
+| [0038](./ADR-0038-dns-ecs-sip.md) | DNS 精细策略（mini 扩展）：上游 URL `ecs=auto|<CIDR>` 注入 ECS（客户端子网，v4/24 v6/56，已带 OPT 透传，缓存按子网分域）+ 请求函数 `sip(...)` 客户端网段路由；真网关国内域 DoH+ECS | 已采纳 | —（P18c 实用化扩展二） |
 
 ## 新增一条 ADR
 

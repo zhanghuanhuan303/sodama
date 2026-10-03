@@ -21,7 +21,7 @@
 //! socket 为 AF_INET；解析在启动/重载时做一次）。
 
 use std::io::{Read, Write};
-use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs, UdpSocket};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -60,6 +60,15 @@ impl Scheme {
     }
 }
 
+/// ECS 注入模式（mini 扩展；URL 参数 `ecs=auto|CIDR`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EcsMode {
+    /// 用查询发起方的地址归整：v4 /24、v6 /56
+    Auto,
+    /// 固定前缀
+    Prefix(IpAddr, u8),
+}
+
 #[derive(Debug, Clone)]
 pub struct UpstreamSpec {
     pub scheme: Scheme,
@@ -68,6 +77,8 @@ pub struct UpstreamSpec {
     pub path: String,
     pub sni: Option<String>,
     pub insecure: bool,
+    /// ECS 注入（默认不注入，透传客户端自带 EDNS）
+    pub ecs: Option<EcsMode>,
 }
 
 /// 解析上游 URL（对照 dae `ParseRawUpstream` 的默认值）。
@@ -142,6 +153,7 @@ pub fn parse(raw: &str) -> Result<UpstreamSpec, String> {
     }
     let mut sni = None;
     let mut insecure = false;
+    let mut ecs = None;
     for kv in query.split('&') {
         let Some((k, v)) = kv.split_once('=') else {
             continue;
@@ -150,6 +162,9 @@ pub fn parse(raw: &str) -> Result<UpstreamSpec, String> {
             "sni" => sni = Some(v.to_string()),
             "insecure" | "allowinsecure" | "skip-cert-verify" => {
                 insecure = matches!(v, "1" | "true" | "TRUE" | "True")
+            }
+            "ecs" => {
+                ecs = Some(parse_ecs(v)?);
             }
             _ => {}
         }
@@ -161,7 +176,25 @@ pub fn parse(raw: &str) -> Result<UpstreamSpec, String> {
         path,
         sni,
         insecure,
+        ecs,
     })
+}
+
+/// 解析 `ecs=auto` 或 `ecs=<ip>/<prefix>`（v4/v6）。
+fn parse_ecs(v: &str) -> Result<EcsMode, String> {
+    if v.eq_ignore_ascii_case("auto") {
+        return Ok(EcsMode::Auto);
+    }
+    let (a, p) = v
+        .split_once('/')
+        .ok_or_else(|| format!("ecs 参数需为 auto 或 CIDR（如 192.168.0.0/24）: {v}"))?;
+    let ip: IpAddr = a.parse().map_err(|e| format!("ecs 地址非法（{v}）: {e}"))?;
+    let plen: u8 = p.parse().map_err(|e| format!("ecs 前缀非法（{v}）: {e}"))?;
+    let max = if ip.is_ipv4() { 32 } else { 128 };
+    if plen == 0 || plen > max {
+        return Err(format!("ecs 前缀越界（{v}）"));
+    }
+    Ok(EcsMode::Prefix(ip, plen))
 }
 
 fn dns_id(msg: &[u8]) -> Option<u16> {
@@ -668,6 +701,16 @@ mod tests {
         let s = parse("tls://10.0.0.1:853?sni=dns.test&insecure=1").unwrap();
         assert_eq!(s.sni.as_deref(), Some("dns.test"));
         assert!(s.insecure);
+        // ecs（mini 扩展）
+        let s = parse("https://223.5.5.5/dns-query?sni=dns.alidns.com&ecs=auto").unwrap();
+        assert_eq!(s.ecs, Some(EcsMode::Auto));
+        let s = parse("udp://127.0.0.1:53?ecs=192.0.2.0/24").unwrap();
+        assert_eq!(
+            s.ecs,
+            Some(EcsMode::Prefix("192.0.2.0".parse().unwrap(), 24))
+        );
+        assert!(parse("udp://127.0.0.1:53?ecs=10.0.0.0/33").is_err());
+        assert!(parse("udp://127.0.0.1:53?ecs=banana").is_err());
         // v6 字面量
         let s = parse("tls://[2001:db8::1]:853").unwrap();
         assert_eq!(s.host, "2001:db8::1");
