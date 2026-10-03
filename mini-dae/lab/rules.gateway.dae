@@ -37,5 +37,16 @@ l4proto(udp) && dport(443) -> block
 # --- 其余 UDP：直连（暂不做 UDP 代理） ---
 l4proto(udp) -> direct
 
+# --- P17b：pname（本机进程名；仅 WAN egress 新连接生效） ---
+# 进程名 = comm（≤15 字符）。查法：`cat /proc/<pid>/comm`，或
+# `mini-dae status --socket /tmp/mini-dae-gw.sock --json` 看 .pname 采集面（hits/entries）。
+# 当前策略：命令行调试工具（curl/python3）直连，方便对比「直连 vs 代理」；
+# 浏览器等其它进程不受影响（继续走 fallback -> proxy）。
+# 想给其它应用（wechat/qq/下载器…）直连时，照抄一行），例如：
+#   pname(wechat) -> direct
+#   pname(curl, python3) -> direct        # 多值 = OR
+pname(curl) -> direct
+pname(python3) -> direct
+
 # --- 兜底：全部 TCP 走代理 ---
 fallback -> proxy
