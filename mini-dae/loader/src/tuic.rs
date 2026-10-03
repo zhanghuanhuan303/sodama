@@ -188,7 +188,7 @@ impl TuicDialer {
     /// 每条 TCP relay 连接开一条 QUIC 双向流。
     pub fn connect_tcp(
         &self,
-        target: SocketAddr,
+        target: &crate::target::Target,
         timeout: Duration,
     ) -> io::Result<(TuicReadHalf, TuicWriteHalf)> {
         let conn = self.ensure_conn()?;
@@ -203,7 +203,7 @@ impl TuicDialer {
         let mut head = Vec::with_capacity(24);
         head.push(VER5);
         head.push(CMD_CONNECT);
-        push_addr(&mut head, target)?;
+        push_target_addr(&mut head, target)?;
         rt.block_on(async {
             match tokio::time::timeout(timeout, send.write_all(&head)).await {
                 Ok(Ok(())) => Ok(()),
@@ -253,6 +253,11 @@ fn push_addr(buf: &mut Vec<u8>, target: SocketAddr) -> io::Result<()> {
     }
     buf.extend_from_slice(&target.port().to_be_bytes());
     Ok(())
+}
+
+/// connect 路径的地址编码：0x00=域名 / 0x01=IPv4（含端口）。
+fn push_target_addr(buf: &mut Vec<u8>, target: &crate::target::Target) -> io::Result<()> {
+    target.encode_tuic_addr(buf)
 }
 
 // ---------------------------------------------------------------- TCP 读写半
@@ -737,8 +742,9 @@ mod tests {
         });
 
         let d = TuicDialer::new(cfg(port));
+        let t = crate::target::Target::from_socket_addr(echo_addr).unwrap();
         let (mut r, mut w) = d
-            .connect_tcp(echo_addr, Duration::from_secs(5))
+            .connect_tcp(&t, Duration::from_secs(5))
             .expect("connect_tcp");
         // 256KB 往返（分块写读，避开握手窗口）
         let chunk = vec![0x5au8; 64 * 1024];

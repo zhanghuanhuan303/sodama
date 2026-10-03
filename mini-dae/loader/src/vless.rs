@@ -18,6 +18,8 @@ use std::net::SocketAddr;
 use sha1::Sha1;
 use sha2::Digest as _;
 
+use crate::target::Target;
+
 /// 解析 VLESS UUID；失败返回 None。
 pub fn parse_uuid(s: &str) -> Option<[u8; 16]> {
     if s.len() < 32 || s.len() > 36 {
@@ -43,25 +45,14 @@ pub fn parse_uuid(s: &str) -> Option<[u8; 16]> {
 }
 
 /// 构造请求头（cmd 后的 port/ATYP/ADDR）。
-pub fn build_request_header(uuid: &[u8; 16], target: SocketAddr, udp: bool) -> io::Result<Vec<u8>> {
+pub fn build_request_header(uuid: &[u8; 16], target: &Target, udp: bool) -> io::Result<Vec<u8>> {
     let mut h = Vec::with_capacity(18 + 1 + 2 + 1 + 5);
     h.push(0x00);
     h.extend_from_slice(uuid);
     h.push(0x00); // addon 长度
     h.push(if udp { 0x02 } else { 0x01 });
     h.extend_from_slice(&target.port().to_be_bytes());
-    match target {
-        SocketAddr::V4(v4) => {
-            h.push(0x01);
-            h.extend_from_slice(&v4.ip().octets());
-        }
-        SocketAddr::V6(_) => {
-            return Err(io::Error::new(
-                ErrorKind::Unsupported,
-                "vless 只支持 IPv4 目标",
-            ))
-        }
-    }
+    target.encode_v2ray_addr(&mut h)?;
     Ok(h)
 }
 
@@ -123,7 +114,7 @@ pub fn connect_split<R, W>(
     read: R,
     mut write: W,
     uuid: &[u8; 16],
-    target: SocketAddr,
+    target: &Target,
 ) -> io::Result<(VlessReader<R>, VlessWriter<W>)>
 where
     R: Read,
@@ -238,7 +229,7 @@ where
     R: Read,
     W: Write,
 {
-    let head = build_request_header(uuid, target, true)?;
+    let head = build_request_header(uuid, &Target::from_socket_addr(target)?, true)?;
     write.write_all(&head)?;
     write.flush()?;
     Ok((
@@ -286,8 +277,8 @@ mod tests {
     #[test]
     fn request_header_layout() {
         let uuid = [0x11u8; 16];
-        let target: SocketAddr = "1.2.3.4:8080".parse().unwrap();
-        let h = build_request_header(&uuid, target, false).unwrap();
+        let target: Target = "1.2.3.4:8080".parse().unwrap();
+        let h = build_request_header(&uuid, &target, false).unwrap();
         #[rustfmt::skip]
         let mut want = vec![
             0x00,
@@ -298,7 +289,19 @@ mod tests {
         assert_eq!(h, want);
         // UDP cmd（idx18）
         want[18] = 0x02;
-        assert_eq!(build_request_header(&uuid, target, true).unwrap(), want);
+        assert_eq!(build_request_header(&uuid, &target, true).unwrap(), want);
+    }
+
+    #[test]
+    fn request_header_domain_target() {
+        let uuid = [0x22u8; 16];
+        let target: Target = "www.example.com:443".parse().unwrap();
+        let h = build_request_header(&uuid, &target, false).unwrap();
+        let tail = &h[19..]; // cmd 之后：port(2) + ATYP+ADDR
+        assert_eq!(&tail[..2], &443u16.to_be_bytes());
+        assert_eq!(tail[2], 0x02); // ATYP=域名
+        assert_eq!(tail[3] as usize, "www.example.com".len());
+        assert_eq!(&tail[4..], b"www.example.com");
     }
 
     #[test]

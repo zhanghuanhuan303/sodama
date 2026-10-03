@@ -28,7 +28,7 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -49,10 +49,12 @@ mod hysteria2;
 mod outbound;
 mod quicsock;
 mod rules;
+mod sniffer;
 mod socks5;
 mod socksin;
 mod ss;
 mod status;
+mod target;
 mod tls;
 mod trojan;
 mod tuic;
@@ -107,6 +109,36 @@ static RELAY_IDLE_SECS: AtomicU64 = AtomicU64::new(300);
 static RELAY_DIAL_TIMEOUT_MS: AtomicU64 = AtomicU64::new(5000);
 /// P4b：UDP NAT 会话空闲阈值（秒）。
 static UDP_IDLE_SECS: AtomicU64 = AtomicU64::new(60);
+
+// ---- P14：嗅探 / dial_mode（远端域名解析）----
+/// 0=ip（默认，不嗅探）| 1=domain | 2=domain+（当前同 domain）。
+static DIAL_MODE: AtomicU8 = AtomicU8::new(0);
+/// 嗅探等待上限（毫秒）；只在 dial_mode != ip 时生效。
+static SNIFF_TIMEOUT_MS: AtomicU64 = AtomicU64::new(100);
+
+struct SniffStats {
+    attempts: AtomicU64,
+    hits: AtomicU64,
+    misses: AtomicU64,
+}
+impl SniffStats {
+    const fn new() -> Self {
+        Self {
+            attempts: AtomicU64::new(0),
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
+        }
+    }
+}
+static SNIFF_STATS: SniffStats = SniffStats::new();
+
+fn dial_mode_name(mode: u8) -> &'static str {
+    match mode {
+        1 => "domain",
+        2 => "domain+",
+        _ => "ip",
+    }
+}
 
 #[derive(Default)]
 struct RelayStats {
@@ -354,6 +386,10 @@ struct Args {
     relay_idle_timeout: Option<u64>,
     /// P11：relay 拨号超时秒数（默认 5；真实节点慢首连可调大）
     dial_timeout: Option<u64>,
+    /// P14：拨号模式 ip|domain|domain+（缺省 ip；config global.dial_mode 可提供）
+    dial_mode: Option<String>,
+    /// P14：嗅探等待上限（毫秒，默认 100；仅 dial_mode != ip 时生效）
+    sniffing_timeout_ms: Option<u64>,
     /// P12：本地 SOCKS5 入口（如 127.0.0.1:11080）；开启后不加载 eBPF、不需要 root
     listen_socks: Option<String>,
     /// P4：UDP NAT 会话空闲秒数（默认 60）
@@ -439,6 +475,8 @@ fn usage() -> ! {
            --dialer <url>        P4：代理出口拨号器（direct 或 socks5://host:port）\n\
            --relay-idle-timeout <s> P4：relay 空闲回收秒数（默认 300）
            --dial-timeout <s>       P11：relay 拨号超时秒数（默认 5；真实节点慢首连可调大）
+           --dial-mode <m>          P14：ip|domain|domain+（默认 ip；域名模式嗅探 SNI/Host 后远端解析，绕 DNS 污染）
+           --sniffing-timeout-ms <n> P14：嗅探等待上限毫秒（默认 100；仅 dial_mode != ip 生效）
            --listen-socks <addr>    P12：本地 SOCKS5 入口（浏览器测试用；不加载 eBPF、不需 root）\n\
            --udp-idle-timeout <s>   P4：UDP NAT 会话空闲秒数（默认 60）\n\
            --forward <url>       旧写法：等价于 --dialer socks5://host:port\n\
@@ -483,6 +521,8 @@ fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
         dialer: None,
         relay_idle_timeout: None,
         dial_timeout: None,
+        dial_mode: None,
+        sniffing_timeout_ms: None,
         listen_socks: None,
         udp_idle_timeout: None,
         forward: None,
@@ -520,6 +560,14 @@ fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
             "--dialer" => args.dialer = Some(next()?),
             "--relay-idle-timeout" => args.relay_idle_timeout = Some(next()?.parse()?),
             "--dial-timeout" => args.dial_timeout = Some(next()?.parse()?),
+            "--dial-mode" => {
+                let v = next()?;
+                match v.as_str() {
+                    "ip" | "domain" | "domain+" | "domain++" => args.dial_mode = Some(v),
+                    other => return Err(format!("--dial-mode 取值非法: {other}").into()),
+                }
+            }
+            "--sniffing-timeout-ms" => args.sniffing_timeout_ms = Some(next()?.parse()?),
             "--listen-socks" => args.listen_socks = Some(next()?),
             "--udp-idle-timeout" => args.udp_idle_timeout = Some(next()?.parse()?),
             "--forward" => args.forward = Some(next()?),
@@ -1085,17 +1133,28 @@ fn handle_socks_conn(mut client: TcpStream) {
         }
     };
     let tname = target.display();
-    let resolved = match target.resolve() {
-        Ok(a) => a,
-        Err(e) => {
-            let _ = socksin::reply(&mut client, socksin::REP_GENERAL);
-            log(&format!("socks: 解析 {tname} 失败: {e}"));
-            let _ = client.shutdown(std::net::Shutdown::Both);
-            return;
+    // P14：SOCKS 客户端给的是域名且开启 dial_mode 时，不做本地解析，域名直交节点。
+    let mode = DIAL_MODE.load(Ordering::Relaxed);
+    let dial_target = match target {
+        socksin::SocksTarget::Domain(name, port) if mode != 0 => {
+            log(&format!(
+                "socks: {name}:{port} 远端解析（dial_mode {}）",
+                dial_mode_name(mode)
+            ));
+            target::Target::domain(name, port)
         }
+        t => match t.resolve().and_then(target::Target::from_socket_addr) {
+            Ok(a) => a,
+            Err(e) => {
+                let _ = socksin::reply(&mut client, socksin::REP_GENERAL);
+                log(&format!("socks: 解析 {tname} 失败: {e}"));
+                let _ = client.shutdown(std::net::Shutdown::Both);
+                return;
+            }
+        },
     };
     let dial_timeout = Duration::from_millis(RELAY_DIAL_TIMEOUT_MS.load(Ordering::Relaxed));
-    let dialed = match dialer.dial_tcp(resolved, dial_timeout) {
+    let dialed = match dialer.dial_tcp(&dial_target, dial_timeout) {
         Ok(d) => d,
         Err(e) => {
             let _ = socksin::reply(&mut client, socksin::REP_GENERAL);
@@ -1156,14 +1215,39 @@ fn handle_socks_conn(mut client: TcpStream) {
 
 /// relay 一条连接：按 dialer 拨号到 orig_dst，双向转发（含半关闭）。
 fn handle_relay_conn(mut client: TcpStream) {
-    let Ok(target) = client.local_addr() else {
+    let Ok(orig) = client.local_addr() else {
         return;
     };
     let Some(dialer) = OUTBOUND.get() else {
         return;
     };
+    // P14：dial_mode != ip 时先做用户态嗅探（MSG_PEEK 只读，不消费字节流）
+    let mode = DIAL_MODE.load(Ordering::Relaxed);
+    let target = if mode != 0 {
+        SNIFF_STATS.attempts.fetch_add(1, Ordering::Relaxed);
+        let timeout = Duration::from_millis(SNIFF_TIMEOUT_MS.load(Ordering::Relaxed));
+        match sniffer::sniff_domain(&client, timeout) {
+            Some(name) => {
+                SNIFF_STATS.hits.fetch_add(1, Ordering::Relaxed);
+                log(&format!("sniff {orig} → {name}（域名交节点远端解析）"));
+                target::Target::domain(name, orig.port())
+            }
+            None => {
+                SNIFF_STATS.misses.fetch_add(1, Ordering::Relaxed);
+                match target::Target::from_socket_addr(orig) {
+                    Ok(t) => t,
+                    Err(_) => return,
+                }
+            }
+        }
+    } else {
+        match target::Target::from_socket_addr(orig) {
+            Ok(t) => t,
+            Err(_) => return,
+        }
+    };
     let dial_timeout = Duration::from_millis(RELAY_DIAL_TIMEOUT_MS.load(Ordering::Relaxed));
-    let dialed = match dialer.dial_tcp(target, dial_timeout) {
+    let dialed = match dialer.dial_tcp(&target, dial_timeout) {
         Ok(d) => d,
         Err(e) => {
             RELAY_STATS.dial_errors.fetch_add(1, Ordering::Relaxed);
@@ -1175,7 +1259,15 @@ fn handle_relay_conn(mut client: TcpStream) {
             return;
         }
     };
-    log(&format!("RELAY {target} established（{}）", dialer.name()));
+    log(&format!(
+        "RELAY {target}{} established（{}）",
+        if target.is_domain() {
+            "（远端解析）"
+        } else {
+            ""
+        },
+        dialer.name()
+    ));
     RELAY_STATS.conns_total.fetch_add(1, Ordering::Relaxed);
     RELAY_STATS.conns_active.fetch_add(1, Ordering::Relaxed);
     let outbound::DialedStream {
@@ -1639,6 +1731,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if let Some(s) = args.udp_idle_timeout {
         UDP_IDLE_SECS.store(s, Ordering::SeqCst);
+    }
+
+    // P14：dial_mode（CLI > config global.dial_mode > ip）
+    {
+        let mut mode = args.dial_mode.clone();
+        if mode.is_none() {
+            if let Some(cfg_path) = &args.config {
+                if let Ok(cfg) = config::load(std::path::Path::new(cfg_path)) {
+                    mode = config::global_value(&cfg, "dial_mode");
+                }
+            }
+        }
+        let m = match mode.as_deref() {
+            None | Some("ip") => 0u8,
+            Some("domain") => 1,
+            Some("domain+") | Some("domain++") => 2,
+            Some(other) => {
+                eprintln!("[mini-dae] 未知 dial_mode {other}，按 ip 处理");
+                0
+            }
+        };
+        DIAL_MODE.store(m, Ordering::SeqCst);
+        if let Some(ms) = args.sniffing_timeout_ms {
+            SNIFF_TIMEOUT_MS.store(ms, Ordering::SeqCst);
+        }
+        if m != 0 {
+            log(&format!(
+                "dial_mode: {}（嗅探上限 {}ms；命中 SNI/Host 则域名交节点远端解析）",
+                dial_mode_name(m),
+                SNIFF_TIMEOUT_MS.load(Ordering::SeqCst)
+            ));
+        }
     }
 
     // 对拍模式：只编译规则（不加载 eBPF、不需要 root）。
@@ -2942,6 +3066,13 @@ fn status_json(ebpf: &mut Ebpf) -> serde_json::Value {
             "offload_enabled": RELAY_OFFLOAD.get().is_some(),
             "offloaded_total": RELAY_STATS.offloaded_total.load(Ordering::Relaxed),
             "offload_failures": RELAY_STATS.offload_failures.load(Ordering::Relaxed),
+        },
+        "sniffing": {
+            "dial_mode": dial_mode_name(DIAL_MODE.load(Ordering::Relaxed)),
+            "timeout_ms": SNIFF_TIMEOUT_MS.load(Ordering::Relaxed),
+            "attempts": SNIFF_STATS.attempts.load(Ordering::Relaxed),
+            "hits": SNIFF_STATS.hits.load(Ordering::Relaxed),
+            "misses": SNIFF_STATS.misses.load(Ordering::Relaxed),
         },
         "udp_nat": {
             "sessions_active": UDP_NAT.lock().map(|t| t.len()).unwrap_or(0),

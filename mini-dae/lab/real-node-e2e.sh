@@ -7,6 +7,7 @@
 # 可选：
 #   VLESS_WS_TARGET_HOST=www.gstatic.com   # 目标域名（默认）
 #   VLESS_WS_TARGET_PATH=/generate_204     # 目标路径（默认）
+#   DIAL_MODE=domain                       # P14：嗅探 SNI 后域名交节点远端解析（默认 ip）
 #
 # 语义：client ns → mini-dae（tproxy + relay）→ 真实节点 → 目标。
 # 目标 IP 在宿主解析后写进 IP 规则（不依赖 DNS 接管）；节点 URL 仅经环境变量传递。
@@ -42,7 +43,9 @@ trap cleanup EXIT
 chmod 640 "$rules"
 
 echo "== 启动 mini-dae（relay → 真实节点）=="
-USE_RULES="$rules" USE_DIALER="$NODE_URL" USE_RELAY_IDLE=30 "$HERE/lab.sh" up
+env_args=()
+[ -n "${DIAL_MODE:-}" ] && env_args+=(USE_DIAL_MODE="$DIAL_MODE")
+env USE_RULES="$rules" USE_DIALER="$NODE_URL" USE_RELAY_IDLE=30 "${env_args[@]}" "$HERE/lab.sh" up
 
 echo "== 客户端经网关请求 https://$TARGET_HOST$TARGET_PATH =="
 code="$(ip netns exec mini_client curl -sS -o /dev/null -w '%{http_code}' -m 30 \
@@ -52,6 +55,15 @@ echo "gw_http_code=$code"
 echo "== 网关计数 =="
 "$ROOT/target/release/mini-dae" metrics --socket /tmp/mini-dae-status.sock \
   | awk '$1 ~ /mini_dae_relay_(bytes_up|bytes_down|conns_total|dial_errors)/ {print}'
+
+if [ -n "${DIAL_MODE:-}" ] && [ "$DIAL_MODE" != ip ]; then
+  echo "== 嗅探证据（dial_mode=$DIAL_MODE）=="
+  grep -E "sniff .*→" /tmp/mini-dae.log | tail -2 || true
+  if ! grep -q "远端解析" /tmp/mini-dae.log; then
+    echo "FAIL: dial_mode=$DIAL_MODE 但日志未出现远端解析（嗅探未命中？）"
+    exit 1
+  fi
+fi
 
 case "$code" in
   2* | 3*) echo "PASS: 真实节点端到端（→ $TARGET_HOST）" ;;

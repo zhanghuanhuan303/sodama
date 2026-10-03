@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # mini-dae 真网关模式：在宿主 netns 用 eBPF 透明接管本机流量（浏览器零配置）。
 #
-#   sudo lab/gateway.sh up [--iface wlan0] [--node <文件|URL>] [--rules <文件>] [--no-ipv6]
+#   sudo lab/gateway.sh up [--iface wlan0] [--node <文件|URL>] [--rules <文件>] [--no-ipv6] [--dial-mode ip|domain]
 #   sudo lab/gateway.sh down          # 停止并恢复（幂等）
 #   sudo lab/gateway.sh status        # 查看进程/钩子/日志
 #   lab/gateway.sh test               # 连通性快检（可直接用当前用户跑）
@@ -15,6 +15,8 @@
 #   - 回程由 dae0 ingress 按 redirect_track 还原 MAC 后 BPF_F_INGRESS 注回 WAN；
 #   - DNS 默认被数据面自动送控制面 DNS 模块；本脚本配套规则用 direct(must)
 #     把它压回系统解析路径（见 lab/rules.gateway.dae 的说明）。
+#   - P14：默认 dial_mode=domain——relay 先嗅探 TLS SNI / HTTP Host，命中后把
+#     域名（而不是被污染 DNS 解析出的 IP）交给节点远端解析；--dial-mode ip 可关。
 #
 # 安全与回滚：
 #   - 不移动网卡、不碰 NetworkManager；loader 异常退出时 tc 钩子随进程自动拆除，
@@ -45,6 +47,8 @@ DEFAULT_NODE_FILE=/tmp/mini-dae-node.url
 IFACE=""
 RULES="$HERE/rules.gateway.dae"
 NODE=""
+DIAL_MODE="domain"
+SNIFF_TIMEOUT_MS=100
 NO_IPV6=0
 DRY_RUN=0
 
@@ -137,6 +141,10 @@ up() {
   [ -x "$LOADER" ] || die "缺 loader：$LOADER（先 lab/lab.sh build）"
   [ -f "$OBJ" ] || die "缺 eBPF 对象：$OBJ（先 lab/build-ebpf-rs.sh）"
   [ -f "$RULES" ] || die "缺规则文件：$RULES"
+  case "$DIAL_MODE" in
+  ip | domain | domain+ | domain++) ;;
+  *) die "--dial-mode 取值非法：$DIAL_MODE（ip|domain|domain+）" ;;
+  esac
 
   [ -n "$IFACE" ] || IFACE="$(detect_iface)"
   [ -n "$IFACE" ] || die "拿不到默认路由网卡，请用 --iface 指定"
@@ -159,7 +167,7 @@ up() {
   dns_up="$(detect_dns)"
   [ -n "$dns_up" ] || dns_up="127.0.0.1"
 
-  info "真网关模式 iface=$IFACE dns=$dns_up:53 rules=$RULES"
+  info "真网关模式 iface=$IFACE dns=$dns_up:53 rules=$RULES dial_mode=$DIAL_MODE"
   echo "   节点：$(printf '%s' "$node_url" | cut -d: -f1)://…（敏感信息不回显）"
 
   cleanup
@@ -206,7 +214,7 @@ up() {
 
   info "启动 loader（log=$LOG）"
   if [ "$DRY_RUN" -eq 1 ]; then
-    echo "  + nohup $LOADER --ebpf $OBJ --lan none --wan $IFACE --dae0 $DAE0 --dae0peer $DAE0PEER --daens $DAE_NS --rules $RULES --dialer '<node-url>' --dial-timeout 15 --dns-upstream $dns_up:53 --status-socket $STATUS_SOCK --log-file $LOG >>$LOG 2>&1 &"
+    echo "  + nohup $LOADER --ebpf $OBJ --lan none --wan $IFACE --dae0 $DAE0 --dae0peer $DAE0PEER --daens $DAE_NS --rules $RULES --dialer '<node-url>' --dial-timeout 15 --dial-mode $DIAL_MODE --sniffing-timeout-ms $SNIFF_TIMEOUT_MS --dns-upstream $dns_up:53 --status-socket $STATUS_SOCK --log-file $LOG >>$LOG 2>&1 &"
     echo "（dry-run：未执行任何变更）"
     return 0
   fi
@@ -214,6 +222,7 @@ up() {
   nohup "$LOADER" --ebpf "$OBJ" --lan none --wan "$IFACE" \
     --dae0 "$DAE0" --dae0peer "$DAE0PEER" --daens "$DAE_NS" \
     --rules "$RULES" --dialer "$node_url" --dial-timeout 15 \
+    --dial-mode "$DIAL_MODE" --sniffing-timeout-ms "$SNIFF_TIMEOUT_MS" \
     --dns-upstream "$dns_up:53" \
     --status-socket "$STATUS_SOCK" --log-file "$LOG" >>"$LOG" 2>&1 &
   echo $! >"$PID_FILE"
@@ -297,6 +306,7 @@ while [ $# -gt 0 ]; do
   --iface) IFACE="$2"; shift 2 ;;
   --node) NODE="$2"; shift 2 ;;
   --rules) RULES="$2"; shift 2 ;;
+  --dial-mode) DIAL_MODE="$2"; shift 2 ;;
   --no-ipv6) NO_IPV6=1; shift ;;
   --dry-run) DRY_RUN=1; shift ;;
   -h | --help) usage; exit 0 ;;

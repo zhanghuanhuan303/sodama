@@ -388,7 +388,7 @@ impl Hy2Dialer {
     /// 每条 TCP relay 连接开一条 QUIC 双向流；拨号阶段解析服务端响应（非 FastOpen）。
     pub fn connect_tcp(
         &self,
-        target: SocketAddr,
+        target: &crate::target::Target,
         timeout: Duration,
     ) -> io::Result<(Hy2ReadHalf, Hy2WriteHalf)> {
         let conn = self.ensure_conn()?;
@@ -960,7 +960,10 @@ mod tests {
 
         let d = Hy2Dialer::new(client_cfg(port));
         let (mut r, mut w) = d
-            .connect_tcp(echo_addr, Duration::from_secs(5))
+            .connect_tcp(
+                &crate::target::Target::from_socket_addr(echo_addr).unwrap(),
+                Duration::from_secs(5),
+            )
             .expect("connect_tcp");
         // 256KB 往返（分块写读，避开握手窗口）
         let chunk = vec![0xa5u8; 64 * 1024];
@@ -1045,7 +1048,10 @@ mod tests {
         cfg.obfs_password = Some("testpass".into());
         let d = Hy2Dialer::new(cfg);
         let (mut r, mut w) = d
-            .connect_tcp(echo_addr, Duration::from_secs(5))
+            .connect_tcp(
+                &crate::target::Target::from_socket_addr(echo_addr).unwrap(),
+                Duration::from_secs(5),
+            )
             .expect("connect_tcp (obfs)");
         let chunk = vec![0x5au8; 64 * 1024];
         w.write_all(&chunk).unwrap();
@@ -1116,7 +1122,10 @@ mod tests {
         cfg.rx_bytes_per_sec = 1_000_000;
         let d = Hy2Dialer::new(cfg);
         let (mut r, mut w) = d
-            .connect_tcp(echo_addr, Duration::from_secs(5))
+            .connect_tcp(
+                &crate::target::Target::from_socket_addr(echo_addr).unwrap(),
+                Duration::from_secs(5),
+            )
             .expect("connect_tcp (brutal)");
         let chunk = vec![0x3cu8; 128 * 1024];
         for _ in 0..2 {
@@ -1165,7 +1174,10 @@ mod tests {
         cfg.hop_interval = Duration::from_secs(5);
         let d = Hy2Dialer::new(cfg);
         let (mut r, mut w) = d
-            .connect_tcp(echo_addr, Duration::from_secs(5))
+            .connect_tcp(
+                &crate::target::Target::from_socket_addr(echo_addr).unwrap(),
+                Duration::from_secs(5),
+            )
             .expect("connect_tcp (hop)");
         // 持续打流 ~11s（跨 2 次跳）；逐块回显校验
         let chunk = vec![0x77u8; 16 * 1024];

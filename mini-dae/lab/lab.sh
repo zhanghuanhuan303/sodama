@@ -479,6 +479,8 @@ up() {
   extra_args=()
   [ -n "${USE_RELAY_IDLE:-}" ] && extra_args+=(--relay-idle-timeout "$USE_RELAY_IDLE")
   [ -n "${USE_DIAL_TIMEOUT:-}" ] && extra_args+=(--dial-timeout "$USE_DIAL_TIMEOUT")
+  [ -n "${USE_DIAL_MODE:-}" ] && extra_args+=(--dial-mode "$USE_DIAL_MODE")
+  [ -n "${USE_SNIFF_TIMEOUT:-}" ] && extra_args+=(--sniffing-timeout-ms "$USE_SNIFF_TIMEOUT")
   [ -n "${USE_UDP_IDLE:-}" ] && extra_args+=(--udp-idle-timeout "$USE_UDP_IDLE")
   [ -n "${USE_OFFLOAD:-}" ] && extra_args+=(--offload)
   [ -n "${USE_LOG_FILE:-}" ] && extra_args+=(--log-file "$OPS_LOG")

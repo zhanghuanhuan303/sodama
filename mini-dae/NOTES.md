@@ -820,6 +820,32 @@ P4 稳定性 → P3 内核矩阵）：
 - **边界**：IPv6 不代理（`--no-ipv6` 可临时关网卡 v6）；UDP 不代理（QUIC 显式 block，引导浏览器回落 TCP）；
   无 systemd 常驻/崩溃自愈（未做，重启后需重新 up）；Docker/容器流量同样经 wlan0 被接管。
 
+### 11.21 P14（用户态嗅探 / dial_mode 远端域名解析）已验收的行为
+
+（决策与取舍、与 dae 的差异见 ADR-0030；实现 `loader/src/target.rs` +
+`loader/src/sniffer.rs` + `main.rs` 的 relay/accepted 路径。）
+
+- **入口**：`--dial-mode ip|domain|domain+`（`domain++` 为兼容别名；CLI > config
+  `global.dial_mode` > 默认 `ip`）、`--sniffing-timeout-ms`（默认 100）；
+  `gateway.sh` 默认 `domain`；lab 透传 `USE_DIAL_MODE`/`USE_SNIFF_TIMEOUT`；
+  `real-node-e2e.sh` 接受 `DIAL_MODE=` 环境变量。
+- **实现要点**：
+  - `target::Target`（Ip/Domain）+ 逐协议域名编码：RFC1928 风格 0x03（ss/socks5/
+    trojan/anytls）、vless/vmess 0x02、tuic v5 0x00、hysteria2 字符串；direct 本地解析；
+  - `sniffer::sniff`（纯函数，可测）：TLS ClientHello SNI + HTTP/1.x Host / CONNECT；
+  - relay accept 后 `MSG_PEEK` 只读采集（**不消费字节**，泵语义不变），超时回退 IP；
+  - SOCKS5 入口：客户端给域名且 dial_mode != ip 时不做本地解析，域名直交节点。
+- **可观测**：状态面 `sniffing`（dial_mode / timeout_ms / attempts / hits / misses）。
+- **实测**：`cargo test --release` **108/108**（嗅探 8 + 目标 4 + vless 域名头 1 等）；
+  `DIAL_MODE=domain REAL_NODE_URL=anytls://… sudo lab/real-node-e2e.sh` →
+  日志 `sniff 203.0.113.34:443 → www.gstatic.com（域名交节点远端解析）`、**204**、
+  relay `dial_errors=0`；真机网关（wlan0 + anytls 节点）：`sniffing: attempts=10 hits=10
+  misses=0`、gstatic **204** / YouTube **200** / 出口 IP=节点侧。
+- **边界（如实）**：只做 TCP 嗅探；QUIC/UDP 与 HTTP/2 明文（h2c）不做；
+  ClientHello 只看首 record（超时回退 IP）；无 sniff-punt（不按嗅探域名重判路由）；
+  `domain` 即「命中即用域名」（等价 dae `domain+` 的“总是使用”行为，dae 的
+  `domain` 带 DNS 缓存/后台探测门槛，未实现）；UDP 目标仍为 IP。
+
 ## 12. 用 Rust 重写这套东西的可行性
 
 已验证（本仓库 mini-dae，实测跑通）：

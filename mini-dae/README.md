@@ -63,6 +63,11 @@ P6（suspend/reload/metrics/sysdump/日志轮转/整配置热重载）已完成*
   只挂 wan egress/ingress 钩子接管**宿主自身流量**（浏览器零配置）；规则纪律：
   DNS `direct(must)` 置顶、禁用任何 `sip()`（宿主机源地址即私网）、QUIC 阻断回落 TCP；
   一键 up/down/status/test，一键回滚无残留（ADR-0029、NOTES §11.20）
+- **P14 用户态嗅探 + dial_mode（远端域名解析）**：TLS ClientHello SNI / HTTP/1.x Host/CONNECT
+  嗅探（`MSG_PEEK` 只读采集不消费，超时默认 100ms 回退 IP）；`--dial-mode ip|domain|domain+`
+  命中即交域名给节点远端解析（绕 DNS 污染）；目标地址类型化（vless/vmess 0x02、tuic 0x00、
+  ss/socks5/trojan/anytls 0x03、hy2 字符串、direct 本地解析）；SOCKS 入口同享；
+  状态面 `sniffing` 计数（ADR-0030、NOTES §11.21）
 - **P5-G3a QUIC（tuic v5）**：惰性 tokio 运行时 + quinn（阻塞 relay 用 block_on 桥接）；
   认证 token = TLS exporter（label=uuid 裸字节、context=password）；TCP 每条中继一条 QUIC
   双向流，UDP 走 QUIC DATAGRAM（含分片/重组）；上游 socket 用自建 `Endpoint` 打 `SO_MARK`；
@@ -108,6 +113,8 @@ ebpf-rs/src/         Rust/aya-ebpf 数据面（唯一）：8 个 tc 程序 + 规
 loader/src/main.rs   Rust + aya：加载、挂钩子、setns、tproxy/UDP socket、规则下发/热重载、
                      relay/Dialer、UDP NAT、offload 注册、janitor、只读状态面、DNS 线程
 loader/src/rules.rs  迷你规则解析 + 编译（match_set 编码 + LPM trie + regex 编译 + dump/对拍）
+loader/src/target.rs P14：拨号目标类型（IPv4/域名）+ 逐协议域名编码（vless/vmess/tuic/RFC1928/字符串）
+loader/src/sniffer.rs P14：TLS SNI / HTTP Host 嗅探（纯解析函数 + MSG_PEEK 采集循环）
 loader/src/config.rs 全量 .dae 解析（词法/语法、include 合并、schema 校验、deferred 提取）
 loader/src/status.rs 状态面（Unix socket：status/rules/config/maps/metrics + reload/suspend/resume 控制命令）
 loader/src/socks5.rs 最小 SOCKS5 客户端（relay 的一种 dialer，握手 + CONNECT）
@@ -275,6 +282,7 @@ sudo lab/lab.sh test-hy2-hop     # 两轮 512KB 跨跳存活
 #   REAL_NODE_URL='vless://…type=ws…' 或 'anytls://…' 或 'socks5://…'（桥接） \
 #     sudo lab/real-node-e2e.sh    # client ns → tproxy → relay → 真实节点 → gstatic 204
 # 慢节点首连可调：USE_DIAL_TIMEOUT=15 sudo -E lab/real-node-e2e.sh
+# P14：嗅探 + 远端解析（域名交节点）：DIAL_MODE=domain sudo -E lab/real-node-e2e.sh
 sudo lab/lab.sh ops-up      # P6：运维面会话（--log-file + 状态面控制命令）
 sudo lab/lab.sh test-ops         # suspend(fail-open)/reload/metrics/sysdump/日志轮转
 sudo lab/lab.sh ops-reload-up    # P6：整配置热重载会话（/tmp 配置副本 + 假 DNS）
@@ -787,8 +795,8 @@ MATRIX-RESULT kernel=7.2.8-arch1-2 verify=PASS
 数据面：DNS 嗅探 punt（`ROUTE_STATE_DNS_QUERY` 强制控制面路径）、geoip/geosite 数据、
 进程名匹配（cgroup cookie）、IPv6、事件 ringbuf。
 转发面：offload 的 backlog fuse / tcp_info 精确计费 / SK_PASS 用户态回退协调（ADR-0022 已补：
-半关闭超时看门狗、fast_sock 键注销、注册前排空队列；已 offload 的连接可回收）；UDP 跨目标
-full-cone；嗅探（TLS/QUIC）；relay 并发上限。
+（ADR-0022 已补：半关闭超时看门狗、fast_sock 键注销、注册前排空队列；已 offload 的连接可回收）；UDP 跨目标
+full-cone；嗅探的剩余形态（QUIC/UDP、h2c、sniff-punt；TLS/HTTP1 已做见 ADR-0030）；relay 并发上限。
 协议栈（P5-G3b+ 后的剩余）：hysteria2 的 gecko 混淆、pinSHA256/ECH/自定义 CA、QPACK 动态表
 （当前只支持静态表）；udphop 只支持链接扩展 interval（dae 是全局配置）；Brutal 是近似
 （无 pacer 直接控制，见 ADR-0020）；vmess aid≠0/CFB/packetaddr、vless vision/XUDP/reality、
@@ -902,6 +910,9 @@ CONNECT；ss 不支持插件与 2022 版；trojan 不支持 UDP 与域名目标�
     53 端口改送控制面 DNS 模块；且缺省上游 `8.8.8.8:53` 在受限网络不可达。
 35. **真网关不必移动网卡**：`--lan none --wan wlan0` 即可（复用 `test-host-proxy` 路径）；
     移动网卡会闪断且惊扰 NetworkManager。status/日志输出对 `--dialer`（含凭据）要 redact。
+36. **dial_mode 嗅探是 MSG_PEEK（只读）**：不消费字节才能不破坏后续泵；嗅探失败/超时必须回退 IP。
+    `domain` 只在客户端首包是 TLS/HTTP/1.x 时命中（h2c/QUIC/二进制协议一律 IP）；
+    客户端给域名的 SOCKS 入口在 domain 模式下不做本地解析，直交节点。
 
 ## Rust 化的边界
 

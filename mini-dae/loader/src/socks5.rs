@@ -5,7 +5,7 @@
 //! 本地 SOCKS5 后端；Rust 侧负责内核分流、透明交付与 relay，保持 orig_dst 语义。
 
 use std::io::{Read, Write};
-use std::net::{IpAddr, SocketAddr, TcpStream};
+use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
 
 /// 解析 `socks5://host:port`（也接受裸 `host:port`）。
@@ -20,10 +20,10 @@ pub fn parse_proxy(url: &str) -> Result<String, String> {
 }
 
 /// 在一个**已连接到代理**的流上与 SOCKS5 代理握手并 CONNECT 到 target；
-/// 成功返回可用的双向流。
+/// 成功返回可用的双向流。域名目标 → ATYP=0x03（远端解析）。
 pub fn handshake(
     mut s: TcpStream,
-    target: SocketAddr,
+    target: &crate::target::Target,
     timeout: Duration,
 ) -> std::io::Result<TcpStream> {
     s.set_read_timeout(Some(timeout))?;
@@ -42,17 +42,7 @@ pub fn handshake(
 
     // request：CONNECT target
     let mut req = vec![0x05, 0x01, 0x00];
-    match target.ip() {
-        IpAddr::V4(v4) => {
-            req.push(0x01);
-            req.extend_from_slice(&v4.octets());
-        }
-        IpAddr::V6(v6) => {
-            req.push(0x04);
-            req.extend_from_slice(&v6.octets());
-        }
-    }
-    req.extend_from_slice(&target.port().to_be_bytes());
+    target.encode_socks_addr_port(&mut req)?;
     s.write_all(&req)?;
 
     // reply：VER REP RSV ATYP BND.ADDR BND.PORT

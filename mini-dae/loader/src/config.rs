@@ -122,6 +122,23 @@ pub struct Config {
     pub sections: Vec<Section>,
 }
 
+/// P14：读取 global 段的字符串参数（运行时开关，如 `dial_mode`）。
+pub fn global_value(cfg: &Config, key: &str) -> Option<String> {
+    for sec in &cfg.sections {
+        if sec.name != "global" {
+            continue;
+        }
+        for item in &sec.items {
+            if let Item::Param(p) = item {
+                if p.key.as_deref() == Some(key) {
+                    return p.val.clone();
+                }
+            }
+        }
+    }
+    None
+}
+
 #[derive(Debug, Clone)]
 pub struct Diag {
     pub file: Option<PathBuf>,

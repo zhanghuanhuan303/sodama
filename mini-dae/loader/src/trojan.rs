@@ -40,7 +40,7 @@ pub fn connect(
     password: &str,
     sni: &str,
     insecure: bool,
-    target: SocketAddr,
+    target: &crate::target::Target,
     timeout: Duration,
     tcp: TcpStream,
 ) -> io::Result<(tls::TlsReader, tls::TlsWriter)> {
@@ -51,19 +51,7 @@ pub fn connect(
     head.extend_from_slice(password_hash(password).as_bytes());
     head.extend_from_slice(b"\r\n");
     head.push(0x01); // CONNECT
-    match target {
-        SocketAddr::V4(v4) => {
-            head.push(0x01);
-            head.extend_from_slice(&v4.ip().octets());
-        }
-        SocketAddr::V6(_) => {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "trojan 只支持 IPv4 目标",
-            ))
-        }
-    }
-    head.extend_from_slice(&target.port().to_be_bytes());
+    target.encode_socks_addr_port(&mut head)?;
     head.extend_from_slice(b"\r\n");
     writer.write_all(&head)?;
     writer.flush()?;

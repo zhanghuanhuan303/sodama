@@ -19,7 +19,8 @@ use percent_encoding::percent_decode_str;
 use sha2::{Digest as _, Sha256};
 
 use crate::{
-    anytls, hysteria2, quicsock, socks5, ss, tls, trojan, tuic, vless, vmess, ws, DAE_SOCKET_MARK,
+    anytls, hysteria2, quicsock, socks5, ss, target::Target, tls, trojan, tuic, vless, vmess, ws,
+    DAE_SOCKET_MARK,
 };
 
 const SO_MARK_OPT: libc::c_int = 36;
@@ -509,10 +510,11 @@ impl Outbound {
         )
     }
 
-    pub fn dial_tcp(&self, target: SocketAddr, timeout: Duration) -> io::Result<DialedStream> {
+    pub fn dial_tcp(&self, target: &Target, timeout: Duration) -> io::Result<DialedStream> {
         match self {
             Self::Direct => {
-                let sock = marked_tcp_connect(target, timeout)?;
+                let addr = target.resolve_local()?;
+                let sock = marked_tcp_connect(addr, timeout)?;
                 let kill = sock.try_clone()?;
                 let read = sock.try_clone()?;
                 Ok(DialedStream {
@@ -540,21 +542,9 @@ impl Outbound {
                 let sock = marked_tcp_connect(*server, timeout)?;
                 let kill = sock.try_clone()?;
                 let (reader, mut writer) = ss::connect_split(sock, *method, master)?;
-                // 首块写 SOCKS5 风格目标地址头（ATYP=IPv4）
-                let mut head = Vec::with_capacity(7);
-                match target {
-                    SocketAddr::V4(v4) => {
-                        head.push(0x01);
-                        head.extend_from_slice(&v4.ip().octets());
-                    }
-                    SocketAddr::V6(_) => {
-                        return Err(io::Error::new(
-                            io::ErrorKind::Unsupported,
-                            "ss 目标仅支持 IPv4",
-                        ))
-                    }
-                }
-                head.extend_from_slice(&target.port().to_be_bytes());
+                // 首块写 SOCKS5 风格目标地址头（IPv4 / 域名）
+                let mut head = Vec::with_capacity(7 + 1 + 255);
+                target.encode_socks_addr_port(&mut head)?;
                 writer.write_all(&head)?;
                 writer.flush()?;
                 Ok(DialedStream {
@@ -1530,7 +1520,12 @@ mod tests {
             ),
             "该探针需要 ws 节点"
         );
-        let mut d = ob.dial_tcp(target, Duration::from_secs(10)).expect("dial");
+        let mut d = ob
+            .dial_tcp(
+                &Target::from_socket_addr(target).unwrap(),
+                Duration::from_secs(10),
+            )
+            .expect("dial");
         if let Some(s) = d.socket.as_ref() {
             s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
         }

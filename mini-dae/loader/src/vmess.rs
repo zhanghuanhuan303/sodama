@@ -189,7 +189,7 @@ pub struct RequestKeys {
 pub fn build_request_header(
     cmd_key: &[u8; 16],
     security: VmessSecurity,
-    target: SocketAddr,
+    target: &crate::target::Target,
     udp: bool,
 ) -> io::Result<(Vec<u8>, RequestKeys)> {
     let p = (rand::random::<u8>() % 16) as usize;
@@ -208,18 +208,7 @@ pub fn build_request_header(
     instr.push(0);
     instr.push(if udp { 2 } else { 1 });
     instr.extend_from_slice(&target.port().to_be_bytes());
-    match target {
-        SocketAddr::V4(v4) => {
-            instr.push(0x01);
-            instr.extend_from_slice(&v4.ip().octets());
-        }
-        SocketAddr::V6(_) => {
-            return Err(io::Error::new(
-                ErrorKind::Unsupported,
-                "vmess 只支持 IPv4 目标",
-            ))
-        }
-    }
+    target.encode_v2ray_addr(&mut instr)?;
     let mut pad = vec![0u8; p];
     rand::thread_rng().fill_bytes(&mut pad);
     instr.extend_from_slice(&pad);
@@ -693,7 +682,7 @@ pub fn connect_split<R, W>(
     mut write: W,
     cmd_key: &[u8; 16],
     security: VmessSecurity,
-    target: SocketAddr,
+    target: &crate::target::Target,
 ) -> io::Result<(VmessReader<R>, VmessWriter<W>)>
 where
     R: Read,
@@ -821,7 +810,12 @@ where
     R: Read,
     W: Write,
 {
-    let (head, req) = build_request_header(cmd_key, security, target, true)?;
+    let (head, req) = build_request_header(
+        cmd_key,
+        security,
+        &crate::target::Target::from_socket_addr(target)?,
+        true,
+    )?;
     write.write_all(&head)?;
     write.flush()?;
     let sealer = ChunkSealer::new(security, &req.body_iv, &req.body_key)?;
@@ -947,9 +941,9 @@ mod tests {
     fn request_header_is_parseable_by_server_side_logic() {
         // 模拟服务端解析：解长度块 → 解指令 → 校验 FNV/目标/选项
         let cmd_key = cmd_key(b"0011223344556677");
-        let target: SocketAddr = "1.1.1.1:8080".parse().unwrap();
+        let target: crate::target::Target = "1.1.1.1:8080".parse().unwrap();
         let (wire, req) =
-            build_request_header(&cmd_key, VmessSecurity::Aes128Gcm, target, false).unwrap();
+            build_request_header(&cmd_key, VmessSecurity::Aes128Gcm, &target, false).unwrap();
         let e_auth = &wire[..16];
         let conn_nonce = &wire[34..42];
         let len_key = kdf(&cmd_key, &[REQ_LEN_KEY, e_auth, conn_nonce]);
@@ -980,9 +974,9 @@ mod tests {
     fn udp_datagram_roundtrip_through_writer_and_reader() {
         // 用内存管道模拟：writer 的字节 → 当成“服务端回包”用同密钥的 receiver 读回
         let cmd_key = [1u8; 16];
-        let target: SocketAddr = "9.9.9.9:53".parse().unwrap();
+        let target: crate::target::Target = "9.9.9.9:53".parse().unwrap();
         let (head, req) =
-            build_request_header(&cmd_key, VmessSecurity::Aes128Gcm, target, true).unwrap();
+            build_request_header(&cmd_key, VmessSecurity::Aes128Gcm, &target, true).unwrap();
         assert!(!head.is_empty());
         // 反向（server→client）密钥 = SHA256(请求密钥)
         let rk = Sha256::digest(req.body_key);

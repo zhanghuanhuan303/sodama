@@ -15,7 +15,6 @@
 
 use std::collections::HashMap;
 use std::io::{self, ErrorKind, Read, Write};
-use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
 use md5::{Digest as _, Md5};
@@ -132,21 +131,11 @@ fn frame(cmd: u8, sid: u32, data: &[u8]) -> Vec<u8> {
     v
 }
 
-/// RFC1928 SocksAddr（仅 IPv4，与 vless 目标约束一致）。
-fn socks_addr(target: SocketAddr) -> io::Result<Vec<u8>> {
-    match target {
-        SocketAddr::V4(v4) => {
-            let mut v = Vec::with_capacity(7);
-            v.push(0x01);
-            v.extend_from_slice(&v4.ip().octets());
-            v.extend_from_slice(&target.port().to_be_bytes());
-            Ok(v)
-        }
-        SocketAddr::V6(_) => Err(io::Error::new(
-            ErrorKind::Unsupported,
-            "anytls 只支持 IPv4 目标",
-        )),
-    }
+/// RFC1928 SocksAddr（IPv4 / 域名）。
+fn socks_addr(target: &crate::target::Target) -> io::Result<Vec<u8>> {
+    let mut v = Vec::with_capacity(7 + 259);
+    target.encode_socks_addr_port(&mut v)?;
+    Ok(v)
 }
 
 pub struct AnyTlsWriter<W> {
@@ -372,7 +361,7 @@ pub fn connect_split<R: Read, W: Write>(
     read: R,
     mut write: W,
     password_sha256: &[u8; 32],
-    target: SocketAddr,
+    target: &crate::target::Target,
 ) -> io::Result<(AnyTlsReader<R>, AnyTlsWriter<W>)> {
     let scheme = PaddingScheme::default_scheme();
     let pad0 = scheme
@@ -428,7 +417,7 @@ pub fn connect_split<R: Read, W: Write>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sha2::{Digest as _, Sha256};
+    use sha2::Sha256;
     use std::net::TcpListener;
     use std::time::Duration;
 
@@ -525,8 +514,9 @@ mod tests {
         let (port, server) = spawn_mock_server(hash);
         let sock = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
         sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-        let target: SocketAddr = "1.2.3.4:443".parse().unwrap();
-        let (mut r, mut w) = connect_split(sock.try_clone().unwrap(), sock, &hash, target).unwrap();
+        let target: crate::target::Target = "1.2.3.4:443".parse().unwrap();
+        let (mut r, mut w) =
+            connect_split(sock.try_clone().unwrap(), sock, &hash, &target).unwrap();
         let mut buf = [0u8; 64];
         let n = r.read(&mut buf).unwrap();
         assert_eq!(&buf[..n], b"hello-from-server");
@@ -557,8 +547,8 @@ mod tests {
             String::from_utf8(data).unwrap()
         });
         let sock = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
-        let target: SocketAddr = "9.9.9.9:80".parse().unwrap();
-        let _ = connect_split(sock.try_clone().unwrap(), sock, &hash, target).unwrap();
+        let target: crate::target::Target = "9.9.9.9:80".parse().unwrap();
+        let _ = connect_split(sock.try_clone().unwrap(), sock, &hash, &target).unwrap();
         let settings = h.join().unwrap();
         assert!(settings.contains("v=2"), "{settings}");
         assert!(settings.contains("client=mini-dae/0.1.0"), "{settings}");
@@ -625,8 +615,9 @@ mod tests {
         });
         let sock = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
         sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-        let target: SocketAddr = "9.9.9.9:80".parse().unwrap();
-        let (mut r, mut w) = connect_split(sock.try_clone().unwrap(), sock, &hash, target).unwrap();
+        let target: crate::target::Target = "9.9.9.9:80".parse().unwrap();
+        let (mut r, mut w) =
+            connect_split(sock.try_clone().unwrap(), sock, &hash, &target).unwrap();
         let mut b = [0u8; 8];
         assert_eq!(r.read(&mut b).unwrap(), 1); // 触发 update 解析
         w.write_all(b"pong").unwrap();
@@ -713,7 +704,13 @@ mod tests {
         sock.set_read_timeout(Some(Duration::from_secs(8))).unwrap();
         let (r, w) = crate::tls::connect(sock, "localhost", true, &[], Duration::from_secs(8))
             .expect("tls to sing-box");
-        let (mut r, mut w) = connect_split(r, w, &hash, echo_addr).unwrap();
+        let (mut r, mut w) = connect_split(
+            r,
+            w,
+            &hash,
+            &crate::target::Target::from_socket_addr(echo_addr).unwrap(),
+        )
+        .unwrap();
         w.write_all(b"ping-through-singbox").unwrap();
         w.flush().unwrap();
         let mut buf = [0u8; 64];
@@ -740,6 +737,7 @@ mod tests {
         };
         let target_host =
             std::env::var("REAL_ANYTLS_TARGET").unwrap_or_else(|_| "www.gstatic.com:80".into());
+        use std::net::SocketAddr;
         use std::net::ToSocketAddrs as _;
         let target: SocketAddr = target_host
             .to_socket_addrs()
@@ -747,8 +745,9 @@ mod tests {
             .next()
             .expect("目标无结果");
         let ob = crate::outbound::parse(&url).expect("解析 dialer");
+        let dial_target = crate::target::Target::from_socket_addr(target).expect("v4 目标");
         let mut d = ob
-            .dial_tcp(target, Duration::from_secs(10))
+            .dial_tcp(&dial_target, Duration::from_secs(10))
             .expect("dial anytls");
         if let Some(s) = d.socket.as_ref() {
             s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
