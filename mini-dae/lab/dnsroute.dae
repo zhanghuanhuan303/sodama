@@ -17,6 +17,7 @@ dns {
     routing {
         request {
             qname(full: blocked.test) -> reject
+            qname(file: 'blocklist.test.txt') -> reject
             qname(suffix: via2.test) -> up2
             qtype(https) -> reject
             qname(suffix: asis.test) -> asis

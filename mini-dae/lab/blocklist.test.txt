@@ -1,0 +1,7 @@
+# P18c 自定义名单夹具（qname(file:)）：
+# 每行一条；`#` 注释；默认 suffix 语义；可用 full:/keyword:/regex: 前缀覆盖。
+fileblocked.test
+full:fullblocked.test
+
+# 行内注释也算注释：下面这行被整行忽略
+# keyword:never-

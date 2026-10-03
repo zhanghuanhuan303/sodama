@@ -31,9 +31,13 @@ dns {
     }
     routing {
         request {
-            # 广告/跟踪域：空应答（NOERROR）拦截
+            # 1) 广告/跟踪域：geosite 数据集
             qname(geosite:category-ads-all) -> reject
-            # 其余全部走加密上游；想切 DoQ 就换成 ali_quic（或加 qname(…) 分流）
+            # 2) 自定义拦截名单（每行一条；相对路径按本文件目录解析）
+            qname(file: 'blocklist.txt') -> reject
+            # 3) 国内域走本地路由器明文 DNS（快、国内 CDN 解析准）
+            qname(geosite:cn) -> router
+            # 4) 其余（海外）走加密 DoH；想全局 DoQ 就把下面换成 ali_quic
             fallback: alidns
         }
         response {

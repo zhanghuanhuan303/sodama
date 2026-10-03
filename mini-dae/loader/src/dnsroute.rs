@@ -301,9 +301,11 @@ fn param_text(p: &Param) -> Result<(Option<String>, String), String> {
 }
 
 /// 展开 `qname` 的参数组：返回按 key 分组的 (key, values)。
+/// `files` 为配置参与合并的文件表（`file:` 相对路径按规则所在文件目录解析）。
 fn qname_groups(
     f: &Function,
     geo: Option<&geodata::Geodata>,
+    files: &[std::path::PathBuf],
     notes: &mut Vec<String>,
 ) -> Result<Vec<(String, Vec<String>)>, String> {
     let mut order: Vec<String> = Vec::new();
@@ -322,6 +324,22 @@ fn qname_groups(
         let key = key.unwrap_or_else(|| "suffix".to_string());
         match key.as_str() {
             "suffix" | "full" | "keyword" | "regex" => push(&mut order, &mut groups, &key, val),
+            "file" => {
+                // mini 扩展：自定义名单文件（每行一条；`#` 注释；行首可按
+                // `full:`/`keyword:`/`regex:` 覆盖类型，默认 suffix；相对路径
+                // 按**规则所在文件**的目录解析）。
+                let path = resolve_relative(files, f.loc.file, &val);
+                let entries = parse_domain_file(&path)?;
+                notes.push(format!(
+                    "{}(file: {}) → {} 条域名",
+                    f.name,
+                    path.display(),
+                    entries.len()
+                ));
+                for (k, v) in entries {
+                    push(&mut order, &mut groups, &k, v);
+                }
+            }
             "geosite" | "ext" => {
                 let g = geo.ok_or_else(|| {
                     format!(
@@ -353,9 +371,9 @@ fn qname_groups(
             }
             other => {
                 return Err(format!(
-                    "{}(…) 不认识的 key: {other}（可用 suffix/full/keyword/regex/geosite/ext）",
-                    f.name
-                ))
+                "{}(…) 不认识的 key: {other}（可用 suffix/full/keyword/regex/geosite/ext/file）",
+                f.name
+            ))
             }
         }
     }
@@ -443,6 +461,54 @@ fn rule_params(rule: &Rule) -> Result<(), String> {
     Ok(())
 }
 
+/// `file:` 参数：绝对路径原样；相对路径按**规则所在文件**的目录解析。
+fn resolve_relative(
+    files: &[std::path::PathBuf],
+    file_idx: usize,
+    val: &str,
+) -> std::path::PathBuf {
+    let p = std::path::PathBuf::from(val);
+    if p.is_absolute() {
+        return p;
+    }
+    if let Some(f) = files.get(file_idx) {
+        if let Some(dir) = f.parent() {
+            return dir.join(p);
+        }
+    }
+    p
+}
+
+/// 解析自定义域名名单文件（mini 扩展）：每行一条；`#` 开始为注释；
+/// 行首 `suffix:`/`full:`/`keyword:`/`regex:` 可覆盖类型（默认 suffix）；
+/// 空行忽略。返回 (key, value) 列表。
+fn parse_domain_file(path: &std::path::Path) -> Result<Vec<(String, String)>, String> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("qname(file: {}): {e}", path.display()))?;
+    let mut out = Vec::new();
+    for (i, raw) in text.lines().enumerate() {
+        let line = raw.split('#').next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+        let (key, val) = match line.split_once(':') {
+            Some((k, v)) if matches!(k.trim(), "suffix" | "full" | "keyword" | "regex") => {
+                (k.trim().to_string(), v.trim().to_string())
+            }
+            _ => ("suffix".to_string(), line.to_string()),
+        };
+        if val.is_empty() {
+            return Err(format!(
+                "qname(file: {}):{}: 缺少域名",
+                path.display(),
+                i + 1
+            ));
+        }
+        out.push((key, val));
+    }
+    Ok(out)
+}
+
 /// 从 config 编译请求/应答路由。`tags` 是 `dns.upstream` 的 tag 集合。
 /// 返回 `None` 表示配置里没有 `dns.routing` 段（保持 legacy 单上游行为）。
 pub fn compile(
@@ -472,7 +538,7 @@ pub fn compile(
         };
         let mut notes = Vec::new();
         let (resp, resp_domains, resp_ips, resp_out, resp_fb, lines) =
-            compile_response(resp_sec, tags, geo, &mut notes)?;
+            compile_response(resp_sec, tags, geo, &cfg.files, &mut notes)?;
         return Ok(Some(DnsRouter {
             req: Vec::new(),
             req_domains: Vec::new(),
@@ -489,13 +555,14 @@ pub fn compile(
         }));
     };
     let mut notes = Vec::new();
-    let (req, req_domains, req_out, req_fb, lines) = compile_request(sec, tags, geo, &mut notes)?;
+    let (req, req_domains, req_out, req_fb, lines) =
+        compile_request(sec, tags, geo, &cfg.files, &mut notes)?;
     let (resp, resp_domains, resp_ips, resp_out, resp_fb, rlines) =
         match routing.items.iter().find_map(|i| match i {
             Item::Section(s) if s.name == "response" => Some(s),
             _ => None,
         }) {
-            Some(s) => compile_response(s, tags, geo, &mut notes)?,
+            Some(s) => compile_response(s, tags, geo, &cfg.files, &mut notes)?,
             None => (
                 Vec::new(),
                 Vec::new(),
@@ -541,6 +608,7 @@ fn compile_request(
     sec: &crate::config::Section,
     tags: &HashMap<String, String>,
     geo: Option<&geodata::Geodata>,
+    files: &[std::path::PathBuf],
     notes: &mut Vec<String>,
 ) -> Result<RequestParts, String> {
     let mut entries: Vec<ReqEntry> = Vec::new();
@@ -574,7 +642,7 @@ fn compile_request(
                     let before = rule_entries.len();
                     match f.name.as_str() {
                         "qname" => {
-                            for (key, values) in qname_groups(f, geo, notes)? {
+                            for (key, values) in qname_groups(f, geo, files, notes)? {
                                 let idx = domains.len() as u32;
                                 domains.push(DomainSetSpec::build(idx, &key, &values)?);
                                 rule_entries.push((
@@ -664,6 +732,7 @@ fn compile_response(
     sec: &crate::config::Section,
     tags: &HashMap<String, String>,
     geo: Option<&geodata::Geodata>,
+    files: &[std::path::PathBuf],
     notes: &mut Vec<String>,
 ) -> Result<ResponseParts, String> {
     let mut entries: Vec<RespEntry> = Vec::new();
@@ -683,7 +752,7 @@ fn compile_response(
                     let before = rule_entries.len();
                     match f.name.as_str() {
                         "qname" => {
-                            for (key, values) in qname_groups(f, geo, notes)? {
+                            for (key, values) in qname_groups(f, geo, files, notes)? {
                                 let idx = domains.len() as u32;
                                 domains.push(DomainSetSpec::build(idx, &key, &values)?);
                                 rule_entries.push((
@@ -923,6 +992,48 @@ mod tests {
             r.response_select(&resp60, &ReqOut::Tag("up2".into())),
             RespOut::Accept
         );
+    }
+
+    #[test]
+    fn qname_file_list() {
+        let dir = std::env::temp_dir().join(format!("dnsroute-file-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let list = dir.join("blocklist.txt");
+        std::fs::write(
+            &list,
+            "# 注释\n\nblocked.test\nfull:only.test  # 行内注释\nkeyword:kw-\nregex:^re\\.",
+        )
+        .unwrap();
+        let cfg = cfg_with(
+            "dns {\n upstream {\n  up1: 'udp://127.0.0.1:5353'\n }\n routing {\n  request {\n   qname(file: 'blocklist.txt') -> reject\n   fallback: up1\n  }\n }\n}\n",
+        );
+        // 相对路径：按规则所在文件（cfg.files[0]）的目录解析
+        let mut cfg = cfg;
+        cfg.files = vec![dir.join("entry.dae")];
+        let r = compile(&cfg, &tags(), None).unwrap().unwrap();
+        assert!(
+            r.notes.iter().any(|n| n.contains("4 条域名")),
+            "{:?}",
+            r.notes
+        );
+        assert_eq!(r.request_select(&q("blocked.test", 1)), ReqOut::Reject);
+        assert_eq!(r.request_select(&q("sub.blocked.test", 1)), ReqOut::Reject);
+        assert_eq!(r.request_select(&q("only.test", 1)), ReqOut::Reject);
+        assert_eq!(
+            r.request_select(&q("sub.only.test", 1)),
+            ReqOut::Tag("up1".into())
+        );
+        assert_eq!(r.request_select(&q("a-kw-b.test", 1)), ReqOut::Reject);
+        assert_eq!(r.request_select(&q("re.x", 1)), ReqOut::Reject);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn qname_file_missing_is_error() {
+        let cfg = cfg_with(
+            "dns {\n upstream {\n  up1: 'udp://127.0.0.1:5353'\n }\n routing {\n  request {\n   qname(file: '/nonexistent/dnsroute-blocklist.txt') -> reject\n   fallback: up1\n  }\n }\n}\n",
+        );
+        assert!(compile(&cfg, &tags(), None).is_err());
     }
 
     #[test]

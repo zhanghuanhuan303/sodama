@@ -1473,6 +1473,20 @@ test_dnsroute() {
     echo "FAIL: reject 的查询不应到上游"; exit 1
   fi
   echo "route: request reject -> 空应答且不上行"
+  # 1b) 自定义名单 qname(file:)：suffix 默认、full: 前缀精确、行内注释
+  out="$(ip netns exec "$CLIENT_NS" timeout 8 python3 "$HERE/dns_probe.py" 9.9.9.9 fileblocked.test 2>&1 || true)"
+  echo "$out"
+  printf '%s\n' "$out" | grep -q '^ancount=0' || { echo "FAIL: 名单域名 fileblocked.test 应被拦截"; exit 1; }
+  out="$(ip netns exec "$CLIENT_NS" timeout 8 python3 "$HERE/dns_probe.py" 9.9.9.9 sub.fileblocked.test 2>&1 || true)"
+  printf '%s\n' "$out" | grep -q '^ancount=0' || { echo "FAIL: 名单 suffix 应匹配子域 sub.fileblocked.test"; exit 1; }
+  out="$(ip netns exec "$CLIENT_NS" timeout 8 python3 "$HERE/dns_probe.py" 9.9.9.9 fullblocked.test 2>&1 || true)"
+  printf '%s\n' "$out" | grep -q '^ancount=0' || { echo "FAIL: 名单 full: 精确应拦截"; exit 1; }
+  out="$(ip netns exec "$CLIENT_NS" timeout 8 python3 "$HERE/dns_probe.py" 9.9.9.9 x.fullblocked.test 2>&1 || true)"
+  printf '%s\n' "$out" | grep -q '^answer=10.9.10.47' || { echo "FAIL: full: 不应匹配子域（应正常解析）"; exit 1; }
+  if grep -qE '^QUERY (fileblocked|sub\.fileblocked|fullblocked)\.test' "$FAKE_DNS_LOG" 2>/dev/null; then
+    echo "FAIL: 名单拦截的查询不应到上游"; exit 1
+  fi
+  echo "route: qname(file:) 自定义名单（suffix/full/注释，拦截不上行）"
   # 2) qtype(https)=65 -> reject
   out="$(ip netns exec "$CLIENT_NS" timeout 8 python3 "$HERE/dns_probe.py" 9.9.9.9 q65.test 65 2>&1 || true)"
   echo "$out"
@@ -1553,11 +1567,12 @@ import json
 v = json.load(open("/tmp/mini-dae-status.json"))
 d = v["dns"]
 r = d["routing"]
-assert r["request_rules"] == 4 and r["response_rules"] == 3, r
-assert r["rejects"] >= 2 and r["response_rejects"] >= 1 and r["relookups"] >= 1, r
+assert r["request_rules"] == 5 and r["response_rules"] == 3, r
+assert r["rejects"] >= 5 and r["response_rejects"] >= 1 and r["relookups"] >= 1, r
 assert set(d["upstreams"].keys()) == {"up1", "up2"}, d["upstreams"]
-print("dnsroute: rules=%d/%d rejects=%d resp_rejects=%d relookups=%d" % (
-    r["request_rules"], r["response_rules"], r["rejects"], r["response_rejects"], r["relookups"]))
+assert r["upstream_hits"].get("up1", 0) >= 1 and r["upstream_hits"].get("up2", 0) >= 1, r["upstream_hits"]
+print("dnsroute: rules=%d/%d rejects=%d resp_rejects=%d relookups=%d hits=%s" % (
+    r["request_rules"], r["response_rules"], r["rejects"], r["response_rejects"], r["relookups"], r["upstream_hits"]))
 PY
   echo "PASS: dns.routing（reject/qtype/多上游/缓存作用域/应答 reject/重查/asis/热重载）"
 }
@@ -2592,7 +2607,8 @@ case "${1:-}" in
     USE_DNS_UPSTREAM="quic://127.0.0.1:$DOQ_PORT?sni=localhost&insecure=1" up ;;
   test-doq) test_doq ;;
   dnsroute-up) chmod 640 "$HERE/dnsroute.dae"; cp "$HERE/dnsroute.dae" /tmp/mini-dae-dnsroute.dae; \
-    chmod 640 /tmp/mini-dae-dnsroute.dae; USE_CONFIG=/tmp/mini-dae-dnsroute.dae \
+    chmod 640 /tmp/mini-dae-dnsroute.dae; cp "$HERE/blocklist.test.txt" /tmp/blocklist.test.txt; \
+    USE_CONFIG=/tmp/mini-dae-dnsroute.dae \
     USE_FAKE_DNS=1 USE_FAKE_DNS_B=1 up ;;
   dns-udp-up) USE_RULES="$HERE/rules.dns.dae" USE_FAKE_DNS=1 \
     USE_DNS_UPSTREAM="udp://127.0.0.1:$FAKE_DNS_PORT" up ;;

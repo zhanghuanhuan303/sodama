@@ -264,6 +264,17 @@ impl UpstreamSet {
     }
 }
 
+/// P18c：按出口统计的请求路由选路次数（tag/asis/legacy/reject）；
+/// DNS 线程写、状态面读，Mutex 持有时间极短。
+static DNS_TAG_HITS: std::sync::LazyLock<Mutex<std::collections::HashMap<String, u64>>> =
+    std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
+fn note_tag_hit(tag: &str) {
+    if let Ok(mut g) = DNS_TAG_HITS.lock() {
+        *g.entry(tag.to_string()).or_insert(0) += 1;
+    }
+}
+
 static UPSTREAMS: Mutex<Option<Arc<UpstreamSet>>> = Mutex::new(None);
 /// P18c：`dns.routing` 编译结果（None = 无该段，走 legacy 单上游）。
 static DNS_ROUTER: Mutex<Option<Arc<dnsroute::DnsRouter>>> = Mutex::new(None);
@@ -2863,6 +2874,7 @@ fn select_request_upstream(
     let Some(router) = dns_router() else {
         let u = set.legacy.clone();
         let scope = format!("legacy|{}", u.url);
+        note_tag_hit("legacy");
         return Ok(Selected::Up(
             u,
             scope,
@@ -2870,18 +2882,23 @@ fn select_request_upstream(
         ));
     };
     match router.request_select(q) {
-        dnsroute::ReqOut::Reject => Ok(Selected::Reject),
+        dnsroute::ReqOut::Reject => {
+            note_tag_hit("reject");
+            Ok(Selected::Reject)
+        }
         dnsroute::ReqOut::AsIs => {
             // dae：asis 总是走 UDP 发往客户端原始目的；TCP 客户端路径拿不到时退回 legacy。
             match orig_dst {
                 Some(orig) => {
                     let u = set.asis(orig)?;
                     let scope = format!("asis|{orig}");
+                    note_tag_hit("asis");
                     Ok(Selected::Up(u, scope, dnsroute::ReqOut::AsIs))
                 }
                 None => {
                     let u = set.legacy.clone();
                     let scope = format!("legacy|{}", u.url);
+                    note_tag_hit("legacy");
                     Ok(Selected::Up(
                         u,
                         scope,
@@ -2895,6 +2912,7 @@ fn select_request_upstream(
                 .get(&t)
                 .ok_or_else(|| format!("dns.routing.request 出口 {t:?} 不在 dns.upstream"))?;
             let scope = format!("tag|{t}|{}", u.url);
+            note_tag_hit(&t);
             Ok(Selected::Up(u, scope, dnsroute::ReqOut::Tag(t)))
         }
     }
@@ -3879,6 +3897,18 @@ fn status_json(ebpf: &mut Ebpf) -> serde_json::Value {
                 "rejects": DNS_STATS.rejects.load(Ordering::Relaxed),
                 "response_rejects": DNS_STATS.response_rejects.load(Ordering::Relaxed),
                 "relookups": DNS_STATS.relookups.load(Ordering::Relaxed),
+                "upstream_hits": DNS_TAG_HITS
+                    .lock()
+                    .map(|g| {
+                        let mut m = serde_json::Map::new();
+                        let mut keys: Vec<String> = g.keys().cloned().collect();
+                        keys.sort();
+                        for k in keys {
+                            m.insert(k.clone(), json!(g[&k]));
+                        }
+                        serde_json::Value::Object(m)
+                    })
+                    .unwrap_or(serde_json::Value::Null),
                 "notes": dns_router().map(|r| r.notes.clone()).unwrap_or_default(),
             },
             "queries": DNS_STATS.queries.load(Ordering::Relaxed),

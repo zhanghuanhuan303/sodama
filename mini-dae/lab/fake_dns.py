@@ -54,6 +54,7 @@ TABLE = {
     "relook.test": "10.9.10.61",
     "asis.test": "10.9.10.44",
     "tcp.asis.test": "10.9.10.46",
+    "x.fullblocked.test": "10.9.10.47",
 }
 
 # P3b-2a：大应答（60 条 A ≈ 990 字节 > 512，用于验证 UDP 截断/EDNS）

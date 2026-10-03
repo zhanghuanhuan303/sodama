@@ -1,0 +1,15 @@
+# mini-dae 自定义 DNS 拦截名单（dns.routing 的 qname(file: 'blocklist.txt') 读取）
+#
+# 规则：
+# - 每行一个域名；空行与 `#` 注释忽略；行尾可用 `#` 写注释
+# - 默认 suffix 语义（example.com 同时匹配子域 www.example.com）
+# - 行首可用 `full:` / `keyword:` / `regex:` 覆盖类型，例如：
+#     full: exact.example.net        # 只匹配这一个名字
+#     keyword: doubleclick           # 域名任意位置包含该子串
+#     regex: ^ads[0-9]+\.            # 正则（非锚定，匹配小写 qname）
+# - 修改后热生效：sudo target/release/mini-dae reload --socket /tmp/mini-dae-gw.sock
+#
+# 下面是示例（默认全部注释；取消注释即生效）：
+# ads.example.com
+# full: tracker.example.net
+# keyword: analytics-

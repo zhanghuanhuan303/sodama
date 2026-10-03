@@ -1059,6 +1059,12 @@ Selected/应答重查循环；夹具 `lab/dnsroute.dae`、假 DNS 支持 bind �
 - 边界：DoH h2/h3、ECS、optimistic cache、`fixed_domain_ttl`、`ipversion_prefer`、
   `bootstrap_resolver`、嗅探 punt 未做；`upstream(...)` 按名字比较（不复刻 dae 的
   数值巧合）；`ip()` 线性匹配（dae 用 trie）。
+- **自定义名单与分流观测（ADR-0037，mini 扩展）**：`qname(file: 'x.txt')`——每行一条、
+  空行/`#` 注释、默认 suffix、行首 `full:/keyword:/regex:` 覆盖、相对路径按规则文件
+  目录解析、文件缺失/空域名硬失败；`dns.routing.upstream_hits{tag|asis|legacy|reject}`
+  计数。真网关默认：广告数据集 + 用户名单 → reject，`geosite:cn` → 本地明文 router，
+  其余 → DoH（实测 `{alidns: 92, router: 13}`）；名单热加载实测（加 `example.com`
+  → reload → 空应答；移除 → reload → 恢复）。
 - **真机网关实测**（`lab/gateway.dae`，`--config` + `--geodata-dir /usr/share/v2ray`）：
   去掉 `dport(53) -> direct(must)` 后，宿主机 DNS 进控制面 → DoH
   （`https://223.5.5.5/dns-query?sni=dns.alidns.com`）：123 查询 0 错误、
@@ -1068,6 +1074,23 @@ Selected/应答重查循环；夹具 `lab/dnsroute.dae`、假 DNS 支持 bind �
   204 / YouTube 200 / 嗅探+远端解析正常。CLI `--dns-upstream` 现在作为 tag
   `default` 与配置 tags 共存（同名时 CLI 优先），`--config`+`--dns` 不再打断
   路由 tag 引用。
+
+### 11.28 `qname(file:)` 自定义名单 + `upstream_hits`（真网关实用化）
+
+（决策与边界见 ADR-0037；实现 `dnsroute.rs` 的 `resolve_relative`/`parse_domain_file`
+与 `main.rs` 的 `DNS_TAG_HITS`；夹具 `lab/blocklist.test.txt`、`lab/blocklist.txt`。）
+
+- `qname(file: '<路径>')`（请求/应答均可）：每行一条；空行/`#`（含行内）注释；
+  默认 suffix；行首 `full:/keyword:/regex:` 覆盖类型；相对路径按**规则所在文件**
+  目录解析（`Loc.file` → `cfg.files`）；文件缺失/行无域名 = 编译硬失败；空名单合法；
+  notes 记 `→ N 条域名`。
+- `dns.routing.upstream_hits`：请求选路计数（`tag|asis|legacy|reject`），状态面可见。
+- 真网关（`lab/gateway.dae`）：`category-ads-all` + 用户名单 → reject；
+  `geosite:cn` → `router`（192.0.2.1:53 明文）；fallback `alidns`（DoH）。
+- 实测：`cargo test` **143/143**；lab `test-dnsroute`（名单 suffix/full/注释/
+  不上行 + 5 条请求规则 + upstream_hits 断言）；真机：3 条请求规则、105 查询
+  0 错误、`upstream_hits {alidns: 92, router: 13}`；名单热加载：加 `example.com`
+  → reload → 拦截（rejects+2）→ 移除 → reload → 恢复。
 
 ## 12. 用 Rust 重写这套东西的可行性
 
