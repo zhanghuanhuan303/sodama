@@ -323,12 +323,21 @@ status() {
 
 test_conn() {
   local code exitip
-  code="$(env -u http_proxy -u https_proxy -u all_proxy \
-    curl -s -o /dev/null -w '%{http_code}' --max-time 20 \
-    https://www.gstatic.com/generate_204 || true)"
-  echo "generate_204 -> ${code:-失败}"
-  exitip="$(env -u http_proxy -u https_proxy -u all_proxy \
-    curl -s --max-time 20 https://api.ipify.org || true)"
+  # 注意：规则里 pname(curl)->direct、pname(python3)->direct（调试用），所以用
+  # curl 测到的是**直连**路径。快检希望覆盖**代理**路径，因此优先用 wget
+  # （不在 pname 名单 → 走 fallback -> proxy）。
+  if command -v wget >/dev/null 2>&1; then
+    code="$(wget -S -O /dev/null --timeout=20 https://www.gstatic.com/generate_204 2>&1 \
+      | awk '/HTTP\//{c=$2} END{print c}' || true)"
+    exitip="$(wget -qO- --timeout=20 https://api.ipify.org 2>/dev/null || true)"
+  else
+    code="$(env -u http_proxy -u https_proxy -u all_proxy \
+      curl -s -o /dev/null -w '%{http_code}' --max-time 20 \
+      https://www.gstatic.com/generate_204 || true)"
+    exitip="$(env -u http_proxy -u https_proxy -u all_proxy \
+      curl -s --max-time 20 https://api.ipify.org || true)"
+  fi
+  echo "generate_204 -> ${code:-失败}（代理路径）"
   echo "出口 IP      -> ${exitip:-失败}"
   if getent hosts www.google.com >/dev/null 2>&1; then
     echo "DNS 解析     -> ok（www.google.com）"
