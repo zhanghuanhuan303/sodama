@@ -1544,6 +1544,12 @@ test_dnsroute() {
   grep -q '^QUERY relook.test' "$FAKE_DNS_LOG" || { echo "FAIL: relook 初查未到 up1"; exit 1; }
   grep -q '^QUERY relook.test' "$FAKE_DNS_B_LOG" || { echo "FAIL: relook 重查未到 up2"; exit 1; }
   echo "route: response ip(10.9.10.61/32) -> up2 重查"
+  # 7b) 应答侧 sip：客户端 10.0.0.2 ∈ 10.0.0.0/24（10.9.9.0/24 规则应跳过）→ 空应答
+  out="$(ip netns exec "$CLIENT_NS" timeout 8 python3 "$HERE/dns_probe.py" 9.9.9.9 rsip.test 2>&1 || true)"
+  echo "$out"
+  printf '%s\n' "$out" | grep -q '^ancount=0' || { echo "FAIL: 应答侧 sip 未命中（应空应答）"; exit 1; }
+  grep -q '^QUERY rsip.test ' "$FAKE_DNS_LOG" || { echo "FAIL: rsip.test 应先到 up1"; exit 1; }
+  echo "route: response sip(10.0.0.0/24) && ip(...) -> reject（客户端来源过滤）"
   # 8) asis：客户端向 10.9.9.2:53（WAN ns）发查，控制面 asis 发回该地址
   out="$(ip netns exec "$CLIENT_NS" timeout 8 python3 "$HERE/dns_probe.py" 10.9.9.2 asis.test 2>&1 || true)"
   echo "$out"
@@ -1583,8 +1589,8 @@ import json
 v = json.load(open("/tmp/mini-dae-status.json"))
 d = v["dns"]
 r = d["routing"]
-assert r["request_rules"] == 7 and r["response_rules"] == 3, r
-assert r["rejects"] >= 5 and r["response_rejects"] >= 1 and r["relookups"] >= 1, r
+assert r["request_rules"] == 7 and r["response_rules"] == 5, r
+assert r["rejects"] >= 5 and r["response_rejects"] >= 2 and r["relookups"] >= 1, r
 assert set(d["upstreams"].keys()) == {"up1", "up2", "up2ecs"}, d["upstreams"]
 assert r["upstream_hits"].get("up1", 0) >= 1 and r["upstream_hits"].get("up2", 0) >= 1, r["upstream_hits"]
 assert r["upstream_hits"].get("up2ecs", 0) >= 1, r["upstream_hits"]

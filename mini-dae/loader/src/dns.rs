@@ -272,6 +272,38 @@ pub fn client_udp_size(query: &[u8]) -> usize {
     }
 }
 
+/// 首条 A/AAAA 应答的 TTL（工具展示用；无则 None）。
+pub fn first_answer_ttl(resp: &[u8]) -> Option<u32> {
+    for rr in parse_rrs(resp)? {
+        if rr.section == SEC_ANSWER && (rr.rtype == 1 || rr.rtype == 28) {
+            return Some(rr.ttl);
+        }
+    }
+    None
+}
+
+/// 构造一个最小查询报文（工具/测试用：单 question、RD=1、无 EDNS）。
+pub fn build_query(name: &str, qtype: u16, id: u16) -> Vec<u8> {
+    let mut q = Vec::with_capacity(32 + name.len());
+    q.extend_from_slice(&id.to_be_bytes());
+    q.extend_from_slice(&0x0100u16.to_be_bytes()); // RD
+    q.extend_from_slice(&1u16.to_be_bytes()); // qdcount
+    q.extend_from_slice(&0u16.to_be_bytes());
+    q.extend_from_slice(&0u16.to_be_bytes());
+    q.extend_from_slice(&0u16.to_be_bytes());
+    for label in name.trim_end_matches('.').split('.') {
+        if label.is_empty() || label.len() > 63 {
+            continue;
+        }
+        q.push(label.len() as u8);
+        q.extend_from_slice(label.as_bytes());
+    }
+    q.push(0);
+    q.extend_from_slice(&qtype.to_be_bytes());
+    q.extend_from_slice(&1u16.to_be_bytes()); // IN
+    q
+}
+
 /// 自动 ECS 前缀（RFC 7871 常见实践）：v4 /24、v6 /56（本机/客户端地址归整）。
 pub fn ecs_auto_prefix(client: IpAddr) -> (IpAddr, u8) {
     match client {

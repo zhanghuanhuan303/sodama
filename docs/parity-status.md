@@ -23,7 +23,7 @@
 | 10 | **IPv6** | 数据面 + 规则 + 协议全支持 | TCP 全链：v6 解析/tproxy（sockmap key 2）/全部协议 v6 目标编码/v6 direct/v6 嗅探远端解析/AAAA 入域位图；**UDP v6（含 DNS over UDP6）与 ICMPv6/分片未做** | **≈80%**（TCP） | ADR-0032、NOTES §11.23；lab `test-v6` 3 断言全过（tproxy→ss(ATYP=4)→v6 echo；v6 direct）；真机网关 v6：嗅探 `[2001::1]→RELAY 远端解析` 204、字面量 `[2606:4700:4700::1111]` 200；静态 fe80 邻居不可省（NA 被 dae0peer_ingress 丢弃，上游同样要求） |
 | 11 | **部署自动化** | netns 自动搭建（移网卡/sysctl/tproxy 规则，`netns_utils.go`）、systemd（`install/dae.service`）、Docker、发行包、shell 补全 | `lab.sh` / `gateway.sh` 脚本级一键；无 systemd/打包 | **≈40%** | 真网关一键脚本体验接近（ADR-0029），自动化深度不同（脚本代劳，安全性更高） |
 | 12 | **运维面** | 主线较弱（daed 独立项目提供 GraphQL/Web UI） | SIGHUP/USR2、状态 socket（status/rules/config/maps/metrics/reload/suspend/resume）、Prometheus、sysdump/trace、日志轮转 | **≈90%** | 相对 dae 主线领先；daed 的 UI/鉴权不在范围（ADR-0021） |
-| 13 | **质量工程** | Go 单测 244 文件/3.9 万行 + CI（bpf-test/build/docker/go-test…）+ fuzz | 95 单测 + verify 9×2 拓扑 + 6 专项 + 协议梯 17 + 对拍 5 逐字节 + QEMU 双内核矩阵 + soak + 六路径基准；无 CI | **≈70%** | 方法学密度高、绝对规模小（ADR-0010/0022/0025） |
+| 13 | **质量工程** | Go 单测 244 文件/3.9 万行 + CI（bpf-test/build/docker/go-test…）+ fuzz | 146 单测 + verify 9×2 拓扑 + 6 专项 + 协议梯 17 + 对拍 5 逐字节 + QEMU 双内核矩阵 + soak + 六路径基准 + `dns-bench` 上游 A/B；无 CI | **≈72%** | 方法学密度高、绝对规模小（ADR-0010/0022/0025/0039） |
 | 14 | **性能** | 生产级优化（THP/内存上限/连接池/看门狗） | 六路径基准：direct 31Gbps / relay 24.7Gbps / offload 14.6Gbps / ss 2.5Gbps | **≈55%** | 有数据、缺与 Go 版同机对拍（如实，ADR-0022） |
 | 15 | **真实订阅生态** | 全原生 | 订阅#1（50×vless-ws）✅；订阅#2：anytls ✅、REALITY+Vision ❌（SOCKS5 桥接兜底） | **≈70%** | ADR-0026/0027/0028；边界外协议可桥接过渡 |
 

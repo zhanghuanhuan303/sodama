@@ -1846,11 +1846,20 @@ fn geodata_for(args: &Args) -> &'static std::sync::Mutex<geodata::Geodata> {
 /// P18c：构建上游集合（CLI `--dns-upstream` 作为 tag "default"；配置 dns.upstream map
 /// 的其它 tag 仍保留，供 dns.routing 引用；同名时 CLI 优先）。
 fn build_upstream_set(args: &Args) -> Result<Arc<UpstreamSet>, Box<dyn std::error::Error>> {
-    let cli = args.dns_upstream.clone();
-    let cfg_map = args
-        .config
-        .as_ref()
-        .and_then(|p| config::load(Path::new(p)).ok())
+    build_upstream_set_core(
+        args.dns_upstream.clone(),
+        args.config.as_deref().map(Path::new),
+    )
+    .map_err(|e| e.into())
+}
+
+/// 上游集合构建核心（启动/reload/`dns-bench` 共用；错误为字符串）。
+fn build_upstream_set_core(
+    cli: Option<String>,
+    config_path: Option<&Path>,
+) -> Result<Arc<UpstreamSet>, String> {
+    let cfg_map = config_path
+        .and_then(|p| config::load(p).ok())
         .map(|c| config::dns_upstream_map(&c))
         .unwrap_or_default();
     let legacy_url = cli
@@ -2245,6 +2254,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "validate"
                 | "export-config"
                 | "extract-routing"
+                | "dns-bench"
                 | "status"
                 | "reload"
                 | "suspend"
@@ -3004,7 +3014,7 @@ fn resolve_dns(
     loop {
         let verdict = router
             .as_ref()
-            .map(|r| r.response_select(&resp, &served))
+            .map(|r| r.response_select_for(&resp, &served, client))
             .unwrap_or(dnsroute::RespOut::Accept);
         match verdict {
             dnsroute::RespOut::Accept => break,
@@ -3630,8 +3640,143 @@ fn run_subcommand(argv: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             }
             Ok(())
         }
+        "dns-bench" => run_dns_bench(argv),
         _ => unreachable!(),
     }
+}
+
+/// P18c+：`dns-bench`——对配置里的上游做同域名延迟对比（A/B）。
+/// 工具用：需 root（上游 socket 打 SO_MARK，避免被运行中的网关自己接管）。
+///
+/// 用法： mini-dae dns-bench --config <file.dae> --names a.com,b.com
+///        [--tags t1,t2] [--runs N] [--client <IP>]
+/// `--client` 供 `ecs=auto` 上游注入子网（缺省不注入）。
+fn run_dns_bench(argv: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let mut cfg: Option<String> = None;
+    let mut names: Vec<String> = Vec::new();
+    let mut tags: Vec<String> = Vec::new();
+    let mut runs = 5usize;
+    let mut client: Option<std::net::IpAddr> = None;
+    let mut it = argv.iter().skip(2);
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--config" => cfg = Some(it.next().ok_or("--config 需要值")?.clone()),
+            "--names" => {
+                names = it
+                    .next()
+                    .ok_or("--names 需要值")?
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            }
+            "--tags" => {
+                tags = it
+                    .next()
+                    .ok_or("--tags 需要值")?
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            }
+            "--runs" => runs = it.next().ok_or("--runs 需要值")?.parse()?,
+            "--client" => client = Some(it.next().ok_or("--client 需要值")?.parse()?),
+            other => return Err(format!("未知参数 {other}").into()),
+        }
+    }
+    let cfg = cfg.ok_or("用法: mini-dae dns-bench --config <file.dae> --names a.com,b.com [--tags t1,t2] [--runs N] [--client <IP>]")?;
+    if names.is_empty() {
+        return Err("--names 不能为空".into());
+    }
+    if runs == 0 || runs > 100 {
+        return Err("--runs 取值 1..=100".into());
+    }
+    let ups = build_upstream_set_core(None, Some(Path::new(&cfg)))?;
+    let mut sel: Vec<String> = if tags.is_empty() {
+        ups.by_tag.keys().cloned().collect()
+    } else {
+        tags.clone()
+    };
+    sel.sort();
+    for t in &sel {
+        if !ups.by_tag.contains_key(t) {
+            return Err(format!(
+                "dns.upstream 里没有 tag {t:?}（可用: {:?}）",
+                ups.by_tag.keys().collect::<Vec<_>>()
+            )
+            .into());
+        }
+    }
+    println!(
+        "dns-bench: runs={runs} client={} names={} tags={}",
+        client.map(|c| c.to_string()).unwrap_or_else(|| "-".into()),
+        names.join(","),
+        sel.join(",")
+    );
+    println!(
+        "{:<10} {:<6} {:<24} {:>5} {:>9} {:>9} {:>9} {:>8} {:>6}",
+        "tag", "scheme", "name", "ok", "min_ms", "avg_ms", "p50_ms", "ancount", "ttl"
+    );
+    for name in &names {
+        for tag in &sel {
+            let up = ups.by_tag.get(tag).unwrap();
+            let mut times: Vec<f64> = Vec::new();
+            let mut errs = 0usize;
+            let mut ancount_last = 0usize;
+            let mut ttl_last = 0u32;
+            for i in 0..runs {
+                let q = dns::build_query(name, 1, 0x100 + i as u16);
+                let q = match up.spec.ecs {
+                    Some(dnsup::EcsMode::Auto) => client
+                        .and_then(|c| dns::add_ecs(&q, dns::ecs_auto_prefix(c)))
+                        .unwrap_or(q),
+                    Some(dnsup::EcsMode::Prefix(ip, p)) => dns::add_ecs(&q, (ip, p)).unwrap_or(q),
+                    None => q,
+                };
+                let t0 = Instant::now();
+                match up.exchange(&q) {
+                    Ok(resp) => {
+                        times.push(t0.elapsed().as_secs_f64() * 1000.0);
+                        if let Some(ttl) = dns::first_answer_ttl(&resp) {
+                            ttl_last = ttl;
+                        }
+                        let (v4, v6) = dns::answer_a_and_aaaa_records(&resp);
+                        ancount_last = v4.len() + v6.len();
+                    }
+                    Err(_) => errs += 1,
+                }
+            }
+            let (min, avg, p50) = if times.is_empty() {
+                (f64::NAN, f64::NAN, f64::NAN)
+            } else {
+                let min = times.iter().cloned().fold(f64::INFINITY, f64::min);
+                let avg = times.iter().sum::<f64>() / times.len() as f64;
+                let mut s = times.clone();
+                s.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                (min, avg, s[s.len() / 2])
+            };
+            println!(
+                "{:<10} {:<6} {:<24} {:>5} {:>9.2} {:>9.2} {:>9.2} {:>8} {:>6}",
+                tag,
+                up.spec.scheme.name(),
+                name,
+                format!("{}/{}", times.len(), runs),
+                min,
+                avg,
+                p50,
+                ancount_last,
+                if ttl_last == 0 {
+                    "-".to_string()
+                } else {
+                    ttl_last.to_string()
+                }
+            );
+            if errs > 0 {
+                println!("            （{tag} {name}: {errs} 次失败）");
+            }
+        }
+    }
+    Ok(())
 }
 
 /// P6：解析 `--socket <path>` / `--out <path>`（子命令公用）。

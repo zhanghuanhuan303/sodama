@@ -205,7 +205,7 @@
     <span class="chip">代码量 <b>~65k 非测试 LOC / ~40k 测试</b></span>
     <span class="chip">数据面 <b>tproxy.c 4403 行 · 23 个程序 · 24 个 map</b></span>
     <span class="chip">许可 <b>AGPL-3.0</b></span>
-    <span class="chip">文档版本 <b>v2.23 · 2026-10-04</b></span>
+    <span class="chip">文档版本 <b>v2.24 · 2026-10-04</b></span>
   </div>
 </header>
 
@@ -1240,7 +1240,7 @@ wait signal → reload / suspend / shutdown</pre>
 </section>
 
 <p style="color:var(--dim);font-family:var(--mono);font-size:.78rem;margin-top:56px;border-top:1px solid var(--line);padding-top:14px">
-  dae → Rust 决策档案 · v2.23 · 生成于 2026-10-04 · 基于 dae main@e3fee8f（nightly）· 本文件自包含，可离线打开<br>
+  dae → Rust 决策档案 · v2.24 · 生成于 2026-10-04 · 基于 dae main@e3fee8f（nightly）· 本文件自包含，可离线打开<br>
   v1.1：新增 4.5 部署形态、4.6 常驻与故障语义、决策点 D8<br>
   v1.2：按 ADR-0009 改为 K 轨道路线图；D7 修订为内核切片先行；K0 第一步（规则 VM + LPM）已实测<br>
   v1.3：K0、K1 均已完成并实测（双 epoch 热重载、conn_state 缓存、五钩子角色、本机 WAN 流量与回程）<br>
@@ -1273,6 +1273,7 @@ wait signal → reload / suspend / shutdown</pre>
                         v2.21：P18c `dns.routing` 请求/应答分流 + 多上游——`dns.upstream { tag: url }` 全部生效（未知 tag 编译期硬失败；CLI 单上游仍为 legacy 默认）；**请求** `qname/qtype` → `reject`（空应答 NOERROR、不缓存）/`asis`（marked UDP 回客户端原目的：UDP 取 IP_ORIGDSTADDR、TCP 取透明套接字 `local_addr`）/tag，默认 fallback `asis`，**路由先于缓存**；**应答** `qname/qtype/upstream`（按名）/`ip`（裸 CIDR/geoip/ext）→ `accept`/`reject`（清空 answer 后入缓存）/换上游重查（深度上限 3）；缓存键加**上游作用域**；`dnsroute` 逐行复刻 dae 链编码（And/Or/Tail）与默认 fallback；`sub/node/subnode` 以 note 跳过（语义等效）；状态面 `dns.upstreams` + `dns.routing{...}`；lab 双假上游 + WAN ns asis 夹具全矩阵（reject/多上游/缓存作用域/应答 reject/重查/asis UDP+TCP/热重载）；实测：`cargo test` 141/141、`test-dnsroute` 全过、回归 verify 9/9 + 明文 DNS 三连 + config-reload + test-dot + parity 5/5（对标表缺口 #5 收官，余 DoH h2/h3/ECS/optimistic cache/嗅探 punt）（详情见 ADR-0036 与 `mini-dae/NOTES.md` §11.27）<br>
                                 v2.22：P18c 实用化扩展——`qname(file: '<名单>')`（mini 扩展）：文本名单（每行一条、空行/`#` 注释、默认 suffix、行首 `full:/keyword:/regex:` 覆盖、相对路径按规则所在文件目录、缺失/空域名硬失败、空名单合法）；`dns.routing.upstream_hits{tag|asis|legacy|reject}` 选路计数（状态面）；真网关默认配置 `lab/gateway.dae`：广告数据集 + 用户名单 → reject、`geosite:cn` → 本地路由器明文、其余 → DoH，`--dns <URL>`/`--geodata-dir` 新增到 gateway.sh。实测：`cargo test` 143/143；lab 名单矩阵（suffix/full/注释/不上行）；真机 105 查询 0 错误、`upstream_hits {alidns: 92, router: 13}`（分流生效）、名单热加载（加 `example.com` → reload → 拦截；移除 → reload → 恢复）（详情见 ADR-0037 与 `mini-dae/NOTES.md` §11.28）<br>
                                         v2.23：DNS 精细策略（mini 扩展，ADR-0038）——上游 URL `ecs=auto|<CIDR>`：发送前尾插 OPT+ECS option 8（v4 /24、v6 /56，地址按前缀截断，RDLEN/option-length 分列），客户端已带 OPT 时透传不注入，注入时缓存作用域加 `|ecs=<前缀>`（不同子网不串答），应答重查按新上游重新注入；请求函数 `sip(...)`（CIDR/geoip/ext，支持 `!`，与 qname/qtype 同链，UDP 取源地址/TCP 取 peer）；真网关 `alidns_ecs`（DoH+ECS）接 `geosite:cn`。实测：`cargo test` 145/145；lab 假上游收到 `ecs=1/24/10.0.0`、`qname && sip(10.0.0.0/24)` 命中 up2、7/3 规则矩阵全断言；真机 `upstream_hits {alidns: 78, alidns_ecs: 8}`、86 查询 0 错误（详情见 ADR-0038 与 `mini-dae/NOTES.md` §11.29）<br>
+                                                v2.24：应答侧 `sip()` + `dns-bench` 上游 A/B——应答路由可按客户端来源过滤（CIDR/geoip/ext、`!`、同链；UDP 源地址/TCP peer 透传）；`dns-bench` 子命令（用户态、marked socket 不被运行中网关接管，需 root）：复用生产 `UpstreamSet`，同域名跨上游 min/avg/p50/ancount/TTL，`--client` 供 `ecs=auto`。实测：`cargo test` 146/146；lab 7/5 规则矩阵（resp_rejects=2）；真机 A/B runs=5：taobao 1.31/7.43/7.45ms、baidu 1.32/7.37/7.24ms、google 1.32/7.25/6.81ms（router/DoH/DoH+ECS，均 5/5），ECS 与普通 DoH 应答 TTL 不同（上游视角随子网变化）（详情见 ADR-0039 与 `mini-dae/NOTES.md` §11.30）<br>
 </p>
 </main>
 

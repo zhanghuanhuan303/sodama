@@ -1113,6 +1113,24 @@ Selected/应答重查循环；夹具 `lab/dnsroute.dae`、假 DNS 支持 bind �
   `upstream_hits` 全断言；真机：`upstream_hits {alidns: 78, alidns_ecs: 8}`、
   86 查询 0 错误。
 
+### 11.30 应答侧 `sip()` + `dns-bench`（上游 A/B 工具）
+
+（决策与边界见 ADR-0039；实现 `dnsroute.rs` 的 `RespKind::Sip`/
+`response_select_for`、`main.rs` 的 `run_dns_bench`、`dns.rs` 的
+`build_query/first_answer_ttl`。）
+
+- 应答侧 `sip(...)`：与请求侧同义（CIDR/geoip/ext、`!`、同链）；客户端地址由
+  main 透传（UDP recvmsg 源地址 / TCP peer_addr）；无来源不命中。
+- `dns-bench`（需 root，marked socket 不被网关自身接管）：
+  `mini-dae dns-bench --config <file.dae> --names a,b [--tags …] [--runs N]
+  [--client <IP>]`，复用生产 `UpstreamSet`（`build_upstream_set_core`），
+  输出 ok/min/avg/p50/ancount/TTL；`--client` 供 `ecs=auto`。
+- 实测：`cargo test` **146/146**；lab `test-dnsroute` 7/5 规则矩阵全过
+  （resp_rejects=2）；真机 A/B（runs=5，client=192.0.2.254）：
+  taobao 1.31 / 7.43 / 7.45ms，baidu 1.32 / 7.37 / 7.24ms，
+  google 1.32 / 7.25 / 6.81ms（router / DoH / DoH+ECS，均 5/5）；
+  ECS 与普通 DoH 的应答 TTL 不同（上游视角随子网变化）。
+
 ## 12. 用 Rust 重写这套东西的可行性
 
 已验证（本仓库 mini-dae，实测跑通）：

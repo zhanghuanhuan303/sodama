@@ -63,6 +63,7 @@
 | [0036](./ADR-0036-p18c-dns-routing.md) | P18c `dns.routing` 请求/应答分流 + 多上游：qname/qtype→reject/asis/tag（asis 回客户端原目的，UDP/TCP 两路径）、应答 qname/qtype/upstream/ip→accept/reject/换上游重查（深度 3）；路由先于缓存 + 按上游作用域缓存；dae 链编码/默认 fallback 对齐；sub/node/subnode 以 note 跳过 | 已采纳 | —（P18c 执行；对标表缺口 #5 收尾） |
 | [0037](./ADR-0037-dns-file-blocklist.md) | `qname(file:)` 自定义域名名单（mini 扩展：文本名单、默认 suffix、full:/keyword:/regex: 前缀、相对路径按规则文件目录、缺失硬失败）+ `upstream_hits` 分流命中观测；真网关默认国内→本地明文/其余→DoH/名单拦截 | 已采纳 | —（P18c 实用化扩展） |
 | [0038](./ADR-0038-dns-ecs-sip.md) | DNS 精细策略（mini 扩展）：上游 URL `ecs=auto|<CIDR>` 注入 ECS（客户端子网，v4/24 v6/56，已带 OPT 透传，缓存按子网分域）+ 请求函数 `sip(...)` 客户端网段路由；真网关国内域 DoH+ECS | 已采纳 | —（P18c 实用化扩展二） |
+| [0039](./ADR-0039-dns-response-sip-bench.md) | 应答侧 `sip(...)`（按客户端来源过滤应答）+ `dns-bench` 子命令（用户态、marked socket、同域名跨上游 min/avg/p50/TTL 对比）；真机 router↔DoH↔DoH+ECS A/B | 已采纳 | —（P18c 实用化扩展三） |
 
 ## 新增一条 ADR
 

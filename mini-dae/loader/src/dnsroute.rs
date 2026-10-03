@@ -73,6 +73,8 @@ struct ReqEntry {
 enum RespKind {
     QName(usize),
     QType(u16),
+    /// 客户端源地址（mini 扩展；无客户端信息时不命中）
+    Sip(usize),
     /// 按名字比较请求阶段选中的上游（tag / asis / reject）
     Upstream(ReqOut),
     Ip(usize),
@@ -96,6 +98,7 @@ pub struct DnsRouter {
     resp: Vec<RespEntry>,
     resp_domains: Vec<DomainSetSpec>,
     resp_ips: Vec<Vec<Cidr>>,
+    resp_sips: Vec<Vec<Cidr>>,
     resp_out: Vec<RespOut>,
     pub resp_fallback: RespOut,
     pub response_rule_lines: usize,
@@ -146,9 +149,20 @@ impl DnsRouter {
         self.req_fallback.clone()
     }
 
-    /// 应答分流；`served` 是请求阶段选中的出口（用于 `upstream(...)`）。
-    /// 返回 None = accept；Some(RespOut::Reject) 等。
+    /// 应答分流（无客户端地址；测试/兼容用）。生产走 `response_select_for`。
+    #[allow(dead_code)]
     pub fn response_select(&self, resp: &[u8], served: &ReqOut) -> RespOut {
+        self.response_select_for(resp, served, None)
+    }
+
+    /// 应答分流；`served` 是请求阶段选中的出口（用于 `upstream(...)`）；
+    /// `client` 为查询发起方地址（`sip()` 匹配用）。
+    pub fn response_select_for(
+        &self,
+        resp: &[u8],
+        served: &ReqOut,
+        client: Option<IpAddr>,
+    ) -> RespOut {
         let q = dns::parse_query(resp);
         let qname = q.as_ref().map(|q| q.qname.clone()).unwrap_or_default();
         let qtype = q.as_ref().map(|q| q.qtype).unwrap_or(0);
@@ -163,6 +177,9 @@ impl DnsRouter {
                             && dns::domain_set_matches(&self.resp_domains[*idx], &qname)
                     }
                     RespKind::QType(t) => qtype == *t,
+                    RespKind::Sip(idx) => client
+                        .map(|ip| ip_hits(&self.resp_sips[*idx], ip))
+                        .unwrap_or(false),
                     RespKind::Upstream(u) => u == served,
                     RespKind::Ip(idx) => ips.iter().any(|ip| ip_hits(&self.resp_ips[*idx], *ip)),
                 };
@@ -550,7 +567,7 @@ pub fn compile(
             return Ok(None);
         };
         let mut notes = Vec::new();
-        let (resp, resp_domains, resp_ips, resp_out, resp_fb, lines) =
+        let (resp, resp_domains, resp_ips, resp_sips, resp_out, resp_fb, lines) =
             compile_response(resp_sec, tags, geo, &cfg.files, &mut notes)?;
         return Ok(Some(DnsRouter {
             req: Vec::new(),
@@ -562,6 +579,7 @@ pub fn compile(
             resp,
             resp_domains,
             resp_ips,
+            resp_sips,
             resp_out,
             resp_fallback: resp_fb,
             response_rule_lines: lines,
@@ -571,13 +589,14 @@ pub fn compile(
     let mut notes = Vec::new();
     let (req, req_domains, req_ips, req_out, req_fb, lines) =
         compile_request(sec, tags, geo, &cfg.files, &mut notes)?;
-    let (resp, resp_domains, resp_ips, resp_out, resp_fb, rlines) =
+    let (resp, resp_domains, resp_ips, resp_sips, resp_out, resp_fb, rlines) =
         match routing.items.iter().find_map(|i| match i {
             Item::Section(s) if s.name == "response" => Some(s),
             _ => None,
         }) {
             Some(s) => compile_response(s, tags, geo, &cfg.files, &mut notes)?,
             None => (
+                Vec::new(),
                 Vec::new(),
                 Vec::new(),
                 Vec::new(),
@@ -596,6 +615,7 @@ pub fn compile(
         resp,
         resp_domains,
         resp_ips,
+        resp_sips,
         resp_out,
         resp_fallback: resp_fb,
         response_rule_lines: rlines,
@@ -614,6 +634,7 @@ type RequestParts = (
 type ResponseParts = (
     Vec<RespEntry>,
     Vec<DomainSetSpec>,
+    Vec<Vec<Cidr>>,
     Vec<Vec<Cidr>>,
     Vec<RespOut>,
     RespOut,
@@ -770,6 +791,7 @@ fn compile_response(
     let mut entries: Vec<RespEntry> = Vec::new();
     let mut domains: Vec<DomainSetSpec> = Vec::new();
     let mut ipsets: Vec<Vec<Cidr>> = Vec::new();
+    let mut sipsets: Vec<Vec<Cidr>> = Vec::new();
     let mut outs: Vec<RespOut> = Vec::new();
     let mut fallback: Option<RespOut> = None;
     let mut lines = 0usize;
@@ -854,9 +876,23 @@ fn compile_response(
                                 None,
                             ));
                         }
+                        "sip" => {
+                            // mini 扩展：客户端源地址匹配（应答侧过滤）
+                            let set = ip_set(f, geo, notes)?;
+                            let idx = sipsets.len();
+                            sipsets.push(set);
+                            rule_entries.push((
+                                RespEntry {
+                                    kind: RespKind::Sip(idx),
+                                    not: f.not,
+                                    chain: Chain::Or,
+                                },
+                                None,
+                            ));
+                        }
                         other => {
                             return Err(format!(
-                                "dns.routing.response 不支持函数 {other}（可用 qname/qtype/upstream/ip）"
+                                "dns.routing.response 不支持函数 {other}（可用 qname/qtype/upstream/ip/sip）"
                             ))
                         }
                     }
@@ -900,6 +936,7 @@ fn compile_response(
         entries,
         domains,
         ipsets,
+        sipsets,
         outs,
         fallback.unwrap_or(RespOut::Accept),
         lines,
@@ -1094,6 +1131,32 @@ mod tests {
         assert_eq!(
             r.request_select_for(&q("other.test", 1), Some(lan)),
             ReqOut::Tag("up1".into())
+        );
+    }
+
+    #[test]
+    fn response_sip_filters_by_client() {
+        use std::net::IpAddr;
+        let cfg = cfg_with(
+            "dns {\n upstream {\n  up1: 'udp://127.0.0.1:5353'\n }\n routing {\n  request { fallback: up1 }\n  response {\n   sip(10.9.9.0/24) && ip(10.9.10.60/32) -> reject\n   sip(10.0.0.0/24) && ip(10.9.10.60/32) -> up1\n   fallback: accept\n  }\n }\n}\n",
+        );
+        let r = compile(&cfg, &tags(), None).unwrap().unwrap();
+        assert_eq!(r.response_rule_lines, 2);
+        let resp = crate::dns::tests_support::a_response("x.test", [10, 9, 10, 60], 30);
+        let lan: IpAddr = "10.0.0.2".parse().unwrap();
+        let other: IpAddr = "10.9.9.2".parse().unwrap();
+        assert_eq!(
+            r.response_select_for(&resp, &ReqOut::Tag("up1".into()), Some(other)),
+            RespOut::Reject
+        );
+        assert_eq!(
+            r.response_select_for(&resp, &ReqOut::Tag("up1".into()), Some(lan)),
+            RespOut::Tag("up1".into())
+        );
+        // 无客户端信息：sip 不命中 → 落到 fallback
+        assert_eq!(
+            r.response_select_for(&resp, &ReqOut::Tag("up1".into()), None),
+            RespOut::Accept
         );
     }
 

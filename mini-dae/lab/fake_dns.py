@@ -55,9 +55,10 @@ TABLE = {
     "asis.test": "10.9.10.44",
     "tcp.asis.test": "10.9.10.46",
     "x.fullblocked.test": "10.9.10.47",
-    # P18c+：ECS 注入 / 客户端网段路由夹具
     "ecsroute.test": "10.9.10.48",
     "viacli.test": "10.9.10.49",
+    # P18c+：ECS 注入 / 客户端网段路由夹具
+    "rsip.test": "10.9.10.62",
 }
 
 # P3b-2a：大应答（60 条 A ≈ 990 字节 > 512，用于验证 UDP 截断/EDNS）
