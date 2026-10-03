@@ -285,7 +285,9 @@ status() {
   local pid=""
   [ -f "$PID_FILE" ] && pid="$(cat "$PID_FILE" 2>/dev/null || true)"
   if [ -n "$pid" ] && [ -d "/proc/$pid" ]; then
-    ps -o pid=,etime=,args= -p "$pid" 2>/dev/null | sed 's#--dialer [^ ]*#--dialer <redacted>#' || true
+    ps -o pid=,etime=,args= -p "$pid" 2>/dev/null \
+      | sed -e 's#--dialer [^ ]*#--dialer <redacted>#' -e 's#--subscribe [^ ]*#--subscribe <redacted>#' \
+      || true
   else
     echo "  mini-dae 未运行（或不是本脚本启动的实例）"
   fi
