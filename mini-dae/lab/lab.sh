@@ -186,6 +186,14 @@ FAKE_DNS_PORT=5353
 FAKE_DNS_LOG=/tmp/mini-dae-fake-dns.txt
 FAKE_DNS_PID_FILE=/tmp/mini-dae-fake-dns.pid
 
+# P18a：DoT/DoH 上游夹具（Python 自签，转发到假 UDP DNS）
+DOT_PORT=8853
+DOT_LOG=/tmp/mini-dae-dot.txt
+DOT_PID_FILE=/tmp/mini-dae-dot.pid
+DOH_PORT=8953
+DOH_LOG=/tmp/mini-dae-doh.txt
+DOH_PID_FILE=/tmp/mini-dae-doh.pid
+
 die() { echo "!! $*" >&2; exit 1; }
 
 require_root() {
@@ -274,6 +282,14 @@ cleanup() {
   if [ -f "$FAKE_DNS_PID_FILE" ]; then
     kill "$(cat "$FAKE_DNS_PID_FILE")" 2>/dev/null || true
     rm -f "$FAKE_DNS_PID_FILE"
+  fi
+  if [ -f "$DOT_PID_FILE" ]; then
+    kill "$(cat "$DOT_PID_FILE")" 2>/dev/null || true
+    rm -f "$DOT_PID_FILE"
+  fi
+  if [ -f "$DOH_PID_FILE" ]; then
+    kill "$(cat "$DOH_PID_FILE")" 2>/dev/null || true
+    rm -f "$DOH_PID_FILE"
   fi
   if [ -f "$BENCH_PID_FILE" ]; then
     kill "$(cat "$BENCH_PID_FILE")" 2>/dev/null || true
@@ -533,6 +549,29 @@ up() {
       >/tmp/mini-dae-fake-dns.stdout 2>&1 &
     echo $! >"$FAKE_DNS_PID_FILE"
     sleep 0.3
+  fi
+
+  # P18a：DoT/DoH 上游服务端（自签证书；转发到假 UDP DNS）
+  if [ -n "${USE_DNS_TRANSPORT:-}" ]; then
+    [ -f "$CERTS_DIR/cert.pem" ] && [ -f "$CERTS_DIR/key.pem" ] \
+      || die "缺自签证书：先运行 lab/gen-certs.sh"
+    if [ "$USE_DNS_TRANSPORT" = tls ]; then
+      rm -f "$DOT_LOG"
+      python3 "$HERE/dns_transport_server.py" tls "$DOT_PORT" "$CERTS_DIR/cert.pem" \
+        "$CERTS_DIR/key.pem" "127.0.0.1:$FAKE_DNS_PORT" "$DOT_LOG" \
+        >/tmp/mini-dae-dot.stdout 2>&1 &
+      echo $! >"$DOT_PID_FILE"
+      sleep 0.3
+      kill -0 "$(cat "$DOT_PID_FILE")" 2>/dev/null || { cat /tmp/mini-dae-dot.stdout; die "DoT 服务端启动失败"; }
+    else
+      rm -f "$DOH_LOG"
+      python3 "$HERE/dns_transport_server.py" https "$DOH_PORT" "$CERTS_DIR/cert.pem" \
+        "$CERTS_DIR/key.pem" "127.0.0.1:$FAKE_DNS_PORT" "$DOH_LOG" \
+        >/tmp/mini-dae-doh.stdout 2>&1 &
+      echo $! >"$DOH_PID_FILE"
+      sleep 0.3
+      kill -0 "$(cat "$DOH_PID_FILE")" 2>/dev/null || { cat /tmp/mini-dae-doh.stdout; die "DoH 服务端启动失败"; }
+    fi
   fi
 
   echo "== 启动 mini-dae =="
@@ -1125,20 +1164,24 @@ PY
   echo "PASS: DNS 缓存（命中不重查上游、TTL 递减、负缓存）"
 }
 
-# P3b-1：TCP DNS——长度前缀分帧；同一 name 第二次命中缓存（上游 TCP 只查一次）。
+# P3b-1：TCP 客户端 DNS——长度前缀分帧；上游链路仍按**上游 scheme** 选传输
+# （tcp+udp：UDP 优先，TC/失败才回退 TCP，对照 dae）；同一 name 第二次命中缓存。
+# 显式 tcp:// 上游（仅 TCP，2B 分帧）另见 test_dns_tcpup。
 test_dns_tcp() {
   require_root
-  echo "== 测试 TCP DNS（2 字节分帧 + 缓存）=="
-  local out up
+  echo "== 测试 TCP 客户端 DNS（2 字节分帧 + 缓存）=="
+  local out up tcp_up
   out="$(ip netns exec "$CLIENT_NS" timeout 8 python3 "$HERE/dns_probe.py" --tcp 9.9.9.9 tcp.test 2>&1 || true)"
   echo "$out"
   printf '%s\n' "$out" | grep -q '^proto=tcp' || { echo "FAIL: 探针未走 TCP"; exit 1; }
   printf '%s\n' "$out" | grep -q '^answer=10.9.10.6' || { echo "FAIL: TCP DNS 未解析到 10.9.10.6"; exit 1; }
-  up="$(grep -c '^QUERY-TCP tcp.test' "$FAKE_DNS_LOG" || true)"
-  [ "$up" = "1" ] || { echo "FAIL: TCP 上游收到 $up 次查询（应为 1）"; exit 1; }
+  up="$(grep -c '^QUERY tcp.test ' "$FAKE_DNS_LOG" || true)"
+  tcp_up="$(grep -c '^QUERY-TCP tcp.test ' "$FAKE_DNS_LOG" || true)"
+  [ "$up" = "1" ] && [ "$tcp_up" = "0" ] \
+    || { echo "FAIL: tcp+udp 上游应为 UDP 优先（UDP=$up TCP=$tcp_up，期望 1/0）"; exit 1; }
   out="$(ip netns exec "$CLIENT_NS" timeout 8 python3 "$HERE/dns_probe.py" --tcp 9.9.9.9 tcp.test 2>&1 || true)"
   echo "$out"
-  up="$(grep -c '^QUERY-TCP tcp.test' "$FAKE_DNS_LOG" || true)"
+  up="$(grep -c '^QUERY tcp.test ' "$FAKE_DNS_LOG" || true)"
   [ "$up" = "1" ] || { echo "FAIL: 第二次 TCP 查询未命中缓存（上游 $up 次）"; exit 1; }
   "$LOADER" status --socket "$STATUS_SOCK" --json >/tmp/mini-dae-status.json
   python3 - /tmp/mini-dae-status.json <<'PY'
@@ -1151,7 +1194,7 @@ assert d["tcp_unsupported"] == 0, d
 print("dns tcp: queries=%d responses=%d cache_hits=%d" % (
     d["tcp_queries"], d["tcp_responses"], d["cache_hits"]))
 PY
-  echo "PASS: TCP DNS（2 字节分帧、可缓存、无 unsupported 计数）"
+  echo "PASS: TCP 客户端 DNS（2 字节分帧、可缓存、上游 tcp+udp 走 UDP）"
 }
 
 # P3b-1：reload（SIGHUP）后用 DNS 缓存重建新槽域位图，且新槽位图端到端生效。
@@ -1269,6 +1312,94 @@ test_dns_edns() {
   up="$(grep -c '^QUERY big.test' "$FAKE_DNS_LOG" || true)"
   [ "$up" = "1" ] || { echo "FAIL: big.test 上行了 $up 次（应为 1，其余命中缓存）"; exit 1; }
   echo "PASS: EDNS 尺寸、UDP 截断（TC=1 + 清空 answer）、TCP 完整应答"
+}
+
+# P18a：DoT 上游（tls://，TLS + 2B 分帧 + 持久连接）
+test_dot() {
+  require_root
+  echo "== 测试 DoT 上游（tls://） =="
+  [ -f "$DOT_PID_FILE" ] && kill -0 "$(cat "$DOT_PID_FILE")" 2>/dev/null \
+    || die "DoT 服务端未运行（先用 dot-up 会话启动）"
+  local out conns
+  out="$(ip netns exec "$CLIENT_NS" timeout 8 python3 "$HERE/dns_probe.py" 9.9.9.9 dot.test 2>&1 || true)"
+  echo "$out"
+  printf '%s\n' "$out" | grep -q '^answer=10.9.10.31' || { echo "FAIL: DoT 上游未解析 dot.test"; exit 1; }
+  # 第二个名字（未缓存）复用同一连接 → 验证持久化
+  out="$(ip netns exec "$CLIENT_NS" timeout 8 python3 "$HERE/dns_probe.py" 9.9.9.9 dot2.test 2>&1 || true)"
+  echo "$out"
+  printf '%s\n' "$out" | grep -q '^answer=10.9.10.32' || { echo "FAIL: DoT 上游未解析 dot2.test"; exit 1; }
+  grep -q '^TLS-QUERY dot.test ' "$DOT_LOG" || { echo "FAIL: DoT 服务端未收到 dot.test"; cat "$DOT_LOG"; exit 1; }
+  grep -q '^TLS-QUERY dot2.test ' "$DOT_LOG" || { echo "FAIL: DoT 服务端未收到 dot2.test"; exit 1; }
+  conns="$(grep -c '^TLS-CONN$' "$DOT_LOG" || true)"
+  [ "$conns" = "1" ] || { echo "FAIL: DoT 连接数 $conns（应为 1，持久连接未复用）"; cat "$DOT_LOG"; exit 1; }
+  # 后端确实经假 UDP DNS 应答（转发链完整）
+  grep -q '^QUERY dot.test ' "$FAKE_DNS_LOG" || { echo "FAIL: DoT 服务端未转发到假上游"; exit 1; }
+  "$LOADER" status --socket "$STATUS_SOCK" --json >/tmp/mini-dae-status.json
+  python3 - <<'PY'
+import json
+v = json.load(open("/tmp/mini-dae-status.json"))
+assert v["dns"]["upstream_scheme"] == "tls", v["dns"]
+assert v["dns"]["upstream_url"].startswith("tls://"), v["dns"]
+print("dot: status upstream=%s scheme=%s" % (v["dns"]["upstream"], v["dns"]["upstream_scheme"]))
+PY
+  echo "PASS: DoT 上游（2 次查询复用 1 条 TLS 连接）"
+}
+
+# P18a：DoH 上游（https://，HTTP/1.1 POST application/dns-message + keep-alive）
+test_doh() {
+  require_root
+  echo "== 测试 DoH 上游（https://） =="
+  [ -f "$DOH_PID_FILE" ] && kill -0 "$(cat "$DOH_PID_FILE")" 2>/dev/null \
+    || die "DoH 服务端未运行（先用 doh-up 会话启动）"
+  local out conns
+  out="$(ip netns exec "$CLIENT_NS" timeout 8 python3 "$HERE/dns_probe.py" 9.9.9.9 doh.test 2>&1 || true)"
+  echo "$out"
+  printf '%s\n' "$out" | grep -q '^answer=10.9.10.33' || { echo "FAIL: DoH 上游未解析 doh.test"; exit 1; }
+  out="$(ip netns exec "$CLIENT_NS" timeout 8 python3 "$HERE/dns_probe.py" 9.9.9.9 doh2.test 2>&1 || true)"
+  echo "$out"
+  printf '%s\n' "$out" | grep -q '^answer=10.9.10.34' || { echo "FAIL: DoH 上游未解析 doh2.test"; exit 1; }
+  grep -q '^DOH-QUERY /dns-query doh.test ' "$DOH_LOG" || { echo "FAIL: DoH 服务端未收到 doh.test（path 应为 /dns-query）"; cat "$DOH_LOG"; exit 1; }
+  grep -q '^DOH-QUERY /dns-query doh2.test ' "$DOH_LOG" || { echo "FAIL: DoH 服务端未收到 doh2.test"; exit 1; }
+  conns="$(grep -c '^DOH-CONN$' "$DOH_LOG" || true)"
+  [ "$conns" = "1" ] || { echo "FAIL: DoH 连接数 $conns（应为 1，keep-alive 未复用）"; cat "$DOH_LOG"; exit 1; }
+  grep -q '^QUERY doh.test ' "$FAKE_DNS_LOG" || { echo "FAIL: DoH 服务端未转发到假上游"; exit 1; }
+  "$LOADER" status --socket "$STATUS_SOCK" --json >/tmp/mini-dae-status.json
+  python3 - <<'PY'
+import json
+v = json.load(open("/tmp/mini-dae-status.json"))
+assert v["dns"]["upstream_scheme"] == "https", v["dns"]
+assert v["dns"]["upstream_url"].startswith("https://"), v["dns"]
+print("doh: status upstream=%s scheme=%s" % (v["dns"]["upstream"], v["dns"]["upstream_scheme"]))
+PY
+  echo "PASS: DoH 上游（2 次查询复用 1 条 keep-alive 连接）"
+}
+
+# P18a：显式 udp:// 上游（仅 UDP；不应出现 TCP 上行）
+test_dns_udp() {
+  require_root
+  echo "== 测试显式 udp:// 上游 =="
+  local out hits tcp_hits
+  out="$(ip netns exec "$CLIENT_NS" timeout 8 python3 "$HERE/dns_probe.py" 9.9.9.9 udpup.test 2>&1 || true)"
+  echo "$out"
+  printf '%s\n' "$out" | grep -q '^answer=10.9.10.35' || { echo "FAIL: udp:// 上游未解析 udpup.test"; exit 1; }
+  hits="$(grep -c '^QUERY udpup.test ' "$FAKE_DNS_LOG" || true)"
+  tcp_hits="$(grep -c '^QUERY-TCP udpup.test ' "$FAKE_DNS_LOG" || true)"
+  [ "$hits" = "1" ] && [ "$tcp_hits" = "0" ] || { echo "FAIL: udp:// 上行走 UDP=$hits TCP=$tcp_hits（应为 1/0）"; exit 1; }
+  echo "PASS: udp:// 上游（仅 UDP，1 次上行）"
+}
+
+# P18a：显式 tcp:// 上游（仅 TCP，2B 分帧）
+test_dns_tcpup() {
+  require_root
+  echo "== 测试显式 tcp:// 上游 =="
+  local out hits udp_hits
+  out="$(ip netns exec "$CLIENT_NS" timeout 8 python3 "$HERE/dns_probe.py" 9.9.9.9 tcpup.test 2>&1 || true)"
+  echo "$out"
+  printf '%s\n' "$out" | grep -q '^answer=10.9.10.36' || { echo "FAIL: tcp:// 上游未解析 tcpup.test"; exit 1; }
+  hits="$(grep -c '^QUERY-TCP tcpup.test ' "$FAKE_DNS_LOG" || true)"
+  udp_hits="$(grep -c '^QUERY tcpup.test ' "$FAKE_DNS_LOG" || true)"
+  [ "$hits" = "1" ] && [ "$udp_hits" = "0" ] || { echo "FAIL: tcp:// 上行走 TCP=$hits UDP=$udp_hits（应为 1/0）"; exit 1; }
+  echo "PASS: tcp:// 上游（仅 TCP，1 次上行）"
 }
 
 # P4a：TCP relay（direct 拨号）——真实转发到目标，含大流量完整性。
@@ -2263,6 +2394,18 @@ case "${1:-}" in
   test-pname) test_pname ;;
   forward-up) USE_FORWARD="socks5://127.0.0.1:$SOCKS5_PORT" up ;;
   dns-up) USE_RULES="$HERE/rules.dns.dae" USE_DNS_UPSTREAM="127.0.0.1:$FAKE_DNS_PORT" USE_FAKE_DNS=1 up ;;
+  dot-up) USE_RULES="$HERE/rules.dns.dae" USE_FAKE_DNS=1 USE_DNS_TRANSPORT=tls \
+    USE_DNS_UPSTREAM="tls://127.0.0.1:$DOT_PORT?sni=localhost&insecure=1" up ;;
+  test-dot) test_dot ;;
+  doh-up) USE_RULES="$HERE/rules.dns.dae" USE_FAKE_DNS=1 USE_DNS_TRANSPORT=https \
+    USE_DNS_UPSTREAM="https://127.0.0.1:$DOH_PORT/dns-query?sni=localhost&insecure=1" up ;;
+  test-doh) test_doh ;;
+  dns-udp-up) USE_RULES="$HERE/rules.dns.dae" USE_FAKE_DNS=1 \
+    USE_DNS_UPSTREAM="udp://127.0.0.1:$FAKE_DNS_PORT" up ;;
+  test-dns-udp) test_dns_udp ;;  # 显式 udp:// 上游（仅 UDP）
+  dns-tcpup-up) USE_RULES="$HERE/rules.dns.dae" USE_FAKE_DNS=1 \
+    USE_DNS_UPSTREAM="tcp://127.0.0.1:$FAKE_DNS_PORT" up ;;
+  test-dns-tcpup) test_dns_tcpup ;;  # 显式 tcp:// 上游（仅 TCP，服务端同端口的 TCP 面）
   geo-up) USE_RULES="$HERE/rules.geo.dae" USE_DNS_UPSTREAM="127.0.0.1:$FAKE_DNS_PORT" USE_FAKE_DNS=1 \
     USE_GEODATA_DIR=/tmp/mini-dae-geodata up ;;
   test-geo) test_geo ;;
@@ -2352,5 +2495,5 @@ case "${1:-}" in
   status) status ;;
   trace) trace ;;
   down) down ;;
-  *) echo "usage: $0 {build|up|dual-up|config-up|forward-up|dns-up|geo-up|pname-up|regex-up|relay-up|offload-up|udp-up|ss-up|ss-udp-up|trojan-up|vless-up|vless-tls-up|vless-udp-up|vmess-up|vmess-tls-up|vmess-udp-up|tuic-up|tuic-udp-up|hy2-up|hy2-udp-up|hy2-obfs-up|hy2-obfs-udp-up|hy2-brutal-up|hy2-hop-up|ops-up|ops-reload-up|bench-up|test-proxy|test-direct|test-block|test-host-proxy|test-reload|test-rebind|test-status|test-config|test-forward|test-domain|test-dns-cache|test-dns-tcp|test-dns-reload|test-domain-regex|test-dns-edns|test-geo|test-pname|test-v6|test-relay|test-relay-idle|test-relay-offload|test-offload-lifecycle|test-udp-relay|test-udp-idle|test-ss|test-trojan|test-ss-udp|test-vless|test-vless-udp|test-vmess|test-vmess-udp|test-tuic|test-tuic-udp|test-hy2|test-hy2-udp|test-hy2-obfs|test-hy2-obfs-udp|test-hy2-brutal|test-hy2-hop|test-ops|test-config-reload|test-fault-reload|test-fault-kill|reload|verify|status|trace|down}"; exit 2 ;;
+  *) echo "usage: $0 {build|up|dual-up|config-up|forward-up|dns-up|dot-up|doh-up|dns-udp-up|dns-tcpup-up|geo-up|pname-up|regex-up|relay-up|offload-up|udp-up|ss-up|ss-udp-up|trojan-up|vless-up|vless-tls-up|vless-udp-up|vmess-up|vmess-tls-up|vmess-udp-up|tuic-up|tuic-udp-up|hy2-up|hy2-udp-up|hy2-obfs-up|hy2-obfs-udp-up|hy2-brutal-up|hy2-hop-up|ops-up|ops-reload-up|bench-up|test-proxy|test-direct|test-block|test-host-proxy|test-reload|test-rebind|test-status|test-config|test-forward|test-domain|test-dns-cache|test-dns-tcp|test-dns-reload|test-domain-regex|test-dns-edns|test-dot|test-doh|test-dns-udp|test-dns-tcpup|test-geo|test-pname|test-v6|test-relay|test-relay-idle|test-relay-offload|test-offload-lifecycle|test-udp-relay|test-udp-idle|test-ss|test-trojan|test-ss-udp|test-vless|test-vless-udp|test-vmess|test-vmess-udp|test-tuic|test-tuic-udp|test-hy2|test-hy2-udp|test-hy2-obfs|test-hy2-obfs-udp|test-hy2-brutal|test-hy2-hop|test-ops|test-config-reload|test-fault-reload|test-fault-kill|reload|verify|status|trace|down}"; exit 2 ;;
 esac

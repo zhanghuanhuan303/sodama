@@ -33,6 +33,14 @@ TABLE = {
     # P17a：geosite 夹具（lab/rules.geo.dae 的 domain(geosite: cn) 展开自
     # lab/gen-geo-dat.py，suffix 条目 geo.test）
     "geo.test": "10.9.10.3",
+    # P18a：DoT/DoH 传输夹具（dns_transport_server.py 转发到本服务）
+    "dot.test": "10.9.10.31",
+    "dot2.test": "10.9.10.32",
+    "doh.test": "10.9.10.33",
+    "doh2.test": "10.9.10.34",
+    # P18a：显式 udp:// / tcp:// 上游夹具
+    "udpup.test": "10.9.10.35",
+    "tcpup.test": "10.9.10.36",
 }
 
 # P3b-2a：大应答（60 条 A ≈ 990 字节 > 512，用于验证 UDP 截断/EDNS）

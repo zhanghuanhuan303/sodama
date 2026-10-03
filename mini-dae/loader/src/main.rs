@@ -26,7 +26,7 @@
  */
 use std::ffi::CString;
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
@@ -45,6 +45,7 @@ mod anytls;
 mod brutal;
 mod config;
 mod dns;
+mod dnsup;
 mod geodata;
 mod group;
 mod hpack;
@@ -227,28 +228,18 @@ static RELAY_CONNS: std::sync::LazyLock<Mutex<std::collections::HashMap<u64, Arc
     std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
 static NEXT_RELAY_ID: AtomicU64 = AtomicU64::new(1);
 
-/// P3a：DNS 上游与统计；P3b-1：缓存 + TCP DNS
-/// P3a/P6：DNS 上游（host:port）。P6 起支持热重载（`--config` 模式下重读 dns.upstream）。
-static UPSTREAM_ADDR: Mutex<Option<SocketAddr>> = Mutex::new(None);
+/// P3a/P6/P18a：DNS 上游（已解析的传输对象；支持 udp/tcp/tcp+udp/tls/https scheme）。
+/// P6 起支持热重载（`--config` 模式下重读 dns.upstream 并重建）。
+static UPSTREAM: Mutex<Option<Arc<dnsup::Upstream>>> = Mutex::new(None);
 
-fn upstream_addr() -> Option<SocketAddr> {
-    UPSTREAM_ADDR.lock().ok().and_then(|g| *g)
+fn upstream() -> Option<Arc<dnsup::Upstream>> {
+    UPSTREAM.lock().ok().and_then(|g| g.clone())
 }
 
-fn set_upstream_addr(a: SocketAddr) {
-    if let Ok(mut g) = UPSTREAM_ADDR.lock() {
-        *g = Some(a);
+fn set_upstream(u: Arc<dnsup::Upstream>) {
+    if let Ok(mut g) = UPSTREAM.lock() {
+        *g = Some(u);
     }
-}
-
-/// 解析 DNS 上游 URL（`udp://host:port` 或 `host:port`）。
-fn resolve_upstream_url(url: &str) -> Result<SocketAddr, String> {
-    let hostport = url.strip_prefix("udp://").unwrap_or(url);
-    hostport
-        .to_socket_addrs()
-        .map_err(|e| format!("解析 DNS 上游 {url} 失败: {e}"))?
-        .next()
-        .ok_or_else(|| format!("解析 DNS 上游 {url} 无结果"))
 }
 static DOMAIN_SETS: Mutex<Vec<rules::DomainSetSpec>> = Mutex::new(Vec::new());
 /// P3b-1：DNS 应答缓存（UDP/TCP 共用；锁仅短暂持有）
@@ -424,7 +415,8 @@ struct Args {
     forward: Option<String>,
     /// P4c：启用 TCP relay offload（fast_sock + sk_skb）
     offload: bool,
-    /// P3a：DNS 上游（host:port 或 udp://host:port；缺省时用配置 dns.upstream 或 8.8.8.8:53）
+    /// P3a/P18a：DNS 上游 URL（无 scheme 或 udp://、tcp://、tcp+udp://、tls://(DoT)、
+    /// https://(DoH)；缺省时用配置 dns.upstream 或 8.8.8.8:53）
     dns_upstream: Option<String>,
     /// 打印编译出的 match_set / LPM 内容（对拍用）
     dump: bool,
@@ -1844,12 +1836,16 @@ fn do_reload(args: &Args, ebpf: &mut Ebpf) -> ReloadOutcome {
                 if let Some(path) = &args.config {
                     if let Ok(cfg) = config::load(Path::new(path)) {
                         if let Some(url) = config::dns_upstream_url(&cfg) {
-                            match resolve_upstream_url(&url) {
-                                Ok(new_addr) => {
-                                    let old = upstream_addr();
-                                    if old != Some(new_addr) {
-                                        set_upstream_addr(new_addr);
-                                        log(&format!("dns upstream 切换: {old:?} -> {new_addr}"));
+                            match dnsup::Upstream::new(&url) {
+                                Ok(new_up) => {
+                                    let old = upstream().map(|u| u.url.clone());
+                                    if old.as_deref() != Some(url.as_str()) {
+                                        log(&format!(
+                                            "dns upstream 切换: {old:?} -> {url} ({}, {})",
+                                            new_up.spec.scheme.name(),
+                                            new_up.addr()
+                                        ));
+                                        set_upstream(new_up);
                                     }
                                 }
                                 Err(e) => log(&format!("reload: {e}（保留原上游）")),
@@ -2197,7 +2193,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return run_socks_server(&listen);
     }
 
-    // P3a：DNS 上游 socket 必须在 host ns 创建（上游查询走宿主路由，
+    // P3a/P18a：DNS 上游传输对象必须在 host ns 创建（上游查询走宿主路由，
     // 不经 dae0/自己的钩子）；缺省上游优先取 --config 的 dns.upstream。
     let upstream_url = args.dns_upstream.clone().unwrap_or_else(|| {
         args.config
@@ -2206,10 +2202,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .and_then(|c| config::dns_upstream_url(&c))
             .unwrap_or_else(|| "8.8.8.8:53".into())
     });
-    let upstream_addr: SocketAddr = resolve_upstream_url(&upstream_url)?;
-    let upstream_sock = outbound::new_marked_udp()?;
-    set_upstream_addr(upstream_addr);
-    log(&format!("dns upstream: {upstream_addr}"));
+    let dns_up = dnsup::Upstream::new(&upstream_url)?;
+    log(&format!(
+        "dns upstream: {upstream_url} scheme={} addr={}",
+        dns_up.spec.scheme.name(),
+        dns_up.addr()
+    ));
+    set_upstream(dns_up);
 
     // SIGHUP = 热重载（对照 dae `dae reload`）；SIGUSR2 = suspend（对照 dae suspend）
     unsafe {
@@ -2374,7 +2373,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // P3a：DNS 线程在 host ns（回包直接从宿主接口发向客户端；监听 fd 来自 daens）。
     {
         let dns_tx = _keep_tx.clone();
-        std::thread::spawn(move || dns_loop(udp_listener, upstream_sock, dns_tx));
+        std::thread::spawn(move || dns_loop(udp_listener, dns_tx));
     }
 
     // P3b-1：TCP DNS 处理线程（host ns）。accept 在 daens，连接经通道转交到这里；
@@ -2629,41 +2628,11 @@ fn recv_with_orig_dst(
 
 // ---------------------------------------------------------------- P3b-1：缓存 + TCP
 
-/// 上游链路：UDP 用共享 socket（host ns 创建），TCP 每查询一条连接（host ns 线程内建立）。
-enum DnsUplink<'a> {
-    Udp(&'a UdpSocket),
+/// 客户端入口协议（决定应答是否按 UDP 尺寸截断；上游方向由 dnsup 负责）。
+#[derive(Clone, Copy)]
+enum ClientProto {
+    Udp,
     Tcp,
-}
-
-fn forward_dns(query: &[u8], uplink: &DnsUplink, upstream_addr: SocketAddr) -> Option<Vec<u8>> {
-    match uplink {
-        DnsUplink::Udp(sock) => {
-            let mut rbuf = vec![0u8; 4096];
-            if sock.send_to(query, upstream_addr).is_err() {
-                return None;
-            }
-            let n = sock.recv(&mut rbuf).ok()?;
-            Some(rbuf[..n].to_vec())
-        }
-        DnsUplink::Tcp => {
-            let mut s = TcpStream::connect_timeout(&upstream_addr, Duration::from_secs(3)).ok()?;
-            s.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
-            s.set_write_timeout(Some(Duration::from_secs(5))).ok()?;
-            let len = (query.len() as u16).to_be_bytes();
-            s.write_all(&len).ok()?;
-            s.write_all(query).ok()?;
-            s.flush().ok()?;
-            let mut lb = [0u8; 2];
-            s.read_exact(&mut lb).ok()?;
-            let n = u16::from_be_bytes(lb) as usize;
-            if n == 0 {
-                return None;
-            }
-            let mut rbuf = vec![0u8; n];
-            s.read_exact(&mut rbuf).ok()?;
-            Some(rbuf)
-        }
-    }
 }
 
 /// 由 (question, 应答) 计算要写入数据面的域位图更新；hits = 命中的 domain 规则数。
@@ -2729,10 +2698,11 @@ fn publish_live(
 
 /// 查询处理（UDP/TCP 共用）：缓存命中 → 直接回；否则上游 → 发布位图 → 回填缓存。
 /// UDP 最终应答按客户端公布尺寸截断（TCP 不截断）；位图从**完整**应答发布。
+/// 上游经 `dnsup::Upstream`（P18a：udp/tcp/tcp+udp/tls/https）。
 fn resolve_dns(
     query: &[u8],
-    uplink: &DnsUplink,
-    upstream_addr: SocketAddr,
+    proto: ClientProto,
+    upstream: &dnsup::Upstream,
     tx: &std::sync::mpsc::Sender<status::MainMsg>,
 ) -> Option<Vec<u8>> {
     let parsed = dns::parse_query(query);
@@ -2745,12 +2715,16 @@ fn resolve_dns(
         if let Some(resp) = hit {
             DNS_STATS.responses.fetch_add(1, Ordering::Relaxed);
             publish_live(q, &resp, tx, true);
-            return Some(serve_response(query, resp, uplink));
+            return Some(serve_response(query, resp, proto));
         }
     }
-    let Some(resp) = forward_dns(query, uplink, upstream_addr) else {
-        DNS_STATS.upstream_errors.fetch_add(1, Ordering::Relaxed);
-        return None;
+    let resp = match upstream.exchange(query) {
+        Ok(r) => r,
+        Err(e) => {
+            DNS_STATS.upstream_errors.fetch_add(1, Ordering::Relaxed);
+            log(&format!("dns 上游 {} 查询失败: {e}", upstream.url));
+            return None;
+        }
     };
     DNS_STATS.responses.fetch_add(1, Ordering::Relaxed);
     if let Some(q) = &parsed {
@@ -2759,26 +2733,24 @@ fn resolve_dns(
             c.insert(q, &edns, &resp, Instant::now());
         }
     }
-    Some(serve_response(query, resp, uplink))
+    Some(serve_response(query, resp, proto))
 }
 
 /// 发给客户端的最终应答：UDP 按客户端公布尺寸截断（缓存/上游都保留完整版），TCP 原样。
-fn serve_response(query: &[u8], response: Vec<u8>, uplink: &DnsUplink) -> Vec<u8> {
-    match uplink {
-        DnsUplink::Udp(_) => dns::truncate_for_udp(&response, dns::client_udp_size(query)),
-        DnsUplink::Tcp => response,
+fn serve_response(query: &[u8], response: Vec<u8>, proto: ClientProto) -> Vec<u8> {
+    match proto {
+        ClientProto::Udp => dns::truncate_for_udp(&response, dns::client_udp_size(query)),
+        ClientProto::Tcp => response,
     }
 }
 
 /// P3a/P3b/P4b UDP 线程（host ns）：一个透明监听同时承载
 /// DNS（orig_dst port=53，解析/缓存/位图）与普通 UDP NAT（其他目的端口）。
-fn dns_loop(listener: OwnedFd, upstream: UdpSocket, tx: std::sync::mpsc::Sender<status::MainMsg>) {
+fn dns_loop(listener: OwnedFd, tx: std::sync::mpsc::Sender<status::MainMsg>) {
     let fd = listener.as_raw_fd();
     let mut buf = vec![0u8; 2048];
     let mut reply_sockets: std::collections::HashMap<SocketAddr, Arc<OwnedFd>> =
         std::collections::HashMap::new();
-    let _ = upstream.set_read_timeout(Some(Duration::from_secs(3)));
-    let uplink = DnsUplink::Udp(&upstream);
     loop {
         let (n, client, orig_dst) = match recv_with_orig_dst(fd, &mut buf) {
             Ok(v) => v,
@@ -2793,10 +2765,10 @@ fn dns_loop(listener: OwnedFd, upstream: UdpSocket, tx: std::sync::mpsc::Sender<
             continue;
         }
         DNS_STATS.queries.fetch_add(1, Ordering::Relaxed);
-        let Some(uaddr) = upstream_addr() else {
+        let Some(up) = upstream() else {
             continue;
         };
-        let Some(resp) = resolve_dns(&buf[..n], &uplink, uaddr, &tx) else {
+        let Some(resp) = resolve_dns(&buf[..n], ClientProto::Udp, &up, &tx) else {
             continue;
         };
         let Some(s) = reply_socket_for(&mut reply_sockets, orig_dst) else {
@@ -2837,8 +2809,8 @@ fn handle_tcp_dns_conn(mut stream: TcpStream, tx: std::sync::mpsc::Sender<status
             break;
         }
         DNS_STATS.tcp_queries.fetch_add(1, Ordering::Relaxed);
-        let Some(uaddr) = upstream_addr() else { break };
-        let Some(resp) = resolve_dns(&query, &DnsUplink::Tcp, uaddr, &tx) else {
+        let Some(up) = upstream() else { break };
+        let Some(resp) = resolve_dns(&query, ClientProto::Tcp, &up, &tx) else {
             break;
         };
         DNS_STATS.tcp_responses.fetch_add(1, Ordering::Relaxed);
@@ -3586,7 +3558,9 @@ fn status_json(ebpf: &mut Ebpf) -> serde_json::Value {
             "offload_verdicts": offload_verdicts,
         },
         "dns": {
-            "upstream": upstream_addr().map(|a| a.to_string()),
+            "upstream": upstream().map(|u| u.addr().to_string()),
+            "upstream_url": upstream().map(|u| u.url.clone()),
+            "upstream_scheme": upstream().map(|u| u.spec.scheme.name()),
             "queries": DNS_STATS.queries.load(Ordering::Relaxed),
             "responses": DNS_STATS.responses.load(Ordering::Relaxed),
             "published_ips": DNS_STATS.published_ips.load(Ordering::Relaxed),

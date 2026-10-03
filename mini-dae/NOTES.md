@@ -970,6 +970,45 @@ P4 稳定性 → P3 内核矩阵）：
   - tproxy 回显不是 HTTP 响应，curl≥8 默认拒 HTTP/0.9：测试用 `curl --http0.9`。
   - pname 来源差异（comm vs argv basename）与 geosite 未入对拍写在 ADR-0033。
 
+### 11.25 P18a（DoT/DoH 上游 + 上游抽象）已验收的行为
+
+（决策与边界见 ADR-0034；实现 `loader/src/dnsup.rs` + `main.rs` 接入；夹具
+`lab/dns_transport_server.py`、假 DNS 新增夹具名、会话 `dot-up`/`doh-up`/
+`dns-udp-up`/`dns-tcpup-up`。）
+
+- 上游对象：`UpstreamSpec{scheme,host,port,path,sni,insecure}` + `parse()`
+  （`[v6]`、`?sni=`、`?insecure=1`）；默认端口/默认 path 与 dae 逐项对齐
+  （tcp/udp 53；tls/quic 853；https/h3 443 + `/dns-query`）；`h3://` 显式报错。
+- 传输：`udp`（marked socket、锁内串行、按 DNS ID 跳杂包）；`tcp`（每查询一条
+  2B 分帧）；`tcp+udp` = **UDP 优先，TC/失败才 TCP**；`tls`（DoT）= 持久连接
+  （30s 空闲重建、失败丢弃重连一次）+ 2B 分帧；`https`（DoH）= 持久连接 +
+  HTTP/1.1 POST `application/dns-message`（Content-Length/chunked）。
+- 接入：全局 `UPSTREAM: Mutex<Option<Arc<Upstream>>>`；客户端侧枚举改名
+  `ClientProto{Udp,Tcp}`，**不再决定上游传输**（修正旧行为：TCP 客户端 →
+  tcp+udp 上游现在也走 UDP 优先）；`resolve_dns` 统一 `exchange()`；
+  `--dns-upstream` 接受完整 URL；reload 时按 URL 重建 Upstream 热切换；
+  状态面新增 `dns.upstream_url`/`dns.upstream_scheme`（`dns.upstream` 仍为
+  解析后地址串，兼容旧脚本）。
+- lab 夹具：`dns_transport_server.py`（tls/https 两模式，自签证书转发到假 UDP
+  DNS；日志 `TLS-CONN/TLS-QUERY/…`、`DOH-CONN/DOH-QUERY <path> …`）；
+  假 DNS 新增 `dot/dot2/doh/doh2/udpup/tcpup.test`。
+- 实测：`cargo test` **135/135**（dnsup 4 单测）；lab `test-dot`（2 次查询复用
+  1 条 TLS 连接、scheme=tls）、`test-doh`（keep-alive 复用、path=/dns-query）、
+  `test-dns-udp`（仅 UDP 上行）、`test-dns-tcpup`（仅 TCP 上行）；明文回归
+  `test-dns-cache`/`test-dns-tcp`（已改断言：客户端 TCP → 上游 UDP 优先）/
+  `test-dns-edns` 全过；`test-config-reload`（上游 URL 热切换）全过；
+  `verify` 9/9；`parity.sh` 5/5。
+- 真实公网：`https://223.5.5.5/dns-query?sni=dns.alidns.com` 与
+  `tls://223.5.5.5?sni=dns.alidns.com` 在 lab 拓扑内解析 `www.baidu.com`/
+  `www.qq.com` 成功（证书校验通过、`upstream_errors=0`）。
+- **踩坑/边界**：
+  - DoH 用 HTTP/1.1（RFC 8484 名义要求 h2/h3；公共 DoH 实测兼容）；h2 需
+    HPACK **编码**侧（现有 hpack.rs 只有解码 + QPACK 静态表），列入修订条件。
+  - 上游域名用系统解析器解析**一次**（无 `global.bootstrap_resolver`）；
+    IP 字面量 + `?sni=` 完全规避（已实测）。
+  - DoT/DoH 持锁串行：单 dns_loop 线程下无争用；线程池化时需去锁重构。
+  - DoQ（P18b）、`dns.routing`（P18c）未做（对标表缺口 #5 余项）。
+
 ## 12. 用 Rust 重写这套东西的可行性
 
 已验证（本仓库 mini-dae，实测跑通）：
