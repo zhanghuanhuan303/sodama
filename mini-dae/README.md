@@ -52,6 +52,10 @@ P6（suspend/reload/metrics/sysdump/日志轮转/整配置热重载）已完成*
   拆半、ping→pong、close→EOF）；`type=ws` + `host`/`path` 参数；与参照客户端（v2ray）同目标对拍，
   gateway e2e（client ns → tproxy → vless-ws → 真实节点 → gstatic 204）见 `lab/real-node-e2e.sh`
   与 ADR-0026（grpc/h2/指纹仍不做）
+- **P11 AnyTLS（真实订阅节点接入）**：anytls-go 协议 v2 客户端（sha256 认证 + 帧 +
+  默认 paddingScheme 逐字节对齐 + UpdatePaddingScheme 即时生效）；单 Stream；
+  跨实现测试对 sing-box 服务端，真实节点 e2e gstatic 204（ADR-0027）；
+  同批：`--dial-timeout`（默认 5s）可配，lab 用 `USE_DIAL_TIMEOUT` 透传
 - **P5-G3a QUIC（tuic v5）**：惰性 tokio 运行时 + quinn（阻塞 relay 用 block_on 桥接）；
   认证 token = TLS exporter（label=uuid 裸字节、context=password）；TCP 每条中继一条 QUIC
   双向流，UDP 走 QUIC DATAGRAM（含分片/重组）；上游 socket 用自建 `Endpoint` 打 `SO_MARK`；
@@ -108,6 +112,7 @@ loader/src/tls.rs   共享 TLS 层（rustls：握手 + 读路径 pending/抽干�
 loader/src/trojan.rs trojan（TLS + CONNECT 头；仅 TCP/IPv4/无 close_notify 半关闭）
 loader/src/vless.rs vless（TCP/UDP，tls/none，tcp/ws 传输，UUID 解析含 UUID5 回退，惰性响应头）
 loader/src/ws.rs    VLESS over WebSocket：RFC6455 客户端传输（Upgrade 握手 + 掩码帧，可拆半）
+loader/src/anytls.rs AnyTLS 客户端（anytls-go v2：sha256 认证 + 帧 + paddingScheme，单 Stream）
 loader/src/vmess.rs vmess AEAD（嵌套 HMAC KDF、auth id、SHAKE128 分块/填充、终止块）
 loader/src/tuic.rs tuic v5（QUIC：exporter 认证、双向流、DATAGRAM 分片/重组、连接复用）
 loader/src/quicsock.rs QUIC socket 中间件：salamander 混淆（ObfsSocket）+ udphop（HopSocket）
@@ -165,6 +170,7 @@ lab/matrix/SUMMARY.md 矩阵执行结果与未覆盖项
   libbpf 头文件（`/usr/include/bpf`）、`ip`/`tc`/`bpftool`、python3、gcc（仅 P7 基准端点 `bench_io.c`）
 - root 权限（加载 eBPF、建 netns）；对拍与矩阵的 VM 无需 root
 - QUIC 交叉验证（P5-G3a/G3b）：Go 工具链 + module 缓存
+- （可选）sing-box：anytls 跨实现测试靶子（`cargo test` 缺失时自动跳过）
   （`lab/proto-check/build-tuic-server.sh` / `build-hy2-server.sh`）
 
 ## 快速开始
@@ -246,9 +252,10 @@ sudo lab/lab.sh hy2-brutal-up    # P5-G3b+：cc_override=brutal + 带宽声明
 sudo lab/lab.sh test-hy2-brutal  # 512KB（Brutal 近似路径）
 sudo lab/lab.sh hy2-hop-up  # P5-G3b+：udphop（端口并集 + 5s 跳端口 + 多端口 mux）
 sudo lab/lab.sh test-hy2-hop     # 两轮 512KB 跨跳存活
-# P10：真实 vless-ws 节点端到端（节点 URL 只经环境变量传入，不落盘）：
-# VLESS_WS_URL='vless://uuid@host:port?type=ws&security=tls&sni=...&host=...&path=...' \
-#   sudo lab/real-node-e2e.sh    # client ns → tproxy → vless-ws → 真实节点 → gstatic 204
+# P10：真实节点端到端（节点 URL 只经环境变量传入，不落盘）：
+#   REAL_NODE_URL='vless://…type=ws…' 或 'anytls://…' 或 'socks5://…'（桥接） \
+#     sudo lab/real-node-e2e.sh    # client ns → tproxy → relay → 真实节点 → gstatic 204
+# 慢节点首连可调：USE_DIAL_TIMEOUT=15 sudo -E lab/real-node-e2e.sh
 sudo lab/lab.sh ops-up      # P6：运维面会话（--log-file + 状态面控制命令）
 sudo lab/lab.sh test-ops         # suspend(fail-open)/reload/metrics/sysdump/日志轮转
 sudo lab/lab.sh ops-reload-up    # P6：整配置热重载会话（/tmp 配置副本 + 假 DNS）
@@ -865,6 +872,10 @@ CONNECT；ss 不支持插件与 2022 版；trojan 不支持 UDP 与域名目标�
     可能跨两次 read 到达；首版实现因此在真实节点上报“握手响应中途关闭”（ADR-0026）。
 30. **验收真实节点先跟参照客户端对拍**：节点对目标可达性自身有策略（实测部分目标被
     节点侧黑洞，v2ray 与 mini-dae 失败模式一致）；否则会把节点问题误判为实现 bug。
+31. **AnyTLS 首包必须 Settings+SYN+PSH(目标) 一次写**：目标地址在首条 PSH 里（不在 SYN），
+    pkt1 的 padding 只作用于这一批；拆开写会与真实客户端特征不一致。
+32. **AnyTLS pkt1 的尾部 waste 帧长度随机**：mock/测试里读尾帧要用短超时探测，
+    不能无条件 read；另 UpdatePaddingScheme 只影响**下一次写**（已用定长 scheme 钉住）。
 
 ## Rust 化的边界
 
@@ -876,9 +887,8 @@ CONNECT；ss 不支持插件与 2022 版；trojan 不支持 UDP 与域名目标�
   是唯一数据面；两个边界：① `bpf_loop` 不可用（aya-obj 的 PSEUDO_FUNC relocation 缺口），
   规则 VM 用有界循环；② 仍需 `debug = 2` 才能让 bpf-linker 产出 `.BTF`。
   需要 C 对照时从 `dae/` 重建 C 对象并临时切换 `--ebpf`（调试手段，非常规路径）。
-- **真实订阅形态（2026-10-04 普查）**：除已支持的 vless-ws（ADR-0026）外，主流节点还有
-  **vless+REALITY+Vision** 与 **anytls**——当前在解析期显式拒绝（边界外；测试已钉住）。
-  参照（sing-box 1.14）验证这两类订阅可用；过渡期可直接用 SOCKS5 桥接：
-  `--dialer socks5://127.0.0.1:<sing-box/mihomo 的 socks 端口>`（比自研 REALITY 现实得多，
-  且所有协议都可立即接入）；自研 REALITY 需要 TLS 握手级控制（uTLS/密钥共享/session_id），
-  属独立档位，需先写 ADR。
+- **真实订阅形态（2026-10-04 普查/更新）**：主流节点形态与我们的实现状态——
+  vless-ws ✅（ADR-0026）、**anytls ✅**（ADR-0027，单 Stream、无 UDP/会话复用）、
+  **vless+REALITY+Vision ❌**（解析期显式拒绝，测试钉住；需要 TLS 握手级控制，
+  属独立档位，需先写 ADR）。边界外协议过渡期可用 SOCKS5 桥接：
+  `--dialer socks5://127.0.0.1:<sing-box/mihomo 的 socks 端口>`（所有协议立即可用）。

@@ -39,6 +39,7 @@ use aya::programs::{SchedClassifier, SkSkb};
 use aya::Ebpf;
 use serde_json::json;
 
+mod anytls;
 mod brutal;
 mod config;
 mod dns;
@@ -101,6 +102,8 @@ static OUTBOUND: OnceLock<outbound::Outbound> = OnceLock::new();
 static TCP_RELAY_TX: OnceLock<std::sync::mpsc::Sender<TcpStream>> = OnceLock::new();
 /// relay 连接空闲回收阈值（秒）；janitor 每 5s 扫描一次。
 static RELAY_IDLE_SECS: AtomicU64 = AtomicU64::new(300);
+/// P11：relay 拨号超时（毫秒，默认 5000；真实节点首连可能较慢）
+static RELAY_DIAL_TIMEOUT_MS: AtomicU64 = AtomicU64::new(5000);
 /// P4b：UDP NAT 会话空闲阈值（秒）。
 static UDP_IDLE_SECS: AtomicU64 = AtomicU64::new(60);
 
@@ -346,6 +349,8 @@ struct Args {
     dialer: Option<String>,
     /// P4：relay 空闲回收秒数（默认 300）
     relay_idle_timeout: Option<u64>,
+    /// P11：relay 拨号超时秒数（默认 5；真实节点慢首连可调大）
+    dial_timeout: Option<u64>,
     /// P4：UDP NAT 会话空闲秒数（默认 60）
     udp_idle_timeout: Option<u64>,
     /// K3 过渡一跳：等价的旧写法（`--forward socks5://…` = `--dialer socks5://…`）
@@ -427,7 +432,8 @@ fn usage() -> ! {
            --status-socket <path> 状态面：Unix socket 上的 JSON（status/rules/config/maps + 控制命令）\n\
            --log-file <path>     P6：日志写文件（默认 stdout；SIGHUP 时 reopen，轮转友好）\n\
            --dialer <url>        P4：代理出口拨号器（direct 或 socks5://host:port）\n\
-           --relay-idle-timeout <s> P4：relay 空闲回收秒数（默认 300）\n\
+           --relay-idle-timeout <s> P4：relay 空闲回收秒数（默认 300）
+           --dial-timeout <s>       P11：relay 拨号超时秒数（默认 5；真实节点慢首连可调大）\n\
            --udp-idle-timeout <s>   P4：UDP NAT 会话空闲秒数（默认 60）\n\
            --forward <url>       旧写法：等价于 --dialer socks5://host:port\n\
            --offload             P4c：启用 TCP relay offload（内核对拼，需 --dialer）\n\
@@ -469,6 +475,7 @@ fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
         status_socket: None,
         dialer: None,
         relay_idle_timeout: None,
+        dial_timeout: None,
         udp_idle_timeout: None,
         forward: None,
         offload: false,
@@ -497,6 +504,7 @@ fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
             "--log-file" => args.log_file = Some(next()?),
             "--dialer" => args.dialer = Some(next()?),
             "--relay-idle-timeout" => args.relay_idle_timeout = Some(next()?.parse()?),
+            "--dial-timeout" => args.dial_timeout = Some(next()?.parse()?),
             "--udp-idle-timeout" => args.udp_idle_timeout = Some(next()?.parse()?),
             "--forward" => args.forward = Some(next()?),
             "--offload" => args.offload = true,
@@ -1026,7 +1034,8 @@ fn handle_relay_conn(mut client: TcpStream) {
     let Some(dialer) = OUTBOUND.get() else {
         return;
     };
-    let dialed = match dialer.dial_tcp(target, Duration::from_secs(5)) {
+    let dial_timeout = Duration::from_millis(RELAY_DIAL_TIMEOUT_MS.load(Ordering::Relaxed));
+    let dialed = match dialer.dial_tcp(target, dial_timeout) {
         Ok(d) => d,
         Err(e) => {
             RELAY_STATS.dial_errors.fetch_add(1, Ordering::Relaxed);
@@ -1496,6 +1505,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if let Some(s) = args.relay_idle_timeout {
         RELAY_IDLE_SECS.store(s, Ordering::SeqCst);
+    }
+    if let Some(s) = args.dial_timeout {
+        RELAY_DIAL_TIMEOUT_MS.store(s.saturating_mul(1000), Ordering::SeqCst);
     }
     if let Some(s) = args.udp_idle_timeout {
         UDP_IDLE_SECS.store(s, Ordering::SeqCst);
@@ -2286,7 +2298,10 @@ fn udp_nat_handle(
             };
             // P5：有 dialer 且协议支持 UDP → 走代理；否则直连回退
             let relay = match OUTBOUND.get() {
-                Some(o) if o.supports_udp() => match o.dial_udp(orig_dst, Duration::from_secs(5)) {
+                Some(o) if o.supports_udp() => match o.dial_udp(
+                    orig_dst,
+                    Duration::from_millis(RELAY_DIAL_TIMEOUT_MS.load(Ordering::Relaxed)),
+                ) {
                     Ok(Some(r)) => {
                         UDP_NAT_STATS
                             .sessions_proxied

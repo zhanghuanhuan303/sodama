@@ -9,8 +9,9 @@ byte-exact parity tests against dae's Go rule compiler and a netns test lab.*
   + 14 张 BTF map，全部为 Rust/aya-ebpf，**无 C 数据面**（P9+，ADR-0025）。
 - **控制面（用户态）**：Rust + aya 加载器——`.dae` 全量配置解析与规则编译、
   透明 DNS 接管（缓存/TCP/regex/EDNS）、TCP relay / UDP NAT / TCP offload、
-  协议栈 shadowsocks / trojan / vless（tcp/ws）/ vmess / tuic / hysteria2（含 UDP 与会话）、
-  状态面 / 热重载 / 指标导出；vless 的 **WebSocket 传输**已接入真实订阅节点（ADR-0026）。
+  协议栈 shadowsocks / trojan / vless（tcp/ws）/ vmess / tuic / hysteria2 / **anytls**（含 UDP 与会话）、
+  状态面 / 热重载 / 指标导出；vless 的 **WebSocket 传输**与 **AnyTLS** 已接入真实订阅节点
+  （ADR-0026 / ADR-0027）。
 - **lab**：netns 拓扑（标准 + 单臂）、`verify` 9 用例、DNS / 转发面 / 协议梯 / 运维专项、
   soak、与 dae 原版 Go 规则编译器的**逐字节对拍**、真实 Go 客户端跨实现联调、
   双内核矩阵（宿主 + QEMU 第二内核）。

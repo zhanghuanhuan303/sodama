@@ -758,6 +758,27 @@ P4 稳定性 → P3 内核矩阵）：
   （出站 = 真实节点），gateway e2e gstatic **204** 实测通过；注意慢节点首连可能 >5s
   （relay 拨号硬编码 5s 超时，会 dial_errors=1，重试即过——后续可加 `--dial-timeout`）。
 
+### 11.18 P11（AnyTLS 客户端 / --dial-timeout）已验收的行为
+
+（决策与取舍见 ADR-0027；脚本 `lab/real-node-e2e.sh`（REAL_NODE_URL）；探针 `real_anytls_probe`。）
+
+- **触发**：第二订阅 18×anytls；把 §11.17 普查里的边界外协议变成原生支持；
+- **实现**（`loader/src/anytls.rs`）：认证 `sha256(password)+padding0(30B)`；帧
+  `[cmd][sid BE32][len BE16][data]`；首包批 Settings+SYN+PSH(SocksAddr) 计 pkt1；
+  读路径处理 Update/Settings/SYNACK/Heart/Waste/Alert；paddingScheme 默认值与
+  anytls-go 逐字节一致（md5 `75cff2ad89aadf5e257059ee571ebe11`），区间随机 + `c` 检查符；
+- **实现坑（值得记）**：
+  1. 首包必须是 **Settings + SYN + PSH(目标地址)** 一次写（地址不在 SYN data 里），
+     否则 pkt1 padding 与真实客户端对不上；
+  2. pkt1 的尾部 waste 帧**长度随机**（100-400），mock 测试要短超时探测尾帧，
+     不能无条件 read；
+  3. 自读缓冲（pending）拼接时要按 `out[off..]` 偏移读底层，否则短读会覆写头部；
+- **附带**：`--dial-timeout <s>`（默认 5）与 lab `USE_DIAL_TIMEOUT` 透传；
+  真实节点慢首连（>5s）曾触发默认超时重试；
+- **验收**：`cargo test` 89/89（+2 ignored）；sing-box 服务端跨实现回环；
+  `REAL_NODE_URL=anytls://… lab/real-node-e2e.sh`：真实节点 gstatic **204**，
+  relay up 1981B/down 4713B、dial_errors=0；标准 verify 9/9。
+
 ## 12. 用 Rust 重写这套东西的可行性
 
 已验证（本仓库 mini-dae，实测跑通）：

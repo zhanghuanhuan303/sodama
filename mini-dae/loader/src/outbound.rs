@@ -16,9 +16,10 @@ use std::time::Duration;
 
 use base64::Engine as _;
 use percent_encoding::percent_decode_str;
+use sha2::{Digest as _, Sha256};
 
 use crate::{
-    hysteria2, quicsock, socks5, ss, tls, trojan, tuic, vless, vmess, ws, DAE_SOCKET_MARK,
+    anytls, hysteria2, quicsock, socks5, ss, tls, trojan, tuic, vless, vmess, ws, DAE_SOCKET_MARK,
 };
 
 const SO_MARK_OPT: libc::c_int = 36;
@@ -190,6 +191,12 @@ impl<W: WriteHalf> WriteHalf for vless::VlessWriter<W> {
 }
 
 impl<W: WriteHalf> WriteHalf for ws::WsWriter<W> {
+    fn shutdown_write(&self) -> io::Result<()> {
+        self.inner().shutdown_write()
+    }
+}
+
+impl<W: WriteHalf> WriteHalf for anytls::AnyTlsWriter<W> {
     fn shutdown_write(&self) -> io::Result<()> {
         self.inner().shutdown_write()
     }
@@ -437,6 +444,13 @@ pub enum Outbound {
     Hysteria2 {
         dialer: std::sync::Arc<hysteria2::Hy2Dialer>,
     },
+    /// P11：AnyTLS（anytls-go 协议 v2，单 Stream）；TLS 固定开启。
+    AnyTls {
+        server: SocketAddr,
+        password_sha256: [u8; 32],
+        sni: String,
+        insecure: bool,
+    },
 }
 
 impl Outbound {
@@ -474,6 +488,7 @@ impl Outbound {
             }
             Self::Tuic { dialer } => dialer.name(),
             Self::Hysteria2 { dialer } => dialer.name(),
+            Self::AnyTls { server, sni, .. } => format!("anytls://{server}?sni={sni}"),
         }
     }
 
@@ -635,6 +650,22 @@ impl Outbound {
                     socket: None,
                 })
             }
+            Self::AnyTls {
+                server,
+                password_sha256,
+                sni,
+                insecure,
+            } => {
+                let sock = marked_tcp_connect(*server, timeout)?;
+                let kill = sock.try_clone()?;
+                let (r, w) = tls::connect(sock, sni, *insecure, &[], timeout)?;
+                let (r, w) = anytls::connect_split(r, w, password_sha256, target)?;
+                Ok(DialedStream {
+                    from_remote: Box::new(r),
+                    to_remote: Box::new(w),
+                    socket: Some(kill),
+                })
+            }
         }
     }
 
@@ -773,6 +804,9 @@ pub fn parse(url: &str) -> Result<Outbound, String> {
     if let Some(rest) = url.strip_prefix("hy2://") {
         return parse_hysteria2(rest);
     }
+    if let Some(rest) = url.strip_prefix("anytls://") {
+        return parse_anytls(rest);
+    }
     if url.starts_with("socks5://") || url.contains(':') {
         return Ok(Outbound::Socks5 {
             server: resolve(socks5::parse_proxy(url)?.as_str())?,
@@ -790,6 +824,48 @@ fn resolve(hostport: &str) -> Result<SocketAddr, String> {
         .map_err(|e| format!("解析 {hostport} 失败: {e}"))?
         .next()
         .ok_or_else(|| format!("解析 {hostport} 无结果"))
+}
+
+/// `anytls://password@host:port?sni=...&insecure=1`（anytls-go 协议，见 `anytls.rs`）。
+///
+/// TLS 固定开启（AnyTLS 基于 TLS）；密码在解析期即 SHA-256（协议认证只发摘要）。
+fn parse_anytls(rest: &str) -> Result<Outbound, String> {
+    let rest = rest.split('#').next().unwrap_or(rest);
+    let (main, query) = match rest.split_once('?') {
+        Some((m, q)) => (m, q),
+        None => (rest, ""),
+    };
+    let (id, hostport) = main
+        .split_once('@')
+        .ok_or_else(|| "anytls:// 需要 password@host:port".to_string())?;
+    let password = percent_decode(id);
+    if password.is_empty() {
+        return Err("anytls:// 密码为空".to_string());
+    }
+    let mut sni: Option<String> = None;
+    let mut insecure = false;
+    for kv in query.split('&').filter(|s| !s.is_empty()) {
+        let (k, v) = kv.split_once('=').unwrap_or((kv, ""));
+        match k.to_ascii_lowercase().as_str() {
+            "sni" | "peer" => sni = Some(percent_decode(v)),
+            "insecure" | "allowinsecure" | "skip-cert-verify" => {
+                insecure = matches!(v, "1" | "true" | "TRUE" | "True")
+            }
+            _ => {}
+        }
+    }
+    let hostport = percent_decode(hostport);
+    let default_sni = hostport
+        .rsplit_once(':')
+        .map(|(h, _)| h.to_string())
+        .unwrap_or_else(|| hostport.clone());
+    let password_sha256: [u8; 32] = Sha256::digest(password.as_bytes()).into();
+    Ok(Outbound::AnyTls {
+        server: resolve(&hostport)?,
+        password_sha256,
+        sni: sni.unwrap_or(default_sni),
+        insecure,
+    })
 }
 
 fn b64_decode_any(s: &str) -> Option<Vec<u8>> {
@@ -1393,9 +1469,28 @@ mod tests {
 
     #[test]
     fn parse_rejects_anytls_scheme() {
-        // anytls 未实现：不能静默降级成 socks5 解析
-        let e = parse("anytls://pass@1.2.3.4:8443?insecure=1&sni=example.com").unwrap_err();
-        assert!(!e.is_empty(), "{e}");
+        // anytls 已实现（P11）：空密码必须报错，不能静默降级
+        let e = parse("anytls://@1.2.3.4:8443").unwrap_err();
+        assert!(e.contains("密码"), "{e}");
+    }
+
+    #[test]
+    fn parse_anytls_url() {
+        let ob = parse("anytls://testpass@1.2.3.4:8443?sni=example.com&insecure=1").unwrap();
+        match ob {
+            Outbound::AnyTls {
+                password_sha256,
+                sni,
+                insecure,
+                ..
+            } => {
+                let want: [u8; 32] = Sha256::digest(b"testpass").into();
+                assert_eq!(password_sha256, want);
+                assert_eq!(sni, "example.com");
+                assert!(insecure);
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     /// 真实订阅节点探针（默认忽略，需要网络与环境变量）：
