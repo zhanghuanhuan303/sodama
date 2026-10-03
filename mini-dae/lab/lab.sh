@@ -197,6 +197,12 @@ DOH_PID_FILE=/tmp/mini-dae-doh.pid
 DOQ_PORT=9053
 DOQ_LOG=/tmp/mini-dae-doq.txt
 DOQ_PID_FILE=/tmp/mini-dae-doq.pid
+# P18c：dns.routing 夹具（第二假上游 + asis 目标）
+FAKE_DNS_B_PORT=5354
+FAKE_DNS_B_LOG=/tmp/mini-dae-fake-dns-b.txt
+FAKE_DNS_B_PID_FILE=/tmp/mini-dae-fake-dns-b.pid
+ASIS_DNS_LOG=/tmp/mini-dae-asis-dns.txt
+ASIS_DNS_PID_FILE=/tmp/mini-dae-asis-dns.pid
 
 die() { echo "!! $*" >&2; exit 1; }
 
@@ -298,6 +304,14 @@ cleanup() {
   if [ -f "$DOQ_PID_FILE" ]; then
     kill "$(cat "$DOQ_PID_FILE")" 2>/dev/null || true
     rm -f "$DOQ_PID_FILE"
+  fi
+  if [ -f "$FAKE_DNS_B_PID_FILE" ]; then
+    kill "$(cat "$FAKE_DNS_B_PID_FILE")" 2>/dev/null || true
+    rm -f "$FAKE_DNS_B_PID_FILE"
+  fi
+  if [ -f "$ASIS_DNS_PID_FILE" ]; then
+    kill "$(cat "$ASIS_DNS_PID_FILE")" 2>/dev/null || true
+    rm -f "$ASIS_DNS_PID_FILE"
   fi
   if [ -f "$BENCH_PID_FILE" ]; then
     kill "$(cat "$BENCH_PID_FILE")" 2>/dev/null || true
@@ -556,6 +570,15 @@ up() {
     python3 "$HERE/fake_dns.py" "$FAKE_DNS_LOG" "$FAKE_DNS_PORT" \
       >/tmp/mini-dae-fake-dns.stdout 2>&1 &
     echo $! >"$FAKE_DNS_PID_FILE"
+    sleep 0.3
+  fi
+
+  # P18c：第二个假上游（dns.routing 多上游实验）
+  if [ -n "${USE_FAKE_DNS_B:-}" ]; then
+    rm -f "$FAKE_DNS_B_LOG"
+    python3 "$HERE/fake_dns.py" "$FAKE_DNS_B_LOG" "$FAKE_DNS_B_PORT" \
+      >/tmp/mini-dae-fake-dns-b.stdout 2>&1 &
+    echo $! >"$FAKE_DNS_B_PID_FILE"
     sleep 0.3
   fi
 
@@ -1423,6 +1446,120 @@ assert v["dns"]["upstream_url"].startswith("quic://"), v["dns"]
 print("doq: status upstream=%s scheme=%s" % (v["dns"]["upstream"], v["dns"]["upstream_scheme"]))
 PY
   echo "PASS: DoQ 上游（2 次查询复用 1 条 QUIC 连接、ID 0/恢复）"
+}
+
+# P18c：dns.routing 请求/应答分流（两上游、reject/asis/tag、应答重查）
+test_dnsroute() {
+  require_root
+  echo "== 测试 dns.routing（请求/应答分流） =="
+  [ -f "$FAKE_DNS_B_PID_FILE" ] && kill -0 "$(cat "$FAKE_DNS_B_PID_FILE")" 2>/dev/null \
+    || die "第二假上游未运行（先用 dnsroute-up 会话启动）"
+  # asis 目标：WAN ns 内的假 DNS（10.9.9.2:53；客户端用这个地址发起查询）
+  ip -n "$WAN_NS" addr add 10.9.9.2/32 dev wanpeer 2>/dev/null || true
+  [ -f "$ASIS_DNS_PID_FILE" ] && kill "$(cat "$ASIS_DNS_PID_FILE")" 2>/dev/null || true
+  rm -f "$ASIS_DNS_LOG"
+  ip netns exec "$WAN_NS" python3 "$HERE/fake_dns.py" "$ASIS_DNS_LOG" 53 10.9.9.2 \
+    >/tmp/mini-dae-asis-dns.stdout 2>&1 &
+  echo $! >"$ASIS_DNS_PID_FILE"
+  sleep 0.4
+
+  local out hits1 hits2
+  # 1) request reject：空应答；上游不得收到
+  out="$(ip netns exec "$CLIENT_NS" timeout 8 python3 "$HERE/dns_probe.py" 9.9.9.9 blocked.test 2>&1 || true)"
+  echo "$out"
+  printf '%s\n' "$out" | grep -q '^rcode=0' || { echo "FAIL: reject 应为 NOERROR"; exit 1; }
+  printf '%s\n' "$out" | grep -q '^ancount=0' || { echo "FAIL: reject 应无 answer"; exit 1; }
+  if grep -q '^QUERY blocked.test' "$FAKE_DNS_LOG" 2>/dev/null; then
+    echo "FAIL: reject 的查询不应到上游"; exit 1
+  fi
+  echo "route: request reject -> 空应答且不上行"
+  # 2) qtype(https)=65 -> reject
+  out="$(ip netns exec "$CLIENT_NS" timeout 8 python3 "$HERE/dns_probe.py" 9.9.9.9 q65.test 65 2>&1 || true)"
+  echo "$out"
+  printf '%s\n' "$out" | grep -q '^ancount=0' || { echo "FAIL: qtype(https) 应 reject"; exit 1; }
+  echo "route: qtype(https) -> reject"
+  # 3) qname(suffix: via2.test) -> up2
+  out="$(ip netns exec "$CLIENT_NS" timeout 8 python3 "$HERE/dns_probe.py" 9.9.9.9 a.via2.test 2>&1 || true)"
+  echo "$out"
+  printf '%s\n' "$out" | grep -q '^answer=10.9.10.42' || { echo "FAIL: via2.test 未解析"; exit 1; }
+  grep -q '^QUERY a.via2.test' "$FAKE_DNS_B_LOG" || { echo "FAIL: up2 未收到 via2.test"; cat "$FAKE_DNS_B_LOG"; exit 1; }
+  if grep -q '^QUERY a.via2.test' "$FAKE_DNS_LOG" 2>/dev/null; then
+    echo "FAIL: via2.test 不应到 up1"; exit 1
+  fi
+  echo "route: qname(suffix: via2.test) -> up2"
+  # 4) 缓存作用域：重查不进上游
+  out="$(ip netns exec "$CLIENT_NS" timeout 8 python3 "$HERE/dns_probe.py" 9.9.9.9 a.via2.test 2>&1 || true)"
+  hits2="$(grep -c '^QUERY a.via2.test' "$FAKE_DNS_B_LOG" || true)"
+  [ "$hits2" = "1" ] || { echo "FAIL: via2.test 缓存未命中（up2 $hits2 次）"; exit 1; }
+  echo "route: 按上游作用域缓存（第二次命中）"
+  # 5) fallback=up1
+  out="$(ip netns exec "$CLIENT_NS" timeout 8 python3 "$HERE/dns_probe.py" 9.9.9.9 other.test 2>&1 || true)"
+  echo "$out"
+  printf '%s\n' "$out" | grep -q '^answer=10.9.10.45' || { echo "FAIL: fallback 未走 up1"; exit 1; }
+  grep -q '^QUERY other.test' "$FAKE_DNS_LOG" || { echo "FAIL: up1 未收到 other.test"; exit 1; }
+  echo "route: fallback -> up1"
+  # 6) 应答 reject：ip(10.9.10.60/32)
+  out="$(ip netns exec "$CLIENT_NS" timeout 8 python3 "$HERE/dns_probe.py" 9.9.9.9 polluted.test 2>&1 || true)"
+  echo "$out"
+  printf '%s\n' "$out" | grep -q '^ancount=0' || { echo "FAIL: 应答路由未 reject（应清空 answer）"; exit 1; }
+  grep -q '^QUERY polluted.test' "$FAKE_DNS_LOG" || { echo "FAIL: polluted.test 应先到 up1"; exit 1; }
+  if grep -q '^QUERY polluted.test' "$FAKE_DNS_B_LOG" 2>/dev/null; then
+    echo "FAIL: polluted.test 不应被重查到 up2"; exit 1
+  fi
+  echo "route: response ip(10.9.10.60/32) -> reject（清空 answer）"
+  # 7) 应答重查：ip(10.9.10.61/32) -> up2
+  out="$(ip netns exec "$CLIENT_NS" timeout 8 python3 "$HERE/dns_probe.py" 9.9.9.9 relook.test 2>&1 || true)"
+  echo "$out"
+  printf '%s\n' "$out" | grep -q '^answer=10.9.10.61' || { echo "FAIL: relook.test 未解析"; exit 1; }
+  grep -q '^QUERY relook.test' "$FAKE_DNS_LOG" || { echo "FAIL: relook 初查未到 up1"; exit 1; }
+  grep -q '^QUERY relook.test' "$FAKE_DNS_B_LOG" || { echo "FAIL: relook 重查未到 up2"; exit 1; }
+  echo "route: response ip(10.9.10.61/32) -> up2 重查"
+  # 8) asis：客户端向 10.9.9.2:53（WAN ns）发查，控制面 asis 发回该地址
+  out="$(ip netns exec "$CLIENT_NS" timeout 8 python3 "$HERE/dns_probe.py" 10.9.9.2 asis.test 2>&1 || true)"
+  echo "$out"
+  printf '%s\n' "$out" | grep -q '^answer=10.9.10.44' || { echo "FAIL: asis 未解析（原目的地址回查）"; exit 1; }
+  grep -q '^QUERY asis.test' "$ASIS_DNS_LOG" || { echo "FAIL: asis 目标未收到查询"; cat "$ASIS_DNS_LOG"; exit 1; }
+  echo "route: qname(full: asis.test) -> asis（回原目的地址 10.9.9.2:53）"
+  # 8b) asis（TCP 客户端路径）：透明套接字的 local_addr = 原目的地址
+  out="$(ip netns exec "$CLIENT_NS" timeout 8 python3 "$HERE/dns_probe.py" --tcp 10.9.9.2 tcp.asis.test 2>&1 || true)"
+  echo "$out"
+  printf '%s\n' "$out" | grep -q '^answer=10.9.10.46' || { echo "FAIL: TCP asis 未解析（原目的地址）"; exit 1; }
+  grep -q '^QUERY tcp.asis.test' "$ASIS_DNS_LOG" || { echo "FAIL: TCP asis 目标未收到查询"; exit 1; }
+  echo "route: TCP 客户端 asis（local_addr 原目的地址）"
+
+  # 9) dns.routing 热重载：request fallback up1 -> reject，新名字变空应答
+  sed -i 's/fallback: up1/fallback: reject/' /tmp/mini-dae-dnsroute.dae
+  chmod 640 /tmp/mini-dae-dnsroute.dae
+  "$LOADER" reload --socket "$STATUS_SOCK" >/dev/null
+  out="$(ip netns exec "$CLIENT_NS" timeout 8 python3 "$HERE/dns_probe.py" 9.9.9.9 z.other.test 2>&1 || true)"
+  echo "$out"
+  printf '%s\n' "$out" | grep -q '^ancount=0' || { echo "FAIL: 重载后 fallback=reject 未生效"; exit 1; }
+  if grep -q '^QUERY z.other.test' "$FAKE_DNS_LOG" 2>/dev/null; then
+    echo "FAIL: 重载后 reject 的查询不应到上游"; exit 1
+  fi
+  "$LOADER" status --socket "$STATUS_SOCK" --json | python3 -c 'import json,sys; v=json.load(sys.stdin); assert v["dns"]["routing"]["request_fallback"]=="Reject", v["dns"]["routing"]; print("route: reload 后 request_fallback=Reject")'
+  # 恢复
+  sed -i 's/fallback: reject/fallback: up1/' /tmp/mini-dae-dnsroute.dae
+  chmod 640 /tmp/mini-dae-dnsroute.dae
+  "$LOADER" reload --socket "$STATUS_SOCK" >/dev/null
+  # other.test 可能命中缓存；但请求路由先于缓存，fallback=reject 时会直接空应答
+  out="$(ip netns exec "$CLIENT_NS" timeout 8 python3 "$HERE/dns_probe.py" 9.9.9.9 other.test 2>&1 || true)"
+  printf '%s\n' "$out" | grep -q '^answer=10.9.10.45' || { echo "FAIL: 恢复 fallback=up1 后未解析"; exit 1; }
+  echo "route: dns.routing 热重载（fallback 切换即时生效）"
+
+  "$LOADER" status --socket "$STATUS_SOCK" --json >/tmp/mini-dae-status.json
+  python3 - <<'PY'
+import json
+v = json.load(open("/tmp/mini-dae-status.json"))
+d = v["dns"]
+r = d["routing"]
+assert r["request_rules"] == 4 and r["response_rules"] == 3, r
+assert r["rejects"] >= 2 and r["response_rejects"] >= 1 and r["relookups"] >= 1, r
+assert set(d["upstreams"].keys()) == {"up1", "up2"}, d["upstreams"]
+print("dnsroute: rules=%d/%d rejects=%d resp_rejects=%d relookups=%d" % (
+    r["request_rules"], r["response_rules"], r["rejects"], r["response_rejects"], r["relookups"]))
+PY
+  echo "PASS: dns.routing（reject/qtype/多上游/缓存作用域/应答 reject/重查/asis/热重载）"
 }
 
 # P18a：显式 udp:// 上游（仅 UDP；不应出现 TCP 上行）
@@ -2454,6 +2591,9 @@ case "${1:-}" in
   doq-up) USE_RULES="$HERE/rules.dns.dae" USE_FAKE_DNS=1 USE_DNS_TRANSPORT=doq \
     USE_DNS_UPSTREAM="quic://127.0.0.1:$DOQ_PORT?sni=localhost&insecure=1" up ;;
   test-doq) test_doq ;;
+  dnsroute-up) chmod 640 "$HERE/dnsroute.dae"; cp "$HERE/dnsroute.dae" /tmp/mini-dae-dnsroute.dae; \
+    chmod 640 /tmp/mini-dae-dnsroute.dae; USE_CONFIG=/tmp/mini-dae-dnsroute.dae \
+    USE_FAKE_DNS=1 USE_FAKE_DNS_B=1 up ;;
   dns-udp-up) USE_RULES="$HERE/rules.dns.dae" USE_FAKE_DNS=1 \
     USE_DNS_UPSTREAM="udp://127.0.0.1:$FAKE_DNS_PORT" up ;;
   test-dns-udp) test_dns_udp ;;  # 显式 udp:// 上游（仅 UDP）
@@ -2519,6 +2659,7 @@ case "${1:-}" in
   test-dns-reload) test_dns_reload ;;
   test-domain-regex) test_domain_regex ;;
   test-dns-edns) test_dns_edns ;;
+  test-dnsroute) test_dnsroute ;;
   test-relay) test_relay ;;
   test-relay-idle) test_relay_idle ;;
   test-udp-relay) test_udp_relay ;;
@@ -2549,5 +2690,5 @@ case "${1:-}" in
   status) status ;;
   trace) trace ;;
   down) down ;;
-  *) echo "usage: $0 {build|up|dual-up|config-up|forward-up|dns-up|dot-up|doh-up|doq-up|dns-udp-up|dns-tcpup-up|geo-up|pname-up|regex-up|relay-up|offload-up|udp-up|ss-up|ss-udp-up|trojan-up|vless-up|vless-tls-up|vless-udp-up|vmess-up|vmess-tls-up|vmess-udp-up|tuic-up|tuic-udp-up|hy2-up|hy2-udp-up|hy2-obfs-up|hy2-obfs-udp-up|hy2-brutal-up|hy2-hop-up|ops-up|ops-reload-up|bench-up|test-proxy|test-direct|test-block|test-host-proxy|test-reload|test-rebind|test-status|test-config|test-forward|test-domain|test-dns-cache|test-dns-tcp|test-dns-reload|test-domain-regex|test-dns-edns|test-dot|test-doh|test-doq|test-dns-udp|test-dns-tcpup|test-geo|test-pname|test-v6|test-relay|test-relay-idle|test-relay-offload|test-offload-lifecycle|test-udp-relay|test-udp-idle|test-ss|test-trojan|test-ss-udp|test-vless|test-vless-udp|test-vmess|test-vmess-udp|test-tuic|test-tuic-udp|test-hy2|test-hy2-udp|test-hy2-obfs|test-hy2-obfs-udp|test-hy2-brutal|test-hy2-hop|test-ops|test-config-reload|test-fault-reload|test-fault-kill|reload|verify|status|trace|down}"; exit 2 ;;
+  *) echo "usage: $0 {build|up|dual-up|config-up|forward-up|dns-up|dot-up|doh-up|doq-up|dnsroute-up|dns-udp-up|dns-tcpup-up|geo-up|pname-up|regex-up|relay-up|offload-up|udp-up|ss-up|ss-udp-up|trojan-up|vless-up|vless-tls-up|vless-udp-up|vmess-up|vmess-tls-up|vmess-udp-up|tuic-up|tuic-udp-up|hy2-up|hy2-udp-up|hy2-obfs-up|hy2-obfs-udp-up|hy2-brutal-up|hy2-hop-up|ops-up|ops-reload-up|bench-up|test-proxy|test-direct|test-block|test-host-proxy|test-reload|test-rebind|test-status|test-config|test-forward|test-domain|test-dns-cache|test-dns-tcp|test-dns-reload|test-domain-regex|test-dns-edns|test-dot|test-doh|test-doq|test-dnsroute|test-dns-udp|test-dns-tcpup|test-geo|test-pname|test-v6|test-relay|test-relay-idle|test-relay-offload|test-offload-lifecycle|test-udp-relay|test-udp-idle|test-ss|test-trojan|test-ss-udp|test-vless|test-vless-udp|test-vmess|test-vmess-udp|test-tuic|test-tuic-udp|test-hy2|test-hy2-udp|test-hy2-obfs|test-hy2-obfs-udp|test-hy2-brutal|test-hy2-hop|test-ops|test-config-reload|test-fault-reload|test-fault-kill|reload|verify|status|trace|down}"; exit 2 ;;
 esac

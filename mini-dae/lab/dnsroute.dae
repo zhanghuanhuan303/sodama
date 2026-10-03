@@ -1,0 +1,39 @@
+# P18c：dns.routing 请求/应答分流（对照 dae docs/en/configuration/dns.md 示例形态）。
+#
+# - request：qname/qtype → reject / asis / tag（up1/up2）
+# - response：upstream/ip → accept / reject / tag（换上游重查）
+# - fallback：request=up1（本实验不用 asis 默认以免出网）、response=accept
+#
+# 路由段沿用 rules.dns.dae：fallback -> proxy 让 dport 53 进控制面（透明 DNS）。
+global {
+    dial_mode: 'ip'
+}
+
+dns {
+    upstream {
+        up1: 'udp://127.0.0.1:5353'
+        up2: 'udp://127.0.0.1:5354'
+    }
+    routing {
+        request {
+            qname(full: blocked.test) -> reject
+            qname(suffix: via2.test) -> up2
+            qtype(https) -> reject
+            qname(suffix: asis.test) -> asis
+            fallback: up1
+        }
+        response {
+            upstream(up2) -> accept
+            ip(10.9.10.60/32) -> reject
+            ip(10.9.10.61/32) -> up2
+            fallback: accept
+        }
+    }
+}
+
+routing {
+    dport(5353) -> direct(must)
+    domain(suffix: 'proxy.test') && dport(9999) -> proxy
+    domain(full: 'direct.test') && dport(9999) -> direct
+    fallback: proxy
+}

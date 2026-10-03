@@ -1030,6 +1030,36 @@ P4 稳定性 → P3 内核矩阵）：
 - 边界：AdGuard 的 UDP 853/784/8853 在本机网络被阻断（openssl -quic 同样超时），
   非实现问题；无 0-RTT、无连接池（锁内串行）。
 
+### 11.27 P18c（`dns.routing` 请求/应答分流 + 多上游）已验收的行为
+
+（决策与边界见 ADR-0036；实现 `loader/src/dnsroute.rs` + `main.rs` 的 UpstreamSet/
+Selected/应答重查循环；夹具 `lab/dnsroute.dae`、假 DNS 支持 bind 地址与第二实例。）
+
+- 上游：`dns.upstream { tag: url }` 全部生效（tag 引用编译期校验，未知 tag 硬失败）；
+  CLI `--dns-upstream` → 单 tag `default`（覆盖一切）；无 `dns.routing` 段时保持
+  legacy 单上游（不改变既有行为）。
+- 请求：`qname`（suffix/full/keyword/regex/geosite/ext，裸值默认 suffix）、`qtype`
+  （常用类型名表 + 数字）；出口 `reject`（空应答 NOERROR，不缓存）/`asis`（marked UDP
+  回客户端原目的；UDP 路径取 IP_ORIGDSTADDR，TCP 路径取透明套接字 local_addr）/tag；
+  默认 fallback `asis`；**路由先于缓存**。
+- 应答：`qname`/`qtype`/`upstream`（按名字）/`ip`（裸 CIDR/geoip/ext，运行时前缀
+  匹配）；出口 `accept`/`reject`（`dns::strip_answers` 清空 answer 后**入缓存**）/
+  tag（换上游重查，深度上限 3 = 最多 2 次重查）；默认 fallback `accept`。
+- 缓存：键加**作用域**（`tag|<tag>|<url>` / `asis|<addr>` / `legacy|<url>`），
+  同 name 不同上游不串答（对照 dae responseCacheKey）。
+- `dnsroute` 编译：逐行复刻 dae 链编码（函数末 And、多值中间 Or、行末 Tail；`!`
+  作用于整个函数）；geosite/geoip 编译期展开；`sub/node/subnode` 跳过并记 note。
+- 状态面：`dns.upstreams{tag→url}`、`dns.routing{request_rules,response_rules,
+  request_fallback,response_fallback,rejects,response_rejects,relookups,notes}`。
+- 实测：`cargo test` **141/141**（dnsroute 5 项）；lab `test-dnsroute`：reject 空应
+  答且上游未见/`qtype(https)` reject/`suffix: via2.test`→up2（日志区分）/缓存作用域
+  （up2 仅 1 上行）/fallback→up1/应答 `ip` reject 清空 answer/应答 `ip`→up2 重查/
+  `asis` UDP+TCP 回 10.9.9.2:53（WAN ns 假 DNS）/热重载 fallback 切换 + status 计数；
+  回归：`verify` 9/9、明文 DNS 三连、`test-config-reload`、`test-dot`、`parity 5/5`。
+- 边界：DoH h2/h3、ECS、optimistic cache、`fixed_domain_ttl`、`ipversion_prefer`、
+  `bootstrap_resolver`、嗅探 punt 未做；`upstream(...)` 按名字比较（不复刻 dae 的
+  数值巧合）；`ip()` 线性匹配（dae 用 trie）。
+
 ## 12. 用 Rust 重写这套东西的可行性
 
 已验证（本仓库 mini-dae，实测跑通）：

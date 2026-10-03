@@ -1523,22 +1523,69 @@ pub fn to_json(cfg: &Config) -> serde_json::Value {
 // ---------------------------------------------------------------- 路由段 → 数据面子集
 
 /// 取 `dns { upstream { ... } }` 的第一个 upstream 值（如 `udp://dns.example:53`）。
+#[allow(dead_code)]
 pub fn dns_upstream_url(cfg: &Config) -> Option<String> {
-    let dns = cfg.sections.iter().find(|s| s.name == "dns")?;
+    dns_upstream_map(cfg).into_iter().next().map(|(_, v)| v)
+}
+
+/// P18c：全部 `dns.upstream { tag: 'url' }`（保序；无 tag 的参数忽略）。
+pub fn dns_upstream_map(cfg: &Config) -> Vec<(String, String)> {
+    let Some(dns) = cfg.sections.iter().find(|s| s.name == "dns") else {
+        return Vec::new();
+    };
     for item in &dns.items {
         if let Item::Section(up) = item {
             if up.name == "upstream" {
-                for it in &up.items {
-                    if let Item::Param(p) = it {
-                        if let Some(v) = &p.val {
-                            return Some(v.clone());
-                        }
-                    }
-                }
+                return up
+                    .items
+                    .iter()
+                    .filter_map(|it| match it {
+                        Item::Param(p) => match (&p.key, &p.val) {
+                            (Some(k), Some(v)) => Some((k.clone(), v.clone())),
+                            (None, Some(v)) => Some((v.clone(), v.clone())),
+                            _ => None,
+                        },
+                        _ => None,
+                    })
+                    .collect();
             }
         }
     }
-    None
+    Vec::new()
+}
+
+/// P18c：dns.routing 的原始文本（状态面展示用）。
+#[allow(dead_code)]
+pub fn dns_routing_text(cfg: &Config) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let Some(dns) = cfg.sections.iter().find(|s| s.name == "dns") else {
+        return out;
+    };
+    let Some(routing) = dns.items.iter().find_map(|i| match i {
+        Item::Section(s) if s.name == "routing" => Some(s),
+        _ => None,
+    }) else {
+        return out;
+    };
+    for flow in ["request", "response"] {
+        let Some(sec) = routing.items.iter().find_map(|i| match i {
+            Item::Section(s) if s.name == flow => Some(s),
+            _ => None,
+        }) else {
+            continue;
+        };
+        for item in &sec.items {
+            match item {
+                Item::Rule(r) => out.push((flow.to_string(), rule_text(r))),
+                Item::Param(p) if p.key.as_deref() == Some("fallback") => out.push((
+                    flow.to_string(),
+                    format!("fallback: {}", p.val.clone().unwrap_or_default()),
+                )),
+                _ => {}
+            }
+        }
+    }
+    out
 }
 
 #[derive(Debug, Clone)]

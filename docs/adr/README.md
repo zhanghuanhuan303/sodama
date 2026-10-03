@@ -60,6 +60,7 @@
 | [0033](./ADR-0033-p17-geodata-pname.md) | P17 规则语言收尾：v2ray `.dat` 的 geoip/geosite 编译期展开（attr/ext/搜索目录/2M LPM）+ pname（cgroup2 六钩子 + cookie_pid_map + WAN egress 16B 匹配）；comm vs argv 差异如实 | 已采纳 | —（P17 执行；对标表缺口 #4） |
 | [0034](./ADR-0034-p18a-dot-doh-upstream.md) | P18a DNS 安全上游：dnsup 上游抽象 + DoT/DoH 持久连接传输（HTTP/1.1）、`tcp+udp` 语义对齐（UDP 优先 TC 回退，客户端协议不再决定上游）、URL 热切换与状态面；DoQ/H3/`dns.routing` 留下一步 | 已采纳 | —（P18a 执行；对标表缺口 #5） |
 | [0035](./ADR-0035-p18b-doq.md) | P18b DoQ（RFC 9250）：quinn 连接复用 + 每查询一条双向流、ID 置 0/恢复、FIN 后读、取消码 0x3；锁中毒恢复 + 单查询 panic 隔离；quic-go 参考服务端交叉验证 + AliDNS 真实 DoQ | 已采纳 | —（P18b 执行；对标表缺口 #5） |
+| [0036](./ADR-0036-p18c-dns-routing.md) | P18c `dns.routing` 请求/应答分流 + 多上游：qname/qtype→reject/asis/tag（asis 回客户端原目的，UDP/TCP 两路径）、应答 qname/qtype/upstream/ip→accept/reject/换上游重查（深度 3）；路由先于缓存 + 按上游作用域缓存；dae 链编码/默认 fallback 对齐；sub/node/subnode 以 note 跳过 | 已采纳 | —（P18c 执行；对标表缺口 #5 收尾） |
 
 ## 新增一条 ADR
 

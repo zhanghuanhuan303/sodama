@@ -95,6 +95,11 @@ P6（suspend/reload/metrics/sysdump/日志轮转/整配置热重载）已完成*
 - **P18b DoQ（DNS over QUIC）**：quinn 连接复用 + 每查询一条双向流，ID 置 0/恢复、
   写完 FIN 后才读、取消码 0x3（RFC 9250）；锁中毒恢复 + 单查询 panic 隔离（DNS 线程不再被单次异常杀死）；
   quic-go 参考服务端交叉验证 + AliDNS 真实 DoQ（ADR-0035、NOTES §11.26）
+- **P18c `dns.routing` 请求/应答分流 + 多上游**：`dns.upstream { tag: url }` 全部生效；
+  请求 `qname/qtype` → `reject`（空应答）/`asis`（回客户端原目的，UDP/TCP 透明套接字原地址）/tag；
+  应答 `qname/qtype/upstream/ip`（含 geoip）→ `accept`/`reject`（清空 answer）/换上游重查（≤3）；
+  路由先于缓存 + 按上游作用域缓存键；dae 链编码与默认 fallback（asis/accept）对齐；
+  `dns.routing` 热重载；lab 双假上游 + asis 夹具全矩阵（ADR-0036、NOTES §11.27）
 - **P5-G3a QUIC（tuic v5）**：惰性 tokio 运行时 + quinn（阻塞 relay 用 block_on 桥接）；
   认证 token = TLS exporter（label=uuid 裸字节、context=password）；TCP 每条中继一条 QUIC
   双向流，UDP 走 QUIC DATAGRAM（含分片/重组）；上游 socket 用自建 `Endpoint` 打 `SO_MARK`；
@@ -167,6 +172,7 @@ loader/src/hpack.rs HPACK Huffman 解码 + QPACK 静态表编解码（h3 认证�
 loader/src/huffman_table.rs 生成表：HPACK Huffman 256 项 + QPACK 静态表 99 项
 loader/src/dns.rs    DNS wire 解析/构造、域名匹配（suffix/full/keyword/regex）、位图计算、正负缓存
 loader/src/dnsup.rs  P18a/b DNS 上游抽象/传输：udp/tcp/tcp+udp/tls(DoT)/https(DoH)/quic(DoQ)，持久连接 + 失败重连
+loader/src/dnsroute.rs  P18c dns.routing：请求/应答分流编译与匹配（qname/qtype/upstream/ip；reject/asis/accept/tag 重查）
 lab/real-user.dae    真实用户风格配置（0640；含可编译规则与 deferred 示例）
 lab/socks5_echo.py   最小 SOCKS5 后端（socks5 dialer 对端，从 host ns 可达）
 lab/ss_server.py     P5-G1：独立实现的 shadowsocks 服务端（Python cryptography，TCP+UDP）
@@ -194,6 +200,7 @@ lab/rules.reload.dae 热重载用的规则集（8080 由 proxy 改为 block）
 lab/ops-reload.dae   P6：整配置热重载模板（会话复制到 /tmp，测试运行中改写 routing/dns）
 lab/rules.fault.dae  reload 打流用的规则集（8080 判决不变，加一条无关规则）
 lab/rules.dns.dae    P3a 域分流规则（proxy.test / direct.test 的 domain 规则 + fallback）
+lab/dnsroute.dae     P18c dns.routing 夹具（双上游 up1/up2 + 请求/应答规则；asis 实验中）
 lab/rules.regex.dae  P3b-2a regex 域分流规则（api[0-9]+.regex.test 命中）
 lab/rules.udp.dae    P4b UDP NAT 规则（所有 UDP:9998 判 proxy，验证 mark 防自环）
 lab/lab.sh           建/拆 netns 拓扑（标准 + 单臂）、跑测试、热重载、故障注入
@@ -335,6 +342,8 @@ sudo lab/lab.sh dns-tcpup-up && sudo lab/lab.sh test-dns-tcpup # 显式 tcp://�
 # P18b：DoQ（先构建 Go/quic-go 参考服务端；断言连接复用与 ID 0/恢复）
 lab/proto-check/build-doq-server.sh
 sudo lab/lab.sh doq-up && sudo lab/lab.sh test-doq
+# P18c：dns.routing 请求/应答分流（双假上游 + asis 回原目的 + 热重载）
+sudo lab/lab.sh dnsroute-up && sudo lab/lab.sh test-dnsroute
 sudo lab/lab.sh ops-up      # P6：运维面会话（--log-file + 状态面控制命令）
 sudo lab/lab.sh test-ops         # suspend(fail-open)/reload/metrics/sysdump/日志轮转
 sudo lab/lab.sh ops-reload-up    # P6：整配置热重载会话（/tmp 配置副本 + 假 DNS）

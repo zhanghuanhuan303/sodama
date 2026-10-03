@@ -19,7 +19,7 @@
 //! `dns.routing` 请求/应答分流、除 DO 外的 EDNS options（带 options 的查询不缓存，
 //! 但也不会按 ECS 等选项分开解析）。见 ADR-0014。
 
-use crate::rules::DomainSetSpec;
+pub use crate::rules::DomainSetSpec;
 use std::collections::HashMap;
 use std::time::Instant;
 
@@ -308,6 +308,65 @@ pub const DNS_CACHE_MAX_ENTRIES: usize = 1024;
 pub const DNS_CACHE_MAX_TTL: u32 = 3600;
 /// 负缓存（NXDOMAIN / NODATA）无 SOA 时的默认寿命。
 pub const DNS_CACHE_NEGATIVE_DEFAULT_TTL: u32 = 30;
+// ---------------------------------------------------------------- 缓存
+
+/// P18c：请求路由 reject 的空应答（NOERROR + 回显 question；对照 dae
+/// `sendRejectWithResponseWriter_`：RcodeSuccess、无 answer）。
+/// 保持 RD 位，置 QR/RA；不携带 EDNS OPT（dae 的空应答同样不附）。
+pub fn empty_noerror(query: &[u8]) -> Vec<u8> {
+    if query.len() < 12 {
+        return Vec::new();
+    }
+    let qdcount = read_u16(query, 4).unwrap_or(0);
+    if qdcount == 0 {
+        return Vec::new();
+    }
+    let Some(qend) = questions_end(query) else {
+        return Vec::new();
+    };
+    let mut out = Vec::with_capacity(12 + (qend - 12));
+    out.extend_from_slice(&query[..12]);
+    out[2] |= 0x80; // QR=1
+    out[2] &= !0x02; // TC=0
+    out[3] = 0x80 | (query[3] & 0x01); // RA=1，保留 RD
+    out[6..8].copy_from_slice(&0u16.to_be_bytes());
+    out[8..10].copy_from_slice(&0u16.to_be_bytes());
+    out[10..12].copy_from_slice(&0u16.to_be_bytes());
+    out.extend_from_slice(&query[12..qend]);
+    out
+}
+
+/// P18c：应答路由 reject——删掉 answer 段（对照 dae `respMsg.Answer = nil`），
+/// 保留 question 与其余段（authority/additional）及头部 flag/rcode。
+pub fn strip_answers(response: &[u8]) -> Vec<u8> {
+    let Some(qend) = questions_end(response) else {
+        return response.to_vec();
+    };
+    let Some(rrs) = parse_rrs(response) else {
+        return response.to_vec();
+    };
+    // answer 段里最后一条 RR 的结束位置（无 answer 则即 question 结束）
+    let mut answer_end = qend;
+    let mut ancount = 0u16;
+    for rr in &rrs {
+        if rr.section == SEC_ANSWER {
+            answer_end = rr.rdata_off + rr.rdlen;
+            ancount += 1;
+        }
+    }
+    if ancount == 0 {
+        return response.to_vec();
+    }
+    let mut out = Vec::with_capacity(response.len());
+    out.extend_from_slice(&response[..12]);
+    out[6..8].copy_from_slice(&0u16.to_be_bytes());
+    out.extend_from_slice(&response[12..qend]);
+    // 跳过 answer 段；authority/additional 原样保留
+    if answer_end <= response.len() {
+        out.extend_from_slice(&response[answer_end..]);
+    }
+    out
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct CacheKey {
@@ -316,6 +375,9 @@ struct CacheKey {
     qclass: u16,
     /// DNSSEC OK：影响上游是否附带 RRSIG，对照 dae 的 EDNS 元数据保留。
     do_bit: bool,
+    /// P18c：请求路由作用域（上游 tag|url / asis 地址 / legacy）；
+    /// 同 name 走不同上游不得共享缓存（对照 dae responseCacheKey 含 upstreamIndex）。
+    scope: String,
 }
 
 struct CacheEntry {
@@ -344,11 +406,24 @@ impl DnsCache {
 
     /// 命中则返回给客户端的应答（改 ID、回填 question、递减 TTL）；否则计 miss 并返回 None。
     /// 带 EDNS options（非 DO）的查询不命中（ECS 等选项会改变上游应答）。
+    /// 兼容签名（无作用域；测试用）。生产走 `answer_from_cache_scoped`。
+    #[allow(dead_code)]
     pub fn answer_from_cache(
         &mut self,
         query: &[u8],
         q: &Question,
         edns: &EdnsInfo,
+        now: Instant,
+    ) -> Option<Vec<u8>> {
+        self.answer_from_cache_scoped(query, q, edns, "", now)
+    }
+
+    pub fn answer_from_cache_scoped(
+        &mut self,
+        query: &[u8],
+        q: &Question,
+        edns: &EdnsInfo,
+        scope: &str,
         now: Instant,
     ) -> Option<Vec<u8>> {
         if edns.has_options {
@@ -360,6 +435,7 @@ impl DnsCache {
             qtype: q.qtype,
             qclass: q.qclass,
             do_bit: edns.do_bit,
+            scope: scope.to_string(),
         };
         let Some(e) = self.map.get(&key) else {
             self.misses += 1;
@@ -377,7 +453,20 @@ impl DnsCache {
     }
 
     /// 按语义入缓存；返回是否已缓存。带 EDNS options 的查询不入缓存。
+    /// 兼容签名（无作用域；测试用）。生产走 `insert_scoped`。
+    #[allow(dead_code)]
     pub fn insert(&mut self, q: &Question, edns: &EdnsInfo, response: &[u8], now: Instant) -> bool {
+        self.insert_scoped(q, edns, "", response, now)
+    }
+
+    pub fn insert_scoped(
+        &mut self,
+        q: &Question,
+        edns: &EdnsInfo,
+        scope: &str,
+        response: &[u8],
+        now: Instant,
+    ) -> bool {
         if edns.has_options {
             return false;
         }
@@ -389,6 +478,7 @@ impl DnsCache {
             qtype: q.qtype,
             qclass: q.qclass,
             do_bit: edns.do_bit,
+            scope: scope.to_string(),
         };
         if self.map.contains_key(&key) {
             self.map.insert(key, entry);
@@ -621,6 +711,40 @@ pub fn map_v4(ip: [u8; 4]) -> [u8; 16] {
 }
 
 // ---------------------------------------------------------------- 测试
+
+// ---------------------------------------------------------------- 测试
+
+/// P18c：供其它模块单测构造应答的最小助手。
+#[cfg(test)]
+pub mod tests_support {
+    pub fn a_response(name: &str, octets: [u8; 4], ttl: u32) -> Vec<u8> {
+        let mut q = Vec::new();
+        q.extend_from_slice(&0x1234u16.to_be_bytes());
+        q.extend_from_slice(&0x0100u16.to_be_bytes());
+        q.extend_from_slice(&1u16.to_be_bytes());
+        q.extend_from_slice(&0u16.to_be_bytes());
+        q.extend_from_slice(&0u16.to_be_bytes());
+        q.extend_from_slice(&0u16.to_be_bytes());
+        for label in name.split('.') {
+            q.push(label.len() as u8);
+            q.extend_from_slice(label.as_bytes());
+        }
+        q.push(0);
+        q.extend_from_slice(&1u16.to_be_bytes());
+        q.extend_from_slice(&1u16.to_be_bytes());
+        // answer
+        let mut resp = q.clone();
+        resp[2] |= 0x80;
+        resp[6..8].copy_from_slice(&1u16.to_be_bytes());
+        resp.extend_from_slice(&[0xc0, 0x0c]);
+        resp.extend_from_slice(&1u16.to_be_bytes());
+        resp.extend_from_slice(&1u16.to_be_bytes());
+        resp.extend_from_slice(&ttl.to_be_bytes());
+        resp.extend_from_slice(&4u16.to_be_bytes());
+        resp.extend_from_slice(&octets);
+        resp
+    }
+}
 
 #[cfg(test)]
 mod tests {

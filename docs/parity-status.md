@@ -1,6 +1,6 @@
 # 对标进度：dae（Go）↔ mini-dae（全 Rust）
 
-- **版本**：v1.6 · 2026-10-04（P18b DoQ 清点）
+- **版本**：v1.7 · 2026-10-04（P18c dns.routing 清点）
 - **口径**：「覆盖度」= 该域**功能点覆盖**的粗估（我方可用 ÷ dae 等价能力），
   **不是代码行数、不是性能等价**；数字是判断值，逐行给出证据出处。
   按口径分两档汇总：主链路（日常代理网关）与 dae 全功能面。
@@ -15,7 +15,7 @@
 | 2 | **分流主链路** | tproxy/direct/block、控制面 DNS override、五钩子角色、conn_state、双 epoch 热重载、redirect_track 单写者 | 同上全有 | **≈95%** | K0–K3 九用例 ×2 拓扑全过；`verify` 9/9（ADR-0009/0010，NOTES §11.16） |
 | 3 | **规则引擎** | dip/sip/dport/sport/l4proto/ipversion/dscp/mac/pname/domain/geoip/geosite/fallback + not/and + mark/must + sub/subnode | dae 现有函数集全覆盖（geoip/geosite 自 `.dat` 编译期展开，含 attr/ext；pname 走 cgroup2 采集；domain 走 DNS 位图 + 预计算索引）；`sub/subnode` 本版 dae 无此函数 | **≈95%** | **编译产物与 dae 逐字节对拍 5/5**（ADR-0010/0033）；真实 `.dat` 计数与上游清点一致（geoip:cn 15,357 / geosite:cn 6,623）；余项：geosite 负载未纳入对拍、无 XDG 搜索目录/流式解析、pname 用 comm 非 argv basename |
 | 4 | **配置系统** | 全量 `.dae`（global/dns/routing/group/subscription/node/include）全部生效 | 全量解析 + schema 校验 + 行级诊断；生效 routing 子集 + dns.upstream；group/node/subscription 仅解析（无运行时） | **≈60%** | 解析面与 `config_merger/parser` 语义逐条对齐；执行面为子集，deferred 显式列出不静默丢（ADR-0011） |
-| 5 | **DNS 子系统** | 透明 UDP/TCP、缓存、EDNS、regex、DoT/DoH/DoQ/H3 上游、`dns.routing` 请求/应答分流、ECS、嗅探 punt | 透明 UDP/TCP、正负缓存 TTL、域位图、regex、EDNS/截断、reload 重投影、TCP keep-alive、**DoT/DoH/DoQ 上游（持久连接，HTTP/1.1）** + `tcp+udp` 语义对齐 + URL 热切换 | **≈70%** | 明文 DNS 全对齐（ADR-0012/0013/0014）；安全上游 DoT/DoH（ADR-0034）+ **DoQ（ADR-0035，RFC 9250，quic-go 交叉 + AliDNS 实测）**；余 DoH H3、`dns.routing` 分流、ECS、嗅探 punt |
+| 5 | **DNS 子系统** | 透明 UDP/TCP、缓存、EDNS、regex、DoT/DoH/DoQ/H3 上游、`dns.routing` 请求/应答分流、ECS、嗅探 punt | 透明 UDP/TCP、正负缓存 TTL、域位图、regex、EDNS/截断、reload 重投影、TCP keep-alive、**DoT/DoH/DoQ 上游**、**多上游 + `dns.routing`（reject/asis/tag、应答重查≤3）** + URL/路由热切换 | **≈85%** | 明文 DNS + 安全上游（ADR-0034/0035）+ 请求/应答分流（ADR-0036，lab 全矩阵：reject/多上游/缓存作用域/应答 reject/重查/asis(UDP+TCP)/热重载）；余 DoH h2/h3、ECS、optimistic cache、`ipversion_prefer`、bootstrap_resolver、嗅探 punt |
 | 6 | **出站协议栈** | ss（含 2022/插件/shadowtls）、ssr、trojan、vmess、vless、tuic、hysteria2、juicity、naive、http、socks5、anytls | ss classic、trojan(TCP)、vmess(AEAD aid=0)、vless(tcp/ws)、tuic v5、hy2(+obfs/Brutal 近似/udphop)、anytls、socks5、direct（TCP 目标已支持域名，逐协议 ATYP 对齐） | **≈60%**（家族）· **≈85%**（主流可用性） | 主流 7 协议全覆盖且纯 Rust 跨实现验收（ADR-0016–0020/0026/0027）；域名目标编码见 ADR-0030；缺 ss2022/ssr/juicity/naive/http、REALITY/Vision/uTLS、gecko |
 | 7 | **转发面** | relay（并发上限/backlog fuse/计费）、UDP endpoint pool（full-cone）、offload 完整 | relay（SO_MARK/半关闭/janitor）、UDP NAT（ss/vless/vmess/tuic/hy2 协议侧可用；网关策略默认 UDP 直连）、offload 最小实现 | **≈75%** | 512KB 逐字节、UDP 会话复用、offload 用户态零字节均实测（ADR-0015/0022）；缺 fuse/计费/并发上限 |
 | 8 | **多节点·订阅·健康检查** | subscription + node + group（min/max/random/fixed）+ alive set + 间隔/容忍度 + 延迟策略 + sticky IP 等 | `--subscribe`/config 订阅（HTTP(S)/file；base64/明文；逐行容错）；group filter（name/keyword/regex/subtag/!）、policy（min/min_moving_avg/min_avg10/random/fixed）、经节点健康探测（last/EMA/hist10、tolerance 标死）、拨号失败切换；**按规则分派不同组未做**（数据面单代理槽） | **≈50%** | ADR-0031、NOTES §11.22；真机订阅#2：18×anytls 入组 18/18 alive、gstatic 204 / YouTube 200；缺热更新/多组分派/sticky/udp_check |
@@ -33,7 +33,7 @@
 |---|---|---|
 | 研究目标（可行性验证） | **100%** | aya 全栈可行、规则逐字节对拍、C 数据面退役、真实节点浏览器可用——结论闭环 |
 | 核心主链路（分流/规则/DNS（含 DoT/DoH）/主流协议/转发/运维） | **≈85%** | 日常「tproxy 网关 + 主流节点」已可用（P13 真网关实测 204 / YouTube 200；P14 嗅探远端解析实测 hits 10/10；P15 订阅组真机 18/18 alive；P18a 真实公网 DoT/DoH 解析实测） |
-| dae 全功能面（嗅探/多节点/geo/IPv6/安全 DNS/系统集成） | **≈68%（±5%）** | 差距集中在结构性 3 项；IPv6（TCP 全链）≈80%、规则语言（geo/pname）≈95%、DNS（安全上游）≈70% |
+| dae 全功能面（嗅探/多节点/geo/IPv6/安全 DNS/系统集成） | **≈70%（±5%）** | 差距集中在结构性 3 项；IPv6（TCP 全链）≈80%、规则语言（geo/pname）≈95%、DNS（安全上游+分流）≈85% |
 
 ## Top 缺口（按优先级）
 
@@ -41,7 +41,7 @@
 2. ~~多节点/订阅/组 + 健康检查~~ **已完成（P15，ADR-0031）**；余项：按规则分派不同组（数据面 outbound id）、订阅热更新、sticky IP/udp_check；
 3. ~~IPv6 数据面~~ **已完成（P16，ADR-0032，TCP 全链）**；余项：UDP v6（含 DNS over UDP6 接管，需 sockmap key 3）、ICMPv6/分片；
 4. ~~geoip/geosite/pname~~ **已完成（P17，ADR-0033）**；余项：geosite 对拍覆盖、pname argv basename（CO-RE）、geodata XDG/流式；
-5. **DoH/DoQ + `dns.routing`**：**DoT/DoH（P18a，ADR-0034）与 DoQ（P18b，ADR-0035）已完成**；余项：`dns.routing` 请求/应答分流（P18c）、DoH h2/h3、ECS、嗅探 punt；
+5. ~~DoH/DoQ + `dns.routing`~~ **已完成（P18a/b/c，ADR-0034/0035/0036）**；余项：DoH h2/h3、ECS、optimistic cache/`fixed_domain_ttl`/`ipversion_prefer`、`bootstrap_resolver`、嗅探 punt；
 6. 协议细节：REALITY/Vision/uTLS、ss2022/插件、juicity/naive/ssr、gecko、tuic 0-RTT；
 7. **systemd/打包/daed**；
 8. offload 完整形态（fuse/计费）与 relay 并发上限。
@@ -56,7 +56,7 @@
 - **单臂 dual-role 程序**、`--lan none` 一键真网关（ADR-0029）、本地 SOCKS5 入口（ADR-0028）；
 - **IPv6 TCP 全链**（P16，ADR-0032）：v4-mapped 统一五元组 + sockmap key 2 + 协议目标 v6 编码 + v6 嗅探，真机实测通过；
 - **规则语言与 dae 对齐**（P17，ADR-0033）：`.dat` 编译期展开（attr/ext、2M LPT 容量）、cgroup2 pname 采集；对拍 5/5 逐字节（含 geoip/pname）；
-- **DNS 安全上游**（P18a/P18b，ADR-0034/0035）：DoT/DoH/DoQ 纯 Rust（rustls + quinn），真实公网 DoH/DoT/DoQ 均验证；上游传输与客户端入口解耦（`tcp+udp` UDP 优先语义回正）；URL 热切换；
+- **DNS 安全上游与分流**（P18a/b/c，ADR-0034/0035/0036）：DoT/DoH/DoQ 纯 Rust（rustls + quinn），真实公网三者验证；多上游 + `dns.routing` 请求/应答分流（asis 回原目的、应答重查、路由先于缓存 + 作用域化缓存键）；URL/路由热切换；
 - **DNS 面鲁棒性**（P18b）：上游锁中毒恢复 + 单查询 panic 隔离，单次异常不再杀死 DNS 线程；
 - **工程化验收**：QEMU 双内核矩阵、soak 三模式、六路径基准、协议三方交叉（Go 客户端/Python+Go 参考服务端）。
 

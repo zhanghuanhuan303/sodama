@@ -45,6 +45,7 @@ mod anytls;
 mod brutal;
 mod config;
 mod dns;
+mod dnsroute;
 mod dnsup;
 mod geodata;
 mod group;
@@ -228,18 +229,68 @@ static RELAY_CONNS: std::sync::LazyLock<Mutex<std::collections::HashMap<u64, Arc
     std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
 static NEXT_RELAY_ID: AtomicU64 = AtomicU64::new(1);
 
-/// P3a/P6/P18a：DNS 上游（已解析的传输对象；支持 udp/tcp/tcp+udp/tls/https scheme）。
-/// P6 起支持热重载（`--config` 模式下重读 dns.upstream 并重建）。
-static UPSTREAM: Mutex<Option<Arc<dnsup::Upstream>>> = Mutex::new(None);
-
-fn upstream() -> Option<Arc<dnsup::Upstream>> {
-    UPSTREAM.lock().ok().and_then(|g| g.clone())
+/// P3a/P6/P18a/P18c：DNS 上游集合（tag → Upstream）+ legacy 单上游。
+/// P6 起支持热重载（`--config` 模式下重读 dns.upstream 并重建）；P18c 起多上游 + dns.routing。
+struct UpstreamSet {
+    by_tag: std::collections::HashMap<String, Arc<dnsup::Upstream>>,
+    /// 无 dns.routing 时的默认上游（对照旧行为）。
+    legacy: Arc<dnsup::Upstream>,
+    /// `asis` 用的按目的地址缓存（每个地址一把 marked UDP socket）。
+    asis: Mutex<std::collections::HashMap<SocketAddr, Arc<dnsup::Upstream>>>,
 }
 
-fn set_upstream(u: Arc<dnsup::Upstream>) {
-    if let Ok(mut g) = UPSTREAM.lock() {
+impl UpstreamSet {
+    fn get(&self, tag: &str) -> Option<Arc<dnsup::Upstream>> {
+        self.by_tag.get(tag).cloned()
+    }
+
+    /// 客户端原始目的地址（仅 UDP；对照 dae `AsIs` 语义）。
+    fn asis(&self, orig: SocketAddr) -> Result<Arc<dnsup::Upstream>, String> {
+        if let Ok(g) = self.asis.lock() {
+            if let Some(u) = g.get(&orig) {
+                return Ok(u.clone());
+            }
+        }
+        let host = match orig.ip() {
+            std::net::IpAddr::V4(a) => a.to_string(),
+            std::net::IpAddr::V6(a) => format!("[{a}]"),
+        };
+        let u = dnsup::Upstream::new(&format!("udp://{host}:{}", orig.port()))
+            .map_err(|e| format!("asis 上游 {orig}: {e}"))?;
+        if let Ok(mut g) = self.asis.lock() {
+            g.insert(orig, u.clone());
+        }
+        Ok(u)
+    }
+}
+
+static UPSTREAMS: Mutex<Option<Arc<UpstreamSet>>> = Mutex::new(None);
+/// P18c：`dns.routing` 编译结果（None = 无该段，走 legacy 单上游）。
+static DNS_ROUTER: Mutex<Option<Arc<dnsroute::DnsRouter>>> = Mutex::new(None);
+
+fn upstreams() -> Option<Arc<UpstreamSet>> {
+    UPSTREAMS.lock().ok().and_then(|g| g.clone())
+}
+
+fn set_upstreams(u: Arc<UpstreamSet>) {
+    if let Ok(mut g) = UPSTREAMS.lock() {
         *g = Some(u);
     }
+}
+
+fn dns_router() -> Option<Arc<dnsroute::DnsRouter>> {
+    DNS_ROUTER.lock().ok().and_then(|g| g.clone())
+}
+
+fn set_dns_router(r: Option<Arc<dnsroute::DnsRouter>>) {
+    if let Ok(mut g) = DNS_ROUTER.lock() {
+        *g = r;
+    }
+}
+
+/// 状态面/旧代码兼容：取 legacy 上游。
+fn upstream() -> Option<Arc<dnsup::Upstream>> {
+    upstreams().map(|s| s.legacy.clone())
 }
 static DOMAIN_SETS: Mutex<Vec<rules::DomainSetSpec>> = Mutex::new(Vec::new());
 /// P3b-1：DNS 应答缓存（UDP/TCP 共用；锁仅短暂持有）
@@ -259,6 +310,12 @@ struct DnsStats {
     tcp_queries: AtomicU64,
     tcp_responses: AtomicU64,
     bitmap_matched: AtomicU64,
+    /// P18c：请求路由 reject 数
+    rejects: AtomicU64,
+    /// P18c：应答路由 reject 数
+    response_rejects: AtomicU64,
+    /// P18c：应答路由换上游重查数
+    relookups: AtomicU64,
 }
 static DNS_STATS: DnsStats = DnsStats {
     queries: AtomicU64::new(0),
@@ -270,6 +327,9 @@ static DNS_STATS: DnsStats = DnsStats {
     tcp_queries: AtomicU64::new(0),
     tcp_responses: AtomicU64::new(0),
     bitmap_matched: AtomicU64::new(0),
+    rejects: AtomicU64::new(0),
+    response_rejects: AtomicU64::new(0),
+    relookups: AtomicU64::new(0),
 };
 
 extern "C" fn on_sighup(_sig: libc::c_int) {
@@ -1772,6 +1832,72 @@ fn geodata_for(args: &Args) -> &'static std::sync::Mutex<geodata::Geodata> {
     })
 }
 
+/// P18c：构建上游集合（CLI `--dns-upstream` 优先→单 tag "default"；否则配置 dns.upstream map）。
+fn build_upstream_set(args: &Args) -> Result<Arc<UpstreamSet>, Box<dyn std::error::Error>> {
+    let cli = args.dns_upstream.clone();
+    let cfg_map = if cli.is_none() {
+        args.config
+            .as_ref()
+            .and_then(|p| config::load(Path::new(p)).ok())
+            .map(|c| config::dns_upstream_map(&c))
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let legacy_url = cli
+        .clone()
+        .or_else(|| cfg_map.first().map(|(_, v)| v.clone()))
+        .unwrap_or_else(|| "8.8.8.8:53".into());
+    let legacy = dnsup::Upstream::new(&legacy_url)?;
+    let mut by_tag: std::collections::HashMap<String, Arc<dnsup::Upstream>> =
+        std::collections::HashMap::new();
+    if cli.is_some() {
+        by_tag.insert("default".to_string(), legacy.clone());
+    } else {
+        for (tag, url) in &cfg_map {
+            let u = dnsup::Upstream::new(url)
+                .map_err(|e| format!("dns.upstream {tag}（{url}）: {e}"))?;
+            by_tag.insert(tag.clone(), u);
+        }
+        if by_tag.is_empty() {
+            by_tag.insert("default".to_string(), legacy.clone());
+        }
+    }
+    Ok(Arc::new(UpstreamSet {
+        by_tag,
+        legacy,
+        asis: Mutex::new(std::collections::HashMap::new()),
+    }))
+}
+
+impl UpstreamSet {
+    /// tag → url（供 dnsroute 编译校验与状态面）。
+    fn tags_map(&self) -> std::collections::HashMap<String, String> {
+        self.by_tag
+            .iter()
+            .map(|(k, v)| (k.clone(), v.url.clone()))
+            .collect()
+    }
+}
+
+/// P18c：编译 dns.routing（None = 未配置）。
+fn build_dns_router(
+    args: &Args,
+    ups: &UpstreamSet,
+) -> Result<Option<dnsroute::DnsRouter>, Box<dyn std::error::Error>> {
+    let Some(path) = &args.config else {
+        return Ok(None);
+    };
+    let cfg =
+        config::load(Path::new(path)).map_err(|d| format!("加载配置失败（{} 项诊断）", d.len()))?;
+    let tags = ups.tags_map();
+    let geo_lock = geodata_for(args);
+    let geo = geo_lock.lock().unwrap();
+    let r =
+        dnsroute::compile(&cfg, &tags, Some(&geo)).map_err(|e| format!("编译 dns.routing: {e}"))?;
+    Ok(r)
+}
+
 /// 编译 + 写入非活跃槽 + 切换。返回规则条数。
 fn reload_rules(args: &Args, ebpf: &mut Ebpf) -> Result<usize, Box<dyn std::error::Error>> {
     let text = rules_text(args)?;
@@ -1831,27 +1957,43 @@ fn do_reload(args: &Args, ebpf: &mut Ebpf) -> ReloadOutcome {
     }
     let out = match reload_rules(args, ebpf) {
         Ok(n) => {
-            // P6：`--config` 模式下 dns.upstream 变更热切换（--dns-upstream 显式给定时不覆盖）。
+            // P6/P18c：`--config` 模式下 dns.upstream/dns.routing 变更热切换
+            // （--dns-upstream 显式给定时不覆盖）。失败保留旧对象（等价回滚）。
             if args.dns_upstream.is_none() {
-                if let Some(path) = &args.config {
-                    if let Ok(cfg) = config::load(Path::new(path)) {
-                        if let Some(url) = config::dns_upstream_url(&cfg) {
-                            match dnsup::Upstream::new(&url) {
-                                Ok(new_up) => {
-                                    let old = upstream().map(|u| u.url.clone());
-                                    if old.as_deref() != Some(url.as_str()) {
-                                        log(&format!(
-                                            "dns upstream 切换: {old:?} -> {url} ({}, {})",
-                                            new_up.spec.scheme.name(),
-                                            new_up.addr()
-                                        ));
-                                        set_upstream(new_up);
+                match build_upstream_set(args) {
+                    Ok(new_ups) => {
+                        let old = upstreams().map(|u| u.legacy.url.clone());
+                        if old.as_deref() != Some(new_ups.legacy.url.as_str()) {
+                            log(&format!(
+                                "dns upstream 切换: {old:?} -> {} (tags={:?})",
+                                new_ups.legacy.url,
+                                {
+                                    let mut v: Vec<String> =
+                                        new_ups.by_tag.keys().cloned().collect();
+                                    v.sort();
+                                    v
+                                }
+                            ));
+                        }
+                        set_upstreams(new_ups.clone());
+                        match build_dns_router(args, &new_ups) {
+                            Ok(r) => {
+                                let n = r
+                                    .as_ref()
+                                    .map(|r| r.request_rule_lines + r.response_rule_lines)
+                                    .unwrap_or(0);
+                                if let Some(r) = &r {
+                                    for note in &r.notes {
+                                        log(&format!("dnsroute: {note}"));
                                     }
                                 }
-                                Err(e) => log(&format!("reload: {e}（保留原上游）")),
+                                log(&format!("dns.routing 重载: {n} 条规则"));
+                                set_dns_router(r.map(Arc::new));
                             }
+                            Err(e) => log(&format!("dns.routing 重载失败（保留旧路由）: {e}")),
                         }
                     }
+                    Err(e) => log(&format!("reload: {e}（保留原上游）")),
                 }
             }
             // 对照 dae reconcileCurrentBpfProjections：新槽需要重建域位图。
@@ -2193,22 +2335,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return run_socks_server(&listen);
     }
 
-    // P3a/P18a：DNS 上游传输对象必须在 host ns 创建（上游查询走宿主路由，
-    // 不经 dae0/自己的钩子）；缺省上游优先取 --config 的 dns.upstream。
-    let upstream_url = args.dns_upstream.clone().unwrap_or_else(|| {
-        args.config
-            .as_ref()
-            .and_then(|p| config::load(Path::new(p)).ok())
-            .and_then(|c| config::dns_upstream_url(&c))
-            .unwrap_or_else(|| "8.8.8.8:53".into())
-    });
-    let dns_up = dnsup::Upstream::new(&upstream_url)?;
-    log(&format!(
-        "dns upstream: {upstream_url} scheme={} addr={}",
-        dns_up.spec.scheme.name(),
-        dns_up.addr()
-    ));
-    set_upstream(dns_up);
+    // P3a/P18a/P18c：DNS 上游集合与路由必须在 host ns 创建/编译（上游查询走宿主路由，
+    // 不经 dae0/自己的钩子）；上游：CLI 优先，否则 config dns.upstream map。
+    let ups = build_upstream_set(&args)?;
+    {
+        let tags: Vec<String> = ups.by_tag.keys().cloned().collect();
+        log(&format!(
+            "dns upstream: legacy={} scheme={} addr={} tags=[{}]",
+            ups.legacy.url,
+            ups.legacy.spec.scheme.name(),
+            ups.legacy.addr(),
+            tags.join(",")
+        ));
+    }
+    set_upstreams(ups.clone());
+    match build_dns_router(&args, &ups) {
+        Ok(Some(r)) => {
+            for n in &r.notes {
+                log(&format!("dnsroute: {n}"));
+            }
+            log(&format!(
+                "dns.routing: request {} 条 / response {} 条，fallback={:?}/{:?}",
+                r.request_rule_lines, r.response_rule_lines, r.req_fallback, r.resp_fallback
+            ));
+            set_dns_router(Some(Arc::new(r)));
+        }
+        Ok(None) => set_dns_router(None),
+        Err(e) => return Err(e),
+    }
 
     // SIGHUP = 热重载（对照 dae `dae reload`）；SIGUSR2 = suspend（对照 dae suspend）
     unsafe {
@@ -2696,41 +2850,173 @@ fn publish_live(
     }
 }
 
-/// 查询处理（UDP/TCP 共用）：缓存命中 → 直接回；否则上游 → 发布位图 → 回填缓存。
-/// UDP 最终应答按客户端公布尺寸截断（TCP 不截断）；位图从**完整**应答发布。
-/// 上游经 `dnsup::Upstream`（P18a：udp/tcp/tcp+udp/tls/https）。
+/// 请求阶段选中的出口（P18c）。
+enum Selected {
+    /// 请求路由 reject（空应答）
+    Reject,
+    /// 实际上游 + 缓存作用域 + 应答路由用的「已服务」出口名
+    Up(Arc<dnsup::Upstream>, String, dnsroute::ReqOut),
+}
+
+/// P18c：请求路由选择上游（asis / tag / legacy）。
+fn select_request_upstream(
+    q: &dns::Question,
+    orig_dst: Option<SocketAddr>,
+) -> Result<Selected, String> {
+    let set = upstreams().ok_or("DNS 上游未初始化")?;
+    let Some(router) = dns_router() else {
+        let u = set.legacy.clone();
+        let scope = format!("legacy|{}", u.url);
+        return Ok(Selected::Up(
+            u,
+            scope,
+            dnsroute::ReqOut::Tag("default".into()),
+        ));
+    };
+    match router.request_select(q) {
+        dnsroute::ReqOut::Reject => Ok(Selected::Reject),
+        dnsroute::ReqOut::AsIs => {
+            // dae：asis 总是走 UDP 发往客户端原始目的；TCP 客户端路径拿不到时退回 legacy。
+            match orig_dst {
+                Some(orig) => {
+                    let u = set.asis(orig)?;
+                    let scope = format!("asis|{orig}");
+                    Ok(Selected::Up(u, scope, dnsroute::ReqOut::AsIs))
+                }
+                None => {
+                    let u = set.legacy.clone();
+                    let scope = format!("legacy|{}", u.url);
+                    Ok(Selected::Up(
+                        u,
+                        scope,
+                        dnsroute::ReqOut::Tag("default".into()),
+                    ))
+                }
+            }
+        }
+        dnsroute::ReqOut::Tag(t) => {
+            let u = set
+                .get(&t)
+                .ok_or_else(|| format!("dns.routing.request 出口 {t:?} 不在 dns.upstream"))?;
+            let scope = format!("tag|{t}|{}", u.url);
+            Ok(Selected::Up(u, scope, dnsroute::ReqOut::Tag(t)))
+        }
+    }
+}
+
+/// 查询处理（UDP/TCP 共用）：请求路由 → 缓存 → 上游 → 应答路由（换上游重查深度 ≤3）
+/// → 发布位图 → 回填缓存。UDP 最终应答按客户端公布尺寸截断（TCP 不截断）；
+/// 位图从**完整**应答发布。上游经 `dnsup::Upstream`（P18a/b）；路由见 `dnsroute`（P18c）。
 fn resolve_dns(
     query: &[u8],
     proto: ClientProto,
-    upstream: &dnsup::Upstream,
+    orig_dst: Option<SocketAddr>,
     tx: &std::sync::mpsc::Sender<status::MainMsg>,
 ) -> Option<Vec<u8>> {
     let parsed = dns::parse_query(query);
     let edns = dns::query_edns(query);
+    // 1) 请求路由（reject 先于缓存；对照 dae「Route request first, then check cache」）
+    let selected = match &parsed {
+        Some(q) => match select_request_upstream(q, orig_dst) {
+            Ok(s) => s,
+            Err(e) => {
+                DNS_STATS.upstream_errors.fetch_add(1, Ordering::Relaxed);
+                log(&format!("dns 请求路由失败: {e}"));
+                return None;
+            }
+        },
+        None => {
+            // 无法解析 question：保持旧行为（legacy 直转，不进缓存/位图）
+            let u = upstream()?;
+            match u.exchange(query) {
+                Ok(r) => return Some(serve_response(query, r, proto)),
+                Err(e) => {
+                    DNS_STATS.upstream_errors.fetch_add(1, Ordering::Relaxed);
+                    log(&format!("dns 上游 {} 查询失败: {e}", u.url));
+                    return None;
+                }
+            }
+        }
+    };
+    if matches!(selected, Selected::Reject) {
+        DNS_STATS.rejects.fetch_add(1, Ordering::Relaxed);
+        let resp = dns::empty_noerror(query);
+        if resp.is_empty() {
+            return None;
+        }
+        return Some(serve_response(query, resp, proto));
+    }
+    let (mut up, scope, mut served) = match selected {
+        Selected::Up(u, scope, s) => (u, scope, s),
+        Selected::Reject => unreachable!(),
+    };
+    // 2) 缓存（按作用域）
     if let Some(q) = &parsed {
         let hit = DNS_CACHE
             .lock()
             .ok()
-            .and_then(|mut c| c.answer_from_cache(query, q, &edns, Instant::now()));
+            .and_then(|mut c| c.answer_from_cache_scoped(query, q, &edns, &scope, Instant::now()));
         if let Some(resp) = hit {
             DNS_STATS.responses.fetch_add(1, Ordering::Relaxed);
             publish_live(q, &resp, tx, true);
             return Some(serve_response(query, resp, proto));
         }
     }
-    let resp = match upstream.exchange(query) {
+    // 3) 上游 + 应答路由（对照 dae resolveDNSUpstream 的递归重查；深度上限 3）
+    let router = dns_router();
+    let mut resp = match up.exchange(query) {
         Ok(r) => r,
         Err(e) => {
             DNS_STATS.upstream_errors.fetch_add(1, Ordering::Relaxed);
-            log(&format!("dns 上游 {} 查询失败: {e}", upstream.url));
+            log(&format!("dns 上游 {} 查询失败: {e}", up.url));
             return None;
         }
     };
+    let mut depth = 0usize;
+    loop {
+        let verdict = router
+            .as_ref()
+            .map(|r| r.response_select(&resp, &served))
+            .unwrap_or(dnsroute::RespOut::Accept);
+        match verdict {
+            dnsroute::RespOut::Accept => break,
+            dnsroute::RespOut::Reject => {
+                DNS_STATS.response_rejects.fetch_add(1, Ordering::Relaxed);
+                resp = dns::strip_answers(&resp);
+                break;
+            }
+            dnsroute::RespOut::Tag(t) => {
+                if depth >= 2 {
+                    DNS_STATS.upstream_errors.fetch_add(1, Ordering::Relaxed);
+                    log("dns 应答路由重查过深（>3），放弃（检查 dns.routing.response 是否成环）");
+                    return None;
+                }
+                depth += 1;
+                DNS_STATS.relookups.fetch_add(1, Ordering::Relaxed);
+                let Some(set) = upstreams() else { return None };
+                let Some(next) = set.get(&t) else {
+                    DNS_STATS.upstream_errors.fetch_add(1, Ordering::Relaxed);
+                    log(&format!("dns 应答路由出口 {t:?} 不在 dns.upstream"));
+                    return None;
+                };
+                up = next;
+                served = dnsroute::ReqOut::Tag(t);
+                resp = match up.exchange(query) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        DNS_STATS.upstream_errors.fetch_add(1, Ordering::Relaxed);
+                        log(&format!("dns 上游 {} 重查失败: {e}", up.url));
+                        return None;
+                    }
+                };
+            }
+        }
+    }
     DNS_STATS.responses.fetch_add(1, Ordering::Relaxed);
     if let Some(q) = &parsed {
         publish_live(q, &resp, tx, false);
         if let Ok(mut c) = DNS_CACHE.lock() {
-            c.insert(q, &edns, &resp, Instant::now());
+            c.insert_scoped(q, &edns, &scope, &resp, Instant::now());
         }
     }
     Some(serve_response(query, resp, proto))
@@ -2765,12 +3051,9 @@ fn dns_loop(listener: OwnedFd, tx: std::sync::mpsc::Sender<status::MainMsg>) {
             continue;
         }
         DNS_STATS.queries.fetch_add(1, Ordering::Relaxed);
-        let Some(up) = upstream() else {
-            continue;
-        };
         // panic 隔离：单次查询（含第三方 QUIC 栈）出 panic 不应杀死整个 DNS 线程
         let resolved = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            resolve_dns(&buf[..n], ClientProto::Udp, &up, &tx)
+            resolve_dns(&buf[..n], ClientProto::Udp, Some(orig_dst), &tx)
         }));
         let resp = match resolved {
             Ok(Some(r)) => r,
@@ -2805,6 +3088,8 @@ fn tcp_dns_loop(
 fn handle_tcp_dns_conn(mut stream: TcpStream, tx: std::sync::mpsc::Sender<status::MainMsg>) {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
+    // P18c：透明 socket 的 local_addr = 客户端原始目的地址（asis 用）
+    let orig_dst = stream.local_addr().ok();
     loop {
         let mut lb = [0u8; 2];
         if stream.read_exact(&mut lb).is_err() {
@@ -2819,9 +3104,8 @@ fn handle_tcp_dns_conn(mut stream: TcpStream, tx: std::sync::mpsc::Sender<status
             break;
         }
         DNS_STATS.tcp_queries.fetch_add(1, Ordering::Relaxed);
-        let Some(up) = upstream() else { break };
         let resolved = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            resolve_dns(&query, ClientProto::Tcp, &up, &tx)
+            resolve_dns(&query, ClientProto::Tcp, orig_dst, &tx)
         }));
         let resp = match resolved {
             Ok(Some(r)) => r,
@@ -3580,6 +3864,27 @@ fn status_json(ebpf: &mut Ebpf) -> serde_json::Value {
             "upstream": upstream().map(|u| u.addr().to_string()),
             "upstream_url": upstream().map(|u| u.url.clone()),
             "upstream_scheme": upstream().map(|u| u.spec.scheme.name()),
+            "upstreams": upstreams().map(|s| {
+                let mut m = serde_json::Map::new();
+                let mut keys: Vec<String> = s.by_tag.keys().cloned().collect();
+                keys.sort();
+                for k in keys {
+                    if let Some(u) = s.by_tag.get(&k) {
+                        m.insert(k, json!(u.url));
+                    }
+                }
+                serde_json::Value::Object(m)
+            }),
+            "routing": {
+                "request_rules": dns_router().map(|r| r.request_rule_lines),
+                "response_rules": dns_router().map(|r| r.response_rule_lines),
+                "request_fallback": dns_router().map(|r| format!("{:?}", r.req_fallback)),
+                "response_fallback": dns_router().map(|r| format!("{:?}", r.resp_fallback)),
+                "rejects": DNS_STATS.rejects.load(Ordering::Relaxed),
+                "response_rejects": DNS_STATS.response_rejects.load(Ordering::Relaxed),
+                "relookups": DNS_STATS.relookups.load(Ordering::Relaxed),
+                "notes": dns_router().map(|r| r.notes.clone()).unwrap_or_default(),
+            },
             "queries": DNS_STATS.queries.load(Ordering::Relaxed),
             "responses": DNS_STATS.responses.load(Ordering::Relaxed),
             "published_ips": DNS_STATS.published_ips.load(Ordering::Relaxed),

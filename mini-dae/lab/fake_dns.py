@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""假上游 DNS（P3a/P3b-1 实验用）：UDP + TCP 同一端口，按固定表回答 A 记录。
+"""假上游 DNS（P3a/P3b-1 实验用）：UDP + TCP 同一地址，按固定表回答 A 记录。
 
-用法： fake_dns.py <query_log> [port]
+用法： fake_dns.py <query_log> [port] [bind_host]
 默认表：
   proxy.test  -> 10.9.10.3
   direct.test -> 10.9.10.4
@@ -21,6 +21,7 @@ import threading
 
 LOG = sys.argv[1] if len(sys.argv) > 1 else "/tmp/mini-dae-fake-dns.txt"
 PORT = int(sys.argv[2]) if len(sys.argv) > 2 else 5353
+BIND = sys.argv[3] if len(sys.argv) > 3 else "127.0.0.1"
 
 TABLE = {
     "proxy.test": "10.9.10.3",
@@ -44,6 +45,15 @@ TABLE = {
     # P18b：DoQ 夹具（doq-server 转发到本服务）
     "doq.test": "10.9.10.37",
     "doq2.test": "10.9.10.38",
+    # P18c：dns.routing 夹具
+    "blocked.test": "10.9.10.43",
+    "via2.test": "10.9.10.42",
+    "a.via2.test": "10.9.10.42",
+    "other.test": "10.9.10.45",
+    "polluted.test": "10.9.10.60",
+    "relook.test": "10.9.10.61",
+    "asis.test": "10.9.10.44",
+    "tcp.asis.test": "10.9.10.46",
 }
 
 # P3b-2a：大应答（60 条 A ≈ 990 字节 > 512，用于验证 UDP 截断/EDNS）
@@ -111,9 +121,9 @@ def recv_exact(conn, n):
 def serve_tcp():
     ls = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     ls.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    ls.bind(("127.0.0.1", PORT))
+    ls.bind((BIND, PORT))
     ls.listen(16)
-    print(f"fake-dns TCP listening on 127.0.0.1:{PORT}", flush=True)
+    print(f"fake-dns TCP listening on {BIND}:{PORT}", flush=True)
     while True:
         conn, _ = ls.accept()
         threading.Thread(target=handle_tcp_conn, args=(conn,), daemon=True).start()
@@ -136,9 +146,9 @@ def handle_tcp_conn(conn):
 
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-s.bind(("127.0.0.1", PORT))
+s.bind((BIND, PORT))
 threading.Thread(target=serve_tcp, daemon=True).start()
-print(f"fake-dns UDP listening on 127.0.0.1:{PORT} table={TABLE}", flush=True)
+print(f"fake-dns UDP listening on {BIND}:{PORT} table={TABLE}", flush=True)
 while True:
     data, addr = s.recvfrom(4096)
     out = respond(data)
