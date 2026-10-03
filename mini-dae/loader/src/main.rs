@@ -43,6 +43,7 @@ mod anytls;
 mod brutal;
 mod config;
 mod dns;
+mod group;
 mod hpack;
 mod huffman_table;
 mod hysteria2;
@@ -54,6 +55,7 @@ mod socks5;
 mod socksin;
 mod ss;
 mod status;
+mod subscribe;
 mod target;
 mod tls;
 mod trojan;
@@ -103,6 +105,8 @@ static CONFIG_STATE: Mutex<Option<(config::Config, config::RoutingExtract)>> = M
 static OUTBOUND: OnceLock<outbound::Outbound> = OnceLock::new();
 /// P4a：accept 线程（daens）→ relay 线程池（host ns）的连接转交通道
 static TCP_RELAY_TX: OnceLock<std::sync::mpsc::Sender<TcpStream>> = OnceLock::new();
+/// P15：活动节点组（状态面输出用）。
+static ACTIVE_GROUP: OnceLock<std::sync::Arc<group::GroupRuntime>> = OnceLock::new();
 /// relay 连接空闲回收阈值（秒）；janitor 每 5s 扫描一次。
 static RELAY_IDLE_SECS: AtomicU64 = AtomicU64::new(300);
 /// P11：relay 拨号超时（毫秒，默认 5000；真实节点首连可能较慢）
@@ -390,6 +394,10 @@ struct Args {
     dial_mode: Option<String>,
     /// P14：嗅探等待上限（毫秒，默认 100；仅 dial_mode != ip 时生效）
     sniffing_timeout_ms: Option<u64>,
+    /// P15：订阅 URL（可重复；每次都拉取并解析为节点池）
+    subscribe: Vec<String>,
+    /// P15：选用的组名（默认优先 `proxy`，否则唯一/第一个非空组）
+    group: Option<String>,
     /// P12：本地 SOCKS5 入口（如 127.0.0.1:11080）；开启后不加载 eBPF、不需要 root
     listen_socks: Option<String>,
     /// P4：UDP NAT 会话空闲秒数（默认 60）
@@ -477,6 +485,8 @@ fn usage() -> ! {
            --dial-timeout <s>       P11：relay 拨号超时秒数（默认 5；真实节点慢首连可调大）
            --dial-mode <m>          P14：ip|domain|domain+（默认 ip；域名模式嗅探 SNI/Host 后远端解析，绕 DNS 污染）
            --sniffing-timeout-ms <n> P14：嗅探等待上限毫秒（默认 100；仅 dial_mode != ip 生效）
+           --subscribe <url>        P15：订阅（可重复；config subscription 段同源），与 --group 搭配
+           --group <name>           P15：选用 config 中的组（默认 proxy / 唯一组）
            --listen-socks <addr>    P12：本地 SOCKS5 入口（浏览器测试用；不加载 eBPF、不需 root）\n\
            --udp-idle-timeout <s>   P4：UDP NAT 会话空闲秒数（默认 60）\n\
            --forward <url>       旧写法：等价于 --dialer socks5://host:port\n\
@@ -523,6 +533,8 @@ fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
         dial_timeout: None,
         dial_mode: None,
         sniffing_timeout_ms: None,
+        subscribe: Vec::new(),
+        group: None,
         listen_socks: None,
         udp_idle_timeout: None,
         forward: None,
@@ -568,6 +580,8 @@ fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
                 }
             }
             "--sniffing-timeout-ms" => args.sniffing_timeout_ms = Some(next()?.parse()?),
+            "--subscribe" => args.subscribe.push(next()?),
+            "--group" => args.group = Some(next()?),
             "--listen-socks" => args.listen_socks = Some(next()?),
             "--udp-idle-timeout" => args.udp_idle_timeout = Some(next()?.parse()?),
             "--forward" => args.forward = Some(next()?),
@@ -1099,7 +1113,7 @@ fn run_socks_server(listen: &str) -> Result<(), Box<dyn std::error::Error>> {
         .next()
         .ok_or_else(|| format!("--listen-socks {listen} 无解析结果"))?;
     let Some(dialer) = OUTBOUND.get() else {
-        return Err("--listen-socks 需要 --dialer <url>（如 anytls://…）".into());
+        return Err("--listen-socks 需要 --dialer <url> 或订阅组（--subscribe / config 的 subscription+group）".into());
     };
     let listener = std::net::TcpListener::bind(addr).map_err(|e| format!("bind {addr}: {e}"))?;
     log(&format!(
@@ -1686,6 +1700,163 @@ fn sweep_conn_state(ebpf: &mut Ebpf) -> Result<usize, Box<dyn std::error::Error>
     Ok(n)
 }
 
+/// P15：构建节点组（config subscription/node/group + `--subscribe`/`--group`）。
+/// 订阅拉取失败/节点全部不支持时返回 None（回落为无 dialer，保持实验回显语义）。
+fn build_group_outbound(args: &Args) -> Option<outbound::Outbound> {
+    let cfg = args.config.as_ref().and_then(|p| {
+        config::load(std::path::Path::new(p))
+            .map_err(|d| {
+                log(&format!(
+                    "订阅/组：配置解析失败（{} 条诊断），跳过组构建",
+                    d.len()
+                ));
+            })
+            .ok()
+    });
+    let sub_specs = cfg.as_ref().map(config::subscriptions).unwrap_or_default();
+    let node_specs = cfg.as_ref().map(config::inline_nodes).unwrap_or_default();
+    let group_specs = cfg.as_ref().map(config::groups).unwrap_or_default();
+    if sub_specs.is_empty() && args.subscribe.is_empty() && node_specs.is_empty() {
+        return None;
+    }
+
+    let mut nodes: Vec<subscribe::ParsedNode> = Vec::new();
+    for n in &node_specs {
+        match outbound::parse(&n.link) {
+            Ok(o) => nodes.push(subscribe::ParsedNode {
+                name: n.name.clone(),
+                tag: "node".into(),
+                outbound: o,
+            }),
+            Err(e) => log(&format!("节点 {} 不支持: {e}", n.name)),
+        }
+    }
+    let timeout = Duration::from_secs(15);
+    let cli_subs: Vec<(String, String)> = args
+        .subscribe
+        .iter()
+        .enumerate()
+        .map(|(i, u)| (format!("cli{}", i + 1), u.clone()))
+        .collect();
+    for (tag, url) in sub_specs
+        .iter()
+        .map(|s| (s.tag.clone(), s.url.clone()))
+        .chain(cli_subs)
+    {
+        match subscribe::fetch(&url, timeout).and_then(|b| subscribe::decode_body(&b)) {
+            Ok(text) => {
+                let (mut ns, errs) = subscribe::parse_subscription(&text, &tag);
+                for e in errs.iter().take(3) {
+                    log(&format!("订阅 {tag}: {e}"));
+                }
+                if errs.len() > 3 {
+                    log(&format!("订阅 {tag}: 另有 {} 行不支持", errs.len() - 3));
+                }
+                log(&format!("订阅 {tag}: 拉取成功，{} 个节点", ns.len()));
+                nodes.append(&mut ns);
+            }
+            Err(e) => log(&format!("订阅 {tag} 拉取失败: {e}")),
+        }
+    }
+    if nodes.is_empty() {
+        log("未获得任何可用节点，组不启用");
+        return None;
+    }
+
+    let pick = |name: &str| group_specs.iter().find(|g| g.name == name);
+    let chosen = if group_specs.is_empty() {
+        Some(("proxy".to_string(), None::<&config::GroupSpec>))
+    } else {
+        args.group
+            .as_deref()
+            .and_then(pick)
+            .or_else(|| pick("proxy"))
+            .or_else(|| group_specs.first())
+            .map(|g| (g.name.clone(), Some(g)))
+    };
+    let Some((gname, spec)) = chosen else {
+        return None;
+    };
+    let policy = group::parse_policy(spec.and_then(|g| g.policy.as_deref()));
+    let filters = spec.map(|g| g.filters.clone()).unwrap_or_default();
+    let members = group::build_members(&nodes, &filters);
+    if members.is_empty() {
+        log(&format!(
+            "组 {gname} 没有命中的节点（filter 过严？），组不启用"
+        ));
+        return None;
+    }
+
+    let global_str = |key: &str| cfg.as_ref().and_then(|c| config::global_value(c, key));
+    let check_urls: Vec<String> = match spec.and_then(|g| {
+        if g.tcp_check_urls.is_empty() {
+            None
+        } else {
+            Some(g.tcp_check_urls.clone())
+        }
+    }) {
+        Some(v) => v,
+        None => global_str("tcp_check_url")
+            .map(|v| v.split(',').map(|s| s.trim().to_string()).collect())
+            .unwrap_or_else(|| vec!["http://cp.cloudflare.com".to_string()]),
+    };
+    let targets: Vec<(String, u16)> = check_urls
+        .iter()
+        .filter_map(|u| parse_check_target(u))
+        .collect();
+    let interval = spec
+        .and_then(|g| g.check_interval.clone())
+        .or_else(|| global_str("check_interval"))
+        .and_then(|v| parse_duration_secs(&v))
+        .unwrap_or(30);
+    let tolerance = spec
+        .and_then(|g| g.check_tolerance.clone())
+        .or_else(|| global_str("check_tolerance"))
+        .and_then(|v| parse_duration_secs(&v))
+        .unwrap_or(1) as u32;
+
+    let rt = group::GroupRuntime::new(
+        gname.clone(),
+        policy,
+        members,
+        targets.clone(),
+        interval,
+        tolerance,
+    );
+    log(&format!(
+        "节点组 {gname}: {} 个成员, policy={policy:?}, check={targets:?} 每 {interval}s, 容忍 {tolerance} 次失败",
+        rt.members.len()
+    ));
+    rt.spawn_health_loop();
+    let _ = ACTIVE_GROUP.set(rt.clone());
+    Some(outbound::Outbound::Group(rt))
+}
+
+fn parse_check_target(u: &str) -> Option<(String, u16)> {
+    let https = u.starts_with("https://");
+    let s = u
+        .strip_prefix("http://")
+        .or_else(|| u.strip_prefix("https://"))
+        .unwrap_or(u);
+    let authority = s.split('/').next().unwrap_or(s);
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((h, p)) if p.chars().all(|c| c.is_ascii_digit()) => {
+            (h.to_string(), p.parse::<u16>().ok()?)
+        }
+        _ => (authority.to_string(), if https { 443 } else { 80 }),
+    };
+    if host.is_empty() || host.starts_with('[') || host.contains(']') {
+        None
+    } else {
+        Some((host, port))
+    }
+}
+
+fn parse_duration_secs(v: &str) -> Option<u64> {
+    let t = v.trim().trim_end_matches('s').trim();
+    t.parse().ok()
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // K3 子命令（不加载 eBPF、不需要 root）
     let argv: Vec<String> = std::env::args().collect();
@@ -1762,6 +1933,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 dial_mode_name(m),
                 SNIFF_TIMEOUT_MS.load(Ordering::SeqCst)
             ));
+        }
+    }
+
+    // P15：无 --dialer/--forward 时，用订阅/节点/组构建拨号出口（单个节点即单成员组）。
+    if OUTBOUND.get().is_none() {
+        if let Some(dialer) = build_group_outbound(&args) {
+            let name = dialer.name();
+            log(&format!("relay dialer: {name}"));
+            let _ = OUTBOUND.set(dialer);
         }
     }
 
@@ -3073,6 +3253,25 @@ fn status_json(ebpf: &mut Ebpf) -> serde_json::Value {
             "attempts": SNIFF_STATS.attempts.load(Ordering::Relaxed),
             "hits": SNIFF_STATS.hits.load(Ordering::Relaxed),
             "misses": SNIFF_STATS.misses.load(Ordering::Relaxed),
+        },
+        "group": match ACTIVE_GROUP.get() {
+            Some(g) => {
+                let snap = g.snapshot();
+                json!({
+                    "name": g.name,
+                    "policy": format!("{:?}", g.policy),
+                    "members": g.members.len(),
+                    "alive": snap.iter().filter(|x| x.2).count(),
+                    "dials": g.stats.dials.load(Ordering::Relaxed),
+                    "failovers": g.stats.failovers.load(Ordering::Relaxed),
+                    "probes_ok": g.stats.probes_ok.load(Ordering::Relaxed),
+                    "probes_fail": g.stats.probes_fail.load(Ordering::Relaxed),
+                    "nodes": snap.iter().map(|(n, tag, alive, last, ema)| json!({
+                        "name": n, "tag": tag, "alive": alive, "last_ms": last, "ema_ms": ema
+                    })).collect::<Vec<_>>(),
+                })
+            }
+            None => serde_json::Value::Null,
         },
         "udp_nat": {
             "sessions_active": UDP_NAT.lock().map(|t| t.len()).unwrap_or(0),

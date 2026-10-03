@@ -121,6 +121,13 @@ BENCH_PID_FILE=/tmp/mini-dae-bench.pid
 SS_PORT=8388
 SS_LOG=/tmp/mini-dae-ss-target.txt
 SS_PID_FILE=/tmp/mini-dae-ss.pid
+# P15：订阅/节点组的第二个 ss 后端 + 订阅 HTTP 服务器
+SS_PORT_B=9488
+SSB_PID_FILE=/tmp/mini-dae-ssb.pid
+SUB_PORT=18530
+SUB_PID_FILE=/tmp/mini-dae-sub.pid
+SUB_BODY=/tmp/mini-dae-sub-body.txt
+SUB_CONFIG=/tmp/mini-dae-subscribe.dae
 TROJAN_PORT=8443
 TROJAN_LOG=/tmp/mini-dae-trojan-target.txt
 TROJAN_PID_FILE=/tmp/mini-dae-trojan.pid
@@ -213,6 +220,14 @@ cleanup() {
   if [ -f "$SS_PID_FILE" ]; then
     kill "$(cat "$SS_PID_FILE")" 2>/dev/null || true
     rm -f "$SS_PID_FILE"
+  fi
+  if [ -f "$SSB_PID_FILE" ]; then
+    kill "$(cat "$SSB_PID_FILE")" 2>/dev/null || true
+    rm -f "$SSB_PID_FILE"
+  fi
+  if [ -f "$SUB_PID_FILE" ]; then
+    kill "$(cat "$SUB_PID_FILE")" 2>/dev/null || true
+    rm -f "$SUB_PID_FILE"
   fi
   if [ -f "$TROJAN_PID_FILE" ]; then
     kill "$(cat "$TROJAN_PID_FILE")" 2>/dev/null || true
@@ -368,6 +383,21 @@ up() {
     echo $! >"$SS_PID_FILE"
     sleep 0.3
     kill -0 "$(cat "$SS_PID_FILE")" 2>/dev/null || { cat /tmp/mini-dae-ss.log; die "ss 服务端启动失败"; }
+  fi
+  # P15：订阅测试的第二个 ss 后端（节点组 failover 用）
+  if [ -n "${USE_SS_B:-}" ]; then
+    python3 -u "$HERE/ss_server.py" "${SS_LOG}.b" "${USE_SS_METHOD:?USE_SS_METHOD 未设置}" "${USE_SS_PASSWORD:?USE_SS_PASSWORD 未设置}" "$SS_PORT_B" \
+      >/tmp/mini-dae-ssb.log 2>&1 &
+    echo $! >"$SSB_PID_FILE"
+    sleep 0.3
+    kill -0 "$(cat "$SSB_PID_FILE")" 2>/dev/null || { cat /tmp/mini-dae-ssb.log; die "ss-B 服务端启动失败"; }
+  fi
+  if [ -n "${USE_SUB_SERVER:-}" ]; then
+    python3 "$HERE/sub_server.py" "$SUB_PORT" "$SUB_BODY" \
+      >/tmp/mini-dae-sub.log 2>&1 &
+    echo $! >"$SUB_PID_FILE"
+    sleep 0.3
+    kill -0 "$(cat "$SUB_PID_FILE")" 2>/dev/null || { cat /tmp/mini-dae-sub.log; die "订阅服务器启动失败"; }
   fi
   if [ -n "${USE_TROJAN:-}" ]; then
     [ -f "$CERTS_DIR/cert.pem" ] && [ -f "$CERTS_DIR/key.pem" ] \
@@ -1259,6 +1289,89 @@ test_udp_idle() {
   echo "PASS: UDP NAT janitor 回收空闲会话"
 }
 
+# P15：订阅 + 节点组会话——两个 ss 后端（A 可被 kill 验证 failover）
+# + 一个不支持协议行（验证订阅逐行容错）+ 本地订阅 HTTP 服务器。
+subscribe_up() {
+  require_root
+  [ -f "$OBJ" ] && [ -x "$LOADER" ] || die "先运行 $0 build"
+  cleanup
+  local meth="chacha20-ietf-poly1305" pass="testpass"
+  {
+    echo "ss://$meth:$pass@127.0.0.1:$SS_PORT#node-a"
+    echo "ss://$meth:$pass@127.0.0.1:$SS_PORT_B#node-b"
+    echo "bogus://ignored"
+  } | base64 -w0 >"$SUB_BODY"
+  echo >>"$SUB_BODY"
+  cat >"$SUB_CONFIG" <<EOF
+# P15：订阅 + 节点组（lab）；tcp_check_url 用 WAN echo（echo 回显即视为 check 成功）
+global {
+    tcp_check_url: 'http://10.9.9.2:9999'
+    check_interval: '1s'
+    check_tolerance: '1'
+}
+subscription {
+    lab: 'http://127.0.0.1:$SUB_PORT/sub'
+}
+group {
+    proxy {
+        filter: subtag(lab)
+        policy: min_moving_avg
+    }
+}
+routing {
+    dip(1.1.1.1/32) && dport(8080) -> proxy
+    fallback: direct
+}
+EOF
+  chmod 640 "$SUB_CONFIG"
+  USE_CONFIG="$SUB_CONFIG" USE_SS=1 USE_SS_METHOD="$meth" USE_SS_PASSWORD="$pass" \
+    USE_SS_B=1 USE_SUB_SERVER=1 USE_RELAY_IDLE=600 up
+}
+
+test_subscribe() {
+  require_root
+  echo "== P15：订阅拉取 + 节点组（policy/健康检查/failover）=="
+  local out json
+  out="$(ip netns exec "$CLIENT_NS" timeout 8 python3 "$HERE/client_probe.py" "$PROXY_DST" 8080 2>&1 || true)"
+  echo "$out" | grep -q "wan-echo-ok" || {
+    echo "FAIL: 首次经组拨号未成功"; echo "$out"; exit 1;
+  }
+  echo "PASS: 首次探测经节点组成功"
+  grep -q "订阅 lab: 拉取成功，2 个节点" "$LOG" \
+    || { echo "FAIL: 日志无订阅拉取记录"; tail -5 "$LOG"; exit 1; }
+  grep -q "节点组 proxy: 2 个成员" "$LOG" \
+    || { echo "FAIL: 日志无组构建记录"; tail -5 "$LOG"; exit 1; }
+  json="$("$LOADER" status --socket "$STATUS_SOCK" --json 2>/dev/null || true)"
+  echo "$json" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+g = d.get("group") or {}
+assert g.get("members") == 2, g
+assert g.get("alive") == 2, g
+print("group=%s policy=%s members=%d alive=%d" % (g["name"], g["policy"], g["members"], g["alive"]))
+' || { echo "FAIL: 状态面 group 信息不符"; exit 1; }
+
+  echo "-- kill 节点 A，等健康检查标死（interval=1s tolerance=1）--"
+  kill "$(cat "$SS_PID_FILE")" 2>/dev/null || true
+  rm -f "$SS_PID_FILE"
+  sleep 4
+  json="$("$LOADER" status --socket "$STATUS_SOCK" --json 2>/dev/null || true)"
+  echo "$json" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+g = d.get("group") or {}
+assert g.get("alive") == 1, ("期望 1 个存活", g)
+dead = [n["name"] for n in g["nodes"] if not n["alive"]]
+print("alive=%d dead=%s" % (g["alive"], dead))
+' || { echo "FAIL: 健康检查未将 A 标死"; exit 1; }
+  echo "PASS: 健康检查将 A 标死"
+
+  out="$(ip netns exec "$CLIENT_NS" timeout 8 python3 "$HERE/client_probe.py" "$PROXY_DST" 8080 2>&1 || true)"
+  echo "$out" | grep -q "wan-echo-ok" \
+    || { echo "FAIL: failover 后探测未成功"; echo "$out"; exit 1; }
+  echo "PASS: failover 后经节点 B 拨号成功（组 select/failover 计数见状态面）"
+}
+
 # P4c：TCP offload——同一 512KB 流量下，用户态字节数远小于总传输（内核拼接证据）。
 test_relay_offload() {
   require_root
@@ -1959,6 +2072,8 @@ case "${1:-}" in
   up) up ;;
   dual-up) dual_up ;;
   config-up) USE_CONFIG="$HERE/real-user.dae" up ;;
+  subscribe-up) subscribe_up ;;
+  test-subscribe) test_subscribe ;;
   forward-up) USE_FORWARD="socks5://127.0.0.1:$SOCKS5_PORT" up ;;
   dns-up) USE_RULES="$HERE/rules.dns.dae" USE_DNS_UPSTREAM="127.0.0.1:$FAKE_DNS_PORT" USE_FAKE_DNS=1 up ;;
   regex-up) USE_RULES="$HERE/rules.regex.dae" USE_DNS_UPSTREAM="127.0.0.1:$FAKE_DNS_PORT" USE_FAKE_DNS=1 up ;;

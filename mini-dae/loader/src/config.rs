@@ -1732,6 +1732,119 @@ fn translate_function(f: &Function, parts: &mut Vec<String>) -> Result<(), Strin
     }
 }
 
+// ---------------------------------------------------------------- P15：订阅/节点/组提取
+
+/// 订阅源（`subscription { tag: 'url' }`）。
+#[derive(Debug, Clone)]
+pub struct SubSpec {
+    pub tag: String,
+    pub url: String,
+}
+
+/// 内联节点（`node { name: 'link' }`）。
+#[derive(Debug, Clone)]
+pub struct NodeSpec {
+    pub name: String,
+    pub link: String,
+}
+
+/// 节点组（`group { name { filter: ...; policy: ... } }`）。
+#[derive(Debug, Clone)]
+pub struct GroupSpec {
+    pub name: String,
+    /// OR 语义：每个元素是一行 filter（AND 组合的 Function 列表）。
+    pub filters: Vec<Vec<Function>>,
+    /// 策略字符串（`min` / `min_moving_avg` / `min_avg10` / `random` / `fixed(0)`）。
+    pub policy: Option<String>,
+    pub tcp_check_urls: Vec<String>,
+    pub check_interval: Option<String>,
+    pub check_tolerance: Option<String>,
+}
+
+pub fn subscriptions(cfg: &Config) -> Vec<SubSpec> {
+    let mut out = Vec::new();
+    for sec in cfg.sections.iter().filter(|s| s.name == "subscription") {
+        for item in &sec.items {
+            if let Item::Param(p) = item {
+                if let (Some(tag), Some(url)) = (p.key.clone(), p.val.clone()) {
+                    out.push(SubSpec { tag, url });
+                }
+            }
+        }
+    }
+    out
+}
+
+pub fn inline_nodes(cfg: &Config) -> Vec<NodeSpec> {
+    let mut out = Vec::new();
+    for sec in cfg.sections.iter().filter(|s| s.name == "node") {
+        for item in &sec.items {
+            if let Item::Param(p) = item {
+                if let (Some(name), Some(link)) = (p.key.clone(), p.val.clone()) {
+                    out.push(NodeSpec { name, link });
+                }
+            }
+        }
+    }
+    out
+}
+
+/// `policy: fixed(0)` 在 AST 里是函数调用；归一化成字符串。
+fn policy_to_string(p: &Param) -> Option<String> {
+    if let Some(v) = &p.val {
+        return Some(v.clone());
+    }
+    let f = p.funcs.as_ref()?.first()?;
+    let args: Vec<String> = f.params.iter().filter_map(|a| a.val.clone()).collect();
+    Some(if args.is_empty() {
+        f.name.clone()
+    } else {
+        format!("{}({})", f.name, args.join(","))
+    })
+}
+
+pub fn groups(cfg: &Config) -> Vec<GroupSpec> {
+    let mut out = Vec::new();
+    for sec in cfg.sections.iter().filter(|s| s.name == "group") {
+        for item in &sec.items {
+            let Item::Section(g) = item else { continue };
+            let mut spec = GroupSpec {
+                name: g.name.clone(),
+                filters: Vec::new(),
+                policy: None,
+                tcp_check_urls: Vec::new(),
+                check_interval: None,
+                check_tolerance: None,
+            };
+            for it in &g.items {
+                let Item::Param(p) = it else { continue };
+                match p.key.as_deref() {
+                    Some("filter") => {
+                        if let Some(funcs) = &p.funcs {
+                            spec.filters.push(funcs.clone());
+                        }
+                    }
+                    Some("policy") => spec.policy = policy_to_string(p),
+                    Some("tcp_check_url") => {
+                        if let Some(v) = &p.val {
+                            spec.tcp_check_urls.extend(
+                                v.split(',')
+                                    .map(|s| s.trim().to_string())
+                                    .filter(|s| !s.is_empty()),
+                            );
+                        }
+                    }
+                    Some("check_interval") => spec.check_interval = p.val.clone(),
+                    Some("check_tolerance") => spec.check_tolerance = p.val.clone(),
+                    _ => {}
+                }
+            }
+            out.push(spec);
+        }
+    }
+    out
+}
+
 // ---------------------------------------------------------------- 测试
 
 #[cfg(test)]

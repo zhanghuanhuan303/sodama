@@ -846,6 +846,29 @@ P4 稳定性 → P3 内核矩阵）：
   `domain` 即「命中即用域名」（等价 dae `domain+` 的“总是使用”行为，dae 的
   `domain` 带 DNS 缓存/后台探测门槛，未实现）；UDP 目标仍为 IP。
 
+### 11.22 P15（订阅 / 节点组 / 健康检查）已验收的行为
+
+（决策与边界见 ADR-0031；实现 `loader/src/subscribe.rs` + `loader/src/group.rs` +
+`config.rs` 提取 + `main.rs` 接线；lab 夹具 `lab/sub_server.py`。）
+
+- **入口**：`--subscribe <url>`（可重复）/ `--group <name>`；config `subscription/node/group` 生效；
+  `gateway.sh --subscribe/--group`；活动组选择：`--group` > 组名 `proxy` > 唯一/第一个；
+  无 config 组时默认单组 `proxy`（全部节点）。
+- **实现要点**：
+  - 订阅：HTTP/1.0 GET（3 跳重定向/chunked/webpki TLS/`marked_tcp_connect`/**优先 IPv4**）；
+    base64（std/url-safe/no-pad）或明文；逐行链接解析，不支持的行逐条报告（REALITY 等）；
+  - filter：`name(精确/keyword:/regex:)`、`subtag`、`!`、行内 AND、多行 OR、空=全部；
+  - policy：`min` / `min_moving_avg`（EMA）/ `min_avg10` / `random` / `fixed(i)`；
+  - 健康：经节点连接 check 目标（默认 cp.cloudflare.com:80）计 last/EMA/hist10，
+    失败按 tolerance 标死；拨号失败自动切换（最多 3 名）；UDP 选支持成员。
+- **实测**：`cargo test` **121/121**；lab `subscribe-up` + `test-subscribe`：
+  拉取/组构建/首探成功 → kill A 后 4s 标死（interval 1s/tolerance 1）→ failover 经 B 成功；
+  真机订阅#2：48×REALITY 逐行跳过 + 18×anytls 入组，`alive 18/18`、EMA 最快 SG 287ms、
+  204/YouTube 200、dials=5 failovers=0。
+- **边界（如实）**：数据面仍把全部用户组映射 proxy（按规则分派不同组需要数据面携带
+  outbound id，未做）；订阅仅启动时拉取（无 update_interval 热更新）；gzip 订阅报错；
+  `add_latency`/`region`/多 check URL/`udp_check_dns` 未实现；check 判定 = 拨号 + 任意响应。
+
 ## 12. 用 Rust 重写这套东西的可行性
 
 已验证（本仓库 mini-dae，实测跑通）：

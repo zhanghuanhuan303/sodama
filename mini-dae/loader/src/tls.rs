@@ -94,6 +94,13 @@ impl Read for TlsReader {
     }
 }
 
+impl TlsReader {
+    /// P15：订阅拉取等短连接用——设置底层 socket 读超时。
+    pub fn set_read_timeout(&self, d: Option<Duration>) -> io::Result<()> {
+        self.sock.set_read_timeout(d)
+    }
+}
+
 impl Write for TlsWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let mut c = self.conn.lock().map_err(poisoned)?;

@@ -685,7 +685,7 @@ mod tests {
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn();
-        let Ok(mut child) = child else {
+        let Ok(child) = child else {
             eprintln!("skip: sing-box 启动失败");
             return;
         };

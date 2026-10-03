@@ -19,8 +19,8 @@ use percent_encoding::percent_decode_str;
 use sha2::{Digest as _, Sha256};
 
 use crate::{
-    anytls, hysteria2, quicsock, socks5, ss, target::Target, tls, trojan, tuic, vless, vmess, ws,
-    DAE_SOCKET_MARK,
+    anytls, group::GroupRuntime, hysteria2, quicsock, socks5, ss, target::Target, tls, trojan,
+    tuic, vless, vmess, ws, DAE_SOCKET_MARK,
 };
 
 const SO_MARK_OPT: libc::c_int = 36;
@@ -452,6 +452,8 @@ pub enum Outbound {
         sni: String,
         insecure: bool,
     },
+    /// P15：节点组（订阅/内联节点池）+ policy + 健康检查；拨号层选择与失败切换。
+    Group(std::sync::Arc<GroupRuntime>),
 }
 
 impl Outbound {
@@ -490,6 +492,7 @@ impl Outbound {
             Self::Tuic { dialer } => dialer.name(),
             Self::Hysteria2 { dialer } => dialer.name(),
             Self::AnyTls { server, sni, .. } => format!("anytls://{server}?sni={sni}"),
+            Self::Group(g) => format!("group:{}（{} 节点）", g.name, g.members.len()),
         }
     }
 
@@ -500,6 +503,9 @@ impl Outbound {
 
     /// 当前支持 UDP 代理的协议：ss（G1）、vless/vmess（G2）、tuic（G3）、hysteria2（G3b）。
     pub fn supports_udp(&self) -> bool {
+        if let Self::Group(g) = self {
+            return g.supports_udp();
+        }
         matches!(
             self,
             Self::Shadowsocks { .. }
@@ -656,6 +662,7 @@ impl Outbound {
                     socket: Some(kill),
                 })
             }
+            Self::Group(g) => g.dial_tcp(target, timeout),
         }
     }
 
@@ -752,6 +759,7 @@ impl Outbound {
                     udp: Box::new(dialer.connect_udp(target)?),
                 },
             })),
+            Self::Group(g) => g.dial_udp(target, timeout),
             _ => Ok(None),
         }
     }

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # mini-dae 真网关模式：在宿主 netns 用 eBPF 透明接管本机流量（浏览器零配置）。
 #
-#   sudo lab/gateway.sh up [--iface wlan0] [--node <文件|URL>] [--rules <文件>] [--no-ipv6] [--dial-mode ip|domain]
+#   sudo lab/gateway.sh up [--iface wlan0] [--node <文件|URL> | --subscribe <文件|URL>] [--group <名>] [--rules <文件>] [--no-ipv6] [--dial-mode ip|domain]
 #   sudo lab/gateway.sh down          # 停止并恢复（幂等）
 #   sudo lab/gateway.sh status        # 查看进程/钩子/日志
 #   lab/gateway.sh test               # 连通性快检（可直接用当前用户跑）
@@ -47,6 +47,8 @@ DEFAULT_NODE_FILE=/tmp/mini-dae-node.url
 IFACE=""
 RULES="$HERE/rules.gateway.dae"
 NODE=""
+SUBSCRIBE=""
+GROUP=""
 DIAL_MODE="domain"
 SNIFF_TIMEOUT_MS=100
 NO_IPV6=0
@@ -150,25 +152,42 @@ up() {
   [ -n "$IFACE" ] || die "拿不到默认路由网卡，请用 --iface 指定"
   ip link show dev "$IFACE" >/dev/null 2>&1 || die "网卡 $IFACE 不存在"
 
-  if [ -z "$NODE" ]; then NODE="$DEFAULT_NODE_FILE"; fi
-  local node_url
-  if [ -f "$NODE" ]; then
-    node_url="$(tr -d ' \t\r\n' <"$NODE")"
-  else
-    node_url="$NODE"
+  if [ -z "$NODE" ] && [ -z "$SUBSCRIBE" ]; then NODE="$DEFAULT_NODE_FILE"; fi
+  local node_url="" sub_url=""
+  if [ -n "$SUBSCRIBE" ]; then
+    if [ -f "$SUBSCRIBE" ]; then
+      sub_url="$(tr -d ' \t\r\n' <"$SUBSCRIBE")"
+    else
+      sub_url="$SUBSCRIBE"
+    fi
+    [ -n "$sub_url" ] || die "订阅 URL 为空（--subscribe <文件|URL>）"
+    case "$sub_url" in
+    http*://* | file://*) ;;
+    *) die "订阅 URL 无效（缺 scheme）：$SUBSCRIBE" ;;
+    esac
+  elif [ -n "$NODE" ]; then
+    if [ -f "$NODE" ]; then
+      node_url="$(tr -d ' \t\r\n' <"$NODE")"
+    else
+      node_url="$NODE"
+    fi
+    [ -n "$node_url" ] || die "缺少节点 URL（--node <文件|URL>，或写入 $DEFAULT_NODE_FILE）"
+    case "$node_url" in
+    *://*) ;;
+    *) die "节点 URL 无效（缺少 scheme）：$NODE" ;;
+    esac
   fi
-  [ -n "$node_url" ] || die "缺少节点 URL（--node <文件|URL>，或写入 $DEFAULT_NODE_FILE）"
-  case "$node_url" in
-  *://*) ;;
-  *) die "节点 URL 无效（缺少 scheme）：$NODE" ;;
-  esac
 
   local dns_up
   dns_up="$(detect_dns)"
   [ -n "$dns_up" ] || dns_up="127.0.0.1"
 
-  info "真网关模式 iface=$IFACE dns=$dns_up:53 rules=$RULES dial_mode=$DIAL_MODE"
-  echo "   节点：$(printf '%s' "$node_url" | cut -d: -f1)://…（敏感信息不回显）"
+  info "真网关模式 iface=$IFACE dns=$dns_up:53 rules=$RULES dial_mode=$DIAL_MODE${GROUP:+ group=$GROUP}"
+  if [ -n "$sub_url" ]; then
+    echo "   订阅：$(printf '%s' "$sub_url" | cut -d: -f1)://…（敏感信息不回显）"
+  else
+    echo "   节点：$(printf '%s' "$node_url" | cut -d: -f1)://…（敏感信息不回显）"
+  fi
 
   cleanup
   restore_sysctls
@@ -213,15 +232,22 @@ up() {
   fi
 
   info "启动 loader（log=$LOG）"
+  local dial_args=()
+  if [ -n "$sub_url" ]; then
+    dial_args=(--subscribe "$sub_url")
+    [ -n "$GROUP" ] && dial_args+=(--group "$GROUP")
+  else
+    dial_args=(--dialer "$node_url")
+  fi
   if [ "$DRY_RUN" -eq 1 ]; then
-    echo "  + nohup $LOADER --ebpf $OBJ --lan none --wan $IFACE --dae0 $DAE0 --dae0peer $DAE0PEER --daens $DAE_NS --rules $RULES --dialer '<node-url>' --dial-timeout 15 --dial-mode $DIAL_MODE --sniffing-timeout-ms $SNIFF_TIMEOUT_MS --dns-upstream $dns_up:53 --status-socket $STATUS_SOCK --log-file $LOG >>$LOG 2>&1 &"
+    echo "  + nohup $LOADER --ebpf $OBJ --lan none --wan $IFACE --dae0 $DAE0 --dae0peer $DAE0PEER --daens $DAE_NS --rules $RULES ${dial_args[*]} --dial-timeout 15 --dial-mode $DIAL_MODE --sniffing-timeout-ms $SNIFF_TIMEOUT_MS --dns-upstream $dns_up:53 --status-socket $STATUS_SOCK --log-file $LOG >>$LOG 2>&1 &"
     echo "（dry-run：未执行任何变更）"
     return 0
   fi
   : >"$LOG"
   nohup "$LOADER" --ebpf "$OBJ" --lan none --wan "$IFACE" \
     --dae0 "$DAE0" --dae0peer "$DAE0PEER" --daens "$DAE_NS" \
-    --rules "$RULES" --dialer "$node_url" --dial-timeout 15 \
+    --rules "$RULES" "${dial_args[@]}" --dial-timeout 15 \
     --dial-mode "$DIAL_MODE" --sniffing-timeout-ms "$SNIFF_TIMEOUT_MS" \
     --dns-upstream "$dns_up:53" \
     --status-socket "$STATUS_SOCK" --log-file "$LOG" >>"$LOG" 2>&1 &
@@ -305,6 +331,8 @@ while [ $# -gt 0 ]; do
   case "$1" in
   --iface) IFACE="$2"; shift 2 ;;
   --node) NODE="$2"; shift 2 ;;
+  --subscribe) SUBSCRIBE="$2"; shift 2 ;;
+  --group) GROUP="$2"; shift 2 ;;
   --rules) RULES="$2"; shift 2 ;;
   --dial-mode) DIAL_MODE="$2"; shift 2 ;;
   --no-ipv6) NO_IPV6=1; shift ;;

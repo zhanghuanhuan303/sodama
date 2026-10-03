@@ -68,6 +68,12 @@ P6（suspend/reload/metrics/sysdump/日志轮转/整配置热重载）已完成*
   命中即交域名给节点远端解析（绕 DNS 污染）；目标地址类型化（vless/vmess 0x02、tuic 0x00、
   ss/socks5/trojan/anytls 0x03、hy2 字符串、direct 本地解析）；SOCKS 入口同享；
   状态面 `sniffing` 计数（ADR-0030、NOTES §11.21）
+- **P15 订阅 / 节点组 / 健康检查（多节点选路）**：`--subscribe <url>`（可重复）/`--group <name>`，
+  config `subscription/node/group` 生效；极小 HTTP(S) 订阅拉取（3 跳重定向/chunked/webpki/
+  **优先 IPv4**/marked socket）+ base64/明文解码 + 逐行容错；filter（name 精确/keyword:/regex:/
+  subtag/`!`，行内 AND / 行间 OR）；policy（min/min_moving_avg/min_avg10/random/fixed）；
+  经节点健康探测（last/EMA/hist10，tolerance 标死）+ 拨号失败自动切换；状态面 `group`
+  （ADR-0031、NOTES §11.22）
 - **P5-G3a QUIC（tuic v5）**：惰性 tokio 运行时 + quinn（阻塞 relay 用 block_on 桥接）；
   认证 token = TLS exporter（label=uuid 裸字节、context=password）；TCP 每条中继一条 QUIC
   双向流，UDP 走 QUIC DATAGRAM（含分片/重组）；上游 socket 用自建 `Endpoint` 打 `SO_MARK`；
@@ -115,6 +121,8 @@ loader/src/main.rs   Rust + aya：加载、挂钩子、setns、tproxy/UDP socket
 loader/src/rules.rs  迷你规则解析 + 编译（match_set 编码 + LPM trie + regex 编译 + dump/对拍）
 loader/src/target.rs P14：拨号目标类型（IPv4/域名）+ 逐协议域名编码（vless/vmess/tuic/RFC1928/字符串）
 loader/src/sniffer.rs P14：TLS SNI / HTTP Host 嗅探（纯解析函数 + MSG_PEEK 采集循环）
+loader/src/subscribe.rs P15：订阅拉取（HTTP(S)/file、重定向/chunked/base64）+ 链接解析
+loader/src/group.rs   P15：节点组 filter/policy/健康探测/失败切换（GroupRuntime）
 loader/src/config.rs 全量 .dae 解析（词法/语法、include 合并、schema 校验、deferred 提取）
 loader/src/status.rs 状态面（Unix socket：status/rules/config/maps/metrics + reload/suspend/resume 控制命令）
 loader/src/socks5.rs 最小 SOCKS5 客户端（relay 的一种 dialer，握手 + CONNECT）
@@ -163,7 +171,8 @@ lab/rules.dns.dae    P3a 域分流规则（proxy.test / direct.test 的 domain �
 lab/rules.regex.dae  P3b-2a regex 域分流规则（api[0-9]+.regex.test 命中）
 lab/rules.udp.dae    P4b UDP NAT 规则（所有 UDP:9998 判 proxy，验证 mark 防自环）
 lab/lab.sh           建/拆 netns 拓扑（标准 + 单臂）、跑测试、热重载、故障注入
-lab/gateway.sh       P13：真网关模式一键脚本（up/down/status/test/--dry-run；宿主流量透明接管）
+lab/gateway.sh       P13：真网关模式一键脚本（up/down/status/test/--dry-run；宿主流量透明接管；P15 支持 --subscribe/--group）
+lab/sub_server.py    P15：订阅服务器夹具（GET /sub 返回指定文件内容）
 lab/rules.gateway.dae P13：网关模式规则（DNS must 置顶、无私网 sip、QUIC block、fallback proxy）
 ebpf-rs/             P9：完整 Rust 数据面（7 classifier + offload verdict + 规则 VM；BTF maps；
                      不属主 workspace，构建：lab/build-ebpf-rs.sh，产物 target/bpfel-unknown-none/release/）
@@ -283,6 +292,9 @@ sudo lab/lab.sh test-hy2-hop     # 两轮 512KB 跨跳存活
 #     sudo lab/real-node-e2e.sh    # client ns → tproxy → relay → 真实节点 → gstatic 204
 # 慢节点首连可调：USE_DIAL_TIMEOUT=15 sudo -E lab/real-node-e2e.sh
 # P14：嗅探 + 远端解析（域名交节点）：DIAL_MODE=domain sudo -E lab/real-node-e2e.sh
+# P15：订阅 + 节点组（两个 ss 后端；kill A 验证健康标死与 failover）：
+sudo lab/lab.sh subscribe-up && sudo lab/lab.sh test-subscribe
+# 真机订阅：sudo lab/gateway.sh up --subscribe /tmp/mini-dae-sub.url [--group proxy]
 sudo lab/lab.sh ops-up      # P6：运维面会话（--log-file + 状态面控制命令）
 sudo lab/lab.sh test-ops         # suspend(fail-open)/reload/metrics/sysdump/日志轮转
 sudo lab/lab.sh ops-reload-up    # P6：整配置热重载会话（/tmp 配置副本 + 假 DNS）
@@ -797,6 +809,8 @@ MATRIX-RESULT kernel=7.2.8-arch1-2 verify=PASS
 转发面：offload 的 backlog fuse / tcp_info 精确计费 / SK_PASS 用户态回退协调（ADR-0022 已补：
 （ADR-0022 已补：半关闭超时看门狗、fast_sock 键注销、注册前排空队列；已 offload 的连接可回收）；UDP 跨目标
 full-cone；嗅探的剩余形态（QUIC/UDP、h2c、sniff-punt；TLS/HTTP1 已做见 ADR-0030）；relay 并发上限。
+节点生态剩余（ADR-0031）：按规则分派不同组（数据面 outbound id）、订阅热更新（update_interval）、
+`add_latency`/`region`/`udp_check_dns`/多 check URL、gzip 压缩订阅。
 协议栈（P5-G3b+ 后的剩余）：hysteria2 的 gecko 混淆、pinSHA256/ECH/自定义 CA、QPACK 动态表
 （当前只支持静态表）；udphop 只支持链接扩展 interval（dae 是全局配置）；Brutal 是近似
 （无 pacer 直接控制，见 ADR-0020）；vmess aid≠0/CFB/packetaddr、vless vision/XUDP/reality、
@@ -913,6 +927,9 @@ CONNECT；ss 不支持插件与 2022 版；trojan 不支持 UDP 与域名目标�
 36. **dial_mode 嗅探是 MSG_PEEK（只读）**：不消费字节才能不破坏后续泵；嗅探失败/超时必须回退 IP。
     `domain` 只在客户端首包是 TLS/HTTP/1.x 时命中（h2c/QUIC/二进制协议一律 IP）；
     客户端给域名的 SOCKS 入口在 domain 模式下不做本地解析，直交节点。
+37. **健康探测的 dial 失败也必须记账**：`probe` 里拨号失败曾走 `?` 提前返回、不计入失败，
+    后果是死节点永远不被标死（lab 回归：kill A 后 alive 仍 2/2；修复后 4s 内标死）。
+    另：订阅 URL 主机双栈时也会 AAAA 优先，拉取路径已改为**优先 IPv4**（同 P12 的 resolve 修订）。
 
 ## Rust 化的边界
 

@@ -12,7 +12,8 @@ byte-exact parity tests against dae's Go rule compiler and a netns test lab.*
   协议栈 shadowsocks / trojan / vless（tcp/ws）/ vmess / tuic / hysteria2 / **anytls**（含 UDP 与会话）、
   状态面 / 热重载 / 指标导出；vless 的 **WebSocket 传输**与 **AnyTLS** 已接入真实订阅节点
   （ADR-0026 / ADR-0027），支持 **真网关模式**（宿主流量透明接管，浏览器零配置，ADR-0029）
-  与 **用户态嗅探 + dial_mode**（TLS SNI/HTTP Host → 域名交节点远端解析，绕 DNS 污染，ADR-0030）。
+  与 **用户态嗅探 + dial_mode**（TLS SNI/HTTP Host → 域名交节点远端解析，绕 DNS 污染，ADR-0030）、
+  **订阅/节点组**（`--subscribe` + group filter/policy + 经节点健康探测与失败切换，ADR-0031）。
 - **lab**：netns 拓扑（标准 + 单臂）、`verify` 9 用例、DNS / 转发面 / 协议梯 / 运维专项、
   soak、与 dae 原版 Go 规则编译器的**逐字节对拍**、真实 Go 客户端跨实现联调、
   双内核矩阵（宿主 + QEMU 第二内核）；**本地 SOCKS5 入口**（`--listen-socks`，零 root/零 eBPF，
@@ -28,7 +29,7 @@ byte-exact parity tests against dae's Go rule compiler and a netns test lab.*
 | 转发面专项（relay/idle/offload/lifecycle/udp） | 6/6 |
 | K3 + 运维（config/status/forward/整配置热重载/ops） | 5/5 |
 | 协议梯（ss/trojan/vless/vmess/tuic/hysteria2 全变体） | 15 会话、17/17 |
-| 单元测试 `cargo test --release` | 108/108 |
+| 单元测试 `cargo test --release` | 121/121 |
 | 规则对拍 vs dae Go 编译器 | 5/5 逐字节一致 |
 | soak（tcp 60s / ss 30s / udp 30s） | 无失败轮、无泄漏 |
 | 内核矩阵（6.18.54-lts 宿主 + 7.2.8 QEMU） | 9/9 · 9/9 |
@@ -38,7 +39,7 @@ byte-exact parity tests against dae's Go rule compiler and a netns test lab.*
 ```
 docs/                        决策与架构文档
 ├── architecture-decision.html   主决策档案（自包含 HTML，可离线打开）
-├── adr/                         ADR-0001..0030（背景/决策/后果/验证方式）
+├── adr/                         ADR-0001..0031（背景/决策/后果/验证方式）
 └── modules/                     协议字节级规格（tuic-v5 / hysteria2）
 
 mini-dae/                    可运行工程（构建、实验、测试都在这里）
@@ -85,9 +86,10 @@ sudo lab/lab.sh down
 - [`docs/architecture-decision.html`](./docs/architecture-decision.html) — 主决策档案：
   上游 dae 的模块/规模分析、Rust 重写的收益与风险、部署形态（Rust worker + eBPF 分流）、
   决策点 D1–D8 与迁移路线（K0–K3、P3–P13）。
-- [`docs/adr/`](./docs/adr/) — 30 条已采纳 ADR：每个决策的背景、选项、理由、后果、
+- [`docs/adr/`](./docs/adr/) — 31 条已采纳 ADR：每个决策的背景、选项、理由、后果、
   **实测验证方式**与修订条件。重要节点：0002（eBPF 程序语言：先 C 后迁）、
-  0023/0024/0025（数据面 Rust 全量迁移 → C 对象退场）、0029（真网关模式）、0030（嗅探 + dial_mode）。
+  0023/0024/0025（数据面 Rust 全量迁移 → C 对象退场）、0029（真网关模式）、
+  0030（嗅探 + dial_mode）、0031（订阅/节点组/健康检查）。
 - [`docs/parity-status.md`](./docs/parity-status.md) — 对标进度：dae（Go）↔ mini-dae（全 Rust）
   分域覆盖度对照（15 域 + 汇总 + Top 缺口 + 优势项，逐行附证据锚点）。
 - [`docs/modules/`](./docs/modules/) — tuic v5 / hysteria2 的字节级客户端规格。
