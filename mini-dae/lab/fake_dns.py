@@ -41,6 +41,9 @@ TABLE = {
     # P18a：显式 udp:// / tcp:// 上游夹具
     "udpup.test": "10.9.10.35",
     "tcpup.test": "10.9.10.36",
+    # P18b：DoQ 夹具（doq-server 转发到本服务）
+    "doq.test": "10.9.10.37",
+    "doq2.test": "10.9.10.38",
 }
 
 # P3b-2a：大应答（60 条 A ≈ 990 字节 > 512，用于验证 UDP 截断/EDNS）

@@ -8,7 +8,9 @@
 //! - `tls://`（DoT，默认 853）：TLS + 2 字节分帧，**持久连接**（锁内串行）；
 //! - `https://`（DoH，默认 443 /path=/dns-query）：TLS + HTTP/1.1 POST
 //!   `application/dns-message`，**持久连接**（keep-alive + Content-Length/chunked）；
-//! - `quic://`（DoQ）：P18b 实现；`h3://`（DoH over HTTP/3）未实现（显式报错）。
+//! - `quic://`（DoQ，默认 853）：RFC 9250——线上 DNS ID 必须置 0（应答恢复客户端
+//!   ID）、每查询一条双向流、**查询写完 FIN 后才读应答**、连接复用（错流/过期重建）；
+//! - `h3://`（DoH over HTTP/3）未实现（显式报错）。
 //!
 //! URL 查询参数（mini 扩展，与其它协议一致）：`sni=` 覆盖 TLS SNI、
 //! `insecure=1|allowInsecure=1` 跳过证书校验（lab 自签用）。
@@ -30,6 +32,10 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(5);
 /// 持久连接最大空闲时间（超过则新建）
 const PERSIST_IDLE: Duration = Duration::from_secs(30);
+/// DoQ 连接最大空闲时间（超过则新建）
+const QUIC_IDLE: Duration = Duration::from_secs(60);
+/// DoQ 请求取消错误码（RFC 9250 §4.3.1 DOQ_REQUEST_CANCELLED）
+const DOQ_REQUEST_CANCELLED: u32 = 0x3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Scheme {
@@ -176,6 +182,12 @@ struct Persist {
     born: Instant,
 }
 
+/// DoQ 连接（quinn；连接复用，每查询一条双向流）。
+struct QuicConn {
+    conn: quinn::Connection,
+    born: Instant,
+}
+
 pub struct Upstream {
     pub spec: UpstreamSpec,
     pub url: String,
@@ -183,6 +195,7 @@ pub struct Upstream {
     /// UDP（含 tcp+udp 的首选路径）；锁内串行避免响应串包
     udp: Option<Mutex<UdpSocket>>,
     persist: Mutex<Option<Persist>>,
+    quic: Mutex<Option<QuicConn>>,
 }
 
 impl Upstream {
@@ -212,6 +225,7 @@ impl Upstream {
             addr,
             udp,
             persist: Mutex::new(None),
+            quic: Mutex::new(None),
         }))
     }
 
@@ -240,7 +254,7 @@ impl Upstream {
             }
             Scheme::Tls => self.exchange_tls(query),
             Scheme::Https => self.exchange_https(query),
-            Scheme::Quic => Err("DoQ（quic://）将在 P18b 实现".into()),
+            Scheme::Quic => self.exchange_quic(query),
         }
     }
 
@@ -249,7 +263,8 @@ impl Upstream {
             .udp
             .as_ref()
             .ok_or_else(|| "上游无 UDP socket".to_string())?;
-        let sock = udp.lock().map_err(|_| "udp 锁中毒".to_string())?;
+        // 锁中毒恢复：持有者 panic 后状态可直接重建（丢旧连接/旧 socket 更安全）
+        let sock = udp.lock().unwrap_or_else(|e| e.into_inner());
         sock.set_read_timeout(Some(EXCHANGE_TIMEOUT))
             .map_err(|e| e.to_string())?;
         sock.send_to(query, self.addr).map_err(|e| e.to_string())?;
@@ -277,10 +292,7 @@ impl Upstream {
 
     /// 取得（必要时新建）持久 TLS 连接；陈旧则重建。
     fn persist_conn(&self, alpn: &[Vec<u8>]) -> Result<(), String> {
-        let mut g = self
-            .persist
-            .lock()
-            .map_err(|_| "persist 锁中毒".to_string())?;
+        let mut g = self.persist.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(p) = g.as_ref() {
             if p.born.elapsed() < PERSIST_IDLE {
                 return Ok(());
@@ -324,10 +336,7 @@ impl Upstream {
     }
 
     fn exchange_tls_once(&self, query: &[u8]) -> Result<Vec<u8>, String> {
-        let mut g = self
-            .persist
-            .lock()
-            .map_err(|_| "persist 锁中毒".to_string())?;
+        let mut g = self.persist.lock().unwrap_or_else(|e| e.into_inner());
         let p = g.as_mut().ok_or_else(|| "无持久连接".to_string())?;
         p.r.set_read_timeout(Some(EXCHANGE_TIMEOUT)).ok();
         p.w.write_all(&(query.len() as u16).to_be_bytes())
@@ -357,10 +366,7 @@ impl Upstream {
     }
 
     fn exchange_https_once(&self, query: &[u8]) -> Result<Vec<u8>, String> {
-        let mut g = self
-            .persist
-            .lock()
-            .map_err(|_| "persist 锁中毒".to_string())?;
+        let mut g = self.persist.lock().unwrap_or_else(|e| e.into_inner());
         let p = g.as_mut().ok_or_else(|| "无持久连接".to_string())?;
         let host_hdr = if self.spec.port == 443 {
             self.spec.host.clone()
@@ -382,6 +388,123 @@ impl Upstream {
         p.r.set_read_timeout(Some(EXCHANGE_TIMEOUT)).ok();
         read_http_dns(&mut p.r)
     }
+
+    /// 取得（必要时新建/重建）DoQ 连接（RFC 9250；ALPN doq）。
+    fn quic_conn(&self) -> Result<(), String> {
+        let mut g = self.quic.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(q) = g.as_ref() {
+            if q.born.elapsed() < QUIC_IDLE && q.conn.close_reason().is_none() {
+                return Ok(());
+            }
+        }
+        let rustls_cfg = tls::build_rustls_config(self.spec.insecure, &[b"doq".to_vec()]);
+        let quic_crypto = quinn::crypto::rustls::QuicClientConfig::try_from(rustls_cfg)
+            .map_err(|e| format!("DoQ TLS 配置: {e}"))?;
+        let mut transport = quinn::TransportConfig::default();
+        transport.keep_alive_interval(Some(Duration::from_secs(5)));
+        transport.max_idle_timeout(Some(
+            quinn::IdleTimeout::try_from(QUIC_IDLE).map_err(|e| format!("idle timeout: {e}"))?,
+        ));
+        let mut client_cfg = quinn::ClientConfig::new(Arc::new(quic_crypto));
+        client_cfg.transport_config(Arc::new(transport));
+        let sock =
+            outbound::new_marked_udp().map_err(|e| format!("DoQ 建 UDP socket 失败: {e}"))?;
+        // Endpoint::new 必须在 tokio 运行时上下文中创建（quinn 需要 reactor）。
+        let mut endpoint = crate::tuic::runtime().block_on(async {
+            quinn::Endpoint::new(
+                quinn::EndpointConfig::default(),
+                None,
+                sock,
+                Arc::new(quinn::TokioRuntime),
+            )
+            .map_err(|e| format!("DoQ endpoint: {e}"))
+        })?;
+        endpoint.set_default_client_config(client_cfg);
+        let sni = self.tls_sni();
+        let conn = crate::tuic::runtime().block_on(async {
+            let connecting = endpoint
+                .connect(self.addr, &sni)
+                .map_err(|e| format!("DoQ connect: {e}"))?;
+            match tokio::time::timeout(CONNECT_TIMEOUT, connecting).await {
+                Ok(Ok(c)) => Ok(c),
+                Ok(Err(e)) => Err(format!("DoQ 握手失败: {e}")),
+                Err(_) => Err("DoQ 连接超时".to_string()),
+            }
+        })?;
+        *g = Some(QuicConn {
+            conn,
+            born: Instant::now(),
+        });
+        Ok(())
+    }
+
+    fn exchange_quic(&self, query: &[u8]) -> Result<Vec<u8>, String> {
+        // 一次重建重试（连接被打断/流被拒时换连接）
+        for attempt in 0..2 {
+            self.quic_conn()?;
+            match self.exchange_quic_once(query) {
+                Ok(r) => return Ok(r),
+                Err(e) => {
+                    if attempt == 0 {
+                        if let Ok(mut g) = self.quic.lock() {
+                            *g = None;
+                        }
+                    } else {
+                        return Err(e);
+                    }
+                }
+            }
+        }
+        unreachable!()
+    }
+
+    fn exchange_quic_once(&self, query: &[u8]) -> Result<Vec<u8>, String> {
+        if query.len() < 12 || query.len() > 65535 {
+            return Err("DoQ 查询长度非法".into());
+        }
+        let g = self.quic.lock().unwrap_or_else(|e| e.into_inner());
+        let q = g.as_ref().ok_or_else(|| "无 DoQ 连接".to_string())?;
+        let wire = zero_dns_id(query);
+        let out = crate::tuic::runtime().block_on(async {
+            let fut = async {
+                let (mut send, mut recv) = q
+                    .conn
+                    .open_bi()
+                    .await
+                    .map_err(|e| format!("DoQ open_bi: {e}"))?;
+                send.write_all(&(wire.len() as u16).to_be_bytes())
+                    .await
+                    .map_err(|e| format!("DoQ 写头: {e}"))?;
+                send.write_all(&wire)
+                    .await
+                    .map_err(|e| format!("DoQ 写查询: {e}"))?;
+                // FIN：DoQ 服务器在查询 FIN 后才应答（RFC 9250 §4.2）
+                send.finish().map_err(|e| format!("DoQ FIN: {e}"))?;
+                let mut lb = [0u8; 2];
+                recv.read_exact(&mut lb)
+                    .await
+                    .map_err(|e| format!("DoQ 读长度: {e}"))?;
+                let n = u16::from_be_bytes(lb) as usize;
+                if n == 0 {
+                    return Err("DoQ 响应长度非法: 0".to_string());
+                }
+                let mut buf = vec![0u8; n];
+                recv.read_exact(&mut buf)
+                    .await
+                    .map_err(|e| format!("DoQ 读应答: {e}"))?;
+                // 已消费完整应答：取消读半端释放流槽（RFC 9250 §4.3.1）
+                let _ = recv.stop(quinn::VarInt::from_u32(DOQ_REQUEST_CANCELLED));
+                Ok::<Vec<u8>, String>(buf)
+            };
+            match tokio::time::timeout(EXCHANGE_TIMEOUT, fut).await {
+                Ok(r) => r,
+                Err(_) => Err("DoQ 交换超时".to_string()),
+            }
+        })?;
+        let mut resp = out;
+        restore_dns_id(&mut resp, query);
+        Ok(resp)
+    }
 }
 
 fn write_tcp_dns<W: Write>(w: &mut W, query: &[u8]) -> Result<(), String> {
@@ -389,6 +512,24 @@ fn write_tcp_dns<W: Write>(w: &mut W, query: &[u8]) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     w.write_all(query).map_err(|e| e.to_string())?;
     w.flush().map_err(|e| e.to_string())
+}
+
+/// DoQ 线上 DNS ID 必须为 0（RFC 9250 §4.2.1）。
+fn zero_dns_id(query: &[u8]) -> Vec<u8> {
+    let mut w = query.to_vec();
+    if w.len() >= 2 {
+        w[0] = 0;
+        w[1] = 0;
+    }
+    w
+}
+
+/// 应答恢复客户端原始 ID（DoQ 应答在线上的 ID 为 0）。
+fn restore_dns_id(resp: &mut [u8], query: &[u8]) {
+    if resp.len() >= 2 && query.len() >= 2 {
+        resp[0] = query[0];
+        resp[1] = query[1];
+    }
 }
 
 fn read_tcp_dns<R: Read>(r: &mut R) -> Result<Vec<u8>, String> {
@@ -557,6 +698,17 @@ mod tests {
         // 非 200
         let resp = b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n";
         assert!(read_http_dns(&mut Cursor::new(resp)).is_err());
+    }
+
+    #[test]
+    fn quic_id_zero_and_restore() {
+        let query = b"\x12\x34abcdefghij";
+        let wire = zero_dns_id(query);
+        assert_eq!(&wire[..2], &[0, 0]);
+        assert_eq!(&wire[2..], &query[2..]);
+        let mut resp = wire.clone();
+        restore_dns_id(&mut resp, query);
+        assert_eq!(resp, query);
     }
 
     #[test]

@@ -193,6 +193,10 @@ DOT_PID_FILE=/tmp/mini-dae-dot.pid
 DOH_PORT=8953
 DOH_LOG=/tmp/mini-dae-doh.txt
 DOH_PID_FILE=/tmp/mini-dae-doh.pid
+# P18b：DoQ 参考服务端（Go/quic-go，需先构建；转发到假 UDP DNS）
+DOQ_PORT=9053
+DOQ_LOG=/tmp/mini-dae-doq.txt
+DOQ_PID_FILE=/tmp/mini-dae-doq.pid
 
 die() { echo "!! $*" >&2; exit 1; }
 
@@ -290,6 +294,10 @@ cleanup() {
   if [ -f "$DOH_PID_FILE" ]; then
     kill "$(cat "$DOH_PID_FILE")" 2>/dev/null || true
     rm -f "$DOH_PID_FILE"
+  fi
+  if [ -f "$DOQ_PID_FILE" ]; then
+    kill "$(cat "$DOQ_PID_FILE")" 2>/dev/null || true
+    rm -f "$DOQ_PID_FILE"
   fi
   if [ -f "$BENCH_PID_FILE" ]; then
     kill "$(cat "$BENCH_PID_FILE")" 2>/dev/null || true
@@ -572,6 +580,19 @@ up() {
       sleep 0.3
       kill -0 "$(cat "$DOH_PID_FILE")" 2>/dev/null || { cat /tmp/mini-dae-doh.stdout; die "DoH 服务端启动失败"; }
     fi
+  fi
+
+  # P18b：DoQ 参考服务端（Go/quic-go，需先构建）
+  if [ "${USE_DNS_TRANSPORT:-}" = doq ]; then
+    [ -x "$HERE/proto-check/bin/doq-server" ] \
+      || die "缺 DoQ 参考服务端：先运行 lab/proto-check/build-doq-server.sh"
+    rm -f "$DOQ_LOG"
+    "$HERE/proto-check/bin/doq-server" -port "$DOQ_PORT" -cert "$CERTS_DIR/cert.pem" \
+      -key "$CERTS_DIR/key.pem" -upstream "127.0.0.1:$FAKE_DNS_PORT" -log "$DOQ_LOG" \
+      >/tmp/mini-dae-doq.stdout 2>&1 &
+    echo $! >"$DOQ_PID_FILE"
+    sleep 0.3
+    kill -0 "$(cat "$DOQ_PID_FILE")" 2>/dev/null || { cat /tmp/mini-dae-doq.stdout; die "DoQ 服务端启动失败"; }
   fi
 
   echo "== 启动 mini-dae =="
@@ -1372,6 +1393,36 @@ assert v["dns"]["upstream_url"].startswith("https://"), v["dns"]
 print("doh: status upstream=%s scheme=%s" % (v["dns"]["upstream"], v["dns"]["upstream_scheme"]))
 PY
   echo "PASS: DoH 上游（2 次查询复用 1 条 keep-alive 连接）"
+}
+
+# P18b：DoQ 上游（quic://，RFC 9250：ALPN doq、每查询一条流、连接复用）
+test_doq() {
+  require_root
+  echo "== 测试 DoQ 上游（quic://） =="
+  [ -f "$DOQ_PID_FILE" ] && kill -0 "$(cat "$DOQ_PID_FILE")" 2>/dev/null \
+    || die "DoQ 服务端未运行（先用 doq-up 会话启动）"
+  local out conns
+  out="$(ip netns exec "$CLIENT_NS" timeout 8 python3 "$HERE/dns_probe.py" 9.9.9.9 doq.test 2>&1 || true)"
+  echo "$out"
+  printf '%s\n' "$out" | grep -q '^answer=10.9.10.37' || { echo "FAIL: DoQ 上游未解析 doq.test"; exit 1; }
+  # 第二个名字（未缓存）复用同一 QUIC 连接（每查询一条流）
+  out="$(ip netns exec "$CLIENT_NS" timeout 8 python3 "$HERE/dns_probe.py" 9.9.9.9 doq2.test 2>&1 || true)"
+  echo "$out"
+  printf '%s\n' "$out" | grep -q '^answer=10.9.10.38' || { echo "FAIL: DoQ 上游未解析 doq2.test"; exit 1; }
+  grep -q '^DOQ-QUERY doq.test ' "$DOQ_LOG" || { echo "FAIL: DoQ 服务端未收到 doq.test"; cat "$DOQ_LOG"; exit 1; }
+  grep -q '^DOQ-QUERY doq2.test ' "$DOQ_LOG" || { echo "FAIL: DoQ 服务端未收到 doq2.test"; exit 1; }
+  conns="$(grep -c '^DOQ-CONN$' "$DOQ_LOG" || true)"
+  [ "$conns" = "1" ] || { echo "FAIL: DoQ 连接数 $conns（应为 1，连接未复用）"; cat "$DOQ_LOG"; exit 1; }
+  grep -q '^QUERY doq.test ' "$FAKE_DNS_LOG" || { echo "FAIL: DoQ 服务端未转发到假上游"; exit 1; }
+  "$LOADER" status --socket "$STATUS_SOCK" --json >/tmp/mini-dae-status.json
+  python3 - <<'PY'
+import json
+v = json.load(open("/tmp/mini-dae-status.json"))
+assert v["dns"]["upstream_scheme"] == "quic", v["dns"]
+assert v["dns"]["upstream_url"].startswith("quic://"), v["dns"]
+print("doq: status upstream=%s scheme=%s" % (v["dns"]["upstream"], v["dns"]["upstream_scheme"]))
+PY
+  echo "PASS: DoQ 上游（2 次查询复用 1 条 QUIC 连接、ID 0/恢复）"
 }
 
 # P18a：显式 udp:// 上游（仅 UDP；不应出现 TCP 上行）
@@ -2400,6 +2451,9 @@ case "${1:-}" in
   doh-up) USE_RULES="$HERE/rules.dns.dae" USE_FAKE_DNS=1 USE_DNS_TRANSPORT=https \
     USE_DNS_UPSTREAM="https://127.0.0.1:$DOH_PORT/dns-query?sni=localhost&insecure=1" up ;;
   test-doh) test_doh ;;
+  doq-up) USE_RULES="$HERE/rules.dns.dae" USE_FAKE_DNS=1 USE_DNS_TRANSPORT=doq \
+    USE_DNS_UPSTREAM="quic://127.0.0.1:$DOQ_PORT?sni=localhost&insecure=1" up ;;
+  test-doq) test_doq ;;
   dns-udp-up) USE_RULES="$HERE/rules.dns.dae" USE_FAKE_DNS=1 \
     USE_DNS_UPSTREAM="udp://127.0.0.1:$FAKE_DNS_PORT" up ;;
   test-dns-udp) test_dns_udp ;;  # 显式 udp:// 上游（仅 UDP）
@@ -2495,5 +2549,5 @@ case "${1:-}" in
   status) status ;;
   trace) trace ;;
   down) down ;;
-  *) echo "usage: $0 {build|up|dual-up|config-up|forward-up|dns-up|dot-up|doh-up|dns-udp-up|dns-tcpup-up|geo-up|pname-up|regex-up|relay-up|offload-up|udp-up|ss-up|ss-udp-up|trojan-up|vless-up|vless-tls-up|vless-udp-up|vmess-up|vmess-tls-up|vmess-udp-up|tuic-up|tuic-udp-up|hy2-up|hy2-udp-up|hy2-obfs-up|hy2-obfs-udp-up|hy2-brutal-up|hy2-hop-up|ops-up|ops-reload-up|bench-up|test-proxy|test-direct|test-block|test-host-proxy|test-reload|test-rebind|test-status|test-config|test-forward|test-domain|test-dns-cache|test-dns-tcp|test-dns-reload|test-domain-regex|test-dns-edns|test-dot|test-doh|test-dns-udp|test-dns-tcpup|test-geo|test-pname|test-v6|test-relay|test-relay-idle|test-relay-offload|test-offload-lifecycle|test-udp-relay|test-udp-idle|test-ss|test-trojan|test-ss-udp|test-vless|test-vless-udp|test-vmess|test-vmess-udp|test-tuic|test-tuic-udp|test-hy2|test-hy2-udp|test-hy2-obfs|test-hy2-obfs-udp|test-hy2-brutal|test-hy2-hop|test-ops|test-config-reload|test-fault-reload|test-fault-kill|reload|verify|status|trace|down}"; exit 2 ;;
+  *) echo "usage: $0 {build|up|dual-up|config-up|forward-up|dns-up|dot-up|doh-up|doq-up|dns-udp-up|dns-tcpup-up|geo-up|pname-up|regex-up|relay-up|offload-up|udp-up|ss-up|ss-udp-up|trojan-up|vless-up|vless-tls-up|vless-udp-up|vmess-up|vmess-tls-up|vmess-udp-up|tuic-up|tuic-udp-up|hy2-up|hy2-udp-up|hy2-obfs-up|hy2-obfs-udp-up|hy2-brutal-up|hy2-hop-up|ops-up|ops-reload-up|bench-up|test-proxy|test-direct|test-block|test-host-proxy|test-reload|test-rebind|test-status|test-config|test-forward|test-domain|test-dns-cache|test-dns-tcp|test-dns-reload|test-domain-regex|test-dns-edns|test-dot|test-doh|test-doq|test-dns-udp|test-dns-tcpup|test-geo|test-pname|test-v6|test-relay|test-relay-idle|test-relay-offload|test-offload-lifecycle|test-udp-relay|test-udp-idle|test-ss|test-trojan|test-ss-udp|test-vless|test-vless-udp|test-vmess|test-vmess-udp|test-tuic|test-tuic-udp|test-hy2|test-hy2-udp|test-hy2-obfs|test-hy2-obfs-udp|test-hy2-brutal|test-hy2-hop|test-ops|test-config-reload|test-fault-reload|test-fault-kill|reload|verify|status|trace|down}"; exit 2 ;;
 esac

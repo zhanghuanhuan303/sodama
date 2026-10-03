@@ -92,6 +92,9 @@ P6（suspend/reload/metrics/sysdump/日志轮转/整配置热重载）已完成*
   失败丢弃重连一次；`--dns-upstream` 接完整 URL，reload 按 URL 热切换；状态面
   `dns.upstream_url`/`upstream_scheme`；lab 自签 DoT/DoH 夹具 + 连接复用断言，
   真实公网 AliDNS DoT/DoH 实测（ADR-0034、NOTES §11.25）
+- **P18b DoQ（DNS over QUIC）**：quinn 连接复用 + 每查询一条双向流，ID 置 0/恢复、
+  写完 FIN 后才读、取消码 0x3（RFC 9250）；锁中毒恢复 + 单查询 panic 隔离（DNS 线程不再被单次异常杀死）；
+  quic-go 参考服务端交叉验证 + AliDNS 真实 DoQ（ADR-0035、NOTES §11.26）
 - **P5-G3a QUIC（tuic v5）**：惰性 tokio 运行时 + quinn（阻塞 relay 用 block_on 桥接）；
   认证 token = TLS exporter（label=uuid 裸字节、context=password）；TCP 每条中继一条 QUIC
   双向流，UDP 走 QUIC DATAGRAM（含分片/重组）；上游 socket 用自建 `Endpoint` 打 `SO_MARK`；
@@ -163,7 +166,7 @@ loader/src/hysteria2.rs hysteria2（QUIC：h3 认证、0x401 TCP 流帧、Sessio
 loader/src/hpack.rs HPACK Huffman 解码 + QPACK 静态表编解码（h3 认证用）
 loader/src/huffman_table.rs 生成表：HPACK Huffman 256 项 + QPACK 静态表 99 项
 loader/src/dns.rs    DNS wire 解析/构造、域名匹配（suffix/full/keyword/regex）、位图计算、正负缓存
-loader/src/dnsup.rs  P18a DNS 上游抽象/传输：udp/tcp/tcp+udp/tls(DoT)/https(DoH)，持久连接 + 失败重连
+loader/src/dnsup.rs  P18a/b DNS 上游抽象/传输：udp/tcp/tcp+udp/tls(DoT)/https(DoH)/quic(DoQ)，持久连接 + 失败重连
 lab/real-user.dae    真实用户风格配置（0640；含可编译规则与 deferred 示例）
 lab/socks5_echo.py   最小 SOCKS5 后端（socks5 dialer 对端，从 host ns 可达）
 lab/ss_server.py     P5-G1：独立实现的 shadowsocks 服务端（Python cryptography，TCP+UDP）
@@ -183,6 +186,7 @@ lab/udp_mark_probe.py lab 调试工具：marked UDP 的 connect vs sendto 在 tp
 lab/fake_dns.py      假 DNS 上游（A 记录应答，UDP+TCP；big.test 供截断测试）
 lab/dns_probe.py     透明 DNS 探针（UDP/TCP/--edns，打印 rcode/tc/ttl/answer）
 lab/dns_transport_server.py  P18a DoT/DoH 上游服务端（自签证书，转发到假 UDP DNS；tls|https 两模式）
+lab/proto-check/doq-server  P18b DoQ 参考服务端（Go/quic-go，独立实现；`build-doq-server.sh` 构建）
 lab/stream_probe.py  relay 大流量探针（发 N KB 并逐字节校验回显）
 lab/udp_probe.py     UDP NAT 探针（多报文 + 应答来源校验）
 lab/rules.dae        实验规则（dae `.dae` 语法子集）
@@ -328,6 +332,9 @@ sudo lab/lab.sh dot-up && sudo lab/lab.sh test-dot     # tls://（2 查询复用
 sudo lab/lab.sh doh-up && sudo lab/lab.sh test-doh     # https://（keep-alive 复用，path=/dns-query）
 sudo lab/lab.sh dns-udp-up && sudo lab/lab.sh test-dns-udp    # 显式 udp://（仅 UDP）
 sudo lab/lab.sh dns-tcpup-up && sudo lab/lab.sh test-dns-tcpup # 显式 tcp://（仅 TCP）
+# P18b：DoQ（先构建 Go/quic-go 参考服务端；断言连接复用与 ID 0/恢复）
+lab/proto-check/build-doq-server.sh
+sudo lab/lab.sh doq-up && sudo lab/lab.sh test-doq
 sudo lab/lab.sh ops-up      # P6：运维面会话（--log-file + 状态面控制命令）
 sudo lab/lab.sh test-ops         # suspend(fail-open)/reload/metrics/sysdump/日志轮转
 sudo lab/lab.sh ops-reload-up    # P6：整配置热重载会话（/tmp 配置副本 + 假 DNS）

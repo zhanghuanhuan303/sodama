@@ -86,11 +86,11 @@ sudo lab/lab.sh down
 - [`docs/architecture-decision.html`](./docs/architecture-decision.html) — 主决策档案：
   上游 dae 的模块/规模分析、Rust 重写的收益与风险、部署形态（Rust worker + eBPF 分流）、
   决策点 D1–D8 与迁移路线（K0–K3、P3–P18）。
-- [`docs/adr/`](./docs/adr/) — 34 条已采纳 ADR：每个决策的背景、选项、理由、后果、
+- [`docs/adr/`](./docs/adr/) — 35 条已采纳 ADR：每个决策的背景、选项、理由、后果、
   **实测验证方式**与修订条件。重要节点：0002（eBPF 程序语言：先 C 后迁）、
   0023/0024/0025（数据面 Rust 全量迁移 → C 对象退场）、0029（真网关模式）、
   0030（嗅探 + dial_mode）、0031（订阅/节点组/健康检查）、0032（IPv6 数据面 TCP 全链）、
-  0033（geoip/geosite 展开 + pname）、0034（DoT/DoH DNS 安全上游）。
+  0033（geoip/geosite 展开 + pname）、0034/0035（DoT/DoH/DoQ DNS 安全上游）。
 - [`docs/parity-status.md`](./docs/parity-status.md) — 对标进度：dae（Go）↔ mini-dae（全 Rust）
   分域覆盖度对照（15 域 + 汇总 + Top 缺口 + 优势项，逐行附证据锚点）。
 - [`docs/modules/`](./docs/modules/) — tuic v5 / hysteria2 的字节级客户端规格。

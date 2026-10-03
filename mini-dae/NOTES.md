@@ -1009,6 +1009,27 @@ P4 稳定性 → P3 内核矩阵）：
   - DoT/DoH 持锁串行：单 dns_loop 线程下无争用；线程池化时需去锁重构。
   - DoQ（P18b）、`dns.routing`（P18c）未做（对标表缺口 #5 余项）。
 
+### 11.26 P18b（DoQ，RFC 9250）已验收的行为
+
+（决策与边界见 ADR-0035；实现 `loader/src/dnsup.rs` 的 `exchange_quic`；夹具
+`lab/proto-check/doq-server`（Go/quic-go）+ `build-doq-server.sh`；会话 `doq-up`+`test-doq`。）
+
+- 传输：quinn 0.11 + `tuic::runtime()`；ALPN `doq`；keep_alive 5s、idle 60s；
+  marked UDP socket；`Endpoint::new` 必须在 `runtime().block_on` 内（否则
+  "there is no reactor running" panic）；连接 `Mutex<Option<QuicConn>>` 复用，
+  陈旧/已关/失败时丢弃重建（重试一次）。
+- RFC 9250：线上 DNS ID 置 0、应答恢复客户端 ID；每查询一条双向流；
+  2 字节长度分帧；**查询写完 FIN 后才读**；读完应答 `stop(0x3)` 释放流槽。
+- 健壮性（本次踩坑）：三把锁中毒恢复（`into_inner()`，丢弃旧连接重建）；
+  `dns_loop`/`handle_tcp_dns_conn` 单查询 `catch_unwind` 隔离——此前一次
+  quinn panic 会杀死 DNS 线程、透明 DNS 永久失效（实测碰到并修复）。
+- 实测：`cargo test` **136/136**（含 ID 置零/恢复单测）；lab `test-doq`：
+  quic-go 服务端交叉验证（doq.test/doq2.test 两次查询复用 **1 条** QUIC 连接、
+  状态面 scheme=quic）；真实公网 `quic://dns.alidns.com` 解析 www.baidu.com/
+  www.qq.com 成功（upstream_errors=0）；`test-dot` 回归通过。
+- 边界：AdGuard 的 UDP 853/784/8853 在本机网络被阻断（openssl -quic 同样超时），
+  非实现问题；无 0-RTT、无连接池（锁内串行）。
+
 ## 12. 用 Rust 重写这套东西的可行性
 
 已验证（本仓库 mini-dae，实测跑通）：

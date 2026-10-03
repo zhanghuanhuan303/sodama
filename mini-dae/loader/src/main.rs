@@ -2768,8 +2768,18 @@ fn dns_loop(listener: OwnedFd, tx: std::sync::mpsc::Sender<status::MainMsg>) {
         let Some(up) = upstream() else {
             continue;
         };
-        let Some(resp) = resolve_dns(&buf[..n], ClientProto::Udp, &up, &tx) else {
-            continue;
+        // panic 隔离：单次查询（含第三方 QUIC 栈）出 panic 不应杀死整个 DNS 线程
+        let resolved = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            resolve_dns(&buf[..n], ClientProto::Udp, &up, &tx)
+        }));
+        let resp = match resolved {
+            Ok(Some(r)) => r,
+            Ok(None) => continue,
+            Err(_) => {
+                DNS_STATS.upstream_errors.fetch_add(1, Ordering::Relaxed);
+                log("dns 查询处理 panic（已隔离，连续出现请查日志）");
+                continue;
+            }
         };
         let Some(s) = reply_socket_for(&mut reply_sockets, orig_dst) else {
             continue;
@@ -2810,8 +2820,17 @@ fn handle_tcp_dns_conn(mut stream: TcpStream, tx: std::sync::mpsc::Sender<status
         }
         DNS_STATS.tcp_queries.fetch_add(1, Ordering::Relaxed);
         let Some(up) = upstream() else { break };
-        let Some(resp) = resolve_dns(&query, ClientProto::Tcp, &up, &tx) else {
-            break;
+        let resolved = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            resolve_dns(&query, ClientProto::Tcp, &up, &tx)
+        }));
+        let resp = match resolved {
+            Ok(Some(r)) => r,
+            Ok(None) => break,
+            Err(_) => {
+                DNS_STATS.upstream_errors.fetch_add(1, Ordering::Relaxed);
+                log("dns TCP 查询处理 panic（已隔离）");
+                break;
+            }
         };
         DNS_STATS.tcp_responses.fetch_add(1, Ordering::Relaxed);
         let len = (resp.len() as u16).to_be_bytes();
