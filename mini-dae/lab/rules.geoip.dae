@@ -1,0 +1,10 @@
+# P17a 对拍：geoip 展开（需要 DAE_LOCATION_ASSET 指向 lab/gen-geo-dat.py 生成的夹具目录）
+# 注意：本文件只包含 geoip 规则 —— geosite 的域集合不在对拍格式内（见 ADR-0033）。
+
+# CN（含 v4 + v6 前缀，覆盖两种 LPM 编码）
+dip(geoip: cn) -> direct
+
+# US（第二个 code，覆盖多 code 展开/去重路径）
+dip(geoip: us) -> block
+
+fallback -> direct

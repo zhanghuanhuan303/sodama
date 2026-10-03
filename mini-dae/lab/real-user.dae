@@ -4,7 +4,7 @@
 # 因此本文件为 0640。include 的文件同样受此约束，且必须在入口文件目录下。
 #
 # 路由段与 lab 用例对齐的可编译规则会真正下发给数据面；
-# domain/geoip 两类规则按 ADR-0011 显式列入 deferred，不会静默丢弃。
+# 未知/未覆盖的函数（如 future_func）按 ADR-0011 显式列入 deferred，不会静默丢弃。
 
 global {
     wan_interface: auto
@@ -59,10 +59,16 @@ routing {
     !dport(9999) && sip(10.0.0.0/24) -> block
     l4proto(udp) && dport(443) -> proxy(must)
     l4proto(tcp) && dport(443) -> direct(mark: 0x800, must)
-
-    # ---- 真实用户常见、但需要 P3/P5 的能力：解析且显式 deferred ----
     domain(suffix: example.com) -> proxy
+    # P17a：geoip 已可编译（编译期展开为 CIDR 集合；需要 geodata 文件，
+    # config-up 会话会用 gen-geo-dat.py 的小型夹具）
     dip(geoip: cn) -> direct
+
+    # ---- 显式 deferred 示例：mini 子集未覆盖的函数（绝不静默丢弃）----
+    # 说明：P17a/P17b 之后 dae 现有 routing 函数（dip/sip/dport/sport/l4proto/
+    # ipversion/dscp/mac/pname/domain）已全部覆盖；这里用一个未来扩展函数名
+    # 演示 deferred 上报机制本身。
+    future_func(example) -> direct
 
     fallback: proxy
 }

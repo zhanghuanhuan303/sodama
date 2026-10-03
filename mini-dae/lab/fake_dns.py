@@ -30,6 +30,9 @@ TABLE = {
     "api1.regex.test": "10.9.10.21",
     "api2.regex.test": "10.9.10.22",
     "web.regex.test": "10.9.10.23",
+    # P17a：geosite 夹具（lab/rules.geo.dae 的 domain(geosite: cn) 展开自
+    # lab/gen-geo-dat.py，suffix 条目 geo.test）
+    "geo.test": "10.9.10.3",
 }
 
 # P3b-2a：大应答（60 条 A ≈ 990 字节 > 512，用于验证 UDP 截断/EDNS）

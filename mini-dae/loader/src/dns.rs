@@ -532,8 +532,9 @@ fn normalize(name: &str) -> String {
     name.trim_end_matches('.').to_ascii_lowercase()
 }
 
-/// 对照 dae 的 RoutingDomainKey 语义。regex 需要编译后的 `Regex`，本函数只处理
-/// 字符串匹配种类（regex 请走 `matched_bitmap` / `domain_set_matches`）。
+/// 对照 dae 的 RoutingDomainKey 语义（语义参考 + 单测用；生产匹配走
+/// `domain_set_matches` 的预计算索引）。
+#[cfg(test)]
 pub fn domain_match(key: &str, pattern: &str, qname: &str) -> bool {
     let q = normalize(qname);
     let p = normalize(pattern);
@@ -543,22 +544,54 @@ pub fn domain_match(key: &str, pattern: &str, qname: &str) -> bool {
     match key {
         "full" => q == p,
         "keyword" => q.contains(&p),
-        "suffix" => q == p || q.ends_with(&format!(".{p}")),
+        "suffix" => {
+            // P17a：前导点 = 只匹配子域（对照 dae ahocorasick_slimtrie 语义）；
+            // 无前导点 = 裸域 + 子域。
+            if let Some(sub) = p.strip_prefix('.') {
+                !sub.is_empty() && q.ends_with(&format!(".{sub}"))
+            } else {
+                q == p || q.ends_with(&format!(".{p}"))
+            }
+        }
         // regex 无编译后形式，不在此函数里静默按 suffix 处理
         _ => false,
     }
 }
 
 /// 一个 domain 集合是否命中 qname（regex 用编译好的模式；对照 dae：qname 小写化、
-/// regex 模式保持原大小写、非锚定匹配）。
+/// regex 模式保持原大小写、非锚定匹配）。suffix/full 走编译期索引（O(labels)/O(1)），
+/// keyword 仍线性扫描（数据量通常小）。
 pub fn domain_set_matches(spec: &DomainSetSpec, qname: &str) -> bool {
-    if spec.key == "regex" {
-        let q = normalize(qname);
-        !q.is_empty() && spec.regexes.iter().any(|r| r.is_match(&q))
-    } else {
-        spec.domains
-            .iter()
-            .any(|pat| domain_match(&spec.key, pat, qname))
+    let q = normalize(qname);
+    if q.is_empty() {
+        return false;
+    }
+    match spec.key.as_str() {
+        "suffix" => {
+            if spec.index.suffix.contains(&q) {
+                return true;
+            }
+            // 枚举 q 的每个「点后缀」（不含 q 自身——sub-only 模式不匹配裸域）。
+            for (i, b) in q.as_bytes().iter().enumerate() {
+                if *b == b'.' {
+                    let s = &q[i + 1..];
+                    if s.is_empty() {
+                        break;
+                    }
+                    if spec.index.suffix.contains(s) || spec.index.suffix_sub_only.contains(s) {
+                        return true;
+                    }
+                }
+            }
+            false
+        }
+        "full" => spec.index.full.contains(&q),
+        "keyword" => spec.domains.iter().any(|pat| {
+            let p = normalize(pat);
+            !p.is_empty() && q.contains(&p)
+        }),
+        "regex" => spec.regexes.iter().any(|r| r.is_match(&q)),
+        _ => false,
     }
 }
 
@@ -592,7 +625,6 @@ pub fn map_v4(ip: [u8; 4]) -> [u8; 16] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use regex::Regex;
     use std::time::Duration;
 
     fn no_edns() -> EdnsInfo {
@@ -673,26 +705,44 @@ mod tests {
         assert!(domain_match("suffix", "proxy.test", "a.proxy.test."));
         assert!(!domain_match("suffix", "proxy.test", "notproxy.test"));
         assert!(!domain_match("suffix", "proxy.test", "proxy.test.evil"));
+        // P17a：前导点 = 只匹配子域
+        assert!(!domain_match("suffix", ".proxy.test", "proxy.test"));
+        assert!(domain_match("suffix", ".proxy.test", "a.proxy.test"));
         assert!(domain_match("full", "direct.test", "direct.test"));
         assert!(!domain_match("full", "direct.test", "x.direct.test"));
         assert!(domain_match("keyword", "kw", "www.kw.example"));
     }
 
     #[test]
+    fn domain_set_index_semantics() {
+        let mk = |key: &str, doms: &[&str]| {
+            DomainSetSpec::build(
+                0,
+                key,
+                &doms.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            )
+            .unwrap()
+        };
+        let suf = mk("suffix", &["proxy.test", ".sub.test"]);
+        assert!(domain_set_matches(&suf, "proxy.test"));
+        assert!(domain_set_matches(&suf, "A.Proxy.Test."));
+        assert!(!domain_set_matches(&suf, "notproxy.test"));
+        assert!(!domain_set_matches(&suf, "proxy.test.evil"));
+        assert!(!domain_set_matches(&suf, "sub.test"));
+        assert!(domain_set_matches(&suf, "x.sub.test"));
+        let full = mk("full", &["full.test"]);
+        assert!(domain_set_matches(&full, "full.test"));
+        assert!(!domain_set_matches(&full, "x.full.test"));
+        let kw = mk("keyword", &["kw"]);
+        assert!(domain_set_matches(&kw, "www.KW.example"));
+        assert!(!domain_set_matches(&kw, "nope.example"));
+    }
+
+    #[test]
     fn bitmap_bits_follow_match_set_index() {
         let sets = vec![
-            DomainSetSpec {
-                match_set_index: 0,
-                key: "suffix".into(),
-                domains: vec!["proxy.test".into()],
-                regexes: vec![],
-            },
-            DomainSetSpec {
-                match_set_index: 33,
-                key: "keyword".into(),
-                domains: vec!["kw".into()],
-                regexes: vec![],
-            },
+            DomainSetSpec::build(0, "suffix", &["proxy.test".into()]).unwrap(),
+            DomainSetSpec::build(33, "keyword", &["kw".into()]).unwrap(),
         ];
         let (bits, hits) = matched_bitmap(&sets, "a.proxy.test");
         assert_eq!(hits, 1);
@@ -888,12 +938,7 @@ mod tests {
     #[test]
     fn regex_domain_set_matches_lowercased_qname() {
         // 对照 dae：qname 小写、模式保持原大小写、非锚定匹配
-        let spec = DomainSetSpec {
-            match_set_index: 5,
-            key: "regex".into(),
-            domains: vec![r"^api[0-9]+\.regex\.test$".into()],
-            regexes: vec![Regex::new(r"^api[0-9]+\.regex\.test$").unwrap()],
-        };
+        let spec = DomainSetSpec::build(5, "regex", &[r"^api[0-9]+\.regex\.test$".into()]).unwrap();
         let sets = vec![spec];
         let (bits, hits) = matched_bitmap(&sets, "API1.Regex.Test.");
         assert_eq!(hits, 1);
@@ -902,12 +947,7 @@ mod tests {
         assert_eq!(hits2, 0);
         assert!(bits2.iter().all(|w| *w == 0));
         // 大写模式不会命中（qname 已小写化，对照 dae 行为）
-        let upper = DomainSetSpec {
-            match_set_index: 0,
-            key: "regex".into(),
-            domains: vec!["API".into()],
-            regexes: vec![Regex::new("API").unwrap()],
-        };
+        let upper = DomainSetSpec::build(0, "regex", &["API".into()]).unwrap();
         let (_, hits3) = matched_bitmap(&[upper], "api.test");
         assert_eq!(hits3, 0);
     }

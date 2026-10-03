@@ -18,8 +18,15 @@ LOADER="$ROOT/target/release/mini-dae"
 
 files=("$@")
 if [ "${#files[@]}" = 0 ]; then
-  files=("$HERE/rules.dae" "$HERE/rules.reload.dae" "$HERE/rules.v6.dae")
+  files=("$HERE/rules.dae" "$HERE/rules.reload.dae" "$HERE/rules.v6.dae" "$HERE/rules.geoip.dae")
 fi
+
+# P17a：geoip 展开对拍需要夹具 geoip.dat/geosite.dat；DAE_LOCATION_ASSET 同时作用于
+# Go 侧（assets.LocationFinder）与 mini 侧（--compile-dump 的 geodata 搜索）。
+GEO_FIXTURE="$(mktemp -d)"
+trap 'rm -rf "$GEO_FIXTURE"' EXIT
+python3 "$HERE/gen-geo-dat.py" "$GEO_FIXTURE" >/dev/null
+export DAE_LOCATION_ASSET="$GEO_FIXTURE"
 
 fails=0
 for f in "${files[@]}"; do

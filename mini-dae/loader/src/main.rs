@@ -43,6 +43,7 @@ mod anytls;
 mod brutal;
 mod config;
 mod dns;
+mod geodata;
 mod group;
 mod hpack;
 mod huffman_table;
@@ -398,6 +399,8 @@ struct Args {
     sniffing_timeout_ms: Option<u64>,
     /// P15：订阅 URL（可重复；每次都拉取并解析为节点池）
     subscribe: Vec<String>,
+    /// P17a：geodata 搜索目录（可重复；优先于 DAE_LOCATION_ASSET/系统目录）
+    geodata_dir: Vec<String>,
     /// P15：选用的组名（默认优先 `proxy`，否则唯一/第一个非空组）
     group: Option<String>,
     /// P12：本地 SOCKS5 入口（如 127.0.0.1:11080）；开启后不加载 eBPF、不需要 root
@@ -489,6 +492,7 @@ fn usage() -> ! {
            --sniffing-timeout-ms <n> P14：嗅探等待上限毫秒（默认 100；仅 dial_mode != ip 生效）
            --subscribe <url>        P15：订阅（可重复；config subscription 段同源），与 --group 搭配
            --group <name>           P15：选用 config 中的组（默认 proxy / 唯一组）
+           --geodata-dir <dir>      P17a：geoip.dat/geosite.dat 搜索目录（可重复；优先于 DAE_LOCATION_ASSET）
            --listen-socks <addr>    P12：本地 SOCKS5 入口（浏览器测试用；不加载 eBPF、不需 root）\n\
            --udp-idle-timeout <s>   P4：UDP NAT 会话空闲秒数（默认 60）\n\
            --forward <url>       旧写法：等价于 --dialer socks5://host:port\n\
@@ -536,6 +540,7 @@ fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
         dial_mode: None,
         sniffing_timeout_ms: None,
         subscribe: Vec::new(),
+        geodata_dir: Vec::new(),
         group: None,
         listen_socks: None,
         udp_idle_timeout: None,
@@ -583,6 +588,7 @@ fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
             }
             "--sniffing-timeout-ms" => args.sniffing_timeout_ms = Some(next()?.parse()?),
             "--subscribe" => args.subscribe.push(next()?),
+            "--geodata-dir" => args.geodata_dir.push(next()?),
             "--group" => args.group = Some(next()?),
             "--listen-socks" => args.listen_socks = Some(next()?),
             "--udp-idle-timeout" => args.udp_idle_timeout = Some(next()?.parse()?),
@@ -1636,10 +1642,34 @@ fn activate_slot(ebpf: &mut Ebpf, slot: u32) -> Result<(), Box<dyn std::error::E
     Ok(())
 }
 
+/// P17a：按进程生命周期构建一次 geodata 上下文（懒解析文件；无 geo 规则时不碰磁盘）。
+/// 编译只在主循环线程发生，这里用 Mutex 包住 RefCell 缓存（静态存储要求 Sync）。
+fn geodata_for(args: &Args) -> &'static std::sync::Mutex<geodata::Geodata> {
+    static GEO: std::sync::OnceLock<std::sync::Mutex<geodata::Geodata>> =
+        std::sync::OnceLock::new();
+    GEO.get_or_init(|| {
+        let dirs = geodata::search_dirs(
+            &args
+                .geodata_dir
+                .iter()
+                .map(std::path::PathBuf::from)
+                .collect::<Vec<_>>(),
+            args.config.as_deref().map(std::path::Path::new),
+        );
+        std::sync::Mutex::new(geodata::Geodata::new(dirs))
+    })
+}
+
 /// 编译 + 写入非活跃槽 + 切换。返回规则条数。
 fn reload_rules(args: &Args, ebpf: &mut Ebpf) -> Result<usize, Box<dyn std::error::Error>> {
     let text = rules_text(args)?;
-    let compiled = rules::parse_and_compile(&text).map_err(|e| format!("compile rules: {e}"))?;
+    let geo = geodata_for(args);
+    let geo = geo.lock().unwrap();
+    let compiled = rules::parse_and_compile_with_geo(&text, Some(&geo))
+        .map_err(|e| format!("compile rules: {e}"))?;
+    for n in &compiled.notes {
+        log(&format!("geoexp: {n}"));
+    }
     let current = ACTIVE_SLOT.load(Ordering::SeqCst);
     let next = (current + 1) % EPOCH_SLOT_NUM;
     // 对照 dae clearReloadDomainRoutingMapSlot：清空即将写入的槽的域位图。
@@ -2033,8 +2063,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 注意：必须在 DNS 上游解析/日志之前返回，保持 stdout 逐字节可控。
     if let Some(path) = &args.compile_dump {
         let text = std::fs::read_to_string(path).map_err(|e| format!("read rules {path}: {e}"))?;
-        let compiled =
-            rules::parse_and_compile(&text).map_err(|e| format!("compile rules: {e}"))?;
+        let geo = geodata_for(&args);
+        let geo = geo.lock().unwrap();
+        let compiled = rules::parse_and_compile_with_geo(&text, Some(&geo))
+            .map_err(|e| format!("compile rules: {e}"))?;
         print!("{}", compiled.dump_parity());
         let _ = std::io::stdout().flush();
         return Ok(());

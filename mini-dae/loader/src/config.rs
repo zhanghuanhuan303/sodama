@@ -309,11 +309,34 @@ fn lex(src: &str, file: &Path) -> Result<Vec<Token>, Vec<Diag>> {
                 i += 1;
             }
             '!' => {
-                out.push(Token {
-                    tok: Tok::Bang,
-                    line,
-                });
-                i += 1;
+                // `!` 只在 token 起始位置是取反运算符；词内出现（如 geosite 的
+                // `geolocation-!cn`、`cn@!ads`）并入上一个 Word（对照 dae：值里的
+                // `!` 是普通字符）。
+                let after_bare = i > 0 && is_bare_char(chars[i - 1]);
+                if after_bare {
+                    let start = i;
+                    i += 1;
+                    while i < chars.len() && is_bare_char(chars[i]) {
+                        i += 1;
+                    }
+                    let tail: String = chars[start..i].iter().collect();
+                    match out.last_mut() {
+                        Some(Token {
+                            tok: Tok::Word(prev),
+                            ..
+                        }) => prev.push_str(&tail),
+                        _ => out.push(Token {
+                            tok: Tok::Word(tail),
+                            line,
+                        }),
+                    }
+                } else {
+                    out.push(Token {
+                        tok: Tok::Bang,
+                        line,
+                    });
+                    i += 1;
+                }
             }
             '-' if i + 1 < chars.len() && chars[i + 1] == '>' => {
                 out.push(Token {
@@ -586,6 +609,31 @@ impl<'a> Parser<'a> {
         self.expect(Tok::Colon);
         let mut p = self.parse_value_expr(self.loc_at(line))?;
         p.key = Some(key);
+        // P17a：允许 `ext:file:code` 这类多段冒号值（仅对非函数、非引号的值生效）。
+        // dae 语法里有 `dip(ext:geoip.dat:cn)`，其值不是 URL，不会与引号写法冲突。
+        if p.funcs.is_none() {
+            if let Some(v) = p.val.as_mut() {
+                while matches!(self.peek().map(|t| &t.tok), Some(Tok::Colon)) {
+                    self.pos += 1;
+                    let Some((tok, tl)) = self.bump() else { break };
+                    let seg = match tok {
+                        Tok::Word(w) => w,
+                        Tok::Quoted(q) => q,
+                        other => {
+                            let d = other.describe();
+                            self.errors.push(diag(
+                                Some(self.file),
+                                tl,
+                                format!("ext 值段应为标识/引号字符串，得到 {d}"),
+                            ));
+                            break;
+                        }
+                    };
+                    v.push(':');
+                    v.push_str(&seg);
+                }
+            }
+        }
         // 注解
         if matches!(self.peek().map(|t| &t.tok), Some(Tok::LBracket)) {
             self.pos += 1;
@@ -1609,21 +1657,6 @@ fn param_values(f: &Function) -> Result<Vec<String>, String> {
     Ok(out)
 }
 
-fn is_v4_cidr(v: &str) -> bool {
-    let (addr, plen) = match v.split_once('/') {
-        Some((a, p)) => (a, Some(p)),
-        None => (v, None),
-    };
-    if addr.parse::<std::net::Ipv4Addr>().is_err() {
-        return false;
-    }
-    match plen {
-        Some(p) => p.parse::<u32>().map(|n| n <= 32).unwrap_or(false),
-        None => true,
-    }
-}
-
-/// P16：IPv4/IPv6 CIDR（dip/sip 用）。
 fn is_ip_cidr(v: &str) -> bool {
     let (addr, plen) = match v.split_once('/') {
         Some((a, p)) => (a, Some(p)),
@@ -1652,29 +1685,44 @@ fn translate_function(f: &Function, parts: &mut Vec<String>) -> Result<(), Strin
     let bang = if f.not { "!" } else { "" };
     match f.name.as_str() {
         "dip" | "sip" => {
-            let vals = param_values(f)?;
-            if vals.is_empty() {
+            if f.params.is_empty() {
                 return Err(format!("{}(...) 需要至少一个参数", f.name));
             }
-            if !vals.iter().all(|v| is_ip_cidr(v)) {
-                return Err(format!(
-                    "{}({}) 含非法前缀（需 IPv4/IPv6 CIDR）",
-                    f.name,
-                    vals.join(", ")
-                ));
-            }
-            // P16：v6 前缀含 ':'，mini 规则语法里需要加引号（dae 语法本身不要求）
-            let quoted: Vec<String> = vals
-                .iter()
-                .map(|v| {
-                    if v.contains(':') {
-                        format!("'{v}'")
-                    } else {
-                        v.clone()
+            let mut vals: Vec<String> = Vec::new();
+            for p in &f.params {
+                let Some(v) = p.val.clone() else {
+                    return Err("函数参数必须是字符串值".into());
+                };
+                match p.key.as_deref() {
+                    // P17a：geoip/ext 在编译期展开（rules.rs + geodata.rs），此处原样透传。
+                    Some("geoip") => {
+                        if v.is_empty() {
+                            return Err(format!("{}(geoip:) 缺少 code", f.name));
+                        }
+                        vals.push(format!("geoip: {v}"));
                     }
-                })
-                .collect();
-            parts.push(format!("{bang}{}({})", f.name, quoted.join(", ")));
+                    Some("ext") => {
+                        if !v.contains(':') {
+                            return Err(format!("{}(ext:{v}) 需要 file:code 形式", f.name));
+                        }
+                        vals.push(format!("ext: {v}"));
+                    }
+                    Some(other) => {
+                        return Err(format!(
+                            "{}(…) 不认识的 key: {other}（可用 geoip/ext 或裸 CIDR）",
+                            f.name
+                        ))
+                    }
+                    None => {
+                        if !is_ip_cidr(&v) {
+                            return Err(format!("{}({v}) 含非法前缀（需 IPv4/IPv6 CIDR）", f.name));
+                        }
+                        // P16：v6 前缀含 ':'，mini 规则语法里需要加引号（dae 语法本身不要求）
+                        vals.push(if v.contains(':') { format!("'{v}'") } else { v });
+                    }
+                }
+            }
+            parts.push(format!("{bang}{}({})", f.name, vals.join(", ")));
             Ok(())
         }
         "dport" | "sport" => {
@@ -1704,13 +1752,10 @@ fn translate_function(f: &Function, parts: &mut Vec<String>) -> Result<(), Strin
         }
         "ipversion" => {
             let vals = param_values(f)?;
-            if !vals.iter().all(|v| v == "4") {
-                return Err(format!(
-                    "ipversion({}) 只支持 4（IPv6 路径未实现）",
-                    vals.join(", ")
-                ));
+            if !vals.iter().all(|v| v == "4" || v == "6") {
+                return Err(format!("ipversion({}) 只支持 4/6", vals.join(", ")));
             }
-            parts.push(format!("{bang}ipversion(4)"));
+            parts.push(format!("{bang}ipversion({})", vals.join(", ")));
             Ok(())
         }
         "mac" => {
@@ -1725,19 +1770,34 @@ fn translate_function(f: &Function, parts: &mut Vec<String>) -> Result<(), Strin
         "domain" => {
             // P3a/P3b-2a：suffix/full/keyword/regex 均可编译（域位图；regex 在
             // mini 规则编译器里编译，非法正则会在启动/重载时硬失败）。
+            // P17a：geosite:code[@attr] 与 ext:file:code 在编译期展开为域名参数。
             let mut groups: Vec<(String, Vec<String>)> = Vec::new();
             for p in &f.params {
                 let key = p.key.clone().unwrap_or_else(|| "suffix".into());
-                match key.as_str() {
-                    "suffix" | "full" | "keyword" | "regex" => {}
-                    other => return Err(format!("domain 不认识的 key: {other}")),
-                }
                 let Some(v) = p.val.clone() else {
                     return Err("domain 参数必须是字符串".into());
                 };
-                match groups.iter_mut().find(|(k, _)| *k == key) {
-                    Some((_, vs)) => vs.push(v),
-                    None => groups.push((key, vec![v])),
+                let emit: Vec<(String, String)> = match key.as_str() {
+                    "suffix" | "full" | "keyword" | "regex" => vec![(key.clone(), v)],
+                    "geosite" => {
+                        if v.is_empty() {
+                            return Err("domain(geosite:) 缺少 code".into());
+                        }
+                        vec![("geosite".into(), v)]
+                    }
+                    "ext" => {
+                        if !v.contains(':') {
+                            return Err(format!("domain(ext:{v}) 需要 file:code 形式"));
+                        }
+                        vec![("ext".into(), v)]
+                    }
+                    other => return Err(format!("domain 不认识的 key: {other}")),
+                };
+                for (k, val) in emit {
+                    match groups.iter_mut().find(|(gk, _)| *gk == k) {
+                        Some((_, vs)) => vs.push(val),
+                        None => groups.push((k, vec![val])),
+                    }
                 }
             }
             if groups.is_empty() {
@@ -2051,21 +2111,54 @@ routing {
             sections: secs,
         };
         let ex = extract_routing(&cfg).unwrap();
-        assert_eq!(ex.supported.len(), 6, "{:#?}", ex.supported);
+        assert_eq!(ex.supported.len(), 7, "{:#?}", ex.supported);
         assert!(ex.supported[0].starts_with("sip(192.168.0.0/24) && !sip("));
         assert_eq!(ex.supported[2], "domain(suffix: 'example.com') -> proxy");
         assert_eq!(
             ex.supported[3],
             "domain(regex: '^api[0-9]+\\.example\\.com$') -> proxy"
         );
-        assert_eq!(ex.supported[5], "mac('aa:bb:cc:dd:ee:ff') -> direct");
-        assert_eq!(ex.deferred.len(), 1, "{:#?}", ex.deferred);
-        assert!(ex.deferred[0].reason.contains("geodata"));
+        // P17a：geoip 从 deferred 变为可编译（展开在编译期，配置层原样透传）
+        assert_eq!(ex.supported[4], "dip(geoip: cn) -> direct");
+        assert_eq!(ex.supported[6], "mac('aa:bb:cc:dd:ee:ff') -> direct");
+        assert!(ex.deferred.is_empty(), "{:#?}", ex.deferred);
         assert_eq!(ex.fallback.as_deref(), Some("proxy"));
         assert!(ex
             .outbound_map
             .iter()
             .any(|(k, v)| k == "mystery_group" && v == "proxy"));
+    }
+
+    #[test]
+    fn extract_routing_geo_ext_keys() {
+        let secs = parse(
+            r#"global {}
+routing {
+    dip(geoip:cn) -> direct
+    dip(ext:mygeo.dat:cn) -> direct
+    domain(geosite:cn) -> proxy
+    domain(geosite:geolocation-!cn@ads) -> proxy
+    domain(ext:mysite.dat:cn@ads) -> proxy
+    fallback: direct
+}"#,
+        )
+        .unwrap();
+        let cfg = Config {
+            entry: PathBuf::from("t.dae"),
+            files: vec![PathBuf::from("t.dae")],
+            sections: secs,
+        };
+        let ex = extract_routing(&cfg).unwrap();
+        assert_eq!(ex.supported.len(), 5, "{:#?}", ex.supported);
+        assert_eq!(ex.supported[0], "dip(geoip: cn) -> direct");
+        assert_eq!(ex.supported[1], "dip(ext: mygeo.dat:cn) -> direct");
+        assert_eq!(ex.supported[2], "domain(geosite: 'cn') -> proxy");
+        assert_eq!(
+            ex.supported[3],
+            "domain(geosite: 'geolocation-!cn@ads') -> proxy"
+        );
+        assert_eq!(ex.supported[4], "domain(ext: 'mysite.dat:cn@ads') -> proxy");
+        assert!(ex.deferred.is_empty(), "{:#?}", ex.deferred);
     }
 
     #[test]

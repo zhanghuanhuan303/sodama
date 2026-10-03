@@ -40,6 +40,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/daeuniverse/dae/common/assets"
 	"github.com/daeuniverse/dae/common/consts"
 	"github.com/daeuniverse/dae/component/routing"
 	"github.com/daeuniverse/dae/config"
@@ -97,11 +98,11 @@ func TestParityDump(t *testing.T) {
 	// AliasOptimizer is what makes dae accept the `dip`/`dport` aliases; the
 	// others are part of the run path and change rule/param ordering for some
 	// inputs, so skipping them would not be parity with what reaches the BPF
-	// maps. No geo/geosite params exist in the mini-dae subset, so the
-	// DatReaderOptimizer never touches LocationFinder.
+	// maps. P17a: DatReaderOptimizer now resolves `geoip:`/`geosite:` params
+	// via assets.LocationFinder (search dirs = DAE_LOCATION_ASSET etc.).
 	program, err := routing.NewNormalizedProgram(conf.Routing.Rules, conf.Routing.Fallback,
 		&routing.AliasOptimizer{},
-		&routing.DatReaderOptimizer{Logger: log},
+		&routing.DatReaderOptimizer{Logger: log, LocationFinder: assets.NewLocationFinder(nil)},
 		&routing.MergeAndSortRulesOptimizer{},
 		&routing.DeduplicateParamsOptimizer{},
 	)

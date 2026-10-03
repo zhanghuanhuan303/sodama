@@ -12,7 +12,7 @@ use crate::common::*;
 pub static config_map: Array<MiniConfig, 1> = Array::new();
 
 #[btf_map]
-pub static lpm_array_map: ArrayOfMaps<LpmTrie<[u8; 16], u32, 1024>, 128> = ArrayOfMaps::new();
+pub static lpm_array_map: ArrayOfMaps<LpmTrie<[u8; 16], u32, 2_048_000>, 128> = ArrayOfMaps::new();
 
 #[btf_map]
 pub static routing_map: Array<MiniMatchSet, 128> = Array::new();

@@ -17,6 +17,10 @@
 #   sudo lab/lab.sh regex-up     # P3b-2a：domain(regex:) 会话（假上游 + rules.regex.dae）
 #   sudo lab/lab.sh test-domain-regex # regex 域命中分流 + 不命中直转
 #   sudo lab/lab.sh test-dns-edns     # P3b-2a：UDP 截断/EDNS 尺寸/TCP 完整应答
+#   sudo lab/lab.sh v6-up      # P16：IPv6 数据面（tproxy v6 → relay → ss(ATYP=4)；v6 direct）
+#   sudo lab/lab.sh test-v6
+#   sudo lab/lab.sh geo-up     # P17a：geoip/geosite 展开（小型夹具 + 假 DNS）
+#   sudo lab/lab.sh test-geo
 #   sudo lab/lab.sh relay-up     # P4：TCP relay（--dialer direct）+ 短 idle 回收
 #   sudo lab/lab.sh test-relay        # 真实转发 + 512KB 完整性 + 状态面
 #   sudo lab/lab.sh test-relay-idle   # janitor 回收空闲连接
@@ -544,6 +548,12 @@ up() {
   else
     rules_args=(--rules "$HERE/rules.dae")
   fi
+  # P17a：生成小型 geoip.dat/geosite.dat 夹具并指向它们（规则里的 geoip:/geosite: 展开）
+  if [ -n "${USE_GEODATA_DIR:-}" ]; then
+    mkdir -p "$USE_GEODATA_DIR"
+    python3 "$HERE/gen-geo-dat.py" "$USE_GEODATA_DIR" >/dev/null
+    rules_args+=(--geodata-dir "$USE_GEODATA_DIR")
+  fi
   if [ -n "${USE_FORWARD:-}" ]; then
     fwd_args=(--forward "$USE_FORWARD")
   elif [ -n "${USE_DIALER:-}" ]; then
@@ -1005,8 +1015,9 @@ test_config() {
 import json, sys
 v = json.load(open(sys.argv[1]))
 r = v["routing"]
-assert len(r["supported"]) == 6, r["supported"]
+assert len(r["supported"]) == 7, r["supported"]
 assert len(r["deferred"]) == 1, r["deferred"]
+assert "future_func" in r["deferred"][0]["reason"], r["deferred"]
 assert any(k == "proxy" for k, _ in r["outbound_map"]), r["outbound_map"]
 assert r["fallback"] == "proxy", r
 print("config: supported=%d deferred=%d fallback=%s" % (
@@ -1365,6 +1376,36 @@ test_v6() {
   echo "$out"
   echo "$out" | grep -q "wan-echo-ok" || { echo "FAIL: IPv6 direct 路径不通"; exit 1; }
   echo "PASS: IPv6 direct 由内核转发（未经 tproxy）"
+}
+
+# P17a：geoip/geosite 展开端到端（geoip → LPM 直连；geosite → 域位图代理）。
+test_geo() {
+  require_root
+  echo "== P17a：geoip 展开（LPM 直连）=="
+  grep -q "geoexp: dip(geoip:cn)" "$LOG" || { echo "FAIL: 日志未见 geoip 展开"; tail -20 "$LOG"; exit 1; }
+  local out
+  # 夹具 CN = 10.9.10.0/24：集合内 → direct（WAN echo）
+  out="$(ip netns exec "$CLIENT_NS" timeout 6 python3 "$HERE/client_probe.py" 10.9.10.2 9999 2>&1 || true)"
+  echo "$out"
+  echo "$out" | grep -q "wan-echo-ok" || { echo "FAIL: geoip:cn 内目的未直连"; exit 1; }
+  # 集合外（10.9.9.2）→ fallback proxy（tproxy 回显）
+  out="$(ip netns exec "$CLIENT_NS" timeout 6 python3 "$HERE/client_probe.py" 10.9.9.2 9999 2>&1 || true)"
+  echo "$out"
+  echo "$out" | grep -q "orig_dst=10.9.9.2:9999" || { echo "FAIL: geoip 集合外目的未走代理（展开过宽？）"; exit 1; }
+  echo "PASS: geoip:cn 展开为 LPM，集合内直连 / 集合外代理"
+
+  echo "== P17a：geosite 展开（域位图代理）=="
+  grep -q "geoexp: domain(geosite:cn)" "$LOG" || { echo "FAIL: 日志未见 geosite 展开"; exit 1; }
+  out="$(ip netns exec "$CLIENT_NS" timeout 8 python3 "$HERE/dns_probe.py" 9.9.9.9 geo.test 2>&1 || true)"
+  echo "$out"
+  local ans
+  ans="$(printf '%s\n' "$out" | sed -n 's/^answer=\(.*\)$/\1/p' | head -1)"
+  [ "$ans" = "10.9.10.3" ] || { echo "FAIL: geo.test 未解析到 10.9.10.3（DNS 接管/转发失败）"; exit 1; }
+  # 用 8080 端口：避开第 1 条规则的 dport(9999) 门（否则 geoip 规则会先命中）
+  out="$(ip netns exec "$CLIENT_NS" timeout 6 python3 "$HERE/client_probe.py" "$ans" 8080 2>&1 || true)"
+  echo "$out"
+  echo "$out" | grep -q "orig_dst=$ans:8080" || { echo "FAIL: geosite:cn 域未走代理（位图未命中）"; exit 1; }
+  echo "PASS: geosite:cn 展开进域位图，geo.test 命中代理"
 }
 
 # P15：订阅 + 节点组会话——两个 ss 后端（A 可被 kill 验证 failover）
@@ -2152,7 +2193,8 @@ case "${1:-}" in
   config-up)
     # loader 校验配置文件权限（≤0640，防敏感配置泄露）；新 clone 默认 0644，这里统一收紧。
     chmod 640 "$HERE/real-user.dae" 2>/dev/null || true
-    USE_CONFIG="$HERE/real-user.dae" up ;;
+    # P17a：配置里有 dip(geoip: cn)（编译期展开），用小型夹具提供 geodata 文件。
+    USE_CONFIG="$HERE/real-user.dae" USE_GEODATA_DIR=/tmp/mini-dae-geodata up ;;
   subscribe-up) subscribe_up ;;
   test-subscribe) test_subscribe ;;
   v6-up) USE_RULES="$HERE/rules.v6.dae" USE_SS=1 USE_SS_METHOD=chacha20-ietf-poly1305 \
@@ -2161,6 +2203,9 @@ case "${1:-}" in
   test-v6) test_v6 ;;
   forward-up) USE_FORWARD="socks5://127.0.0.1:$SOCKS5_PORT" up ;;
   dns-up) USE_RULES="$HERE/rules.dns.dae" USE_DNS_UPSTREAM="127.0.0.1:$FAKE_DNS_PORT" USE_FAKE_DNS=1 up ;;
+  geo-up) USE_RULES="$HERE/rules.geo.dae" USE_DNS_UPSTREAM="127.0.0.1:$FAKE_DNS_PORT" USE_FAKE_DNS=1 \
+    USE_GEODATA_DIR=/tmp/mini-dae-geodata up ;;
+  test-geo) test_geo ;;
   regex-up) USE_RULES="$HERE/rules.regex.dae" USE_DNS_UPSTREAM="127.0.0.1:$FAKE_DNS_PORT" USE_FAKE_DNS=1 up ;;
   relay-up) USE_RULES="$HERE/rules.dae" USE_DIALER=direct USE_RELAY_IDLE=2 USE_UDP_IDLE=2 up ;;
   offload-up) USE_RULES="$HERE/rules.dae" USE_DIALER=direct USE_OFFLOAD=1 USE_RELAY_IDLE=600 up ;;
@@ -2247,5 +2292,5 @@ case "${1:-}" in
   status) status ;;
   trace) trace ;;
   down) down ;;
-  *) echo "usage: $0 {build|up|dual-up|config-up|forward-up|dns-up|regex-up|relay-up|offload-up|udp-up|ss-up|ss-udp-up|trojan-up|vless-up|vless-tls-up|vless-udp-up|vmess-up|vmess-tls-up|vmess-udp-up|tuic-up|tuic-udp-up|hy2-up|hy2-udp-up|hy2-obfs-up|hy2-obfs-udp-up|hy2-brutal-up|hy2-hop-up|ops-up|ops-reload-up|bench-up|test-proxy|test-direct|test-block|test-host-proxy|test-reload|test-rebind|test-status|test-config|test-forward|test-domain|test-dns-cache|test-dns-tcp|test-dns-reload|test-domain-regex|test-dns-edns|test-relay|test-relay-idle|test-relay-offload|test-offload-lifecycle|test-udp-relay|test-udp-idle|test-ss|test-trojan|test-ss-udp|test-vless|test-vless-udp|test-vmess|test-vmess-udp|test-tuic|test-tuic-udp|test-hy2|test-hy2-udp|test-hy2-obfs|test-hy2-obfs-udp|test-hy2-brutal|test-hy2-hop|test-ops|test-config-reload|test-fault-reload|test-fault-kill|reload|verify|status|trace|down}"; exit 2 ;;
+  *) echo "usage: $0 {build|up|dual-up|config-up|forward-up|dns-up|geo-up|regex-up|relay-up|offload-up|udp-up|ss-up|ss-udp-up|trojan-up|vless-up|vless-tls-up|vless-udp-up|vmess-up|vmess-tls-up|vmess-udp-up|tuic-up|tuic-udp-up|hy2-up|hy2-udp-up|hy2-obfs-up|hy2-obfs-udp-up|hy2-brutal-up|hy2-hop-up|ops-up|ops-reload-up|bench-up|test-proxy|test-direct|test-block|test-host-proxy|test-reload|test-rebind|test-status|test-config|test-forward|test-domain|test-dns-cache|test-dns-tcp|test-dns-reload|test-domain-regex|test-dns-edns|test-geo|test-v6|test-relay|test-relay-idle|test-relay-offload|test-offload-lifecycle|test-udp-relay|test-udp-idle|test-ss|test-trojan|test-ss-udp|test-vless|test-vless-udp|test-vmess|test-vmess-udp|test-tuic|test-tuic-udp|test-hy2|test-hy2-udp|test-hy2-obfs|test-hy2-obfs-udp|test-hy2-brutal|test-hy2-hop|test-ops|test-config-reload|test-fault-reload|test-fault-kill|reload|verify|status|trace|down}"; exit 2 ;;
 esac

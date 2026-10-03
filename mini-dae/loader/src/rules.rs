@@ -23,20 +23,25 @@
 //!   非最后一个函数的最后一个 match_set 用 `LogicalAnd(0xFF)`，
 //!   整条规则的最后一个 match_set 用真实 outbound。
 //!
-//! 未实现的 dae 能力（会显式报错，而不是静默忽略）：`pname()` 进程名、IPv6 前缀、
-//! outbound 组名映射。domain 的 suffix/full/keyword/regex 四种 key 均已支持
-//! （regex 在前编译期编译，匹配发生用户态，见 ADR-0014）。
+//! 未实现的 dae 能力（会显式报错，而不是静默忽略）：`pname()` 进程名、outbound 组名映射。
+//! domain 的 suffix/full/keyword/regex 四种 key 均已支持（regex 在前编译期编译，匹配发生在
+//! 用户态，见 ADR-0014）。P17a 起 `dip(geoip:…)`/`dip(ext:…)` 与 `domain(geosite:…)`/
+//! `domain(ext:…)` 在编译期展开（`geodata.rs`，对照 dae `DatReaderOptimizer`）。
 
 use regex::Regex;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fmt::Write as _;
 use std::net::Ipv4Addr;
+
+use crate::geodata::{self, Geodata};
 
 /// 与 `ebpf-rs/src/common.rs` 的 `MINI_MAX_MATCH_SET_LEN` 保持一致。
 pub const MAX_MATCH_SET_LEN: u32 = 64;
 
 /// 与 `ebpf-rs/src/maps.rs` 的内层 LPM 模板一致（map-in-map 的 template 匹配要求）。
-pub const LPM_MAX_ENTRIES: u32 = 1024;
+/// P17a：对齐 dae `tproxy.c:75` 的 `max_entries=2,048,000`（`geoip:cn` ≈15k、
+/// `geoip:us` ≈293k；NO_PREALLOC 下容量只是上限，内存随实际插入增长）。
+pub const LPM_MAX_ENTRIES: u32 = 2_048_000;
 /// LPM trie 必须用 BPF_F_NO_PREALLOC。
 pub const BPF_F_NO_PREALLOC: u32 = 1;
 
@@ -103,6 +108,71 @@ pub struct DomainSetSpec {
     pub domains: Vec<String>,
     /// key=regex 时在编译期编译好的模式（对照 dae `regexp.Compile`；编译错误是硬失败）
     pub regexes: Vec<Regex>,
+    /// P17a：预计算匹配索引（suffix/full 哈希 + 前导点语义；keyword/regex 留存待扫）
+    pub index: DomainIndex,
+}
+
+/// 域名集合的预计算索引。语义对照 dae `ahocorasick_slimtrie.go`：
+/// - suffix 无前导点：匹配裸域与子域；带前导点（`.example.com`）：只匹配子域；
+/// - full：全等；keyword：子串；regex：编译后的模式。
+/// 大小写：qname 与模式均小写化后匹配（与 dae 一致）。
+#[derive(Debug, Clone, Default)]
+pub struct DomainIndex {
+    /// 无前导点 suffix（apex + sub）
+    pub suffix: HashSet<String>,
+    /// 带前导点 suffix（sub only）
+    pub suffix_sub_only: HashSet<String>,
+    pub full: HashSet<String>,
+}
+
+impl DomainSetSpec {
+    /// 构建一个 domain 集合（regex 编译 + 索引）。编译错误 → 整条规则硬失败。
+    pub fn build(match_set_index: u32, key: &str, domains: &[String]) -> Result<Self, String> {
+        let regexes = if key == "regex" {
+            domains
+                .iter()
+                .map(|pat| {
+                    Regex::new(pat).map_err(|e| format!("domain(regex: {pat}) 编译失败: {e}"))
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            Vec::new()
+        };
+        let mut index = DomainIndex::default();
+        match key {
+            "suffix" => {
+                for d in domains {
+                    let d = d.trim_end_matches('.').to_ascii_lowercase();
+                    if d.is_empty() {
+                        continue;
+                    }
+                    if let Some(sub) = d.strip_prefix('.') {
+                        if !sub.is_empty() {
+                            index.suffix_sub_only.insert(sub.to_string());
+                        }
+                    } else {
+                        index.suffix.insert(d);
+                    }
+                }
+            }
+            "full" => {
+                for d in domains {
+                    let d = d.trim_end_matches('.').to_ascii_lowercase();
+                    if !d.is_empty() {
+                        index.full.insert(d);
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(Self {
+            match_set_index,
+            key: key.to_string(),
+            domains: domains.to_vec(),
+            regexes,
+            index,
+        })
+    }
 }
 
 #[derive(Debug, Default, Clone)]
@@ -112,6 +182,8 @@ pub struct CompiledRules {
     pub lpm_tries: BTreeMap<u32, Vec<(u32, [u8; 16])>>,
     /// domain 规则（用户态 DNS 应答经过时据此写域位图）
     pub domain_sets: Vec<DomainSetSpec>,
+    /// P17a：编译期展开说明（geoip/geosite/ext 展宽了多少条），供日志/状态面
+    pub notes: Vec<String>,
 }
 
 // ------------------------------------------------------------------
@@ -308,11 +380,17 @@ impl Parser {
             self.next();
             if !matches!(self.peek(), Some(Tok::RParen)) {
                 loop {
-                    // 允许 key: value（domain 的分组靠它；其它函数会拒绝带 key）
+                    // 允许 key: value（domain 的分组靠它；dip 的 geoip/ext 也用它），
+                    // 并允许第二段冒号（ext:file:code → key=ext, val=file:code）。
                     let first = self.word()?;
                     let arg = if matches!(self.peek(), Some(Tok::Colon)) {
                         self.next();
-                        let v = self.word()?;
+                        let mut v = self.word()?;
+                        while matches!(self.peek(), Some(Tok::Colon)) {
+                            self.next();
+                            v.push(':');
+                            v.push_str(&self.word()?);
+                        }
                         Arg {
                             key: Some(first),
                             val: v,
@@ -465,6 +543,53 @@ fn parse_mac(s: &str) -> Result<[u8; 16], String> {
     Ok(data)
 }
 
+/// geodata CIDR → LPM 键（v4 → v4-mapped + 96，与 `parse_ip_prefix` 同规）。
+fn prefix_from_cidr(c: &geodata::Cidr) -> Result<(u32, [u8; 16]), String> {
+    let mut data = [0u8; 16];
+    match c.ip.len() {
+        4 => {
+            if c.plen > 32 {
+                return Err(format!("geoip v4 前缀长度越界: /{}", c.plen));
+            }
+            data[10] = 0xff;
+            data[11] = 0xff;
+            data[12..16].copy_from_slice(&c.ip);
+            Ok((96 + c.plen, data))
+        }
+        16 => {
+            if c.plen > 128 {
+                return Err(format!("geoip v6 前缀长度越界: /{}", c.plen));
+            }
+            data.copy_from_slice(&c.ip);
+            Ok((c.plen, data))
+        }
+        n => Err(format!("geoip CIDR ip 长度非法（{n} 字节）")),
+    }
+}
+
+fn require_geo<'a>(geo: Option<&'a Geodata>, what: &str) -> Result<&'a Geodata, String> {
+    geo.ok_or_else(|| {
+        format!("{what} 需要 geodata 文件（用 --geodata-dir 或 DAE_LOCATION_ASSET 指定目录）")
+    })
+}
+
+/// domain 分组：保持首次出现的 key 顺序，去重完全相同的 (key, value)。
+fn group_put(
+    order: &mut Vec<String>,
+    grouped: &mut BTreeMap<String, Vec<String>>,
+    seen: &mut HashSet<(String, String)>,
+    key: &str,
+    val: String,
+) {
+    if !seen.insert((key.to_string(), val.clone())) {
+        return;
+    }
+    if !grouped.contains_key(key) {
+        order.push(key.to_string());
+    }
+    grouped.entry(key.to_string()).or_default().push(val);
+}
+
 fn parse_port_range(s: &str) -> Result<(u16, u16), String> {
     match s.split_once('-') {
         Some((a, b)) => {
@@ -482,7 +607,11 @@ fn parse_port_range(s: &str) -> Result<(u16, u16), String> {
     }
 }
 
-fn expand_func(f: &Func) -> Result<Vec<Partial>, String> {
+fn expand_func(
+    f: &Func,
+    geo: Option<&Geodata>,
+    notes: &mut Vec<String>,
+) -> Result<Vec<Partial>, String> {
     if f.args.is_empty() && f.name != "fallback" {
         return Err(format!("函数 {} 需要至少一个参数", f.name));
     }
@@ -495,10 +624,36 @@ fn expand_func(f: &Func) -> Result<Vec<Partial>, String> {
             } else {
                 (MATCH_SOURCE_IP_SET, "sip")
             };
-            let vals = bare_values(f)?;
             let mut prefixes = Vec::new();
-            for a in &vals {
-                prefixes.push(parse_ip_prefix(a)?);
+            for a in &f.args {
+                match a.key.as_deref() {
+                    None => prefixes.push(parse_ip_prefix(&a.val)?),
+                    Some("geoip") => {
+                        let geo = require_geo(geo, &format!("{name}(geoip:{})", a.val))?;
+                        let hit = geo.geoip_code(&a.val)?;
+                        notes.push(format!("{name}(geoip:{}) → {} 条前缀", a.val, hit.0.len()));
+                        for c in hit.0.iter() {
+                            prefixes.push(prefix_from_cidr(c)?);
+                        }
+                    }
+                    Some("ext") => {
+                        let (file, code) = geodata::split_ext(&a.val)?;
+                        let geo = require_geo(geo, &format!("{name}(ext:{})", a.val))?;
+                        let hit = geo.geoip_ext(file, code)?;
+                        notes.push(format!("{name}(ext:{}) → {} 条前缀", a.val, hit.0.len()));
+                        for c in hit.0.iter() {
+                            prefixes.push(prefix_from_cidr(c)?);
+                        }
+                    }
+                    Some(other) => {
+                        return Err(format!(
+                            "{name}(…) 不认识的 key: {other}（可用 geoip/ext 或裸 CIDR）"
+                        ))
+                    }
+                }
+            }
+            if prefixes.is_empty() {
+                return Err(format!("{name}(…) 展开为空"));
             }
             Ok(vec![Partial {
                 type_,
@@ -506,7 +661,7 @@ fn expand_func(f: &Func) -> Result<Vec<Partial>, String> {
                 lpm: Some(prefixes),
                 not,
                 domain: None,
-                desc: format!("{name}({})", vals.join(",")),
+                desc: format!("{name}({} 项)", f.args.len()),
             }])
         }
         "mac" => {
@@ -570,34 +725,73 @@ fn expand_func(f: &Func) -> Result<Vec<Partial>, String> {
         // domain：每个 key 一组域名 → 各自一个 match_set（同函数内 OR）。
         // 无 key 视为 suffix（dae 文档：No key indicates suffix）。匹配发生在
         // 用户态 DNS 应答经过时（写域位图），数据面只读位图。
+        // P17a：`geosite:code[@attr]` 与 `ext:file:code` 在编译期展开为域名参数。
         "domain" => {
             if f.args.is_empty() {
                 return Err("domain(...) 需要至少一个参数".into());
             }
             let mut order: Vec<String> = Vec::new();
             let mut grouped: BTreeMap<String, Vec<String>> = BTreeMap::new();
+            let mut seen: HashSet<(String, String)> = HashSet::new();
             for a in &f.args {
-                let key = a.key.clone().unwrap_or_else(|| "suffix".into());
-                match key.as_str() {
-                    "suffix" | "full" | "keyword" | "regex" => {}
-                    other => return Err(format!("domain 不认识的 key: {other}")),
+                match a.key.as_deref() {
+                    None => group_put(&mut order, &mut grouped, &mut seen, "suffix", a.val.clone()),
+                    Some(k @ ("suffix" | "full" | "keyword" | "regex")) => {
+                        group_put(&mut order, &mut grouped, &mut seen, k, a.val.clone())
+                    }
+                    Some("geosite") => {
+                        let geo = require_geo(geo, &format!("domain(geosite:{})", a.val))?;
+                        let hit = geo.geosite_code(&a.val)?;
+                        notes.push(format!("domain(geosite:{}) → {} 条域名", a.val, hit.len()));
+                        for e in hit.iter() {
+                            group_put(
+                                &mut order,
+                                &mut grouped,
+                                &mut seen,
+                                e.dtype.routing_key(),
+                                e.value.clone(),
+                            );
+                        }
+                    }
+                    Some("ext") => {
+                        let (file, code) = geodata::split_ext(&a.val)?;
+                        let geo = require_geo(geo, &format!("domain(ext:{})", a.val))?;
+                        let hit = geo.geosite_ext(file, code)?;
+                        notes.push(format!("domain(ext:{}) → {} 条域名", a.val, hit.len()));
+                        for e in hit.iter() {
+                            group_put(
+                                &mut order,
+                                &mut grouped,
+                                &mut seen,
+                                e.dtype.routing_key(),
+                                e.value.clone(),
+                            );
+                        }
+                    }
+                    Some(other) => {
+                        return Err(format!(
+                            "domain(…) 不认识的 key: {other}（可用 suffix/full/keyword/regex/geosite/ext）"
+                        ))
+                    }
                 }
-                if !grouped.contains_key(&key) {
-                    order.push(key.clone());
-                }
-                grouped.entry(key).or_default().push(a.val.clone());
             }
             let mut out = Vec::new();
             for key in order {
                 let doms = grouped.remove(&key).unwrap_or_default();
+                if doms.is_empty() {
+                    continue;
+                }
                 out.push(Partial {
                     type_: MATCH_DOMAIN_SET,
                     value: [0u8; 16],
                     lpm: None,
                     not,
                     domain: Some((key.clone(), doms.clone())),
-                    desc: format!("domain({key}:{})", doms.join(",")),
+                    desc: format!("domain({key}: {} 条)", doms.len()),
                 });
+            }
+            if out.is_empty() {
+                return Err("domain(...) 展开为空".into());
             }
             Ok(out)
         }
@@ -658,12 +852,16 @@ fn expand_func(f: &Func) -> Result<Vec<Partial>, String> {
     }
 }
 
-fn compile_rule(rule: &Rule) -> Result<CompiledRules, String> {
+fn compile_rule(
+    rule: &Rule,
+    geo: Option<&Geodata>,
+    notes: &mut Vec<String>,
+) -> Result<CompiledRules, String> {
     // 第一遍：展开成扁平的 match_set 列表（记录所属函数与函数内位置）
     let mut flat: Vec<(Partial, usize, usize)> = Vec::new();
     let mut func_lens: Vec<usize> = Vec::new();
     for (fi, f) in rule.funcs.iter().enumerate() {
-        let partials = expand_func(f)?;
+        let partials = expand_func(f, geo, notes)?;
         func_lens.push(partials.len());
         for (pi, p) in partials.into_iter().enumerate() {
             flat.push((p, fi, pi));
@@ -693,29 +891,25 @@ fn compile_rule(rule: &Rule) -> Result<CompiledRules, String> {
         let mut value = p.value;
         if let Some(prefixes) = &p.lpm {
             value[0..4].copy_from_slice(&index.to_ne_bytes());
-            lpm_tries.insert(index, prefixes.clone());
+            // P17a：排序 + 去重（与 dae MergeAndSort/Deduplicate 后的集合一致；
+            // 对拍输出本就要排序，提前做还让写入顺序确定）。
+            let mut sorted = prefixes.clone();
+            sorted.sort();
+            sorted.dedup();
+            if sorted.len() > LPM_MAX_ENTRIES as usize {
+                return Err(format!(
+                    "LPM 集合超过上限 {LPM_MAX_ENTRIES}（/{} 条）",
+                    sorted.len()
+                ));
+            }
+            lpm_tries.insert(index, sorted);
         }
         if let Some((key, domains)) = &p.domain {
             // domain 位图的位下标 = match_set 在数组中的位置（对照 dae addDomain：
             // Value 不写下标，位下标就是 appendRule 的位置）。
             // 对照 dae ahocorasick_slimtrie.go:137-143：regex 在编译期编译，
             // 编译错误使整条规则编译失败（硬失败，不静默降级）。
-            let regexes = if key == "regex" {
-                domains
-                    .iter()
-                    .map(|pat| {
-                        Regex::new(pat).map_err(|e| format!("domain(regex: {pat}) 编译失败: {e}"))
-                    })
-                    .collect::<Result<Vec<_>, _>>()?
-            } else {
-                Vec::new()
-            };
-            domain_sets.push(DomainSetSpec {
-                match_set_index: index,
-                key: key.clone(),
-                domains: domains.clone(),
-                regexes,
-            });
+            domain_sets.push(DomainSetSpec::build(index, key, domains)?);
         }
         sets.push(MatchSet {
             value,
@@ -730,11 +924,21 @@ fn compile_rule(rule: &Rule) -> Result<CompiledRules, String> {
         sets,
         lpm_tries,
         domain_sets,
+        notes: Vec::new(),
     })
 }
 
-/// 解析整个规则文件（每条规则一行，# 注释）。
+/// 解析整个规则文件（每条规则一行，# 注释）。无 geodata 的入口（单测用）。
+#[cfg(test)]
 pub fn parse_and_compile(text: &str) -> Result<CompiledRules, String> {
+    parse_and_compile_with_geo(text, None)
+}
+
+/// P17a：带 geodata 的编译入口（`dip(geoip:…)`/`domain(geosite:…)` 展开）。
+pub fn parse_and_compile_with_geo(
+    text: &str,
+    geo: Option<&Geodata>,
+) -> Result<CompiledRules, String> {
     let mut all = CompiledRules::default();
     for (lineno, raw) in text.lines().enumerate() {
         let line = raw.trim();
@@ -746,7 +950,10 @@ pub fn parse_and_compile(text: &str) -> Result<CompiledRules, String> {
         let rule = parser
             .parse_rule()
             .map_err(|e| format!("第 {} 行: {e}", lineno + 1))?;
-        let compiled = compile_rule(&rule).map_err(|e| format!("第 {} 行: {e}", lineno + 1))?;
+        let mut rule_notes = Vec::new();
+        let compiled = compile_rule(&rule, geo, &mut rule_notes)
+            .map_err(|e| format!("第 {} 行: {e}", lineno + 1))?;
+        all.notes.extend(rule_notes);
 
         let base = all.sets.len() as u32;
         if base + compiled.sets.len() as u32 > MAX_MATCH_SET_LEN {
