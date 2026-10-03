@@ -1370,6 +1370,34 @@ mod tests {
         assert!(e.contains("未实现"), "{e}");
     }
 
+    // 真实订阅普查（ADR-0026 边界）：REALITY 与 Vision 仍显式拒绝。
+    #[test]
+    fn parse_vless_rejects_reality() {
+        let e = parse(
+            "vless://b831381d-6324-4d53-ad4f-8cda48b30811@1.2.3.4:443\
+             ?type=tcp&security=reality&sni=www.microsoft.com&pbk=abc&sid=def",
+        )
+        .unwrap_err();
+        assert!(e.contains("reality") && e.contains("未实现"), "{e}");
+    }
+
+    #[test]
+    fn parse_vless_rejects_vision_flow() {
+        let e = parse(
+            "vless://b831381d-6324-4d53-ad4f-8cda48b30811@1.2.3.4:443\
+             ?type=tcp&security=tls&flow=xtls-rprx-vision",
+        )
+        .unwrap_err();
+        assert!(e.contains("flow") && e.contains("未实现"), "{e}");
+    }
+
+    #[test]
+    fn parse_rejects_anytls_scheme() {
+        // anytls 未实现：不能静默降级成 socks5 解析
+        let e = parse("anytls://pass@1.2.3.4:8443?insecure=1&sni=example.com").unwrap_err();
+        assert!(!e.is_empty(), "{e}");
+    }
+
     /// 真实订阅节点探针（默认忽略，需要网络与环境变量）：
     ///   REAL_VLESS_WS_URL='vless://...type=ws...' [REAL_VLESS_WS_TARGET=www.gstatic.com:80] \
     ///   cargo test --release real_vless_ws_probe -- --ignored --nocapture

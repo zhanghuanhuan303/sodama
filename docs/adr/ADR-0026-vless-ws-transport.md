@@ -57,3 +57,5 @@ P5-G2 的 vless 只做 `type=tcp`（ADR-0017 边界）。拿真实订阅（50 �
 
 需要 uTLS 指纹或 grpc/h2 传输时另写 ADR；若 Rust 生态出现可用的 TLS 指纹库，
 在 `ws::connect`/`tls::connect` 的调用处替换；permessage-deflate 若成为普遍要求再评估。
+真实订阅形态普查发现 **REALITY（含 xtls-rprx-vision）**与 **anytls** 属独立协议档位
+（当前解析期显式拒绝，测试已钉住），需另写 ADR；过渡期可走 SOCKS5 桥接（NOTES §11.17）。

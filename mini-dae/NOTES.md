@@ -749,6 +749,14 @@ P4 稳定性 → P3 内核矩阵）：
 - **验收**：`cargo test --release` 80/80（+1 ignored）；标准 verify 9/9；vless tcp/tls/udp 专项全过；
   `lab/real-node-e2e.sh`（环境变量注入节点）：client ns → tproxy → vless-ws →
   真实节点 → gstatic **204**，relay up 1981B/down 4713B、dial_errors=0；拨号探针 API 级直连同样通过。
+- **真实订阅形态普查（第二份订阅，2026-10-04）**：48×vless（`security=reality` +
+  `flow=xtls-rprx-vision`，带 pbk/sid/spx）+ 18×anytls——两者都在当前边界外
+  （解析期显式拒绝，已用测试钉住：`parse_vless_rejects_reality/vision`、
+  `parse_rejects_anytls_scheme`）。参照验证：**sing-box 1.14**（REALITY 与 anytls 各取一节点）
+  均 **204**，订阅本身可用；v2ray 5.52 对 REALITY+Vision 支持不全（同目标失败）。
+  **桥接通路（不改代码即可用）**：`--dialer socks5://127.0.0.1:10883` 指向本机 sing-box
+  （出站 = 真实节点），gateway e2e gstatic **204** 实测通过；注意慢节点首连可能 >5s
+  （relay 拨号硬编码 5s 超时，会 dial_errors=1，重试即过——后续可加 `--dial-timeout`）。
 
 ## 12. 用 Rust 重写这套东西的可行性
 

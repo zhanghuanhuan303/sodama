@@ -876,3 +876,9 @@ CONNECT；ss 不支持插件与 2022 版；trojan 不支持 UDP 与域名目标�
   是唯一数据面；两个边界：① `bpf_loop` 不可用（aya-obj 的 PSEUDO_FUNC relocation 缺口），
   规则 VM 用有界循环；② 仍需 `debug = 2` 才能让 bpf-linker 产出 `.BTF`。
   需要 C 对照时从 `dae/` 重建 C 对象并临时切换 `--ebpf`（调试手段，非常规路径）。
+- **真实订阅形态（2026-10-04 普查）**：除已支持的 vless-ws（ADR-0026）外，主流节点还有
+  **vless+REALITY+Vision** 与 **anytls**——当前在解析期显式拒绝（边界外；测试已钉住）。
+  参照（sing-box 1.14）验证这两类订阅可用；过渡期可直接用 SOCKS5 桥接：
+  `--dialer socks5://127.0.0.1:<sing-box/mihomo 的 socks 端口>`（比自研 REALITY 现实得多，
+  且所有协议都可立即接入）；自研 REALITY 需要 TLS 握手级控制（uTLS/密钥共享/session_id），
+  属独立档位，需先写 ADR。
