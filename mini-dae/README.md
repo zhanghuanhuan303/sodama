@@ -204,9 +204,10 @@ lab/dnsroute.dae     P18c dns.routing 夹具（双上游 up1/up2 + 请求/应答
 lab/rules.regex.dae  P3b-2a regex 域分流规则（api[0-9]+.regex.test 命中）
 lab/rules.udp.dae    P4b UDP NAT 规则（所有 UDP:9998 判 proxy，验证 mark 防自环）
 lab/lab.sh           建/拆 netns 拓扑（标准 + 单臂）、跑测试、热重载、故障注入
-lab/gateway.sh       P13：真网关模式一键脚本（up/down/status/test/--dry-run；宿主流量透明接管；P15 支持 --subscribe/--group）
+lab/gateway.sh       P13：真网关模式一键脚本（up/down/status/test/--dry-run；宿主流量透明接管；P15 支持 --subscribe/--group；P18c 支持 --config/--dns/--geodata-dir）
 lab/sub_server.py    P15：订阅服务器夹具（GET /sub 返回指定文件内容）
 lab/rules.gateway.dae P13：网关模式规则（DNS must 置顶、无私网 sip、QUIC block、fallback proxy）
+lab/gateway.dae      P18c：网关模式配置（同规则的 routing + DNS 进控制面 → DoH/DoQ + dns.routing 广告拦截）
 ebpf-rs/             P9：完整 Rust 数据面（7 classifier + offload verdict + 规则 VM；BTF maps；
                      不属主 workspace，构建：lab/build-ebpf-rs.sh，产物 target/bpfel-unknown-none/release/）
 lab/wan_echo.py      WAN 侧 echo（9999/8080 TCP；8082 纯回显；9998 UDP）
@@ -316,10 +317,16 @@ sudo lab/lab.sh test-hy2-hop     # 两轮 512KB 跨跳存活
 # P13：真网关模式（宿主流量透明接管；浏览器零配置）——需 root：
 #   节点 URL 写入 /tmp/mini-dae-node.url（chmod 600），或 --node <文件|URL>：
 #   sudo lab/gateway.sh up                      # 默认接口 = 默认路由网卡（如 wlan0）
-#   lab/gateway.sh test                         # 204 / 出口 IP / DNS 快检
+#   lab/gateway.sh test                         # 204 / 出口 IP（代理路径）/ DNS 快检
 #   sudo lab/gateway.sh down                    # 停止并恢复（幂等）
 #   sudo lab/gateway.sh up --dry-run            # 只预览命令，零副作用
 #   （P16 起 IPv6 TCP 也会被透明代理；--no-ipv6 仍可临时关闭网卡 IPv6，down 时恢复）
+# P18c：真网关 + 加密 DNS（宿主机 DNS 进控制面 → DoH/DoQ + dns.routing 广告拦截）：
+#   sudo lab/gateway.sh up --config lab/gateway.dae --geodata-dir /usr/share/v2ray \
+#        --subscribe /tmp/mini-dae-sub.url
+#   --config <file.dae> 用配置模式（含 dns.upstream/dns.routing；少了 --rules 的简易格式）
+#   --dns <URL>         显式指定控制面上游（https://… / quic://… / tls://…）
+#   --geodata-dir <dir> 指向 v2ray .dat（geosite 规则编译期展开用）
 # P10：真实节点端到端（节点 URL 只经环境变量传入，不落盘）：
 #   REAL_NODE_URL='vless://…type=ws…' 或 'anytls://…' 或 'socks5://…'（桥接） \
 #     sudo lab/real-node-e2e.sh    # client ns → tproxy → relay → 真实节点 → gstatic 204

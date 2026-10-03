@@ -1832,18 +1832,16 @@ fn geodata_for(args: &Args) -> &'static std::sync::Mutex<geodata::Geodata> {
     })
 }
 
-/// P18c：构建上游集合（CLI `--dns-upstream` 优先→单 tag "default"；否则配置 dns.upstream map）。
+/// P18c：构建上游集合（CLI `--dns-upstream` 作为 tag "default"；配置 dns.upstream map
+/// 的其它 tag 仍保留，供 dns.routing 引用；同名时 CLI 优先）。
 fn build_upstream_set(args: &Args) -> Result<Arc<UpstreamSet>, Box<dyn std::error::Error>> {
     let cli = args.dns_upstream.clone();
-    let cfg_map = if cli.is_none() {
-        args.config
-            .as_ref()
-            .and_then(|p| config::load(Path::new(p)).ok())
-            .map(|c| config::dns_upstream_map(&c))
-            .unwrap_or_default()
-    } else {
-        Vec::new()
-    };
+    let cfg_map = args
+        .config
+        .as_ref()
+        .and_then(|p| config::load(Path::new(p)).ok())
+        .map(|c| config::dns_upstream_map(&c))
+        .unwrap_or_default();
     let legacy_url = cli
         .clone()
         .or_else(|| cfg_map.first().map(|(_, v)| v.clone()))
@@ -1851,17 +1849,15 @@ fn build_upstream_set(args: &Args) -> Result<Arc<UpstreamSet>, Box<dyn std::erro
     let legacy = dnsup::Upstream::new(&legacy_url)?;
     let mut by_tag: std::collections::HashMap<String, Arc<dnsup::Upstream>> =
         std::collections::HashMap::new();
+    for (tag, url) in &cfg_map {
+        let u =
+            dnsup::Upstream::new(url).map_err(|e| format!("dns.upstream {tag}（{url}）: {e}"))?;
+        by_tag.insert(tag.clone(), u);
+    }
     if cli.is_some() {
         by_tag.insert("default".to_string(), legacy.clone());
-    } else {
-        for (tag, url) in &cfg_map {
-            let u = dnsup::Upstream::new(url)
-                .map_err(|e| format!("dns.upstream {tag}（{url}）: {e}"))?;
-            by_tag.insert(tag.clone(), u);
-        }
-        if by_tag.is_empty() {
-            by_tag.insert("default".to_string(), legacy.clone());
-        }
+    } else if by_tag.is_empty() {
+        by_tag.insert("default".to_string(), legacy.clone());
     }
     Ok(Arc::new(UpstreamSet {
         by_tag,

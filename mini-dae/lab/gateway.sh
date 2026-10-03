@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # mini-dae 真网关模式：在宿主 netns 用 eBPF 透明接管本机流量（浏览器零配置）。
 #
-#   sudo lab/gateway.sh up [--iface wlan0] [--node <文件|URL> | --subscribe <文件|URL>] [--group <名>] [--rules <文件>] [--no-ipv6] [--dial-mode ip|domain]
+#   sudo lab/gateway.sh up [--iface wlan0] [--node <文件|URL> | --subscribe <文件|URL>] [--group <名>] [--rules <文件> | --config <配置文件>] [--dns <上游URL>] [--geodata-dir <目录>] [--no-ipv6] [--dial-mode ip|domain]
 #   sudo lab/gateway.sh down          # 停止并恢复（幂等）
 #   sudo lab/gateway.sh status        # 查看进程/钩子/日志
 #   lab/gateway.sh test               # 连通性快检（可直接用当前用户跑）
@@ -46,6 +46,9 @@ DEFAULT_NODE_FILE=/tmp/mini-dae-node.url
 
 IFACE=""
 RULES="$HERE/rules.gateway.dae"
+CONFIG=""
+DNS=""
+GEODATA_DIR=""
 NODE=""
 SUBSCRIBE=""
 GROUP=""
@@ -178,11 +181,36 @@ up() {
     esac
   fi
 
-  local dns_up
+  local dns_up dns_args rules_args geo_args
   dns_up="$(detect_dns)"
   [ -n "$dns_up" ] || dns_up="127.0.0.1"
+  if [ -n "$CONFIG" ]; then
+    [ -f "$CONFIG" ] || die "配置文件不存在：$CONFIG"
+    chmod 640 "$CONFIG" 2>/dev/null || true
+    rules_args=(--config "$CONFIG")
+  else
+    rules_args=(--rules "$RULES")
+  fi
+  geo_args=()
+  [ -n "$GEODATA_DIR" ] && geo_args=(--geodata-dir "$GEODATA_DIR")
+  # DNS 上游优先级：--dns 显式 > --config 内部（dns.upstream/dns.routing）> 系统检测
+  if [ -n "$DNS" ]; then
+    dns_args=(--dns-upstream "$DNS")
+  elif [ -n "$CONFIG" ]; then
+    dns_args=()
+  else
+    dns_args=(--dns-upstream "$dns_up:53")
+  fi
 
-  info "真网关模式 iface=$IFACE dns=$dns_up:53 rules=$RULES dial_mode=$DIAL_MODE${GROUP:+ group=$GROUP}"
+  local dns_desc
+  if [ -n "$DNS" ]; then
+    dns_desc="$DNS"
+  elif [ -n "$CONFIG" ]; then
+    dns_desc="config"
+  else
+    dns_desc="$dns_up:53"
+  fi
+  info "真网关模式 iface=$IFACE dns=$dns_desc rules=${CONFIG:-$RULES} dial_mode=$DIAL_MODE${GROUP:+ group=$GROUP}"
   if [ -n "$sub_url" ]; then
     echo "   订阅：$(printf '%s' "$sub_url" | cut -d: -f1)://…（敏感信息不回显）"
   else
@@ -254,16 +282,18 @@ up() {
     dial_args=(--dialer "$node_url")
   fi
   if [ "$DRY_RUN" -eq 1 ]; then
-    echo "  + nohup $LOADER --ebpf $OBJ --lan none --wan $IFACE --dae0 $DAE0 --dae0peer $DAE0PEER --daens $DAE_NS --rules $RULES ${dial_args[*]} --dial-timeout 15 --dial-mode $DIAL_MODE --sniffing-timeout-ms $SNIFF_TIMEOUT_MS --dns-upstream $dns_up:53 --status-socket $STATUS_SOCK --log-file $LOG >>$LOG 2>&1 &"
+    echo -n "  + nohup $LOADER --ebpf $OBJ --lan none --wan $IFACE --dae0 $DAE0 --dae0peer $DAE0PEER --daens $DAE_NS"
+    printf ' %q' "${rules_args[@]}" "${dial_args[@]}" "${geo_args[@]}" "${dns_args[@]}" --dial-timeout 15 \
+      --dial-mode "$DIAL_MODE" --sniffing-timeout-ms "$SNIFF_TIMEOUT_MS" --status-socket "$STATUS_SOCK" --log-file "$LOG"
+    echo " >>$LOG 2>&1 &"
     echo "（dry-run：未执行任何变更）"
     return 0
   fi
   : >"$LOG"
   nohup "$LOADER" --ebpf "$OBJ" --lan none --wan "$IFACE" \
     --dae0 "$DAE0" --dae0peer "$DAE0PEER" --daens "$DAE_NS" \
-    --rules "$RULES" "${dial_args[@]}" --dial-timeout 15 \
+    "${rules_args[@]}" "${dial_args[@]}" "${geo_args[@]}" "${dns_args[@]}" --dial-timeout 15 \
     --dial-mode "$DIAL_MODE" --sniffing-timeout-ms "$SNIFF_TIMEOUT_MS" \
-    --dns-upstream "$dns_up:53" \
     --status-socket "$STATUS_SOCK" --log-file "$LOG" >>"$LOG" 2>&1 &
   echo $! >"$PID_FILE"
   sleep 1.2
@@ -361,6 +391,9 @@ while [ $# -gt 0 ]; do
   --subscribe) SUBSCRIBE="$2"; shift 2 ;;
   --group) GROUP="$2"; shift 2 ;;
   --rules) RULES="$2"; shift 2 ;;
+  --config) CONFIG="$2"; shift 2 ;;
+  --dns) DNS="$2"; shift 2 ;;
+  --geodata-dir) GEODATA_DIR="$2"; shift 2 ;;
   --dial-mode) DIAL_MODE="$2"; shift 2 ;;
   --no-ipv6) NO_IPV6=1; shift ;;
   --dry-run) DRY_RUN=1; shift ;;

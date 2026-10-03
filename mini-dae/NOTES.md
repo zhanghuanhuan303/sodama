@@ -1059,6 +1059,15 @@ Selected/应答重查循环；夹具 `lab/dnsroute.dae`、假 DNS 支持 bind �
 - 边界：DoH h2/h3、ECS、optimistic cache、`fixed_domain_ttl`、`ipversion_prefer`、
   `bootstrap_resolver`、嗅探 punt 未做；`upstream(...)` 按名字比较（不复刻 dae 的
   数值巧合）；`ip()` 线性匹配（dae 用 trie）。
+- **真机网关实测**（`lab/gateway.dae`，`--config` + `--geodata-dir /usr/share/v2ray`）：
+  去掉 `dport(53) -> direct(must)` 后，宿主机 DNS 进控制面 → DoH
+  （`https://223.5.5.5/dns-query?sni=dns.alidns.com`）：123 查询 0 错误、
+  `getent` 正常；`qname(geosite:category-ads-all) -> reject`（911 域）
+  doubleclick.net / adservice.google.com 空应答（rejects=4）；热重载 fallback
+  切到 `quic://dns.alidns.com` 后 23ms 解析（DoQ 真机可用）再切回；代理路径
+  204 / YouTube 200 / 嗅探+远端解析正常。CLI `--dns-upstream` 现在作为 tag
+  `default` 与配置 tags 共存（同名时 CLI 优先），`--config`+`--dns` 不再打断
+  路由 tag 引用。
 
 ## 12. 用 Rust 重写这套东西的可行性
 
