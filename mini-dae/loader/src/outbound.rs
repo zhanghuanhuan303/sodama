@@ -17,7 +17,9 @@ use std::time::Duration;
 use base64::Engine as _;
 use percent_encoding::percent_decode_str;
 
-use crate::{hysteria2, quicsock, socks5, ss, tls, trojan, tuic, vless, vmess, DAE_SOCKET_MARK};
+use crate::{
+    hysteria2, quicsock, socks5, ss, tls, trojan, tuic, vless, vmess, ws, DAE_SOCKET_MARK,
+};
 
 const SO_MARK_OPT: libc::c_int = 36;
 
@@ -184,6 +186,37 @@ impl WriteHalf for hysteria2::Hy2WriteHalf {
 impl<W: WriteHalf> WriteHalf for vless::VlessWriter<W> {
     fn shutdown_write(&self) -> io::Result<()> {
         self.inner().shutdown_write()
+    }
+}
+
+impl<W: WriteHalf> WriteHalf for ws::WsWriter<W> {
+    fn shutdown_write(&self) -> io::Result<()> {
+        self.inner().shutdown_write()
+    }
+}
+
+impl WriteHalf for Box<dyn WriteHalf> {
+    fn shutdown_write(&self) -> io::Result<()> {
+        (**self).shutdown_write()
+    }
+}
+
+/// 按传输层包一层（tcp 直通 / ws 握手后帧化），统一到读写半的盒子里。
+fn apply_ws<R, W>(
+    r: R,
+    w: W,
+    transport: &VlessTransport,
+) -> io::Result<(Box<dyn ReadHalf>, Box<dyn WriteHalf>)>
+where
+    R: Read + Send + 'static,
+    W: WriteHalf + 'static,
+{
+    match transport {
+        VlessTransport::Tcp => Ok((Box::new(r), Box::new(w))),
+        VlessTransport::Ws { host, path } => {
+            let (r, w) = ws::connect(r, w, host, path)?;
+            Ok((Box::new(r), Box::new(w)))
+        }
     }
 }
 
@@ -354,6 +387,17 @@ impl UdpRelay {
 
 // ---------------------------------------------------------------- Dialer
 
+/// VLESS 传输层（P10：tcp / ws；grpc/h2/kcp 仍不支持）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum VlessTransport {
+    Tcp,
+    /// WebSocket（RFC6455）；`host` 是 HTTP Host 头（CDN 域），`path` 是 Upgrade 路径。
+    Ws {
+        host: String,
+        path: String,
+    },
+}
+
 #[derive(Clone, Debug)]
 pub enum Outbound {
     Direct,
@@ -377,6 +421,7 @@ pub enum Outbound {
         tls: bool,
         sni: String,
         insecure: bool,
+        transport: VlessTransport,
     },
     Vmess {
         server: SocketAddr,
@@ -403,9 +448,18 @@ impl Outbound {
                 format!("ss://{method_name}@{server}", method_name = method.name())
             }
             Self::Trojan { server, .. } => format!("trojan://{server}"),
-            Self::Vless { server, tls, .. } => {
+            Self::Vless {
+                server,
+                tls,
+                transport,
+                ..
+            } => {
+                let xport = match transport {
+                    VlessTransport::Tcp => String::new(),
+                    VlessTransport::Ws { .. } => "&type=ws".to_string(),
+                };
                 format!(
-                    "vless://{server}?security={}",
+                    "vless://{server}?security={}{xport}",
                     if *tls { "tls" } else { "none" }
                 )
             }
@@ -516,26 +570,23 @@ impl Outbound {
                 tls: use_tls,
                 sni,
                 insecure,
+                transport,
             } => {
                 let sock = marked_tcp_connect(*server, timeout)?;
                 let kill = sock.try_clone()?;
-                if *use_tls {
+                let (r, w) = if *use_tls {
                     let (r, w) = tls::connect(sock, sni, *insecure, &[], timeout)?;
-                    let (r, w) = vless::connect_split(r, w, uuid, target)?;
-                    Ok(DialedStream {
-                        from_remote: Box::new(r),
-                        to_remote: Box::new(w),
-                        socket: Some(kill),
-                    })
+                    apply_ws(r, w, transport)?
                 } else {
                     let read = sock.try_clone()?;
-                    let (r, w) = vless::connect_split(read, sock, uuid, target)?;
-                    Ok(DialedStream {
-                        from_remote: Box::new(r),
-                        to_remote: Box::new(w),
-                        socket: Some(kill),
-                    })
-                }
+                    apply_ws(read, sock, transport)?
+                };
+                let (r, w) = vless::connect_split(r, w, uuid, target)?;
+                Ok(DialedStream {
+                    from_remote: Box::new(r),
+                    to_remote: Box::new(w),
+                    socket: Some(kill),
+                })
             }
             Self::Vmess {
                 server,
@@ -612,17 +663,20 @@ impl Outbound {
                 tls: use_tls,
                 sni,
                 insecure,
+                transport,
             } => {
                 let sock = marked_tcp_connect(*server, timeout)?;
                 let timeout_sock = sock.try_clone()?;
                 let (read, write): (Box<dyn UdpDatagramSource>, Box<dyn UdpDatagramSink>) =
                     if *use_tls {
                         let (r, w) = tls::connect(sock, sni, *insecure, &[], timeout)?;
+                        let (r, w) = apply_ws(r, w, transport)?;
                         let (r, w) = vless::connect_split_udp(r, w, uuid, target)?;
                         (Box::new(r), Box::new(w))
                     } else {
                         let r = sock.try_clone()?;
-                        let (r, w) = vless::connect_split_udp(r, sock, uuid, target)?;
+                        let (r, w) = apply_ws(r, sock, transport)?;
+                        let (r, w) = vless::connect_split_udp(r, w, uuid, target)?;
                         (Box::new(r), Box::new(w))
                     };
                 Ok(Some(UdpRelay {
@@ -753,10 +807,10 @@ fn b64_decode_any(s: &str) -> Option<Vec<u8>> {
     None
 }
 
-/// `vless://uuid@host:port?type=tcp&security=tls&sni=...&allowInsecure=1`
+/// `vless://uuid@host:port?type=tcp|ws&security=tls&sni=...&allowInsecure=1`
 ///
-/// 只做 type=tcp、headerType=none；flow 非空（vision/XUDP）与 security=reality
-/// 显式拒绝（ADR-0017）。
+/// 传输：tcp / ws（`host`/`path` 参数，缺省 host=sni、path=/）；headerType=none；
+/// flow 非空（vision/XUDP）与 security=reality 显式拒绝（ADR-0017，ws 为 P10 新增）。
 fn parse_vless(rest: &str) -> Result<Outbound, String> {
     let rest = rest.split('#').next().unwrap_or(rest);
     let (main, query) = match rest.split_once('?') {
@@ -769,12 +823,17 @@ fn parse_vless(rest: &str) -> Result<Outbound, String> {
     let mut use_tls = false;
     let mut sni: Option<String> = None;
     let mut insecure = false;
+    let mut ws = false;
+    let mut ws_host: Option<String> = None;
+    let mut ws_path: Option<String> = None;
     for kv in query.split('&').filter(|s| !s.is_empty()) {
         let (k, v) = kv.split_once('=').unwrap_or((kv, ""));
         match k.to_ascii_lowercase().as_str() {
-            "type" if !matches!(v.to_ascii_lowercase().as_str(), "" | "tcp") => {
-                return Err(format!("vless:// 传输 {v} 未实现（G2 只做 tcp）"))
-            }
+            "type" => match v.to_ascii_lowercase().as_str() {
+                "" | "tcp" => {}
+                "ws" => ws = true,
+                other => return Err(format!("vless:// 传输 {other} 未实现（只做 tcp/ws）")),
+            },
             "headertype" if !matches!(v.to_ascii_lowercase().as_str(), "" | "none") => {
                 return Err(format!("vless:// headerType={v} 未实现（G2 只做 none）"))
             }
@@ -784,6 +843,8 @@ fn parse_vless(rest: &str) -> Result<Outbound, String> {
                 other => return Err(format!("vless:// security={other} 未实现（只做 tls/none）")),
             },
             "sni" | "peer" => sni = Some(percent_decode(v)),
+            "host" => ws_host = Some(percent_decode(v)),
+            "path" => ws_path = Some(percent_decode(v)),
             "allowinsecure" | "insecure" | "skip-cert-verify" => {
                 insecure = matches!(v, "1" | "true" | "TRUE" | "True")
             }
@@ -805,12 +866,22 @@ fn parse_vless(rest: &str) -> Result<Outbound, String> {
         .rsplit_once(':')
         .map(|(h, _)| h.to_string())
         .unwrap_or_else(|| hostport.clone());
+    let sni = sni.unwrap_or(default_sni);
+    let transport = if ws {
+        VlessTransport::Ws {
+            host: ws_host.unwrap_or_else(|| sni.clone()),
+            path: ws_path.unwrap_or_else(|| "/".to_string()),
+        }
+    } else {
+        VlessTransport::Tcp
+    };
     Ok(Outbound::Vless {
         server: resolve(&hostport)?,
         uuid,
         tls: use_tls,
-        sni: sni.unwrap_or(default_sni),
+        sni,
         insecure,
+        transport,
     })
 }
 
@@ -1236,4 +1307,131 @@ fn parse_trojan(rest: &str) -> Result<Outbound, String> {
         sni,
         insecure,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::ToSocketAddrs;
+
+    #[test]
+    fn parse_vless_ws_url() {
+        let ob = parse(
+            "vless://b831381d-6324-4d53-ad4f-8cda48b30811@1.2.3.4:443\
+             ?encryption=none&security=tls&sni=cdn.example.com&type=ws\
+             &host=cdn.example.com&path=%2Fabc%3Fed%3D2048&fp=chrome",
+        )
+        .unwrap();
+        match ob {
+            Outbound::Vless {
+                tls,
+                sni,
+                transport,
+                ..
+            } => {
+                assert!(tls);
+                assert_eq!(sni, "cdn.example.com");
+                assert_eq!(
+                    transport,
+                    VlessTransport::Ws {
+                        host: "cdn.example.com".into(),
+                        path: "/abc?ed=2048".into()
+                    }
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_vless_ws_defaults_host_to_sni_path_to_slash() {
+        let ob = parse(
+            "vless://b831381d-6324-4d53-ad4f-8cda48b30811@1.2.3.4:443\
+             ?security=tls&sni=cdn.example.com&type=ws",
+        )
+        .unwrap();
+        match ob {
+            Outbound::Vless { transport, .. } => assert_eq!(
+                transport,
+                VlessTransport::Ws {
+                    host: "cdn.example.com".into(),
+                    path: "/".into()
+                }
+            ),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_vless_rejects_grpc() {
+        let e = parse("vless://b831381d-6324-4d53-ad4f-8cda48b30811@1.2.3.4:443?type=grpc")
+            .unwrap_err();
+        assert!(e.contains("未实现"), "{e}");
+    }
+
+    /// 真实订阅节点探针（默认忽略，需要网络与环境变量）：
+    ///   REAL_VLESS_WS_URL='vless://...type=ws...' [REAL_VLESS_WS_TARGET=www.gstatic.com:80] \
+    ///   cargo test --release real_vless_ws_probe -- --ignored --nocapture
+    #[test]
+    #[ignore = "需要真实节点环境变量 REAL_VLESS_WS_URL"]
+    fn real_vless_ws_probe() {
+        let Ok(url) = std::env::var("REAL_VLESS_WS_URL") else {
+            eprintln!("skip: 未设 REAL_VLESS_WS_URL");
+            return;
+        };
+        let target_host = std::env::var("REAL_VLESS_WS_TARGET")
+            .unwrap_or_else(|_| "www.gstatic.com:80".to_string());
+        let target: SocketAddr = target_host
+            .to_socket_addrs()
+            .expect("解析 REAL_VLESS_WS_TARGET 失败")
+            .next()
+            .expect("REAL_VLESS_WS_TARGET 无结果");
+        let ob = parse(&url).expect("解析 dialer");
+        assert!(
+            matches!(
+                ob,
+                Outbound::Vless {
+                    transport: VlessTransport::Ws { .. },
+                    ..
+                }
+            ),
+            "该探针需要 ws 节点"
+        );
+        let mut d = ob.dial_tcp(target, Duration::from_secs(10)).expect("dial");
+        if let Some(s) = d.socket.as_ref() {
+            s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        }
+        let req = format!(
+            "GET /generate_204 HTTP/1.1\r\nHost: {}\r\nUser-Agent: mini-dae-probe\r\nConnection: close\r\n\r\n",
+            target.ip()
+        );
+        d.to_remote.write_all(req.as_bytes()).unwrap();
+        d.to_remote.flush().unwrap();
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 4096];
+        loop {
+            match d.from_remote.read(&mut tmp) {
+                Ok(0) => break,
+                Ok(n) => {
+                    buf.extend_from_slice(&tmp[..n]);
+                    if buf.len() > 8192 {
+                        break;
+                    }
+                }
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    break
+                }
+                Err(e) => panic!("read: {e}"),
+            }
+        }
+        let head = String::from_utf8_lossy(&buf[..buf.len().min(200)]).to_string();
+        eprintln!("status head: {}", head.lines().next().unwrap_or("(empty)"));
+        assert!(head.starts_with("HTTP/1."), "未拿到 HTTP 响应: {head}");
+    }
 }

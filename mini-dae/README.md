@@ -43,11 +43,15 @@ P6（suspend/reload/metrics/sysdump/日志轮转/整配置热重载）已完成*
   **协议与 offload 互斥**（AEAD/TLS 帧不交给内核拼接，带 `--offload` 也 `offloaded_total=0`）；
   UDP 仅在 ss 支持，其余协议显式计入 `udp_nat.direct_fallback`；验收对端是
   `lab/ss_server.py` / `lab/trojan_server.py`（独立实现，不复用 Rust 代码）
-- **P5-G2 协议栈**：vless（TCP+UDP，tls/none，UUID5 回退）与 vmess AEAD（aid=0，嵌套 HMAC KDF、
+- **P5-G2 协议栈**：vless（TCP+UDP，tls/none，**tcp/ws 传输**，UUID5 回退）与 vmess AEAD（aid=0，嵌套 HMAC KDF、
   AES-ECB auth id、SHAKE128 分块/填充、终止块；TCP+UDP，tls 可选）；共享 `tls.rs`（rustls）；
   **三方交叉验收**：Rust 客户端 ↔ 独立 Python 服务端（lab e2e）与**真实 Go 客户端**
   （dae 依赖的 outbound fork）↔ 同一 Python 服务端（`lab/proto-check/`）；UDP 会话拨号
   不再持 NAT 表锁（首包仍在 dns_loop 同步拨，边界见 ADR-0017）
+- **P10 vless WebSocket（真实订阅节点接入）**：RFC6455 客户端传输（HTTP Upgrade + 掩码帧，
+  拆半、ping→pong、close→EOF）；`type=ws` + `host`/`path` 参数；与参照客户端（v2ray）同目标对拍，
+  gateway e2e（client ns → tproxy → vless-ws → 真实节点 → gstatic 204）见 `lab/real-node-e2e.sh`
+  与 ADR-0026（grpc/h2/指纹仍不做）
 - **P5-G3a QUIC（tuic v5）**：惰性 tokio 运行时 + quinn（阻塞 relay 用 block_on 桥接）；
   认证 token = TLS exporter（label=uuid 裸字节、context=password）；TCP 每条中继一条 QUIC
   双向流，UDP 走 QUIC DATAGRAM（含分片/重组）；上游 socket 用自建 `Endpoint` 打 `SO_MARK`；
@@ -102,7 +106,8 @@ loader/src/ss.rs    shadowsocks classic AEAD（SIP004：evp_bytes_to_key + HKDF-
                    TCP 分块 / UDP 包，读写两半）
 loader/src/tls.rs   共享 TLS 层（rustls：握手 + 读路径 pending/抽干不变量，ALPN）
 loader/src/trojan.rs trojan（TLS + CONNECT 头；仅 TCP/IPv4/无 close_notify 半关闭）
-loader/src/vless.rs vless（TCP/UDP，tls/none，UUID 解析含 UUID5 回退，惰性响应头）
+loader/src/vless.rs vless（TCP/UDP，tls/none，tcp/ws 传输，UUID 解析含 UUID5 回退，惰性响应头）
+loader/src/ws.rs    VLESS over WebSocket：RFC6455 客户端传输（Upgrade 握手 + 掩码帧，可拆半）
 loader/src/vmess.rs vmess AEAD（嵌套 HMAC KDF、auth id、SHAKE128 分块/填充、终止块）
 loader/src/tuic.rs tuic v5（QUIC：exporter 认证、双向流、DATAGRAM 分片/重组、连接复用）
 loader/src/quicsock.rs QUIC socket 中间件：salamander 混淆（ObfsSocket）+ udphop（HopSocket）
@@ -241,6 +246,9 @@ sudo lab/lab.sh hy2-brutal-up    # P5-G3b+：cc_override=brutal + 带宽声明
 sudo lab/lab.sh test-hy2-brutal  # 512KB（Brutal 近似路径）
 sudo lab/lab.sh hy2-hop-up  # P5-G3b+：udphop（端口并集 + 5s 跳端口 + 多端口 mux）
 sudo lab/lab.sh test-hy2-hop     # 两轮 512KB 跨跳存活
+# P10：真实 vless-ws 节点端到端（节点 URL 只经环境变量传入，不落盘）：
+# VLESS_WS_URL='vless://uuid@host:port?type=ws&security=tls&sni=...&host=...&path=...' \
+#   sudo lab/real-node-e2e.sh    # client ns → tproxy → vless-ws → 真实节点 → gstatic 204
 sudo lab/lab.sh ops-up      # P6：运维面会话（--log-file + 状态面控制命令）
 sudo lab/lab.sh test-ops         # suspend(fail-open)/reload/metrics/sysdump/日志轮转
 sudo lab/lab.sh ops-reload-up    # P6：整配置热重载会话（/tmp 配置副本 + 假 DNS）
@@ -853,6 +861,10 @@ CONNECT；ss 不支持插件与 2022 版；trojan 不支持 UDP 与域名目标�
     +30MB，`MALLOC_ARENA_MAX=1` 降到 +7.9MB 且 fd 回基线；不要把它误当逻辑泄漏。
 28. **`verify` 的 rebind 对时序敏感**：并行跑其他负载时出现过一次抖动（单跑必过）；
     回归应串行执行。
+29. **WS 握手响应头要按“扫描进度”搜索，不能每轮从尾回退 3 字节**：`\r\n\r\n`
+    可能跨两次 read 到达；首版实现因此在真实节点上报“握手响应中途关闭”（ADR-0026）。
+30. **验收真实节点先跟参照客户端对拍**：节点对目标可达性自身有策略（实测部分目标被
+    节点侧黑洞，v2ray 与 mini-dae 失败模式一致）；否则会把节点问题误判为实现 bug。
 
 ## Rust 化的边界
 

@@ -50,6 +50,7 @@
 | [0023](./ADR-0023-p8-dataplane-rust-migration.md) | P8 数据面 Rust 迁移（起步）：offload 垂直切片、双对象共存、guard 镜像、镜像工具链 | 已采纳 | —（P8 执行；启动 0002 的“后迁”） |
 | [0024](./ADR-0024-p9-dataplane-full-rust.md) | P9 数据面全量 Rust 化：8 程序/14 map 全量移植、默认切换（USE_EBPF_C 回退）、有界循环替代 bpf_loop | 已采纳 | —（P9 执行；取代 0023 的迁移路线部分） |
 | [0025](./ADR-0025-remove-c-datapath.md) | 移除 C 数据面：单一 Rust 对象、删除 USE_EBPF_* 分支与 offload 双对象，回退即重建 | 已采纳 | —（0002 收尾；接 0024 默认切换） |
+| [0026](./ADR-0026-vless-ws-transport.md) | VLESS WebSocket 传输：接入真实订阅节点（type=ws + host/path，参考对拍验收） | 已采纳 | —（P10 执行；扩展 0017 的 vless 传输边界） |
 
 ## 新增一条 ADR
 

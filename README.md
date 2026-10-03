@@ -9,8 +9,8 @@ byte-exact parity tests against dae's Go rule compiler and a netns test lab.*
   + 14 张 BTF map，全部为 Rust/aya-ebpf，**无 C 数据面**（P9+，ADR-0025）。
 - **控制面（用户态）**：Rust + aya 加载器——`.dae` 全量配置解析与规则编译、
   透明 DNS 接管（缓存/TCP/regex/EDNS）、TCP relay / UDP NAT / TCP offload、
-  协议栈 shadowsocks / trojan / vless / vmess / tuic / hysteria2（含 UDP 与会话）、
-  状态面 / 热重载 / 指标导出。
+  协议栈 shadowsocks / trojan / vless（tcp/ws）/ vmess / tuic / hysteria2（含 UDP 与会话）、
+  状态面 / 热重载 / 指标导出；vless 的 **WebSocket 传输**已接入真实订阅节点（ADR-0026）。
 - **lab**：netns 拓扑（标准 + 单臂）、`verify` 9 用例、DNS / 转发面 / 协议梯 / 运维专项、
   soak、与 dae 原版 Go 规则编译器的**逐字节对拍**、真实 Go 客户端跨实现联调、
   双内核矩阵（宿主 + QEMU 第二内核）。
@@ -46,6 +46,7 @@ mini-dae/                    可运行工程（构建、实验、测试都在这
 │   ├── soak.sh                长时打流 + reload/suspend 泄漏检查
 │   ├── parity.sh + parity/   与 dae Go 编译器的规则编译对拍（逐字节）
 │   ├── proto-check/           真实 Go 客户端 / Go 参考服务端跨实现联调
+│   ├── real-node-e2e.sh       真实 vless-ws 订阅节点端到端验收（env 注入节点）
 │   └── matrix.sh              内核矩阵（宿主 / QEMU 第二内核）
 ├── README.md                  实验手册：构建、拓扑、会话、实测输出
 └── NOTES.md                   数据面/协议栈的源码级笔记（带行号与坑清单）

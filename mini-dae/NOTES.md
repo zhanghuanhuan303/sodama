@@ -725,6 +725,31 @@ P4 稳定性 → P3 内核矩阵）：
 - **完整性边界（如实）**：本回归覆盖 mini-dae 声明范围（ADR-0006/0011），**不等于 full dae**
   ——geoip/pname/CO-RE 等仍显式 deferred；<5.17/<6.6 内核行为未真机验证（见 SUMMARY）。
 
+### 11.17 P10（vless WebSocket 传输 / 真实订阅节点）已验收的行为
+
+（决策与取舍见 ADR-0026；脚本 `lab/real-node-e2e.sh`；探针 `real_vless_ws_probe`。）
+
+- **触发**：用真实订阅（50 节点，全部 vless+ws+tls+CF CDN）检验生态兼容性，
+  原 vless 客户端只做 tcp、解析期即拒绝——属于“接入原有生态”的硬缺口；
+- **实现**：`loader/src/ws.rs`（RFC6455 客户端传输）——
+  - 握手：`GET {path}` + `Host/Sec-WebSocket-Key/Version`，校 101 与
+    `Sec-WebSocket-Accept`（SHA1+GUID）；握手残留字节存读半 pending 不丢帧；
+  - 读半流式（remaining 计数、不缓存整帧）、续帧当字节流、ping→pong（写路径捎带）、close→EOF；
+  - 写半每次 write 一帧（掩码、FIN=1）；传输选择在 `parse_vless`：
+    `type=ws` + `host`/`path`（缺省 host=sni、path=/）；grpc/h2 仍拒绝；
+- **实测坑（值得记）**：
+  1. 响应头搜索不能每轮都从 `buf.len()-3` 重新开始——分隔符可跨两次 read，
+     必须记录上次扫描进度（首次实现漏掉 `\r\n\r\n` → “握手响应中途关闭”）；
+  2. 掩码是客户端→服务端**强制**；服务端帧带 mask 应报错；
+  3. 真实节点对**目标可达性自身有策略**：同一节点 v2ray 5.52 与 mini-dae 在
+     `1.1.1.1`/`1.0.0.1`/`www.cloudflare.com` 上同样失败（节点侧黑洞）、gstatic/ipify 正常
+     ——验收必须带“参照客户端同目标对拍”，否则会把节点问题误判为实现 bug；
+  4. 环境坑：本机容器内 root 覆盖宿主用户属主的 0640 文件会被拒（capability 映射），
+     lab 脚本生成规则文件先 `rm -f` 再写；
+- **验收**：`cargo test --release` 80/80（+1 ignored）；标准 verify 9/9；vless tcp/tls/udp 专项全过；
+  `lab/real-node-e2e.sh`（环境变量注入节点）：client ns → tproxy → vless-ws →
+  真实节点 → gstatic **204**，relay up 1981B/down 4713B、dial_errors=0；拨号探针 API 级直连同样通过。
+
 ## 12. 用 Rust 重写这套东西的可行性
 
 已验证（本仓库 mini-dae，实测跑通）：

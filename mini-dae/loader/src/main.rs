@@ -56,6 +56,7 @@ mod trojan;
 mod tuic;
 mod vless;
 mod vmess;
+mod ws;
 
 /// dae 给控制面自己的 socket 打的内部 mark（对照 so_mark_from_dae / dae_socket_mark）。
 /// 副作用：避免监听 socket 的 sk_mark 为 0 时新连接继承 SYN 上的 TPROXY_MARK
