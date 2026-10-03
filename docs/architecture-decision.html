@@ -1,0 +1,1317 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>dae → Rust 重构决策档案</title>
+<style>
+  :root{
+    --bg:#0a0e14;
+    --panel:#111823;
+    --panel-2:#0e141d;
+    --line:#1e2a3a;
+    --line-2:#2b3b52;
+    --fg:#e6edf3;
+    --muted:#8b9bb0;
+    --dim:#5d6e85;
+    --go:#00add8;
+    --rust:#ff7043;
+    --ok:#3fb950;
+    --warn:#d29922;
+    --bad:#f85149;
+    --info:#58a6ff;
+    --mono:ui-monospace,"JetBrains Mono","Fira Code","SF Mono",Menlo,Consolas,monospace;
+    --sans:system-ui,-apple-system,"Noto Sans CJK SC","Source Han Sans SC","PingFang SC","Microsoft YaHei",sans-serif;
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{
+    margin:0;background:var(--bg);color:var(--fg);font-family:var(--sans);
+    font-size:15px;line-height:1.75;
+    background-image:
+      linear-gradient(rgba(88,166,255,.045) 1px,transparent 1px),
+      linear-gradient(90deg,rgba(88,166,255,.045) 1px,transparent 1px);
+    background-size:44px 44px;
+  }
+  a{color:var(--info);text-decoration:none}
+  a:hover{text-decoration:underline}
+  code{font-family:var(--mono);font-size:.86em;background:#0b111a;border:1px solid var(--line);border-radius:4px;padding:.1em .4em;color:#cfe3ff}
+  h1,h2,h3,h4{font-family:var(--mono);font-weight:600;letter-spacing:-.01em;line-height:1.3}
+  h2{font-size:1.5rem;margin:0 0 .3em;color:#fff}
+  h3{font-size:1.08rem;margin:2em 0 .5em;color:#dbe7f5}
+  h4{font-size:.95rem;margin:1.4em 0 .4em;color:var(--muted);text-transform:uppercase;letter-spacing:.08em}
+  p{margin:.6em 0}
+  ul,ol{margin:.5em 0 .8em;padding-left:1.3em}
+  li{margin:.25em 0}
+  strong{color:#fff}
+  em{color:var(--muted);font-style:normal}
+  hr{border:0;border-top:1px solid var(--line);margin:2.4em 0}
+
+  /* ---------- layout ---------- */
+  .progress{position:fixed;top:0;left:0;height:2px;background:linear-gradient(90deg,var(--rust),var(--info));width:0;z-index:60}
+  .sidebar{
+    position:fixed;top:0;left:0;width:248px;height:100vh;overflow-y:auto;
+    background:rgba(10,14,20,.92);backdrop-filter:blur(6px);
+    border-right:1px solid var(--line);padding:22px 14px 40px;z-index:50;
+  }
+  .sidebar .brand{font-family:var(--mono);font-size:.82rem;color:var(--dim);letter-spacing:.14em;text-transform:uppercase;margin:0 0 4px 10px}
+  .sidebar .brand-2{font-family:var(--mono);font-size:1.02rem;color:var(--rust);margin:0 0 18px 10px}
+  .sidebar nav a{
+    display:block;font-family:var(--mono);font-size:.79rem;color:var(--muted);
+    padding:5px 10px;border-left:2px solid transparent;border-radius:0 4px 4px 0;
+  }
+  .sidebar nav a:hover{color:var(--fg);background:#131c28;text-decoration:none}
+  .sidebar nav a.active{color:#fff;border-left-color:var(--rust);background:#141d29}
+  .sidebar nav a .n{color:var(--dim);margin-right:8px}
+  main{margin-left:248px;max-width:1120px;padding:40px 44px 120px}
+  @media (max-width:900px){
+    .sidebar{position:static;width:auto;height:auto;border-right:0;border-bottom:1px solid var(--line)}
+    .sidebar nav{display:flex;flex-wrap:wrap;gap:2px}
+    .sidebar nav a{border-left:0;border-bottom:2px solid transparent;border-radius:4px 4px 0 0}
+    main{margin-left:0;padding:24px 18px 80px}
+  }
+
+  /* ---------- hero ---------- */
+  .hero{border:1px solid var(--line);border-radius:14px;padding:30px 32px;background:
+    radial-gradient(1200px 220px at 90% -40%,rgba(255,112,67,.14),transparent 60%),
+    radial-gradient(800px 200px at 10% 130%,rgba(0,173,216,.10),transparent 60%),
+    var(--panel-2)}
+  .hero .kicker{font-family:var(--mono);font-size:.76rem;letter-spacing:.22em;text-transform:uppercase;color:var(--rust)}
+  .hero h1{font-size:2.05rem;margin:.35em 0 .2em;color:#fff}
+  .hero .sub{color:var(--muted);max-width:70ch}
+  .meta{display:flex;flex-wrap:wrap;gap:10px;margin-top:18px}
+  .chip{font-family:var(--mono);font-size:.74rem;color:var(--muted);border:1px solid var(--line);background:#0c121b;border-radius:999px;padding:3px 11px}
+  .chip b{color:var(--fg);font-weight:600}
+
+  /* ---------- cards & grids ---------- */
+  .grid{display:grid;gap:16px}
+  .g2{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .g3{grid-template-columns:repeat(3,minmax(0,1fr))}
+  @media (max-width:1000px){.g3{grid-template-columns:1fr 1fr}}
+  @media (max-width:760px){.g2,.g3{grid-template-columns:1fr}}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:18px 20px}
+  .card h3{margin-top:0}
+  .card .tag{font-family:var(--mono);font-size:.7rem;letter-spacing:.12em;text-transform:uppercase;color:var(--dim)}
+  .card.alt{background:var(--panel-2)}
+  .card.rust{border-color:#4a2a20;background:linear-gradient(180deg,rgba(255,112,67,.07),transparent 55%),var(--panel)}
+  .card.go{border-color:#123c4d;background:linear-gradient(180deg,rgba(0,173,216,.06),transparent 55%),var(--panel)}
+
+  /* ---------- badges / stamps ---------- */
+  .b{display:inline-block;font-family:var(--mono);font-size:.7rem;padding:1px 8px;border-radius:999px;border:1px solid;vertical-align:middle;letter-spacing:.04em;white-space:nowrap}
+  .b-ok{color:var(--ok);border-color:#1d4429;background:#0e1a12}
+  .b-warn{color:var(--warn);border-color:#4a3a12;background:#1a1508}
+  .b-bad{color:var(--bad);border-color:#4d1f1c;background:#1d0f0e}
+  .b-info{color:var(--info);border-color:#1c3a5c;background:#0d1622}
+  .b-rust{color:var(--rust);border-color:#4a2a20;background:#1d120d}
+  .b-muted{color:var(--dim);border-color:var(--line);background:#0c121b}
+  .stamp{display:inline-block;font-family:var(--mono);font-size:.68rem;letter-spacing:.1em;color:var(--ok);border:1px dashed #2a5c39;border-radius:6px;padding:1px 7px;transform:rotate(-1.2deg)}
+
+  /* ---------- tables ---------- */
+  table{width:100%;border-collapse:collapse;margin:1em 0;font-size:.88rem}
+  th,td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--line);vertical-align:top}
+  th{font-family:var(--mono);font-size:.74rem;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);background:#0d131c}
+  tr:hover td{background:#0f1620}
+  td.num,th.num{text-align:right;font-family:var(--mono);font-variant-numeric:tabular-nums}
+  .tbl-wrap{overflow-x:auto;border:1px solid var(--line);border-radius:10px}
+  .tbl-wrap table{margin:0;min-width:640px}
+  caption{caption-side:bottom;text-align:left;color:var(--dim);font-size:.78rem;padding:8px 10px;font-family:var(--mono)}
+
+  /* ---------- bars ---------- */
+  .bar{height:9px;border-radius:4px;background:#0c121b;border:1px solid var(--line);overflow:hidden;min-width:70px}
+  .bar i{display:block;height:100%;background:linear-gradient(90deg,#2c4a6b,var(--info))}
+  .bar.rust i{background:linear-gradient(90deg,#5c2f1d,var(--rust))}
+  .bar.go i{background:linear-gradient(90deg,#0e4256,var(--go))}
+
+  /* ---------- callouts ---------- */
+  .call{border-left:3px solid var(--info);background:#0d1622;border-radius:0 10px 10px 0;padding:12px 16px;margin:1em 0}
+  .call.warn{border-left-color:var(--warn);background:#181307}
+  .call.bad{border-left-color:var(--bad);background:#1a0f0e}
+  .call.ok{border-left-color:var(--ok);background:#0d1712}
+  .call .h{font-family:var(--mono);font-size:.78rem;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);margin-bottom:.3em}
+
+  /* ---------- code ---------- */
+  pre{background:#080d13;border:1px solid var(--line);border-radius:10px;padding:14px 16px;overflow-x:auto;font-family:var(--mono);font-size:.8rem;line-height:1.6;color:#c8d6e5}
+  pre .c{color:#5d6e85}
+
+  /* ---------- diagrams ---------- */
+  figure{margin:1.4em 0}
+  figure svg{width:100%;height:auto;display:block;background:var(--panel-2);border:1px solid var(--line);border-radius:12px}
+  figcaption{color:var(--dim);font-size:.78rem;font-family:var(--mono);margin-top:8px}
+
+  /* ---------- decision cards ---------- */
+  .dec{border:1px solid var(--line-2);border-radius:12px;background:var(--panel);overflow:hidden}
+  .dec header{display:flex;gap:12px;align-items:baseline;padding:14px 18px;border-bottom:1px solid var(--line);background:#0e1520}
+  .dec header .id{font-family:var(--mono);color:var(--rust);font-size:.8rem}
+  .dec header h3{margin:0;font-size:1rem}
+  .dec .body{padding:14px 18px}
+  .dec .opts{display:grid;gap:8px;margin:.6em 0 0}
+  .opt{display:flex;gap:10px;align-items:flex-start;border:1px solid var(--line);border-radius:9px;padding:9px 12px;cursor:pointer;transition:border-color .18s,background .18s}
+  .opt:hover{border-color:var(--line-2);background:#101823}
+  .opt input{accent-color:var(--rust);margin-top:8px}
+  .opt.rec{border-color:#4a2a20;background:#150f0c}
+  .opt .t{font-family:var(--mono);font-size:.82rem;color:#fff;display:block}
+  .opt .d{color:var(--muted);font-size:.84rem;display:block}
+  .opt .rec-tag{font-family:var(--mono);font-size:.66rem;color:var(--rust);border:1px solid #4a2a20;border-radius:999px;padding:0 7px;margin-left:6px}
+  .dec .why{border-top:1px dashed var(--line);margin-top:12px;padding-top:10px;color:var(--muted);font-size:.86rem}
+  .dec .why b{color:var(--fg)}
+
+  /* ---------- timeline ---------- */
+  .phase{display:grid;grid-template-columns:170px 1fr;gap:18px;padding:14px 0;border-top:1px solid var(--line)}
+  .phase:first-of-type{border-top:0}
+  .phase .p{font-family:var(--mono);font-size:.85rem;color:var(--rust)}
+  .phase .p small{display:block;color:var(--dim);font-size:.72rem;letter-spacing:.06em}
+  @media (max-width:700px){.phase{grid-template-columns:1fr;gap:6px}}
+
+  .kv{display:grid;grid-template-columns:110px 1fr;gap:6px 16px;font-size:.88rem}
+  .kv dt{color:var(--muted);font-family:var(--mono);font-size:.78rem}
+  .kv dd{margin:0}
+
+  /* 默认可见；只有 JS 生效时才启用入场动画，避免无 JS/截图/打印时内容不可见 */
+  html.js .reveal{opacity:0;transform:translateY(14px);transition:opacity .5s ease,transform .5s ease}
+  html.js .reveal.in{opacity:1;transform:none}
+  @media (prefers-reduced-motion:reduce){html.js .reveal{opacity:1;transform:none;transition:none}}
+  @media print{.sidebar,.progress{display:none}main{margin:0;max-width:none}body{background:#fff;color:#111}}
+</style>
+</head>
+<body>
+<div class="progress" id="progress"></div>
+
+<aside class="sidebar">
+  <p class="brand">architecture dossier</p>
+  <p class="brand-2">dae → Rust</p>
+  <nav id="nav">
+    <a href="#tldr"><span class="n">00</span>决策摘要</a>
+    <a href="#overview"><span class="n">01</span>项目全景</a>
+    <a href="#modules"><span class="n">02</span>模块解剖</a>
+    <a href="#runtime"><span class="n">03</span>运行时机制</a>
+    <a href="#rust-arch"><span class="n">04</span>目标 Rust 架构</a>
+    <a href="#deploy"><span class="n">04.5</span>部署形态</a>
+    <a href="#resident"><span class="n">04.6</span>常驻与故障语义</a>
+    <a href="#optimizations"><span class="n">05</span>优化点</a>
+    <a href="#risks"><span class="n">06</span>风险登记册</a>
+    <a href="#roadmap"><span class="n">07</span>迁移路线图</a>
+    <a href="#decisions"><span class="n">08</span>决策点</a>
+    <a href="#appendix"><span class="n">09</span>附录</a>
+  </nav>
+</aside>
+
+<main>
+<header class="hero reveal">
+  <p class="kicker">Architecture Review &amp; Rewrite Plan</p>
+  <h1>dae → Rust 重构决策档案</h1>
+  <p class="sub">对 Go 版 <code>daeuniverse/dae</code> 的模块、架构与运行时机制做完整拆解，给出全 Rust 目标架构、可落地的优化点、风险登记册与分期路线图。所有「已实测」条目来自本仓库 <code>mini-dae</code> 的实验（C 数据面 + Rust/aya 加载器，K0–K3 九用例 × 两种拓扑实测通过；规则编译与 dae 原版逐字节对拍一致；全量配置解析与 dae schema/include 语义对齐；P3a/b DNS 与 P4 转发面（relay/UDP NAT/offload）已端到端跑通，P5-G1 原生协议栈（shadowsocks classic AEAD + trojan）、P5-G2（vless + vmess AEAD）、P5-G3a（tuic v5 / QUIC）、P5-G3b（hysteria2 / QUIC + 最小 HTTP/3 认证）与 P5-G3b+（salamander 混淆 / Brutal 近似 / udphop）已跨实现实测（含真实 Go 客户端与 Go 参考服务端三方交叉）；P6 运维面（suspend/reload/metrics/sysdump/日志轮转/整配置热重载）已端到端实测）。</p>
+  <div class="meta">
+    <span class="chip">分析对象 <b>dae @ e3fee8f (nightly)</b></span>
+    <span class="chip">代码量 <b>~65k 非测试 LOC / ~40k 测试</b></span>
+    <span class="chip">数据面 <b>tproxy.c 4403 行 · 23 个程序 · 24 个 map</b></span>
+    <span class="chip">许可 <b>AGPL-3.0</b></span>
+    <span class="chip">文档版本 <b>v2.9 · 2026-10-04</b></span>
+  </div>
+</header>
+
+<!-- ============================================================ -->
+<section id="tldr" class="reveal" style="margin-top:56px">
+  <h2><span style="color:var(--dim);font-size:.62em">00 · </span>决策摘要</h2>
+  <p style="color:var(--muted)">给没时间读完全文的人：五条结论 + 七个待拍板项（节 08 可勾选）。</p>
+
+  <div class="grid g2" style="margin-top:18px">
+    <div class="card go">
+      <p class="tag">现状判断</p>
+      <h3>复杂度来自内核与运维边界，不是 Go 语言</h3>
+      <p>65k 非测试行里，<b>59% 在 control/</b>（38.6k）：BPF 生命周期、路由编译、DNS 控制器、TCP/UDP 会话、netns/tc、offload。这些规模由「内核矩阵 × 协议细节 × 热重载」决定，换语言不会消失。</p>
+    </div>
+    <div class="card rust">
+      <p class="tag">收益判断</p>
+      <h3>Rust 的收益集中在四个面</h3>
+      <p>① 用户态转发路径无 GC 尾延迟；② 报文/DNS/协议解析的内存安全；③ 类型系统承载路由 IR 与配置 schema；④ 单静态二进制与更小的运行时占用。<b>不包含</b>「数据面变简单」——eBPF 的 verifier 约束与内核兼容是同一堵墙。</p>
+    </div>
+    <div class="card">
+      <p class="tag">最大风险</p>
+      <h3>outbound 协议栈是真正的深水区</h3>
+      <p>代理协议实现（ss/vmess/vless/trojan/hysteria2/tuic/juicity/anytls…）在同组织的独立仓库 <code>daeuniverse/outbound</code>，<b>规模未知且不在本仓库</b>。Rust 生态只有部分协议有成熟 crate。它决定「生产可替换」是否成立。</p>
+    </div>
+    <div class="card">
+      <p class="tag">已验证路径</p>
+      <h3>「C 数据面 + Rust 控制面」今天就能走通 <span class="stamp">已实测</span></h3>
+      <p>mini-dae 用 <code>aya 0.14</code> 加载并挂载 TCX 钩子、进 daens <code>setns</code>、建 IP_TRANSPARENT socket 入 sockmap、写 LPM/Array/Hash map，proxy/direct/block 分流、本机流量、热重载、单写者、故障注入八用例在标准与单臂两种拓扑下端到端通过。数据面程序本身改用 aya-ebpf 需要 nightly（本环境被网络策略拦住，未验证）。</p>
+    </div>
+  </div>
+
+  <div class="call ok" style="margin-top:20px">
+    <div class="h">建议主线（2026-10-03 修订：内核切片先行）</div>
+    <p><b>按「内核切片先行（K0–K3）→ DNS → 转发面 → 协议栈 → 运维面」推进</b>。关键是把「内核攻坚」定义成<b>纵向切片</b>：数据面（规则 VM / LPM / 双 epoch / conntrack）+ <b>最小驱动</b>（routing 子集编译 + 钩子集合管理）+ <b>最小对拍器</b>（map dump + 包级 e2e）。生态接入走<b>契约级/进程级</b>边界（配置 DSL、订阅格式、状态面；可选「Go 当协议后端」过渡一跳），<b>不用 cgo/FFI</b>。详见 ADR-0009。</p>
+  </div>
+
+  <div class="call" style="margin-top:14px">
+    <div class="h">部署形态结论（详 4.5 / 4.6）</div>
+    <p><b>常驻进程 + eBPF 分流，但不接管 direct 数据面。</b>即「接管所有流量的<i>决策</i>，只接管需要代理的<i>数据</i>」。eBPF 数据面是 per-netns 单例、只能有一个 owner（supervisor）；用户态 worker 只持有连接。第一版单进程多线程，需要隔离时再拆 supervisor + workers。故障语义默认 fail-open（TCX 随进程退出摘钩），隐私敏感场景可加心跳死区开关。</p>
+  </div>
+</section>
+
+<!-- ============================================================ -->
+<section id="overview" class="reveal" style="margin-top:64px">
+  <h2><span style="color:var(--dim);font-size:.62em">01 · </span>项目全景</h2>
+
+  <h3>1.1 定位与设计哲学</h3>
+  <p>dae 是 Linux 上的高性能透明代理网关：在 <b>tc eBPF</b> 层完成流量分流，让 <code>direct</code> 流量走内核三层转发（<b>Real Direct</b>），<code>proxy</code> 流量才进入用户态或内核 offload 路径。分流判据覆盖域名、源/目的 IP、端口、L4 协议、IP 版本、进程名、MAC、DSCP。</p>
+  <p>三个设计支点决定了它的全部复杂度：</p>
+  <ul>
+    <li><b>分流发生在报文进入协议栈之前</b>——所以 direct 流量几乎没有额外开销，但也意味着所有判据必须在 eBPF 里可计算（域名要靠主动 DNS 关联或嗅探）。</li>
+    <li><b>内核数据面与用户态控制面强耦合</b>——规则以「编译产物」形态进 map，热重载是双 epoch 槽切换，状态（conntrack / 路由缓存 / 回程绑定）都在 map 里。</li>
+    <li><b>面向长期运行的网关场景</b>——netns 生命周期、janitor、事件限流、溢出报告、内存上限、systemd 集成，占了 control/ 相当比例。</li>
+  </ul>
+
+  <h3>1.2 规模分布</h3>
+  <div class="tbl-wrap">
+  <table>
+    <thead><tr><th>模块</th><th>职责一句话</th><th class="num">非测试 LOC</th><th class="num">测试 LOC</th><th style="width:150px">比重</th></tr></thead>
+    <tbody>
+      <tr><td><code>control/</code></td><td>控制面总成：BPF 生命周期、路由编译、DNS 控制器、TCP/UDP 会话、netns/tc、offload、统计事件</td><td class="num">38,598</td><td class="num">27,247</td><td><div class="bar go"><i style="width:100%"></i></div></td></tr>
+      <tr><td><code>component/</code></td><td>可复用领域组件：DNS 引擎、outbound 拨号、路由匹配、嗅探、自举 DNS、DNS 传输</td><td class="num">12,823</td><td class="num">6,435</td><td><div class="bar go"><i style="width:33%"></i></div></td></tr>
+      <tr><td><code>cmd/</code></td><td>CLI 与守护进程：run / reload / validate / export / suspend / sysdump / trace</td><td class="num">5,389</td><td class="num">3,345</td><td><div class="bar go"><i style="width:14%"></i></div></td></tr>
+      <tr><td><code>pkg/</code></td><td>基础设施：配置解析(ANTLR)、trie、geodata、anybuffer、ebpf ELF 内部</td><td class="num">3,530</td><td class="num">651</td><td><div class="bar go"><i style="width:9%"></i></div></td></tr>
+      <tr><td><code>common/</code></td><td>共享词汇表与工具：常量、错误、netutils、订阅解析、assets、bitlist</td><td class="num">2,553</td><td class="num">981</td><td><div class="bar go"><i style="width:7%"></i></div></td></tr>
+      <tr><td><code>config/</code></td><td>配置模型：schema/desc、decode、marshal、include 合并、patch、outline</td><td class="num">1,419</td><td class="num">794</td><td><div class="bar go"><i style="width:4%"></i></div></td></tr>
+      <tr><td><code>trace/</code></td><td><code>dae trace</code> 的诊断 eBPF（独立于主数据面）</td><td class="num">638</td><td class="num">0</td><td><div class="bar go"><i style="width:2%"></i></div></td></tr>
+      <tr><td><code>control/kern/</code></td><td><b>数据面本体</b>：<code>tproxy.c</code> 4,403 行 C</td><td class="num">(4,403)</td><td class="num">(1,161)</td><td><div class="bar rust"><i style="width:11%"></i></div></td></tr>
+      <tr><td colspan="2"><b>合计（不含外部仓库；含根目录 main.go）</b></td><td class="num"><b>64,980</b></td><td class="num"><b>39,453</b></td><td></td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p><em>注：外部栈不在统计内——<code>daeuniverse/outbound</code>（全部代理协议）、<code>olicesx/quic-go</code>（定制 fork）、<code>dae-config-dist</code>（配置 DSL 的 ANTLR 语法）、<code>dae_bpf_headers</code>（eBPF 头子模块）。这是「重写全部 dae 功能」与「重写本仓库」之间的规模鸿沟。</em></p>
+
+  <h3>1.3 分层架构</h3>
+  <figure>
+    <svg viewBox="0 0 980 470" role="img" aria-label="dae 分层架构图">
+      <text x="24" y="30" fill="#5d6e85" font-family="monospace" font-size="13">KERNEL</text>
+      <rect x="24" y="42" width="932" height="118" rx="10" fill="#0d1622" stroke="#1c3a5c"/>
+      <rect x="44" y="62" width="270" height="78" rx="8" fill="#111823" stroke="#2b3b52"/>
+      <text x="60" y="86" fill="#cfe3ff" font-family="monospace" font-size="13">tc hooks ×14</text>
+      <text x="60" y="106" fill="#8b9bb0" font-family="monospace" font-size="11">lan/wan ingress+egress · dae0peer/dae0</text>
+      <text x="60" y="124" fill="#8b9bb0" font-family="monospace" font-size="11">分流 / 重定向 / 回程还原</text>
+      <rect x="336" y="62" width="200" height="78" rx="8" fill="#111823" stroke="#2b3b52"/>
+      <text x="352" y="86" fill="#cfe3ff" font-family="monospace" font-size="13">cgroup hooks ×6</text>
+      <text x="352" y="106" fill="#8b9bb0" font-family="monospace" font-size="11">sock_create/release</text>
+      <text x="352" y="124" fill="#8b9bb0" font-family="monospace" font-size="11">connect/sendmsg 4/6</text>
+      <rect x="558" y="62" width="180" height="78" rx="8" fill="#111823" stroke="#2b3b52"/>
+      <text x="574" y="86" fill="#cfe3ff" font-family="monospace" font-size="13">sk_skb + fentry</text>
+      <text x="574" y="106" fill="#8b9bb0" font-family="monospace" font-size="11">TCP offload 转发</text>
+      <text x="574" y="124" fill="#8b9bb0" font-family="monospace" font-size="11">+ 字节记账</text>
+      <rect x="760" y="62" width="176" height="78" rx="8" fill="#111823" stroke="#2b3b52"/>
+      <text x="776" y="86" fill="#cfe3ff" font-family="monospace" font-size="13">24 maps</text>
+      <text x="776" y="106" fill="#8b9bb0" font-family="monospace" font-size="11">LPM/ARRAY/HASH/SOCKMAP</text>
+      <text x="776" y="124" fill="#8b9bb0" font-family="monospace" font-size="11">RINGBUF / PERCPU scratch</text>
+
+      <text x="24" y="206" fill="#5d6e85" font-family="monospace" font-size="13">USERSPACE · dae</text>
+      <rect x="24" y="218" width="932" height="150" rx="10" fill="#111823" stroke="#1e2a3a"/>
+      <rect x="44" y="236" width="290" height="112" rx="8" fill="#0e141d" stroke="#2b3b52"/>
+      <text x="60" y="258" fill="#ff7043" font-family="monospace" font-size="13">control/ · 38.6k</text>
+      <text x="60" y="278" fill="#8b9bb0" font-family="monospace" font-size="11">BPF 生命周期 · 路由编译 · DNS 控制器</text>
+      <text x="60" y="296" fill="#8b9bb0" font-family="monospace" font-size="11">TCP/UDP 会话 · netns/tc · offload</text>
+      <text x="60" y="314" fill="#8b9bb0" font-family="monospace" font-size="11">janitor · 事件/统计 · reload</text>
+      <text x="60" y="334" fill="#5d6e85" font-family="monospace" font-size="10">3252 行 control_plane.go 是总装线</text>
+
+      <rect x="352" y="236" width="290" height="112" rx="8" fill="#0e141d" stroke="#2b3b52"/>
+      <text x="368" y="258" fill="#ff7043" font-family="monospace" font-size="13">component/ · 12.8k</text>
+      <text x="368" y="278" fill="#8b9bb0" font-family="monospace" font-size="11">dns · daedns · dnstransport</text>
+      <text x="368" y="296" fill="#8b9bb0" font-family="monospace" font-size="11">outbound(dialer/健康检查) · routing</text>
+      <text x="368" y="314" fill="#8b9bb0" font-family="monospace" font-size="11">sniffing(TLS/HTTP/QUIC)</text>
+      <text x="368" y="334" fill="#5d6e85" font-family="monospace" font-size="10">可被独立复用的领域层</text>
+
+      <rect x="660" y="236" width="276" height="112" rx="8" fill="#0e141d" stroke="#2b3b52"/>
+      <text x="676" y="258" fill="#ff7043" font-family="monospace" font-size="13">config/ + pkg/ + common/</text>
+      <text x="676" y="278" fill="#8b9bb0" font-family="monospace" font-size="11">.dae DSL(ANTLR) · schema/merge/patch</text>
+      <text x="676" y="296" fill="#8b9bb0" font-family="monospace" font-size="11">trie · geodata · 订阅解析 · 常量表</text>
+      <text x="676" y="314" fill="#8b9bb0" font-family="monospace" font-size="11">netutils · bitlist · assets</text>
+      <text x="676" y="334" fill="#5d6e85" font-family="monospace" font-size="10">common/consts 是全局词汇表(fan-in 113)</text>
+
+      <text x="24" y="410" fill="#5d6e85" font-family="monospace" font-size="13">EXTERNAL · 不在本仓库</text>
+      <rect x="24" y="422" width="932" height="34" rx="8" fill="#150f0c" stroke="#4a2a20"/>
+      <text x="44" y="444" fill="#ff7043" font-family="monospace" font-size="12">daeuniverse/outbound（协议栈） · olicesx/quic-go（fork） · dae-config-dist（语法） · dae_bpf_headers</text>
+    </svg>
+    <figcaption>图 1 · 分层架构：内核数据面 / 用户态三层 / 仓库外依赖</figcaption>
+  </figure>
+
+  <h3>1.4 依赖版图（内部 import 实测，无环）</h3>
+  <div class="grid g2">
+    <div class="card">
+      <p class="tag">fan-in 最高（被依赖次数）</p>
+      <table>
+        <tbody>
+          <tr><td><code>common/consts</code></td><td class="num">113</td><td><em>全局词汇表：outbound id、match type、钩子名、mark…</em></td></tr>
+          <tr><td><code>config</code></td><td class="num">58</td><td><em>配置模型</em></td></tr>
+          <tr><td><code>pkg/config_parser</code></td><td class="num">56</td><td><em>DSL 语法树</em></td></tr>
+          <tr><td><code>component/outbound</code></td><td class="num">41</td><td><em>拨号/选路</em></td></tr>
+          <tr><td><code>component/dns</code></td><td class="num">37</td><td><em>DNS 消息与上游</em></td></tr>
+          <tr><td><code>component/routing</code></td><td class="num">34</td><td><em>规则 IR 与匹配</em></td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="card">
+      <p class="tag">最重要的耦合边</p>
+      <table>
+        <tbody>
+          <tr><td><code>control → common/consts</code></td><td class="num">65</td></tr>
+          <tr><td><code>control → component/outbound</code></td><td class="num">39</td></tr>
+          <tr><td><code>control → component/dns</code></td><td class="num">30</td></tr>
+          <tr><td><code>control → config</code></td><td class="num">23</td></tr>
+          <tr><td><code>component/dns → component/routing</code></td><td class="num">12</td></tr>
+          <tr><td><code>config → pkg/config_parser</code></td><td class="num">11</td></tr>
+        </tbody>
+      </table>
+      <p style="color:var(--muted);font-size:.86rem">control 是唯一编排者，component 之间基本单向（dns→routing、outbound→daedns），没有环。<b>这为按 crate 切分提供了现成边界。</b></p>
+    </div>
+  </div>
+
+  <h3>1.5 外部依赖与 Rust 替代</h3>
+  <div class="tbl-wrap">
+  <table>
+    <thead><tr><th>Go 依赖</th><th>用途</th><th>Rust 替代</th><th>成熟度</th></tr></thead>
+    <tbody>
+      <tr><td><code>cilium/ebpf</code></td><td>BPF 加载/CO-RE/map 操作</td><td><code>aya</code>（userspace）</td><td><span class="b b-ok">已验证</span> mini-dae 全流程跑通</td></tr>
+      <tr><td><code>daeuniverse/outbound</code></td><td>全部代理协议 + 拨号 + 健康检查</td><td>无单一等价物；需组合生态或自研</td><td><span class="b b-bad">最大风险</span></td></tr>
+      <tr><td><code>olicesx/quic-go</code>(fork)</td><td>HTTP/3、DoQ、hysteria2/tuic 的 QUIC</td><td><code>quinn</code> + <code>h2</code></td><td><span class="b b-warn">需验证特性对齐</span></td></tr>
+      <tr><td><code>miekg/dns</code></td><td>DNS 消息编解码</td><td><code>hickory-proto</code> 或自研 wire</td><td><span class="b b-ok">成熟</span></td></tr>
+      <tr><td><code>antlr4 runtime</code> + <code>dae-config-dist</code></td><td>.dae DSL 语法（语法在仓库外）</td><td><code>logos</code>+<code>chumsky</code> / 手写递归下降</td><td><span class="b b-ok">可控</span> 顺带把语法收回仓库</td></tr>
+      <tr><td><code>vishvananda/netlink</code> / <code>netns</code></td><td>veth/netkit、ip rule/route、setns</td><td><code>rtnetlink</code>/<code>neli</code> + <code>nix</code>/libc</td><td><span class="b b-ok">成熟</span></td></tr>
+      <tr><td><code>json-iterator</code> / <code>protobuf</code></td><td>序列化 / geodata</td><td><code>serde_json</code>、<code>prost</code></td><td><span class="b b-ok">成熟</span></td></tr>
+      <tr><td><code>logrus</code> / <code>cobra</code> / <code>fsnotify</code></td><td>日志 / CLI / 文件监听</td><td><code>tracing</code> / <code>clap</code> / <code>notify</code></td><td><span class="b b-ok">成熟</span></td></tr>
+      <tr><td><code>ants</code>、<code>gopsutil</code>、<code>ethtool</code>、<code>sdnotify</code>、<code>lumberjack</code></td><td>池化/系统信息/网卡/systemd/日志轮转</td><td><code>tokio</code>、<code>sysinfo</code>、<code>ethtool</code>、<code>sd-notify</code>、<code>tracing-appender</code></td><td><span class="b b-ok">成熟</span></td></tr>
+      <tr><td><code>ahocorasick-domain</code> + <code>pkg/trie</code></td><td>域名匹配（slim trie）</td><td><code>aho-corasick</code> + 自研 succinct trie</td><td><span class="b b-ok">可控</span></td></tr>
+      <tr><td><code>mholt/archives</code>、<code>x/crypto</code>、<code>x/net</code></td><td>订阅解压 / 加密 / HTTP2</td><td><code>zip</code>+<code>flate2</code>、RustCrypto/ring、<code>h2</code></td><td><span class="b b-ok">成熟</span></td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h3>1.6 内核交互面（重写时必须一并搬走的「隐性契约」）</h3>
+  <div class="grid g3">
+    <div class="card"><p class="tag">eBPF 数据面</p><p><b>4,403 行 C · 23 个程序 · 24 个 map</b><br><em>map 类型：ARRAY×7、PERCPU_ARRAY×5、HASH×5、SOCKMAP/SOCKHASH/LPM_TRIE/ARRAY_OF_MAPS/RINGBUF/PERCPU_HASH/LRU_HASH 各×1</em></p></div>
+    <div class="card"><p class="tag">helper 使用密度</p><p>map lookup <b>36</b> · skb_load_bytes <b>20</b> · map update <b>8</b> · get_socket_cookie <b>7</b> · redirect <b>6</b> · store_bytes <b>5</b> · redirect_peer <b>3</b> · <b>bpf_loop 2</b> · <b>sk_assign 2</b></p></div>
+    <div class="card"><p class="tag">宿主内核配置面</p><p><b>13 个 sysctl 键</b>（ip_forward、rp_filter、accept_local、tcp_early_demux…）+ <b>15 个文件</b>用 netlink 操作链路/地址/路由/规则/邻居 + <b>3 个文件</b>做 netns 切换</p></div>
+  </div>
+</section>
+
+<!-- ============================================================ -->
+<section id="modules" class="reveal" style="margin-top:64px">
+  <h2><span style="color:var(--dim);font-size:.62em">02 · </span>模块解剖</h2>
+  <p style="color:var(--muted)">每块给出：职责 → 关键文件 → 复杂度来源 → Rust 落位。规模数字为实测。</p>
+
+  <h3>2.1 数据面 <code>control/kern/tproxy.c</code> <span class="b b-rust">4,403 行 C · 23 程序 · 24 map</span></h3>
+  <div class="grid g2">
+    <div class="card">
+      <p class="tag">职责</p>
+      <ul>
+        <li><b>分流</b>：14 个 tc 程序覆盖 lan/wan 的 ingress/egress 与单臂双角色；用 <code>bpf_loop</code> 跑用户态编译出的 match_set 规则数组。</li>
+        <li><b>重定向</b>：改目的 MAC → 写 <code>skb-&gt;cb</code> → <code>bpf_redirect</code> 进 dae0/dae0peer；回程按 <code>redirect_track</code> 还原 MAC 并送回原接口。</li>
+        <li><b>交付</b>：dae0peer 上 <code>bpf_sk_assign</code> 给 tproxy socket；已建立 TCP 靠 fwmark+local 路由。</li>
+        <li><b>状态</b>：TCP/UDP conntrack（含路由缓存）、routing handoff、domain 位图、cookie→进程名。</li>
+        <li><b>offload</b>：sockmap 双 socket 直连转发 + 背压保险丝 + 字节记账。</li>
+      </ul>
+      <p class="tag" style="margin-top:12px">复杂度来源</p>
+      <p>不是「C 难写」，而是：<b>内核版本矩阵</b>（bpf_loop≥5.17、redirect_peer 的 CVE 门槛、netkit vs veth）、<b>verifier 约束</b>（栈 512B、循环、指针追踪，因此有大量 per-CPU scratch 与 <code>__noinline</code> 拆分）、<b>并发语义</b>（单写者绑定、内存序取舍、epoch 双槽）。</p>
+    </div>
+    <div class="card rust">
+      <p class="tag">Rust 落位</p>
+      <ul>
+        <li><b>程序本体</b>：两条路——保持 C（同 dae，零风险）或用 <code>aya-ebpf</code> 写 Rust。后者需 nightly + <code>-Z build-std</code>，并把 verifier 友好写法（栈预算、循环上界、指针收敛）重学一遍。</li>
+        <li><b>ABI 单一事实源</b>：建 <code>dae-ebpf-shared</code>（no_std）同时被数据面与用户态引用，替换 dae 现在「C 定义 + JSON 规格 + Go 生成器」三处同步的做法。</li>
+        <li><b>加载与生命周期</b>：<code>aya</code> 的 TCX（内核≥6.6）让钩子随进程退出自动摘除，比 netlink 模式少一整类残留 bug（dae 用 28.5KB 的 netns_cleanup 测试来防这类问题）。</li>
+      </ul>
+      <p><span class="stamp">已实测</span> 5 个 TCX 钩子（host ns 4 + daens 1）的挂载与卸载、跨 netns 的 map 共享、sk_assign 交付，全部在 mini-dae 验证。</p>
+    </div>
+  </div>
+
+  <h3>2.2 控制面 <code>control/</code> <span class="b b-muted">103 源文件 / 156 测试文件 · 38.6k + 27.2k 行</span></h3>
+  <div class="tbl-wrap">
+  <table>
+    <thead><tr><th>子域</th><th>代表文件（行数）</th><th>职责</th><th>Rust 落位</th></tr></thead>
+    <tbody>
+      <tr><td><b>总装/生命周期</b></td><td><code>control_plane.go</code>(3252)、<code>control_plane_core*.go</code>、<code>active_control_plane.go</code></td><td>把配置变成运行时：加载 BPF、编译路由、建 listener、起 janitor、协调热重载与回滚</td><td><code>daed</code>/<code>dae-runtime</code></td></tr>
+      <tr><td><b>BPF 生命周期</b></td><td><code>bpf_utils.go</code>(884)、<code>bpf_maintenance*.go</code>、<code>bpf_purge.go</code>、<code>tc_hook_set.go</code>(737)</td><td>固定/替换 map、pin 目录、批量删除、钩子集合的原子换装</td><td><code>dae-datapath</code>（aya 封装）</td></tr>
+      <tr><td><b>路由编译</b></td><td><code>routing_matcher_builder.go</code>(1185)、<code>routing_epoch*.go</code></td><td>把规则 IR 编译成 match_set 数组 + LPM trie + 域位图，维护双 epoch 槽</td><td><code>dae-routing</code>（纯用户态，可先做）</td></tr>
+      <tr><td><b>DNS 控制器</b></td><td><code>dns.go</code>(1624)、<code>dns_controller_cache.go</code>(1417)、<code>dns_controller_handle.go</code>(712)、<code>dns_listener.go</code></td><td>DNS 监听/缓存/上游策略/响应路由/嗅探协同/乐观缓存；<b>control/ 里最大的单体子系统</b></td><td><code>dae-dns</code></td></tr>
+      <tr><td><b>TCP 会话</b></td><td><code>tcp.go</code>(879)、<code>tcp_relay_*.go</code>、<code>tcp_offload_linux.go</code>(956)、<code>tcp_copy_linux.go</code></td><td>tproxy accept → 拨号 → splice 中继；offload 到 sockmap 的切换与背压</td><td><code>dae-relay</code>（io_uring/splice）</td></tr>
+      <tr><td><b>UDP 会话</b></td><td><code>udp.go</code>(1229)、<code>udp_endpoint_pool.go</code>(1002)、<code>udp_endpoint_lifecycle.go</code>(1002)、<code>udp_task_pool.go</code>(678)</td><td>full-cone NAT、端点池、超时回收、任务池；UDP 是「难维护」集中区</td><td><code>dae-relay</code>（+ BPF 侧 NAT 表）</td></tr>
+      <tr><td><b>嗅探 punt</b></td><td><code>packet_sniffer_pool.go</code>(1050)、<code>tcp_sniff_policy.go</code>、<code>real_domain_runtime.go</code></td><td>首包嗅探、负缓存、punt 后重路由、真实域名查询</td><td><code>dae-sniff</code> + 事件通道</td></tr>
+      <tr><td><b>netns/宿主网络</b></td><td><code>netns_utils.go</code>(994)、<code>netkit_linux.go</code>、<code>sysctl.go</code>、<code>connectivity.go</code></td><td>建 daens/dae0/dae0peer、ip rule/route、sysctl、netkit/veth 选择、网络就绪等待</td><td><code>dae-netns</code>（rtnetlink）</td></tr>
+      <tr><td><b>连接状态与清理</b></td><td><code>conn_state_janitor.go</code>(18.5KB)、<code>datapath_janitor.go</code>、<code>session_manager.go</code>(983)</td><td>map 条目回收、生命周期状态机、与内核状态对账</td><td><code>dae-datapath</code> + cleanup task</td></tr>
+      <tr><td><b>可观测性</b></td><td><code>event_ringbuf.go</code>、<code>runtime_stats.go</code>、<code>datapath_overflow_report.go</code>、<code>alert_pacing.go</code>、<code>node_latency.go</code></td><td>ringbuf 事件消费、限流告警、溢出报告、节点延迟统计</td><td><code>dae-telemetry</code></td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h3>2.3 组件层 <code>component/</code> <span class="b b-muted">12.8k 行</span></h3>
+  <div class="grid g2">
+    <div class="card">
+      <p class="tag">模块清单</p>
+      <dl class="kv">
+        <dt>dns</dt><dd>DNS 消息模型、上游抽象、请求/响应路由（1,327）</dd>
+        <dt>daedns</dt><dd><b>dae 自身的域名解析</b>：为节点/订阅地址按规则走指定 upstream（1,486）；HTTP 客户端代际管理</dd>
+        <dt>dnstransport</dt><dd>DoH/DoQ 的 HTTP/3 与 owned-conn 传输基建（374）</dd>
+        <dt>outbound</dt><dd>拨号器、节点组、选路策略、连通性健康检查（1,068 + <code>dialer/</code> 约 4.9k）</dd>
+        <dt>routing</dt><dd>规则表达式解析 → IR → 优化器 → 匹配器（1,337 + <code>domain_matcher/</code>）</dd>
+        <dt>sniffing</dt><dd>TLS ClientHello / HTTP / QUIC Initial 解析（1,214）</dd>
+      </dl>
+    </div>
+    <div class="card rust">
+      <p class="tag">Rust 落位与判断</p>
+      <ul>
+        <li><b>routing</b> 是最适合先重写的模块：纯用户态、可对拍、无 root 依赖，且 fan-in 高（dns 也依赖它）。</li>
+        <li><b>dns + daedns + dnstransport</b> 三者合计 3.2k 行，可合并为一个 <code>dae-dns</code> crate 的三层（wire / server / bootstrap-router）。</li>
+        <li><b>outbound</b> 的 Go 侧只有「怎么用协议库」的 1k 行，真正的协议实现在仓库外——Rust 版的边界应设计成 <b>trait <code>Dialer</code> + 可插拔实现</b>，先接 direct/socks5/ss，再逐个补。</li>
+        <li><b>sniffing</b> 是 Rust 收益最直观的地方：解析不可信输入，改用 <code>tls-parser</code>/<code>quinn</code> 内部解析器可减少自研解析面积。</li>
+      </ul>
+    </div>
+  </div>
+
+  <h3>2.4 配置与基础设施</h3>
+  <div class="grid g2">
+    <div class="card">
+      <p class="tag">config/ + pkg/config_parser · 1.4k + 0.8k 行</p>
+      <ul>
+        <li>DSL 语法在 <b>仓库外</b>（<code>dae-config-dist/dae_config.g4</code>），仓库内只有 ANTLR 生成物 + walker。</li>
+        <li>配置段：<code>global / subscription / node / dns / group / routing</code>（+ <code>include</code>），支持 include 合并、默认值、patch、outline 导出。</li>
+        <li>路由函数词汇：<code>domain/sip/dip/sport/dport/ipversion/l4proto/pname/mac</code>；DNS 侧有 <code>qname/qtype/ip/upstream</code>；节点侧有 <code>name/subtag</code>。</li>
+        <li>复杂度在<b>语义</b>：include 的路径安全、合并冲突、大小写/通配、NOT 归一化、规则集合函数（<code>function_union_test.go</code> 暗示的联合语义）。</li>
+      </ul>
+      <p class="tag" style="margin-top:12px">Rust 落位</p>
+      <p><code>dae-config</code>：<code>logos</code> 词法 + 手写递归下降（或 <code>chumsky</code>）产出带 span 的 CST → 类型化 AST；错误信息用 <code>miette</code>；把语法从外部仓库收回。配套 <code>--emit-schema-docs</code> 让文档与代码同源。</p>
+    </div>
+    <div class="card">
+      <p class="tag">common/ + pkg/ · 6.1k 行</p>
+      <ul>
+        <li><code>common/consts</code>（471 行，fan-in 113）：outbound id、match type、mark、钩子名——<b>全局枚举词汇表</b>，Rust 版应拆成按领域归属的强类型，而不是一个 crate 装所有。</li>
+        <li><code>pkg/trie</code>（365）：从 succinct 改的域名瘦 trie；<code>component/routing/domain_matcher</code> 的 Aho-Corasick 变体。</li>
+        <li><code>pkg/geodata</code>（881）：geosite/geoip protobuf 解码（内存保守模式）。</li>
+        <li><code>pkg/anybuffer</code>（168）：读写复用的缓冲区抽象。</li>
+        <li><code>pkg/ebpf_internal</code>（414）：vendored cilium/ebpf 内部 ELF/端序代码。</li>
+        <li><code>common/subscription</code>（254）：订阅链接解析与解压（base64/ss/vmess 链接）。</li>
+        <li><code>common/netutils</code>（670）：地址/掩码/接口工具。</li>
+      </ul>
+    </div>
+  </div>
+
+  <h3>2.5 运维面 <code>cmd/</code> 与 <code>trace/</code> <span class="b b-muted">5.4k + 0.6k 行</span></h3>
+  <div class="tbl-wrap">
+  <table>
+    <thead><tr><th>命令</th><th>职责</th><th>重写要点</th></tr></thead>
+    <tbody>
+      <tr><td><code>run</code></td><td>守护进程主循环：配置加载 → 网络等待 → 控制面启动 → 信号处理 → 重载/挂起/退出</td><td><code>clap</code> + <code>tokio</code> 优雅关闭；systemd notify 用 <code>sd-notify</code></td></tr>
+      <tr><td><code>reload</code></td><td>向运行中的 dae 发重载请求并回滚失败（<code>reload_manager.go</code> 674 行）</td><td>epoch 槽切换语义要 1:1 复刻；最容易被低估的运维功能</td></tr>
+      <tr><td><code>validate</code> / <code>export</code></td><td>配置校验 / 导出（可作<b>差分测试的 oracle</b>）</td><td>重写时优先做，作为对拍工具</td></tr>
+      <tr><td><code>suspend</code> / <code>sysdump</code> / <code>trace</code></td><td>临时挂起代理、现场信息收集、eBPF 诊断</td><td><code>trace</code> 自带一套独立 eBPF 程序（638 行 C + Go）</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h3>2.6 测试资产：被低估的「行为规范」 <span class="b b-info">~40k 行</span></h3>
+  <div class="call">
+    <div class="h">为什么测试是重写的核心资产</div>
+    <p>control/ 有 <b>156 个测试文件 / 27.2k 行</b>，名字直接暴露了真实故障类别：
+    <code>bpf_bug_verification_test.go</code>、<code>frozen_ad_regression_test.go</code>、<code>netns_cleanup_test.go</code>(28.5KB)、
+    <code>reload_retirement_cleanup_test.go</code>、<code>conn_state_janitor_lock_scope_test.go</code>、<code>doq_lock_regression_test.go</code>……
+    这些不是覆盖率数字，而是<b>用故障换来的规格</b>。Rust 重写的验收标准应当直接从它们逐条翻译/对拍，而不是重新发明测试。</p>
+  </div>
+</section>
+
+<!-- ============================================================ -->
+<section id="runtime" class="reveal" style="margin-top:64px">
+  <h2><span style="color:var(--dim);font-size:.62em">03 · </span>运行时机制</h2>
+
+  <h3>3.1 启动时序（run 路径）</h3>
+  <pre><span class="c">// 简化时序，方括号内为 Rust 对应 crate</span>
+parse config (.dae)                        <span class="c">[dae-config]</span>
+  → validate + merge includes + patch
+build routing policy (IR → matcher)        <span class="c">[dae-routing]</span>
+create daens netns, dae0/dae0peer, tc hooks <span class="c">[dae-netns]</span>
+  → ip rule/route table 2023, sysctls, accept_local
+load eBPF object, pin maps, write rodata    <span class="c">[dae-datapath]</span>
+compile rules into match_set/LPM/domain     <span class="c">[dae-routing → dae-datapath]</span>
+  → 写 epoch 槽 B，切 active_routing_epoch_map（双缓冲热重载）
+create tproxy listeners, insert sockmap     <span class="c">[dae-datapath + dae-relay]</span>
+start DNS listeners / upstreams             <span class="c">[dae-dns]</span>
+start janitors &amp; event consumers            <span class="c">[dae-datapath/dae-telemetry]</span>
+wait signal → reload / suspend / shutdown</pre>
+
+  <h3>3.2 报文路径 <span class="stamp">已实测</span></h3>
+  <figure>
+    <svg viewBox="0 0 960 430" role="img" aria-label="dae 报文路径">
+      <defs><marker id="a2" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 z" fill="#8b9bb0"/></marker></defs>
+      <rect x="20" y="24" width="150" height="56" rx="8" fill="#111823" stroke="#2b3b52"/>
+      <text x="36" y="48" fill="#e6edf3" font-family="monospace" font-size="12">LAN client</text>
+      <text x="36" y="66" fill="#5d6e85" font-family="monospace" font-size="10">10.0.0.2 → 1.1.1.1:8080</text>
+
+      <line x1="170" y1="52" x2="228" y2="52" stroke="#8b9bb0" marker-end="url(#a2)"/>
+      <rect x="232" y="18" width="196" height="68" rx="8" fill="#0d1622" stroke="#1c3a5c"/>
+      <text x="246" y="40" fill="#58a6ff" font-family="monospace" font-size="12">① tc ingress (landae)</text>
+      <text x="246" y="58" fill="#8b9bb0" font-family="monospace" font-size="10">解析五元组 → 规则匹配</text>
+      <text x="246" y="74" fill="#8b9bb0" font-family="monospace" font-size="10">direct / block / proxy</text>
+
+      <line x1="428" y1="36" x2="520" y2="36" stroke="#3fb950" marker-end="url(#a2)"/>
+      <rect x="524" y="12" width="200" height="48" rx="8" fill="#0d1712" stroke="#1d4429"/>
+      <text x="538" y="32" fill="#3fb950" font-family="monospace" font-size="12">direct → TC_ACT_OK</text>
+      <text x="538" y="50" fill="#8b9bb0" font-family="monospace" font-size="10">内核三层转发（零用户态）</text>
+
+      <line x1="330" y1="86" x2="330" y2="132" stroke="#8b9bb0" marker-end="url(#a2)"/>
+      <rect x="212" y="136" width="236" height="82" rx="8" fill="#150f0c" stroke="#4a2a20"/>
+      <text x="226" y="158" fill="#ff7043" font-family="monospace" font-size="12">② proxy 动作</text>
+      <text x="226" y="176" fill="#8b9bb0" font-family="monospace" font-size="10">改目的 MAC → dae0peer</text>
+      <text x="226" y="192" fill="#8b9bb0" font-family="monospace" font-size="10">记 redirect_track(回程绑定)</text>
+      <text x="226" y="208" fill="#8b9bb0" font-family="monospace" font-size="10">cb[0]=TPROXY_MARK → redirect</text>
+
+      <line x1="448" y1="177" x2="520" y2="177" stroke="#ff7043" marker-end="url(#a2)"/>
+      <rect x="524" y="140" width="200" height="76" rx="8" fill="#111823" stroke="#2b3b52"/>
+      <text x="538" y="162" fill="#e6edf3" font-family="monospace" font-size="12">③ dae0peer ingress</text>
+      <text x="538" y="180" fill="#8b9bb0" font-family="monospace" font-size="10">cgroup 归因 pid/pname</text>
+      <text x="538" y="196" fill="#8b9bb0" font-family="monospace" font-size="10">skb-&gt;mark + change_type</text>
+      <text x="538" y="212" fill="#8b9bb0" font-family="monospace" font-size="10">bpf_sk_assign(SYN/UDP)</text>
+
+      <line x1="624" y1="216" x2="624" y2="252" stroke="#8b9bb0" marker-end="url(#a2)"/>
+      <rect x="510" y="256" width="228" height="60" rx="8" fill="#111823" stroke="#2b3b52"/>
+      <text x="524" y="278" fill="#e6edf3" font-family="monospace" font-size="12">④ tproxy socket (daens)</text>
+      <text x="524" y="296" fill="#8b9bb0" font-family="monospace" font-size="10">accept 保持原始目的地址</text>
+
+      <line x1="510" y1="286" x2="448" y2="286" stroke="#8b9bb0" marker-end="url(#a2)"/>
+      <rect x="212" y="256" width="228" height="60" rx="8" fill="#111823" stroke="#2b3b52"/>
+      <text x="226" y="278" fill="#e6edf3" font-family="monospace" font-size="12">⑤ relay / offload</text>
+      <text x="226" y="296" fill="#8b9bb0" font-family="monospace" font-size="10">splice/io_uring 或 sockmap 直连</text>
+
+      <line x1="250" y1="316" x2="250" y2="356" stroke="#ff7043" marker-end="url(#a2)"/>
+      <rect x="180" y="360" width="292" height="58" rx="8" fill="#0d1622" stroke="#1c3a5c"/>
+      <text x="194" y="382" fill="#58a6ff" font-family="monospace" font-size="12">⑥ dae0 ingress → 回程还原</text>
+      <text x="194" y="400" fill="#8b9bb0" font-family="monospace" font-size="10">查 redirect_track，还原 MAC，送回原接口</text>
+
+      <line x1="180" y1="389" x2="118" y2="389" stroke="#8b9bb0"/>
+      <line x1="118" y1="389" x2="118" y2="86" stroke="#8b9bb0"/>
+      <line x1="118" y1="86" x2="96" y2="86" stroke="#8b9bb0"/>
+      <line x1="96" y1="86" x2="96" y2="52" stroke="#8b9bb0"/>
+      <line x1="96" y1="52" x2="16" y2="52" stroke="#8b9bb0"/>
+      <text x="126" y="340" fill="#5d6e85" font-family="monospace" font-size="10">回包</text>
+
+      <rect x="756" y="256" width="184" height="164" rx="8" fill="#0e141d" stroke="#1e2a3a"/>
+      <text x="770" y="278" fill="#8b9bb0" font-family="monospace" font-size="11">旁路机制</text>
+      <text x="770" y="300" fill="#cfe3ff" font-family="monospace" font-size="10">· DNS 关联域位图</text>
+      <text x="770" y="320" fill="#cfe3ff" font-family="monospace" font-size="10">· sniff punt 回注</text>
+      <text x="770" y="340" fill="#cfe3ff" font-family="monospace" font-size="10">· 节点健康检查</text>
+      <text x="770" y="360" fill="#cfe3ff" font-family="monospace" font-size="10">· 事件 ringbuf / janitor</text>
+      <text x="770" y="382" fill="#cfe3ff" font-family="monospace" font-size="10">· 进程名(cgroup cookie)</text>
+      <text x="770" y="404" fill="#cfe3ff" font-family="monospace" font-size="10">· MAC / DSCP 分流</text>
+    </svg>
+    <figcaption>图 2 · 报文路径：①分流 → ②重定向 → ③交付 → ④tproxy → ⑤relay/offload → ⑥回程还原（direct 在 ① 处直接旁路）</figcaption>
+  </figure>
+
+  <h3>3.3 值得原样保留的四个机制</h3>
+  <div class="grid g2">
+    <div class="card"><p class="tag">① 双 epoch 规则槽</p><p>热重载不中断数据面：写另一槽 → 切 active 指针。Rust 版用户态可用 <code>ArcSwap</code> 思想，内核侧保持双槽，语义不变。</p></div>
+    <div class="card"><p class="tag">② 单写者回程绑定</p><p><code>redirect_track</code> 只允许绑定所有者续租，2s 陈旧窗口防抢注。这是被真实攻击逼出来的设计（<code>tproxy.c:2177</code> 注释），不要「优化」掉。</p></div>
+    <div class="card"><p class="tag">③ offload 背压保险丝</p><p>sockmap 直连 + pause 表 + 字节记账的闭环，解决「内核队列积压时切回用户态不丢包」。需要等价的采样与控制回路。</p></div>
+    <div class="card"><p class="tag">④ 进程名从 argv 读</p><p>cgroup hook 里用 CO-RE 读 <code>task_struct.mm.arg_start</code> + <code>bpf_loop</code> 找可执行名，比 comm 可靠。数据面若重写，这是最容易写错的 CO-RE 代码之一。</p></div>
+  </div>
+
+  <div class="call warn">
+    <div class="h">重写必须一起搬的「隐性契约」（漏一个就变成难查的行为差异）</div>
+    <ul>
+      <li>daens 的回程路由配方：<code>169.254.0.11/32</code> + <code>default via 169.254.0.1</code> + 静态邻居 + <code>accept_local=1</code> <span class="stamp">已实测</span></li>
+      <li>fwmark <code>0x8000000</code> → table 2023 → <code>local default dev lo</code>；以及控制面 socket 的 <code>SO_MARK</code> 隔离</li>
+      <li>sysctl 组合：<code>ip_forward</code>、<code>rp_filter=0</code>、<code>tcp_early_demux=1</code>、<code>disable_ipv6</code>/<code>forwarding</code>（dae0）等 13 个键</li>
+      <li>netkit vs veth 的选择条件、<code>bpf_redirect_peer</code> 的 CVE-2025-37959 版本门槛</li>
+      <li>IPv4-mapped-IPv6 的五元组归一化（redirect_track 的 key 语义）</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ============================================================ -->
+<section id="rust-arch" class="reveal" style="margin-top:64px">
+  <h2><span style="color:var(--dim);font-size:.62em">04 · </span>目标 Rust 架构</h2>
+
+  <h3>4.1 设计原则</h3>
+  <ol>
+    <li><b>边界照抄既有的无环依赖</b>：现有 component/ 之间基本单向，直接映射为 crate 依赖即可，不要发明新分层。</li>
+    <li><b>ABI 单一事实源</b>：map 布局、枚举、常量只有一处定义（共享 crate），用户态与数据面同时引用，替换掉 dae 的三处同步。</li>
+    <li><b>热路径零分配</b>：所有 per-packet/per-connection 结构预分配或来自 arena；<code>Bytes</code>/<code>BytesMut</code> 贯穿解析层。</li>
+    <li><b>显式状态机</b>：连接生命周期、netns 生命周期、reload 阶段都用类型状态机表达，消除靠注释与测试守住的隐式约束。</li>
+    <li><b>可对拍</b>：每个纯逻辑 crate 都要能用 Go 版当 oracle（配置、路由编译产物、DNS 语义、订阅解析）。</li>
+  </ol>
+
+  <h3>4.2 Workspace 与 crate 切分</h3>
+  <figure>
+    <svg viewBox="0 0 960 470" role="img" aria-label="Rust workspace crate 依赖图">
+      <defs><marker id="a3" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 z" fill="#5d6e85"/></marker></defs>
+      <text x="20" y="26" fill="#5d6e85" font-family="monospace" font-size="12">编排层</text>
+      <rect x="20" y="38" width="250" height="64" rx="8" fill="#150f0c" stroke="#4a2a20"/>
+      <text x="34" y="62" fill="#ff7043" font-family="monospace" font-size="13">daed</text>
+      <text x="34" y="80" fill="#8b9bb0" font-family="monospace" font-size="10">CLI / run / reload / suspend / sysdump</text>
+      <text x="34" y="95" fill="#5d6e85" font-family="monospace" font-size="10">+ runtime supervisor</text>
+
+      <rect x="300" y="38" width="250" height="64" rx="8" fill="#111823" stroke="#2b3b52"/>
+      <text x="314" y="62" fill="#e6edf3" font-family="monospace" font-size="13">dae-runtime</text>
+      <text x="314" y="80" fill="#8b9bb0" font-family="monospace" font-size="10">控制面总装：把配置变成运行态</text>
+      <text x="314" y="95" fill="#5d6e85" font-family="monospace" font-size="10">reload epoch 协调 / janitor 编排</text>
+
+      <rect x="580" y="38" width="240" height="64" rx="8" fill="#111823" stroke="#2b3b52"/>
+      <text x="594" y="62" fill="#e6edf3" font-family="monospace" font-size="13">dae-telemetry</text>
+      <text x="594" y="80" fill="#8b9bb0" font-family="monospace" font-size="10">结构化日志/指标/ringbuf 事件</text>
+      <text x="594" y="95" fill="#5d6e85" font-family="monospace" font-size="10">告警限流 / 溢出报告</text>
+
+      <text x="20" y="146" fill="#5d6e85" font-family="monospace" font-size="12">领域层</text>
+      <rect x="20" y="158" width="212" height="76" rx="8" fill="#0e141d" stroke="#2b3b52"/>
+      <text x="34" y="182" fill="#ff7043" font-family="monospace" font-size="13">dae-config</text>
+      <text x="34" y="200" fill="#8b9bb0" font-family="monospace" font-size="10">DSL 词法/语法/类型化 AST</text>
+      <text x="34" y="215" fill="#8b9bb0" font-family="monospace" font-size="10">include 合并 / patch / schema 文档</text>
+
+      <rect x="248" y="158" width="212" height="76" rx="8" fill="#0e141d" stroke="#2b3b52"/>
+      <text x="262" y="182" fill="#ff7043" font-family="monospace" font-size="13">dae-routing</text>
+      <text x="262" y="200" fill="#8b9bb0" font-family="monospace" font-size="10">规则 IR / 优化器 / 匹配器</text>
+      <text x="262" y="215" fill="#8b9bb0" font-family="monospace" font-size="10">域名集合 / LPM 编译</text>
+
+      <rect x="476" y="158" width="212" height="76" rx="8" fill="#0e141d" stroke="#2b3b52"/>
+      <text x="490" y="182" fill="#ff7043" font-family="monospace" font-size="13">dae-dns</text>
+      <text x="490" y="200" fill="#8b9bb0" font-family="monospace" font-size="10">listener/cache/upstream/DoH/DoQ</text>
+      <text x="490" y="215" fill="#8b9bb0" font-family="monospace" font-size="10">自举解析（原 daedns）</text>
+
+      <rect x="704" y="158" width="212" height="76" rx="8" fill="#0e141d" stroke="#2b3b52"/>
+      <text x="718" y="182" fill="#ff7043" font-family="monospace" font-size="13">dae-outbound</text>
+      <text x="718" y="200" fill="#8b9bb0" font-family="monospace" font-size="10">Dialer trait / 节点组 / 健康检查</text>
+      <text x="718" y="215" fill="#8b9bb0" font-family="monospace" font-size="10">协议实现（分阶段）</text>
+
+      <rect x="20" y="252" width="212" height="76" rx="8" fill="#0e141d" stroke="#2b3b52"/>
+      <text x="34" y="276" fill="#ff7043" font-family="monospace" font-size="13">dae-datapath</text>
+      <text x="34" y="294" fill="#8b9bb0" font-family="monospace" font-size="10">aya 封装 / map 模式 / 双 epoch</text>
+      <text x="34" y="309" fill="#8b9bb0" font-family="monospace" font-size="10">程序加载与 TCX 生命周期</text>
+
+      <rect x="248" y="252" width="212" height="76" rx="8" fill="#0e141d" stroke="#2b3b52"/>
+      <text x="262" y="276" fill="#ff7043" font-family="monospace" font-size="13">dae-netns</text>
+      <text x="262" y="294" fill="#8b9bb0" font-family="monospace" font-size="10">rtnetlink / setns / veth·netkit</text>
+      <text x="262" y="309" fill="#8b9bb0" font-family="monospace" font-size="10">ip rule·route / sysctl</text>
+
+      <rect x="476" y="252" width="212" height="76" rx="8" fill="#0e141d" stroke="#2b3b52"/>
+      <text x="490" y="276" fill="#ff7043" font-family="monospace" font-size="13">dae-relay</text>
+      <text x="490" y="294" fill="#8b9bb0" font-family="monospace" font-size="10">TCP relay / UDP NAT / offload 协调</text>
+      <text x="490" y="309" fill="#8b9bb0" font-family="monospace" font-size="10">splice / io_uring</text>
+
+      <rect x="704" y="252" width="212" height="76" rx="8" fill="#0e141d" stroke="#2b3b52"/>
+      <text x="718" y="276" fill="#ff7043" font-family="monospace" font-size="13">dae-sniff</text>
+      <text x="718" y="294" fill="#8b9bb0" font-family="monospace" font-size="10">TLS/HTTP/QUIC 嗅探</text>
+      <text x="718" y="309" fill="#5d6e85" font-family="monospace" font-size="10">负缓存 / punt 策略</text>
+
+      <text x="20" y="368" fill="#5d6e85" font-family="monospace" font-size="12">共享内核 ABI / 数据面</text>
+      <rect x="20" y="380" width="440" height="70" rx="8" fill="#150f0c" stroke="#4a2a20"/>
+      <text x="34" y="404" fill="#ff7043" font-family="monospace" font-size="13">dae-ebpf-shared (no_std)</text>
+      <text x="34" y="422" fill="#8b9bb0" font-family="monospace" font-size="10">map 布局 / 枚举 / 打包位布局 —— 用户态与数据面唯一事实源</text>
+      <text x="34" y="438" fill="#5d6e85" font-family="monospace" font-size="10">替换 dae 的 C 定义 + ebpf_sync_spec.json + go:generate 三处同步</text>
+
+      <rect x="476" y="380" width="440" height="70" rx="8" fill="#150f0c" stroke="#4a2a20"/>
+      <text x="490" y="404" fill="#ff7043" font-family="monospace" font-size="13">dae-ebpf-progs</text>
+      <text x="490" y="422" fill="#8b9bb0" font-family="monospace" font-size="10">数据面程序：先复用现有 C（clang 构建）→ 可选迁 aya-ebpf(Rust)</text>
+      <text x="490" y="438" fill="#5d6e85" font-family="monospace" font-size="10">构建产物嵌入二进制，版本与加载器同源</text>
+
+      <path d="M145,102 L145,158" stroke="#5d6e85" marker-end="url(#a3)"/>
+      <path d="M354,102 L354,158" stroke="#5d6e85" marker-end="url(#a3)"/>
+      <path d="M425,102 L590,102" stroke="#5d6e85" marker-end="url(#a3)"/>
+      <path d="M300,196 L232,196" stroke="#5d6e85" marker-end="url(#a3)"/>
+      <path d="M476,196 L462,196" stroke="#5d6e85" marker-end="url(#a3)"/>
+      <path d="M126,252 L126,234" stroke="#5d6e85" marker-end="url(#a3)"/>
+      <path d="M354,252 L354,234" stroke="#5d6e85" marker-end="url(#a3)"/>
+      <path d="M582,252 L582,234" stroke="#5d6e85" marker-end="url(#a3)"/>
+      <path d="M810,252 L810,234" stroke="#5d6e85" marker-end="url(#a3)"/>
+      <path d="M126,380 L126,328" stroke="#5d6e85" marker-end="url(#a3)"/>
+      <path d="M696,380 L696,328" stroke="#5d6e85" marker-end="url(#a3)"/>
+    </svg>
+    <figcaption>图 3 · Rust workspace 建议切分：无环、可独立对拍、ABI 单源</figcaption>
+  </figure>
+
+  <h3>4.3 运行时与并发模型</h3>
+  <div class="grid g3">
+    <div class="card">
+      <p class="tag">方案 A · tokio 多线程（建议起点）</p>
+      <p>控制面（配置/重载/netlink/指标）用 tokio；转发热路径用<b>专用线程池</b>跑 <code>splice</code>，或投递到内核 offload。</p>
+      <p><span class="b b-ok">风险低</span> 生态最全、与现有语义最接近，便于先拿到正确性。</p>
+    </div>
+    <div class="card">
+      <p class="tag">方案 B · thread-per-core</p>
+      <p>每核一个 runtime（<code>monoio</code>/<code>glommio</code>）+ SO_REUSEPORT + shard 化连接表，共享内存为零、无跨核锁。</p>
+      <p><span class="b b-warn">收益高但需实测</span> 复杂点：与 netns 切换、sockmap 协调、janitor 跨线程回收。</p>
+    </div>
+    <div class="card">
+      <p class="tag">内存模型</p>
+      <p>per-connection arena + 固定大小 buffer pool；<code>Bytes</code> 零拷贝贯穿 DNS/嗅探；热路径禁止 <code>Vec</code> 增长与 <code>Arc</code> 克隆。</p>
+      <p><span class="b b-ok">直接收益</span> 消除 GC 尾延迟与堆抖动（dae 有专门的内存上限/THP 处理代码，说明这确实是痛点）。</p>
+    </div>
+  </div>
+
+  <div class="call warn">
+    <div class="h">netns 亲和：Rust 要比 Go 做得更干净</div>
+    <p>dae 用 <code>runtime.LockOSThread()</code> + <code>netns.Set()</code>（<code>control/netns_utils.go:264,496</code>）把 goroutine 钉在处于目标 netns 的 OS 线程上。这条路径在 tokio 下<b>不可行</b>：task 会在 worker 线程之间迁移，线程序号的 netns 对 task 不成立。</p>
+    <p>替代方案是 <b>per-netns socket 工厂</b>：socket 的 netns 在 <code>socket()</code> 创建时即确定，之后任何线程都可以正常使用（connect/send 的路由查找都走 socket 自己的 netns）。因此只需一个常驻在目标 netns 的专用线程按需创建 socket，把 fd 交给 tokio 任务即可，<b>不要求任务本身具备 netns 亲和</b>。这消除了 dae 那类「忘记解锁/线程漂移」的整类 bug（Go 侧用 <code>netns_cleanup_test.go</code>、<code>listener_netns_test.go</code> 等大量测试来守）。</p>
+  </div>
+
+  <h3>4.4 依赖选型（建议）</h3>
+  <div class="tbl-wrap">
+  <table>
+    <thead><tr><th>面</th><th>选型</th><th>备注</th></tr></thead>
+    <tbody>
+      <tr><td>eBPF</td><td><code>aya</code> 0.14+；数据面可选 <code>aya-ebpf</code></td><td>TCX 自动摘钩；mini-dae 已验证加载器侧 <span class="stamp">已实测</span></td></tr>
+      <tr><td>异步运行时</td><td><code>tokio</code>（+ 可选 <code>monoio</code> 实验）</td><td>先正确后极致</td></tr>
+      <tr><td>网络</td><td><code>socket2</code>、<code>nix</code>、<code>rtnetlink</code>、<code>neli</code></td><td>SO_MARK / IP_TRANSPARENT / setns / netkit</td></tr>
+      <tr><td>DNS wire</td><td><code>hickory-proto</code> 或自研零拷贝解析</td><td>先用成熟库对齐语义，再在基准下替换热点</td></tr>
+      <tr><td>QUIC / HTTP3</td><td><code>quinn</code> + <code>h2</code></td><td>需与 <code>olicesx/quic-go</code> fork 的行为差异做专项验证</td></tr>
+      <tr><td>TLS</td><td><code>rustls</code> + <code>tls-parser</code>（嗅探）</td><td>嗅探只解析不握手</td></tr>
+      <tr><td>解析器</td><td><code>logos</code> + 手写递归下降（或 <code>chumsky</code>）</td><td>错误用 <code>miette</code>；把 g4 语法收回仓库</td></tr>
+      <tr><td>序列化</td><td><code>serde</code> + <code>serde_json</code>；geodata 用 <code>prost</code></td><td>geosite/geoip 是 protobuf wire</td></tr>
+      <tr><td>域名匹配</td><td><code>aho-corasick</code> + 自研 succinct trie</td><td>对照 <code>pkg/trie</code> 与 <code>domain_matcher</code> 行为</td></tr>
+      <tr><td>可观测性</td><td><code>tracing</code> + <code>tracing-subscriber</code> + <code>metrics</code></td><td>ringbuf 事件统一进同一事件模型</td></tr>
+      <tr><td>CLI/服务</td><td><code>clap</code> + <code>sd-notify</code> + <code>notify</code></td><td>systemd、订阅文件监听</td></tr>
+      <tr><td>协议栈</td><td>分阶段：<code>shadowsocks</code>/<code>trojan</code>/SOCKS5 → VMess/VLESS → QUIC 系</td><td><span class="b b-bad">最大不确定性</span></td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h3 id="deploy">4.5 部署形态：常驻 worker + eBPF 分流</h3>
+  <p>目标形态是：<b>一个常驻进程持有 eBPF 数据面并完成分流，只把需要代理的数据交给用户态 worker</b>。这里有两个方向相反的概念，必须先掰开：<code>eBPF 分流</code> 意味着 direct 流量不进用户态；<code>接管所有流量</code> 意味着所有包都进用户态。二者只能有一个作为默认路径。</p>
+
+  <div class="tbl-wrap">
+  <table>
+    <thead><tr><th style="width:18%">维度</th><th>A · eBPF 分流（建议）</th><th>B · worker 全接管</th><th>C · TUN + 用户态 TCP/IP 栈</th></tr></thead>
+    <tbody>
+      <tr><td>direct 流量开销</td><td><b>一次内核路由查找</b>（零用户态）</td><td>两次拷贝 + relay + 2×socket 操作</td><td>用户态协议栈处理每个包</td></tr>
+      <tr><td>代理流量</td><td>tproxy → worker，或 sockmap 内核 offload</td><td>同左</td><td>同左</td></tr>
+      <tr><td>故障域</td><td>部分功能降级（direct 仍可用）</td><td><b>整机断网</b></td><td><b>整机断网</b></td></tr>
+      <tr><td>平台</td><td>仅 Linux（eBPF + tc + netns）</td><td>仅 Linux</td><td>跨平台（macOS/Windows）</td></tr>
+      <tr><td>适用场景</td><td>网关 / 软路由（dae 场景）</td><td>全量审计、按连接 QoS/整形</td><td>非 Linux、需注入或改写报文</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <div class="call bad">
+    <div class="h">不要把 B 当默认</div>
+    <p>除非需求是「必须在用户态看到每一个包」，否则不要选 B：direct 的成本从一次内核路由查找变成两次拷贝 + 用户态 relay，BitTorrent/游戏 NAT 这类场景会退化（dae 文档专门解释过为什么不做全接管），且单点故障从「部分功能降级」变成「整机断网」。若确实需要全量可见（审计/DLP），正确做法是 <b>eBPF 镜像一份给旁路进程</b>，而不是把 worker 串在所有路径上。</p>
+  </div>
+
+  <h4>数据面所有权：per-netns 单例</h4>
+  <ul>
+    <li>程序加载、钩子挂载、map 所有权<b>只能有一个 owner</b>（supervisor）。多个进程各挂一套会互相覆盖；同一 tc hook 上的多个程序是按优先级串行执行的，语义会立刻失控。</li>
+    <li>map 用 bpffs pin 共享（dae 已有 pin 目录与清理逻辑：<code>control/bpf_purge.go</code>、<code>bpf_stub.go</code> 的 pin 清理）。</li>
+    <li>tproxy listener socket 由 supervisor 创建并放入 sockmap，再通过 <b>fd 继承</b>（fork 或 SCM_RIGHTS）交给 worker；所有 worker <code>accept()</code> 同一个 listening socket 即可。sockmap 存的是 socket 引用而非 fd，<code>bpf_sk_assign</code> 交付后由任意一个 accept 者取走 —— 这比「每 worker 各建 listener + SO_REUSEPORT」干净得多。</li>
+  </ul>
+
+  <figure>
+    <svg viewBox="0 0 960 330" role="img" aria-label="常驻 supervisor 与 eBPF 数据面、worker 的关系">
+      <defs><marker id="a4" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 z" fill="#8b9bb0"/></marker></defs>
+
+      <rect x="20" y="70" width="240" height="150" rx="8" fill="#150f0c" stroke="#4a2a20"/>
+      <text x="34" y="94" fill="#ff7043" font-family="monospace" font-size="13">supervisor（控制面）</text>
+      <text x="34" y="118" fill="#8b9bb0" font-family="monospace" font-size="10.5">· 加载/挂载 eBPF 程序与钩子</text>
+      <text x="34" y="138" fill="#8b9bb0" font-family="monospace" font-size="10.5">· 拥有 map（bpffs pin）</text>
+      <text x="34" y="158" fill="#8b9bb0" font-family="monospace" font-size="10.5">· daens / tc / ip rule 生命周期</text>
+      <text x="34" y="178" fill="#8b9bb0" font-family="monospace" font-size="10.5">· 配置解析与规则编译</text>
+      <text x="34" y="198" fill="#8b9bb0" font-family="monospace" font-size="10.5">· 创建 tproxy listener → 入 sockmap</text>
+
+      <line x1="260" y1="145" x2="316" y2="145" stroke="#8b9bb0" marker-end="url(#a4)"/>
+      <text x="262" y="136" fill="#5d6e85" font-family="monospace" font-size="10">加载/配置</text>
+
+      <rect x="320" y="90" width="240" height="110" rx="8" fill="#0d1622" stroke="#1c3a5c"/>
+      <text x="334" y="114" fill="#58a6ff" font-family="monospace" font-size="13">eBPF datapath</text>
+      <text x="334" y="132" fill="#5d6e85" font-family="monospace" font-size="10">per-netns 单例</text>
+      <text x="334" y="154" fill="#8b9bb0" font-family="monospace" font-size="10.5">tc/cgroup 钩子 · 规则 VM</text>
+      <text x="334" y="174" fill="#8b9bb0" font-family="monospace" font-size="10.5">conn_state · redirect_track</text>
+      <text x="334" y="192" fill="#8b9bb0" font-family="monospace" font-size="10.5">bpf_sk_assign → listener</text>
+
+      <line x1="560" y1="145" x2="616" y2="145" stroke="#8b9bb0" marker-end="url(#a4)"/>
+      <text x="564" y="136" fill="#5d6e85" font-family="monospace" font-size="10">交付</text>
+
+      <rect x="620" y="40" width="320" height="210" rx="8" fill="#111823" stroke="#2b3b52"/>
+      <text x="634" y="64" fill="#e6edf3" font-family="monospace" font-size="13">workers ×N（可重启）</text>
+      <text x="634" y="88" fill="#8b9bb0" font-family="monospace" font-size="10.5">accept(listener fd) · TCP relay</text>
+      <text x="634" y="108" fill="#8b9bb0" font-family="monospace" font-size="10.5">UDP NAT · DNS 处理</text>
+      <text x="634" y="128" fill="#8b9bb0" font-family="monospace" font-size="10.5">outbound 拨号与握手</text>
+      <text x="634" y="148" fill="#8b9bb0" font-family="monospace" font-size="10.5">sniffing / 事件上报</text>
+      <text x="634" y="176" fill="#5d6e85" font-family="monospace" font-size="10">无状态或弱状态——因此可以多进程/多线程</text>
+      <text x="634" y="198" fill="#5d6e85" font-family="monospace" font-size="10">崩溃只影响在途连接，不碰数据面</text>
+      <text x="634" y="220" fill="#5d6e85" font-family="monospace" font-size="10">netns 通过 per-netns socket 工厂获取</text>
+
+      <path d="M140,220 L140,290 L780,290 L780,250" stroke="#8b9bb0" fill="none" marker-end="url(#a4)"/>
+      <text x="300" y="307" fill="#5d6e85" font-family="monospace" font-size="10.5">fd 继承（listener）/ 心跳 / 统计 / 任务分发</text>
+
+      <text x="20" y="40" fill="#5d6e85" font-family="monospace" font-size="11">建议第一版：以上全部在同一个进程内（tokio + 专用 relay 线程），worker 边界先做成任务边界</text>
+    </svg>
+    <figcaption>图 4 · 常驻 supervisor / eBPF 数据面 / worker 的所有权与共享关系</figcaption>
+  </figure>
+
+  <h3 id="resident">4.6 常驻内存与故障语义</h3>
+  <div class="grid g2">
+    <div class="card">
+      <p class="tag">内存要分三块账管</p>
+      <dl class="kv" style="grid-template-columns:120px 1fr">
+        <dt>用户态堆</dt><dd>连接状态 + buffer：预分配 buffer pool + arena；用 cgroup <code>MemoryMax</code> 兜底（替代 Go 的 <code>GOMEMLIMIT</code> 自动推导），池化上限显式化。</dd>
+        <dt>内核 BPF map</dt><dd><code>conn_state</code>/<code>redirect_track</code>/LPM trie 的条目数与单条大小决定锁定内存；dae 用 <code>bpf_conn_state_map_size</code> 之类的开关暴露给用户，Rust 版应升级为<b>显式预算模型</b>（按最大并发连接数推算并在启动时校验 memlock）。</dd>
+        <dt>page cache</dt><dd>geosite/geoip 20+ MB；按需加载 + <code>madvise</code>。dae 甚至提供 <code>disable_thp</code> 选项，说明 THP 撐大 RSS 是真实投诉。</dd>
+      </dl>
+    </div>
+    <div class="card">
+      <p class="tag">systemd 部署契约（dae 现有 unit 可直接沿用）</p>
+      <ul style="margin:.2em 0;font-size:.88rem">
+        <li><code>Type=notify</code>（Rust 侧用 <code>sd-notify</code>）</li>
+        <li><code>ExecStartPre=dae validate</code>：配置不合法不开机；Rust 版同样把 validate 做成独立子命令</li>
+        <li><code>Restart=on-abnormal</code> + <code>RestartSec=5s</code> + <code>StartLimitBurst=5/300s</code>：把崩溃循环限住</li>
+        <li><code>LimitNOFILE=1048576</code>、<code>LimitNPROC=4096</code>、<code>OOMScoreAdjust=-100</code></li>
+        <li>冷启动成本：静态二进制毫秒级；真正的开销是 BPF 加载 + 规则编译 + geosite 解析（dae 实测冷缓存 0.08s–0.5s）→ 做预编译产物缓存与预热</li>
+      </ul>
+    </div>
+  </div>
+
+  <h4>故障语义（部署形态里最该先拍板的一件事）</h4>
+  <div class="tbl-wrap">
+  <table>
+    <thead><tr><th style="width:26%">钩子方式</th><th>daemon 挂掉会怎样</th><th>性质</th></tr></thead>
+    <tbody>
+      <tr><td><b>TCX</b>（内核 ≥6.6，dae 首选；<code>tc_hook_set.go:199</code>）</td><td>bpf_link 随进程关闭而摘除 → 分流消失，流量回落为普通转发 <span class="stamp">已实测</span>（mini-dae 进程退出后钩子自动消失）</td><td><span class="b b-ok">fail-open</span> 不断网，但代理规则「泄漏」</td></tr>
+      <tr><td>netlink / cls_bpf 过滤器</td><td>钩子留在内核、无人接管 → 被判定代理的流量进黑洞</td><td><span class="b b-bad">fail-closed</span> 更糟，但不会泄漏</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <div class="call">
+    <div class="h">建议的默认 + 可选死区开关</div>
+    <p>默认选 <b>fail-open + 5s 重启 + map pin 热恢复</b>（与 dae 一致）。对隐私/合规敏感的场景，可以在数据面加一个 <b>心跳死区</b>：用户态周期性刷新一个 timestamp map，数据面发现超时就对 proxy 判决返回 DROP（而不是直连）。dae 的 <code>datapath_generation</code> 是同一类「代际」骨架，但用途不同（reload 追踪），可以直接借用其数据结构设计。</p>
+  </div>
+
+  <h4>worker 化的演进路径（结论）</h4>
+  <ol>
+    <li><b>第一版：单进程多线程</b>——tokio 控制面 + 专用 relay 线程池 + per-netns socket 工厂；把 worker 边界先做成任务边界。</li>
+    <li><b>需要进程级隔离时：supervisor + N workers</b>——listener fd 继承、map bpffs pin 共享；worker 无状态可随时重启。</li>
+    <li><b>容器化成为主场景时：per-netns worker</b>——每个 netns 独立数据面与 daens；注意 map 是全局的、listener 必须在对应 netns 内创建。</li>
+  </ol>
+  <p style="color:var(--muted);font-size:.88rem">拆进程的收益（崩溃隔离、独立重启、CPU 隔离）在「eBPF 已承担主路径」的前提下是有限的，而代价（fd/netns/map 共享复杂度）是真实的。因此不要把 worker 化当成第一优先级。</p>
+</section>
+
+<!-- ============================================================ -->
+<section id="optimizations" class="reveal" style="margin-top:64px">
+  <h2><span style="color:var(--dim);font-size:.62em">05 · </span>优化点</h2>
+  <p style="color:var(--muted)">按「收益 × 风险」排序，每条给出：现状 → 改法 → 收益 → 验证方式。标 <span class="b b-ok">低风险</span> 的可先做。</p>
+
+  <h3>5.1 数据面（eBPF）</h3>
+  <div class="tbl-wrap">
+  <table>
+    <thead><tr><th style="width:24%">优化</th><th>现状</th><th>改法</th><th>预期收益</th><th>验证</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><b>规则匹配结构</b><br><span class="b b-warn">中风险</span></td>
+        <td>线性扫 match_set 数组，<code>bpf_loop</code> 至多 1024 次迭代，每条都要查 <code>routing_map</code>；命中 LPM 类还要查 <code>lpm_array_map</code> + 内层 trie。</td>
+        <td>编译期生成<b>决策树/前缀分桶</b>：先按 l4proto、ipversion、端口区间等「廉价且高选择性」条件分流，再进入候选集；把常见组合折叠成单次查找。</td>
+        <td>热点规则下减少 30–70% 的迭代与 map lookup（取决于规则形态，需实测）。</td>
+        <td>Go 版同规则集做常量流量的 <code>bpftool prog profile</code> 对比；产出语义保持等价。</td>
+      </tr>
+      <tr>
+        <td><b>epoch / 元数据查找合并</b><br><span class="b b-ok">低风险</span></td>
+        <td>每包至少 2 次小 map 查找（active epoch + rules_len），再加逐条 <code>routing_map</code>。</td>
+        <td>把 (epoch, rules_len, generation) 打包进 per-CPU scratch，只在 reload 后失效（代际号判断），或内联进 rodata 重写。</td>
+        <td>每包省 1–2 次 map lookup；UDP 小包场景明显。</td>
+        <td>perf 对比 + reload 后立即打流的正确性用例。</td>
+      </tr>
+      <tr>
+        <td><b>域位图</b><br><span class="b b-ok">低风险</span></td>
+        <td>按目的 IP 查一次 32 位 word（每条规则 1 bit），IPv6 走 128 位 key。</td>
+        <td>扩展到 64 位 word（一次查找覆盖更多规则）；对高频 IP 增加 per-CPU 一级缓存。</td>
+        <td>域名规则密集时减半查找次数；热点重复连接几乎零查找。</td>
+        <td>构造 512 条 domain 规则的合成配置做基准。</td>
+      </tr>
+      <tr>
+        <td><b>包头解析</b><br><span class="b b-ok">低风险</span></td>
+        <td><code>bpf_skb_load_bytes</code> 20 处，部分路径多次拉取同一头。</td>
+        <td>统一 <code>bpf_skb_pull_data</code> 一次 + direct packet access，非常规路径才回落 load_bytes。</td>
+        <td>减少 helper 调用与线性区拷贝。</td>
+        <td>perf + 分片/隧道封装回归用例。</td>
+      </tr>
+      <tr>
+        <td><b>可观测性采样</b><br><span class="b b-ok">低风险</span></td>
+        <td>事件已走 ringbuf，但部分统计是每包原子加。</td>
+        <td>统计改 per-CPU 累加、用户态聚合；异常事件保留限流采样。</td>
+        <td>避免共享 cacheline 争用。</td>
+        <td>多核打流对比 <code>perf stat</code> cache-miss。</td>
+      </tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h3>5.2 转发面（用户态 relay / offload）</h3>
+  <div class="tbl-wrap">
+  <table>
+    <thead><tr><th style="width:24%">优化</th><th>现状</th><th>改法</th><th>预期收益</th><th>验证</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><b>io_uring 中继</b><br><span class="b b-warn">中风险</span></td>
+        <td>Go 侧手工 <code>splice</code>（<code>tcp_copy_linux.go</code>）+ 内核 offload 优先。</td>
+        <td>Rust 版用 io_uring multishot recv/send + <code>splice</code> 组合；buffer 生命周期与 SQE 绑定，消除逃逸与 GC 压力。</td>
+        <td>用户态兜底路径吞吐/P99 提升；syscall 数下降。</td>
+        <td>与 Go 版同机型 iperf/短连接基准；offload 命中率不变。</td>
+      </tr>
+      <tr>
+        <td><b>UDP NAT 下沉</b><br><span class="b b-warn">中风险</span></td>
+        <td>UDP 端点池与 full-cone NAT 在用户态（<code>udp_endpoint_pool.go</code> 1002 行 + 生命周期 1002 行 + 任务池 678 行）。</td>
+        <td>端口分配与映射表放 eBPF map，用户态只做慢路径与保活；NAT 语义用 conntrack 状态机保证。</td>
+        <td>UDP 每包成本显著下降；用户态对象数大幅减少。</td>
+        <td>full-cone 行为测试（外部 STUN 探测）+ 长时间保活回归。</td>
+      </tr>
+      <tr>
+        <td><b>连接状态分片</b><br><span class="b b-ok">低风险</span></td>
+        <td>Go 版多把锁 + janitor 单独扫（存在专门的锁作用域回归测试）。</td>
+        <td>按五元组 hash 分片，每 shard 独立锁/无锁；janitor 每 shard 自带，取消全局扫描。</td>
+        <td>消除跨核争用与长尾停顿。</td>
+        <td>高并发短连接压测 P99.9。</td>
+      </tr>
+      <tr>
+        <td><b>offload 控制回路</b><br><span class="b b-bad">高风险</span></td>
+        <td>pause 表 + <code>tcp_offload_sent</code> 记账 + tcp_info 采样推算积压。</td>
+        <td>保持设计，但采样改用更直接的内核信息，控制回路参数化并可观测。</td>
+        <td>避免极端负载下「切回用户态丢包」。</td>
+        <td>人为制造背压的故障注入测试。</td>
+      </tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h3>5.3 DNS 与解析路径</h3>
+  <div class="grid g2">
+    <div class="card"><p class="tag">零拷贝 wire</p><p>现状 Go 侧多轮 decode/encode + 分配。Rust 版：收到报文直接在原 buffer 上做 name 解压视图（借用而非拷贝），仅在改写 TTL/EDNS 时才复制。收益：P99 与分配压力双降。</p></div>
+    <div class="card"><p class="tag">缓存结构</p><p>分片 LRU + 每 shard 独立单飞（singleflight）；负缓存/乐观缓存语义照搬 dae（有大量回归测试可对拍）。<code>moka</code> 或自研分片 LRU。</p></div>
+    <div class="card"><p class="tag">上游连接复用</p><p>Go 版已有 HTTP 客户端代际管理与 DoQ owned-conn；Rust 版用 <code>quinn</code> 连接池 + <code>h2</code> multiplex，代际切换用 <code>ArcSwap</code> 原子替换。</p></div>
+    <div class="card"><p class="tag">与数据面的耦合</p><p>域位图发布目前是逐条 map update。可改为批量更新 + 代际号，让一次 DNS 应答写入更少的 syscall。</p></div>
+  </div>
+
+  <h3>5.4 内存、并发与工程效率</h3>
+  <div class="grid g3">
+    <div class="card"><p class="tag">无 GC 尾延迟</p><p>网关场景对 P99 敏感；Rust 消除 GC 停顿与堆预留。dae 已有 <code>disable_thp</code>、内存上限相关代码，说明 RSS/抖动是真实运维问题。</p></div>
+    <div class="card"><p class="tag">静态数据竞争检查</p><p><code>Send/Sync</code> 让「janitor 持锁时发包」这类问题在编译期暴露——dae 用多个专门测试文件守这类 bug。</p></div>
+    <div class="card"><p class="tag">启动与常驻</p><p>静态 musl 二进制、无运行时预热；容器镜像更小、启动更快，适合网关侧容器化部署。</p></div>
+    <div class="card"><p class="tag">构建链</p><p><b>现状</b>：<code>go generate</code> + bpf2go 两段构建，eBPF 对象与二进制版本需人工保持一致。<br><b>改法</b>：<code>build.rs</code> 调 clang 编译 C 对象（或 aya-ebpf），产物 <code>include_bytes!</code> 进二进制，单一 <code>cargo build</code> 出全量。</p></div>
+    <div class="card"><p class="tag">错误与可观测</p><p><code>thiserror</code>/<code>anyhow</code> 分层 + <code>tracing</code> span 让「一次 reload 失败」能完整还原调用链；配置错误带源码 span。</p></div>
+    <div class="card"><p class="tag">差分测试与 fuzz</p><p>Go 版编成 <code>dae-oracle</code> 对拍：配置归一化输出、BPF map 内容（<code>bpftool map dump</code> JSON）、DNS 响应字节、订阅解析。<code>cargo-fuzz</code> 直接打 DSL / DNS wire / 嗅探。</p></div>
+  </div>
+
+  <div class="call warn">
+    <div class="h">明确不建议做的「优化」</div>
+    <ul>
+      <li><b>不要在 Rust 里重写内核已有的能力</b>（自己实现拥塞控制、重写 IP 栈）——dae 的 offload 已经证明「能下沉就下沉」。</li>
+      <li><b>不要动单写者回程绑定、epoch 双槽、pause 保险丝</b>这三个安全/稳定性设计；它们是故障换来的。</li>
+      <li><b>不要以 DNS 全自研 wire 解析为第一版目标</b>：先用成熟库对齐语义，再在有基准的情况下替换热点路径。</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ============================================================ -->
+<section id="risks" class="reveal" style="margin-top:64px">
+  <h2><span style="color:var(--dim);font-size:.62em">06 · </span>风险登记册</h2>
+  <div class="tbl-wrap">
+  <table>
+    <thead><tr><th>#</th><th>风险</th><th>影响</th><th>概率</th><th>缓解 / 验证</th></tr></thead>
+    <tbody>
+      <tr><td>R1</td><td><b>outbound 协议栈无法在合理工期对齐</b>（VMess/VLESS 的传输组合、hysteria2/tuic 的 QUIC 行为）</td><td><span class="b b-bad">高</span> 决定「可替换」是否成立</td><td><span class="b b-bad">高</span></td><td>Dialer trait 化 + 协议分档；先覆盖 direct/socks5/ss/trojan（多数用户），QUIC 系单独立项；同节点双跑对拍（吞吐/延迟/兼容性）</td></tr>
+      <tr><td>R2</td><td><b>quinn 与定制 quic-go fork 的行为差异</b>（拥塞、0-RTT、分片、连接迁移）</td><td><span class="b b-warn">中高</span></td><td><span class="b b-warn">中</span></td><td>协议无关的适配层；DoQ/DoH3 与 hysteria2 做专项互通测试矩阵</td></tr>
+      <tr><td>R3</td><td><b>eBPF 内核矩阵回归</b>（verifier 版本差异、netkit/redirect_peer 门槛）</td><td><span class="b b-warn">中高</span></td><td><span class="b b-warn">中</span></td><td>CI 跑多内核（≥5.17/6.1/6.6/6.14+）的加载与 e2e；保留 C 数据面作为可回退路径；ABI 单源减少漂移</td></tr>
+      <tr><td>R4</td><td><b>热重载语义不一致</b>（epoch 切换、失败回滚、map 复用 vs 重建）</td><td><span class="b b-warn">中</span></td><td><span class="b b-warn">中</span></td><td>直接翻译 Go 的 reload 测试用例；故障注入（重载中打流、重载后立即校验）</td></tr>
+      <tr><td>R5</td><td><b>运维面缺口</b>（suspend/sysdump/trace/daed API/systemd 通知/信号语义）</td><td><span class="b b-warn">中</span></td><td><span class="b b-ok">低</span></td><td>按清单逐项对齐；<code>validate/export</code> 先做，天然成为对拍工具</td></tr>
+      <tr><td>R6</td><td><b>IPv6 / NDP / ICMP / 双栈边界情形</b></td><td><span class="b b-warn">中</span></td><td><span class="b b-warn">中</span></td><td>把 <code>wan_lan_ingress</code>、ICMPv6、分片相关 Go 测试作为必过清单</td></tr>
+      <tr><td>R7</td><td><b>许可传染</b>：读 AGPL 代码写出的 Rust 版是衍生作品</td><td><span class="b b-bad">高</span>（若计划闭源分发）</td><td><span class="b b-ok">确定</span></td><td>按 AGPL-3.0 发布（与 dae 一致）；若不能接受，需要 clean-room 设计而非「翻译」</td></tr>
+      <tr><td>R8</td><td><b>工期与人力低估</b>：本仓库 65k 行 + 外部栈 + 40k 行测试规格</td><td><span class="b b-bad">高</span></td><td><span class="b b-warn">中高</span></td><td>按节 07 里程碑推进，每阶段可停可交付；不做「大爆炸」</td></tr>
+      <tr><td>R9</td><td><b>性能假设未经验证</b>（io_uring/per-core 收益可能被内核 offload 掩盖）</td><td><span class="b b-info">低中</span></td><td><span class="b b-warn">中</span></td><td>先建基准再优化；以「offload 命中率」为核心指标，用户态路径只做兜底优化</td></tr>
+    </tbody>
+  </table>
+  </div>
+</section>
+
+<!-- ============================================================ -->
+<section id="roadmap" class="reveal" style="margin-top:64px">
+  <h2><span style="color:var(--dim);font-size:.62em">07 · </span>迁移路线图</h2>
+  <p style="color:var(--muted)">原则：每阶段都产出「可运行、可对拍、可停」的成果。工期为<b>单人粗估</b>（假设熟悉 Rust 与 Linux 网络，不含协议栈全量），仅作量级参考。<b>2026-10-03 修订</b>：按 ADR-0009 改为 K 轨道先行（取代原 P0–P2 顺序）；<b>K0–K3 与 P3a/P3b（a/b-1/b-2a）、P4、P5 G1/G2/G3a/G3b/G3b+、P6、P7 均已完成并实测通过；P8/P9（数据面 Rust 化）已完成——8 程序/14 map 全量移植；P9+ 已移除 C 数据面，Rust 对象为唯一数据面（ADR-0025）</b>（对拍/矩阵见 ADR-0010，配置/一跳见 ADR-0011，DNS 见 0012/0013/0014，转发面见 ADR-0015，协议栈见 ADR-0016–0020，运维面见 ADR-0021，P7 见 ADR-0022，P8/P9 见 ADR-0023/0024）。</p>
+
+  <div class="card" style="padding:8px 22px">
+    <div class="phase"><div class="p">K0 · 数据面工作台<small>2–4 周 · 已完成</small></div><div>
+      <p>产出：mini-dae 升级为工作台——<b>bpf_loop 规则 VM</b>（match_set 数组 + 粘性 OR / AND 编码）、<b>LPM array-of-maps</b>、双 epoch 槽、conntrack 基础、redirect_track 单写者。</p>
+      <p><em>验收：Go 同规则集的 map dump 与判决逐条一致（对拍自动化已在 K2 完成）。</em> <span class="stamp">已实测</span> 规则 VM + LPM：9 个 match_set / 3 个 trie；proxy、direct（LPM 集合第二前缀）、block（NOT+AND）三路径全通；5 个编译器单测。双 epoch 与 conn_state 在 K1 一并落地。</p>
+    </div></div>
+    <div class="phase"><div class="p">K1 · 最小驱动<small>3–5 周 · 已完成</small></div><div>
+      <p>产出：routing 子集编译（dip/sip/mac/l4proto/ipversion/dport/sport/dscp/fallback）+ 钩子集合管理（lan/wan/dae0/dae0peer/单臂）+ listener/sockmap + 生命周期与 reload。</p>
+      <p><em>验收：一份路由子集配置驱动真实分流，direct/proxy/回程 e2e 通过。</em> <span class="stamp">已实测</span> 六种钩子角色（含单臂 dual-role 合用程序）+ SIGHUP 热重载 + conn_state 缓存：proxy/direct/block、本机 WAN 流量与回程、在途连接跨重载全通；janitor 清理生效。</p>
+    </div></div>
+    <div class="phase"><div class="p">K2 · 对拍与内核矩阵<small>2–3 周 · 已完成</small></div><div>
+      <p>产出：map dump/判决对拍自动化；内核矩阵（≥5.17 / 6.1 / 6.6 / 6.14+）；故障注入（kill -9、reload 中打流）。</p>
+      <p><em>验收：矩阵全绿；与 Go 版同规则集产出可对齐。</em> <span class="stamp">已实测</span> 对拍：两份规则集与 dae 原版 Go 编译器输出<b>逐字节一致</b>；矩阵：宿主 6.18.54-lts 与 QEMU 引导的 7.2.8 均 <b>8/8</b>（本环境无 5.17/6.1/6.6 镜像，未执行，边界见 ADR-0010）；故障注入：kill -9 后 TCX 自动摘钩 + 流量 fail-open、10 轮重载打流零失败；单写者：竞争发布者被拒 + 陈旧窗口恢复。</p>
+    </div></div>
+    <div class="phase"><div class="p">K3 · 生态接入<small>3–5 周 · 已完成</small></div><div>
+      <p>产出：全量 <code>.dae</code> 解析（这里才是原 P1 的正式回归）+ 只读状态面 +（可选）Go 后端过渡一跳。</p>
+      <p><em>验收：拿一份真实用户配置与节点跑通。</em> <span class="stamp">已实测</span> 全量解析：include 合并/权限/循环检测与 dae <code>config_merger.go</code> 对齐，schema 未知键/必填与 <code>parser.go</code> 对齐，诊断带文件:行号；官方 <code>example.dae</code> 与真实风格配置均通过。数据面只编译子集，<b>domain/geoip/pname 显式进 deferred</b>（不静默丢弃）；只读状态面（Unix socket JSON，请求经主循环串行处理，拒绝未知命令）；过渡一跳（<code>--forward socks5://…</code>，一跳后 orig_dst 完整保留）。节点协议执行仍属 P5。</p>
+    </div></div>
+    <div class="phase"><div class="p">P3 · DNS 引擎<small>6–8 周 · P3a + P3b-1 + P3b-2a 已完成</small></div><div>
+      <p>产出：<code>dae-dns</code>（listener/cache/upstream/DoH/DoQ/自举解析）+ 域位图发布；与嗅探 punt 的接口先留桩。<b>拆分为 P3a（最小闭环）、P3b-1（缓存/TCP）与 P3b-2（regex/EDNS 已完成；DoH/DoQ/嗅探 punt 待协议栈阶段）。</b></p>
+      <p><em>验收：DNS 响应字节级对拍通过；缓存/负缓存/乐观/截断升级等场景用 Go 测试翻译集覆盖。</em> <span class="stamp">已实测</span> P3a：透明 UDP DNS 接管（<code>IP_TRANSPARENT</code> + <code>IP_ORIGDSTADDR</code>）→ 上游 → 域位图（匹配对照 <code>tproxy.c:1673-1706</code>），<code>domain</code> 规则转可编译（ADR-0012）。P3b-1：正/负缓存（RFC 2308）、命中改 ID/回填 question/递减 TTL、TCP DNS 分帧/keep-alive、命中重发位图、SIGHUP 后缓存重投影（ADR-0013）。P3b-2a：<code>domain(regex:)</code> 编译期编译（对照 dae <code>regexp.Compile</code>，小写 qname + 原大小写模式）、EDNS 的 DO 位入缓存键、带 options 不缓存、UDP 按客户端尺寸截断（TC=1）而缓存/TCP 保留完整应答（ADR-0014）。DNS 单测与缓存/EDNS 单测合计 28 个。</p>
+    </div></div>
+    <div class="phase"><div class="p">P4 · 转发面<small>6–10 周 · 已完成（offload 为最小实现）</small></div><div>
+      <p>产出：<code>dae-relay</code>（TCP relay + offload 协调 + UDP NAT 池）+ janitor。</p>
+      <p><em>验收：大流量长连接 + 短连接压测达到 Go 版基线；offload 命中率不低于 Go 版。</em> <span class="stamp">已实测</span> P4a TCP relay：<code>--dialer direct|socks5://…</code>，accept 在 daens、连接转交 host ns 线程池；出口 socket 打 <code>SO_MARK</code>，数据面（<code>mini_wan_egress</code>/<code>mini_lan_ingress</code>）见 mark 直接放行防自环（对照 dae <code>is_dae_socket</code>）；512KB 回显逐字节一致、janitor 空闲回收、<code>--forward</code> 升级为 relay 的一种 dialer。P4b UDP NAT：透明 UDP 监听按目的端口分流（53 → DNS / 其余 → NAT），按 (client, orig_dst) 会话、回包源=原始目的地址、janitor 回收；3 报文复用 1 会话、mark 防自环实测。P4c TCP offload（最小）：<code>fast_sock</code> SOCKHASH + <code>sk_skb/stream_verdict</code>，键=「对端收到报文的元组」，egress 重定向内核对拼；512KB 流 <code>userspace_bytes=0 verdicts=42 redirects=42</code>；无 backlog fuse/计费（边界见 ADR-0015）；P7 补上连接回收与 fast_sock 键注销（ADR-0022）。</p>
+    </div></div>
+    <div class="phase"><div class="p">P5 · 协议栈<small>8–16 周 · G1（ss/trojan）、G2（vless/vmess）、G3a（tuic/QUIC）、G3b（hysteria2）与 G3b+（混淆/Brutal 近似/udphop）已完成</small></div><div>
+      <p>产出：<code>dae-outbound</code> 的 Dialer trait 与协议梯度：direct/socks5/ss/trojan → VMess/VLESS → QUIC 系。</p>
+      <p><em>验收：与 Go 版同节点双跑，功能矩阵（UDP/full-cone/多路复用）逐项勾选。</em> <span class="stamp">已实测</span> G1：<code>--dialer</code> 支持 <code>ss://</code>（classic AEAD）与 <code>trojan://</code>（rustls），与<b>独立实现</b>的 Python 对端互操，512KB 逐字节一致；协议/offload 互斥显式化（ADR-0016）。G2：<code>vless://</code>（TCP+UDP，tls/none）与 <code>vmess://</code>（AEAD，aid=0；嵌套 HMAC KDF、SHAKE128 分块）；UDP 会话拨号不再持 NAT 表锁；<b>三方交叉验收</b>：Rust 客户端 ↔ 独立 Python 服务端，以及 dae 实际依赖的 outbound Go 客户端 ↔ 同一 Python 服务端（TCP+UDP 全过）；边界（vision/XUDP/packetaddr/aid≠0）见 ADR-0017。G3a：<code>tuic://</code>（QUIC）——惰性 tokio 运行时 + quinn，认证 token 为 TLS exporter，TCP 走 QUIC 双向流、UDP 走 DATAGRAM（含分片/重组），与 Go/quic-go <b>独立参考服务端</b>跨实现验收（本地单测 + lab e2e，512KB/UDP 3/3）；hysteria2 归 G3b（h3+HPACK/Brutal/salamander 的路径见 ADR-0018）。G3b：<code>hysteria2://</code>（QUIC + 最小 HTTP/3 认证）——control 流 + QPACK 请求头（校验 <code>:status 233</code>），解码侧实现 HPACK Huffman（表从 Go 源码机械生成）；TCP 走 0x401 双向流帧、UDP 走 QUIC DATAGRAM（SessionID + 分片/重组），与 Go/http3 <b>独立参考服务端</b>跨实现验收；如实边界：Brutal CC / salamander 混淆 / ECH/pinSHA256/自定义 CA 未做（详见 ADR-0019）。G3b+：salamander 混淆（逐 datagram BLAKE2b XOR）、Brutal <b>近似</b>（hybrid 控制器：认证后按 min(server_rx, client_tx) 定固定窗口，丢包不收缩；quinn pacer 使速率约 +25%，bbr3 以 BBR 近似）、udphop（端口并集、5s 起跳、换本地 socket 并对 quinn 谎报地址；解决了 quinn endpoint driver 不轮询新 socket 的坑）；与 Go/http3 参考服务端（`-obfs-password/-hop-ports`）跨实现验收（详见 ADR-0020）。</p>
+    </div></div>
+    <div class="phase"><div class="p">P6 · 运维面<small>4–6 周 · 已完成（suspend/reload/metrics/sysdump/日志轮转/整配置热重载）</small></div><div>
+      <p>产出：reload/suspend/sysdump/trace/systemd/日志轮转/统计导出；如需，daed API 兼容层。</p>
+      <p><em>验收：Go 的运维回归测试清单全部通过；升级/回滚演练。</em> <span class="stamp">已实测</span> 信号面 SIGHUP=reload / SIGUSR2=suspend（eBPF 控制位 no-load/fail-open，reload 恢复）；状态面扩展为查询+控制（控制命令经主循环串行）；CLI reload/suspend/resume/metrics/sysdump/trace；Prometheus 文本导出（daed GraphQL 不做）；`--log-file` + SIGHUP reopen；`--config` 整配置热重载（失败不切槽回滚、dns.upstream 热切换）；lab `test-ops`/`test-config-reload` 全过（详见 ADR-0021）。</p>
+    </div></div>
+    <div class="phase"><div class="p">P7 · 收敛<small>4–8 周 · 已完成（剖面/offload 修复/soak/静态发布）</small></div><div>
+      <p>产出：性能剖面驱动的优化（节 05 清单按实测取舍）、长期稳定性 soak、发布工程（静态二进制/镜像/包）。</p>
+      <p><em>验收：72h soak 无泄漏；P99 与 RSS 优于或持平 Go 版。</em> <span class="stamp">已实测</span>（口径如实：perf 不可用——<code>perf_event_paranoid=2</code> 且无 perf 二进制，剖面 = 墙钟吞吐 + 状态面 counters + <code>/proc</code> CPU/RSS）。C 基准端点（<code>lab/bench_io.c</code> + <code>bench.sh</code>）六路径：direct 31Gbps/10µs、relay 24.7Gbps/17µs（447ms/GB）、offload 14.6Gbps/23µs（用户态≈0）、ss 2.5Gbps/55µs；<b>offload 生命周期修复</b>（半关闭超时 10s 兜底、fast_sock 键注销、注册前排空队列；基准曾复现挂 60s/丢数据/泄漏），新增 <code>test-offload-lifecycle</code>；<b>TCP_NODELAY</b> 使 ss 小包 p50 43.3ms→55µs；<code>soak.sh</code> 三模式（tcp 60s/870 轮含 435 reload + 290 suspend；ss/udp）RSS/fd 无泄漏（udp 的 glibc arena 保留如实标注）；发布用 glibc crt-static static-pie（<code>build-static.sh</code> + <code>redis:7-alpine</code> 冒烟；musl 因 ring 缺 C 工具链未直构，源码两处 libc 差异已修）（详情见 ADR-0022）。</p>
+    </div></div>
+    <div class="phase"><div class="p">P8 · 数据面 Rust 迁移起步<small>已被 P9 取代（切片历史）</small></div><div>
+      <p>产出：把 ADR-0002「先 C 后迁」的“后迁”启动——唯一未 Rust 化的核心（eBPF 程序本体，1142 行 / 8 程序 / 14 map）逐程序迁往 <code>aya-ebpf</code>。</p>
+      <p><em>验收：逐切片与 C 版行为同口径回归、性能同量级；全量迁移后 C 对象退场。</em> <span class="stamp">已实测</span>（首个切片，已被 P9 取代）环境打通：nightly + rust-src（Tuna 镜像）、crates 源替换（USTC，dl 也镜像）、<code>bpf-linker 0.11.1</code>；<code>ebpf-rs</code>（aya-ebpf 0.2 / no_std / <code>bpfel-unknown-none</code> / <code>-Z build-std=core</code>）产出对象；<b>offload verdict 垂直切片</b>：双对象共存 + <code>offload_guard</code> 镜像预检 + 计数合并；verifier/拼接/回收全过（详情见 ADR-0023）。</p>
+    </div></div>
+    <div class="phase"><div class="p">P9 · 数据面全量 Rust 化<small>已完成（8 程序/14 map；唯一数据面）</small></div><div>
+      <p>产出：单一完整 Rust 数据面对象（7 个 TC classifier + 规则 VM + offload verdict；BTF maps），与 C 同名同型，loader 零分支。<b>P9+（ADR-0025）：C 对象退场</b>——删 <code>ebpf/mini_dae.c</code> 与 <code>USE_EBPF_*</code> 回退分支，Rust 对象是唯一数据面（回退=从 <code>dae/</code> 重建 C，非常规路径）。</p>
+      <p><em>验收：全量回归在 Rust 数据面上与 C 同口径通过；性能同量级。</em> <span class="stamp">已实测</span> 规则 VM 用有界循环（<code>bpf_loop</code> 因 aya-obj 的 <code>PSEUDO_FUNC</code> relocation 缺口被 verifier 拒，规则 ≤64 语义等价）；BTF map-in-map（<code>ArrayOfMaps&lt;LpmTrie&lt;[u8;16],u32,1024&gt;,128&gt;</code>）；实测：标准 verify 9/9、单臂 verify 9/9（P9+ 串行复跑）、DNS 六专项、转发面六专项、G1/G2/G3 全量协议梯、test-ops/config-reload、soak 30s（RSS +372kB/fd +0）、<code>cargo test</code> 73/73；性能：direct 30.4Gbps/10µs、relay 20.4Gbps/18µs、offload 12.4Gbps/19µs（C 同轮 11.9Gbps/21µs）（详情见 ADR-0024/0025）。</p>
+    </div></div>
+  </div>
+  <p style="color:var(--muted);font-size:.86rem">合计单人 <b>11–18 个月</b>（K 轨道比原 P0–P2 略长，因为路由编译与生态接入提前；不含协议栈全量）；2–3 人可压到 5–8 个月。若只做「内核切片 + DNS」，约 K0–K3 + P3 = 6–11 个月单人。</p>
+</section>
+
+<!-- ============================================================ -->
+<section id="decisions" class="reveal" style="margin-top:64px">
+  <h2><span style="color:var(--dim);font-size:.62em">08 · </span>决策点</h2>
+  <p style="color:var(--muted)">勾选会保存在本地（localStorage），方便下次打开继续。★ 为建议项。<b>2026-10-03：D1–D6、D8 采纳建议项；D7 已按 ADR-0009 修订为内核切片先行</b>（逐条记录见 <code>docs/adr/</code>）。</p>
+  <div class="grid" style="gap:14px;margin-top:16px" id="decisions-root"></div>
+</section>
+
+<!-- ============================================================ -->
+<section id="appendix" class="reveal" style="margin-top:64px">
+  <h2><span style="color:var(--dim);font-size:.62em">09 · </span>附录</h2>
+
+  <h3>A · 模块 LOC 明细（实测）</h3>
+  <div class="tbl-wrap">
+  <table>
+    <thead><tr><th>路径</th><th class="num">源文件</th><th class="num">测试文件</th><th class="num">非测试 LOC</th><th class="num">测试 LOC</th></tr></thead>
+    <tbody>
+      <tr><td><code>control/</code></td><td class="num">103</td><td class="num">156</td><td class="num">38,598</td><td class="num">27,247</td></tr>
+      <tr><td><code>component/dns</code></td><td class="num">8</td><td class="num">6</td><td class="num">1,327</td><td class="num">461</td></tr>
+      <tr><td><code>component/daedns</code></td><td class="num">2</td><td class="num">4</td><td class="num">1,486</td><td class="num">927</td></tr>
+      <tr><td><code>component/dnstransport</code></td><td class="num">4</td><td class="num">3</td><td class="num">374</td><td class="num">468</td></tr>
+      <tr><td><code>component/outbound</code></td><td class="num">4</td><td class="num">3</td><td class="num">1,068</td><td class="num">1,090</td></tr>
+      <tr><td><code>component/routing</code></td><td class="num">9</td><td class="num">5</td><td class="num">1,337</td><td class="num">756</td></tr>
+      <tr><td><code>component/sniffing</code></td><td class="num">6</td><td class="num">9</td><td class="num">1,214</td><td class="num">729</td></tr>
+      <tr><td><code>component</code>（含子包合计）</td><td class="num">56</td><td class="num">48</td><td class="num">12,823</td><td class="num">6,435</td></tr>
+      <tr><td><code>config/</code></td><td class="num">9</td><td class="num">6</td><td class="num">1,419</td><td class="num">794</td></tr>
+      <tr><td><code>pkg/config_parser</code></td><td class="num">4</td><td class="num">3</td><td class="num">839</td><td class="num">366</td></tr>
+      <tr><td><code>pkg/geodata</code></td><td class="num">3</td><td class="num">1</td><td class="num">881</td><td class="num">80</td></tr>
+      <tr><td><code>pkg/trie</code></td><td class="num">1</td><td class="num">1</td><td class="num">365</td><td class="num">205</td></tr>
+      <tr><td><code>pkg/ebpf_internal</code></td><td class="num">6</td><td class="num">0</td><td class="num">414</td><td class="num">0</td></tr>
+      <tr><td><code>common/*</code></td><td class="num">20</td><td class="num">11</td><td class="num">2,553</td><td class="num">981</td></tr>
+      <tr><td><code>cmd/</code></td><td class="num">23</td><td class="num">18</td><td class="num">5,389</td><td class="num">3,345</td></tr>
+      <tr><td><code>trace/</code> + 根 <code>main.go</code></td><td class="num">5</td><td class="num">0</td><td class="num">668</td><td class="num">0</td></tr>
+      <tr><td><b>合计</b></td><td class="num"><b>237</b></td><td class="num"><b>244</b></td><td class="num"><b>64,980</b></td><td class="num"><b>39,453</b></td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h3>B · 关键文件 Top 20（重写工作量集中区）</h3>
+  <div class="tbl-wrap">
+  <table>
+    <thead><tr><th>文件</th><th class="num">行</th><th>类别</th></tr></thead>
+    <tbody>
+      <tr><td><code>control/control_plane.go</code></td><td class="num">3,252</td><td>总装线</td></tr>
+      <tr><td><code>control/dns.go</code></td><td class="num">1,624</td><td>DNS 控制器</td></tr>
+      <tr><td><code>component/outbound/dialer/connectivity_check.go</code></td><td class="num">1,517</td><td>节点健康检查</td></tr>
+      <tr><td><code>control/dns_controller_cache.go</code></td><td class="num">1,417</td><td>DNS 缓存</td></tr>
+      <tr><td><code>control/udp.go</code></td><td class="num">1,229</td><td>UDP 会话</td></tr>
+      <tr><td><code>control/routing_matcher_builder.go</code></td><td class="num">1,185</td><td>规则编译</td></tr>
+      <tr><td><code>component/outbound/dialer/dialer.go</code></td><td class="num">1,055</td><td>拨号器</td></tr>
+      <tr><td><code>control/packet_sniffer_pool.go</code></td><td class="num">1,050</td><td>嗅探池</td></tr>
+      <tr><td><code>control/udp_endpoint_pool.go</code></td><td class="num">1,002</td><td>UDP 端点池</td></tr>
+      <tr><td><code>control/udp_endpoint_lifecycle.go</code></td><td class="num">1,002</td><td>UDP 生命周期</td></tr>
+      <tr><td><code>control/netns_utils.go</code></td><td class="num">994</td><td>netns/宿主网络</td></tr>
+      <tr><td><code>control/session_manager.go</code></td><td class="num">983</td><td>会话管理</td></tr>
+      <tr><td><code>control/tcp_offload_linux.go</code></td><td class="num">956</td><td>offload</td></tr>
+      <tr><td><code>cmd/run.go</code></td><td class="num">895</td><td>守护进程</td></tr>
+      <tr><td><code>control/bpf_utils.go</code></td><td class="num">884</td><td>BPF 生命周期</td></tr>
+      <tr><td><code>control/tcp.go</code></td><td class="num">879</td><td>TCP 中继</td></tr>
+      <tr><td><code>component/daedns/router.go</code></td><td class="num">876</td><td>自举解析</td></tr>
+      <tr><td><code>control/tc_hook_set.go</code></td><td class="num">737</td><td>tc 钩子集合</td></tr>
+      <tr><td><code>control/dns_controller_handle.go</code></td><td class="num">712</td><td>DNS 处理</td></tr>
+      <tr><td><code>cmd/reload_manager.go</code></td><td class="num">674</td><td>热重载</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h3>C · 内核要求与宿主契约</h3>
+  <div class="grid g2">
+    <div class="card">
+      <p class="tag">版本门槛</p>
+      <ul>
+        <li><code>bpf_loop</code>（规则遍历 + argv 解析）→ Linux <b>5.17+</b>（dae 的硬门槛）</li>
+        <li><code>bpf_sk_assign</code> → 5.7+（被 5.17 覆盖）</li>
+        <li><code>bpf_redirect_peer</code> → 需 CVE-2025-37959 修复（mainline ≥ 6.14.7），否则退回 <code>bpf_redirect</code></li>
+        <li>TCX（bpf_link 形式的 tc）→ 6.6+；更老内核走 clsact + netlink</li>
+        <li>dae0/dae0peer：netkit（新内核）或 veth</li>
+      </ul>
+    </div>
+    <div class="card">
+      <p class="tag">必须成组迁移的宿主配置</p>
+      <ul>
+        <li>daens 内：<code>169.254.0.11/32</code>、<code>default via 169.254.0.1</code>、静态邻居、<code>accept_local=1</code></li>
+        <li>fwmark <code>0x8000000</code> → table 2023 → <code>local default dev lo</code></li>
+        <li><code>ip_forward</code>、<code>rp_filter</code>、<code>tcp_early_demux</code>、<code>ip_early_demux</code>、dae0 的 v6 开关与 forwarding 等 13 个 sysctl</li>
+        <li>控制面 socket 的 <code>SO_MARK</code>（<code>so_mark_from_dae</code>）</li>
+      </ul>
+    </div>
+  </div>
+
+  <h3>D · 本档案证据来源</h3>
+  <ul>
+    <li>代码规模/依赖/import 图：对本仓库 <code>main@e3fee8f</code> 的静态统计（<code>wc</code>、<code>go mod edit -json</code>、内部 import 解析）。</li>
+    <li>数据面机制：<code>control/kern/tproxy.c</code> 全文精读（行号已在文中标注）；Go 侧 <code>netns_utils.go</code>、<code>control_plane_core_bind.go</code> 等。</li>
+    <li><span class="stamp">已实测</span> 标记：来自本仓库 <code>mini-dae/</code> 的实验（Rust/aya 数据面 + Rust 加载器 + netns lab；P9+ 起 C 数据面已移除，Rust 对象为唯一数据面，见 ADR-0025），九用例（含状态面、单写者与故障注入）在标准/单臂两种拓扑、宿主与 QEMU 两台内核上全通过；规则编译与 dae 原版逐字节一致；K3 配置栈与 dae 解析/校验语义对齐；P3a/b 的 DNS 接管、缓存、TCP DNS、regex、EDNS 与 P4 的 relay、UDP NAT、offload（512KB 用户态零字节）、P5-G1 的 ss/trojan、G2 的 vless/vmess（跨实现 512KB、offload 互斥、Go 客户端三方交叉）、G3a 的 tuic（QUIC 流/DATAGRAM，Go 参考服务端）、G3b 的 hysteria2（h3 认证、0x401 流、DATAGRAM，Go/http3 参考服务端）与 G3b+ 的混淆/Brutal 近似/udphop、P6 的运维面（suspend/reload/metrics/sysdump/日志轮转/整配置热重载）均有专项端到端用例与 73 个单测；详见 <code>mini-dae/NOTES.md</code> 与 <code>mini-dae/README.md</code>。</li>
+    <li>推断项（未验证）：外部仓库规模、quinn 与 quic-go fork 的行为差异、io_uring/per-core 的收益幅度、工期估算——均在文中显式标注。</li>
+  </ul>
+</section>
+
+<p style="color:var(--dim);font-family:var(--mono);font-size:.78rem;margin-top:56px;border-top:1px solid var(--line);padding-top:14px">
+  dae → Rust 决策档案 · v2.9 · 生成于 2026-10-04 · 基于 dae main@e3fee8f（nightly）· 本文件自包含，可离线打开<br>
+  v1.1：新增 4.5 部署形态、4.6 常驻与故障语义、决策点 D8<br>
+  v1.2：按 ADR-0009 改为 K 轨道路线图；D7 修订为内核切片先行；K0 第一步（规则 VM + LPM）已实测<br>
+  v1.3：K0、K1 均已完成并实测（双 epoch 热重载、conn_state 缓存、五钩子角色、本机 WAN 流量与回程）<br>
+  v1.4：K2 完成——规则编译与 dae 原版逐字节对拍、单臂 dual-role、redirect_track 单写者、故障注入、双内核矩阵（详情见 ADR-0010）<br>
+  v1.5：K3 完成——全量 .dae 解析（include/schema/行级诊断）、子集编译 + 显式 deferred、只读状态面、SOCKS5 过渡一跳（详情见 ADR-0011）<br>
+  v1.6：P3a 完成——透明 UDP DNS 接管、域位图（domain 规则转可编译）、DNS 专项端到端实测（详情见 ADR-0012）<br>
+  v1.7：P3b-1 完成——DNS 正/负缓存（TTL 递减、命中重发位图）、TCP DNS（分帧/keep-alive）、reload 后缓存重投影（详情见 ADR-0013）<br>
+  v1.8：P3b-2a 完成——domain(regex:)、EDNS DO 位缓存键/options 不缓存、UDP 按客户端尺寸截断（详情见 ADR-0014）<br>
+  v1.9：P4 完成——TCP relay + Dialer（SO_MARK 防自环、janitor）、UDP NAT 会话、TCP offload 最小实现（512KB 用户态零字节）（详情见 ADR-0015）<br>
+  v2.0：P5-G1 完成——原生协议栈第一梯 shadowsocks classic AEAD（TCP/UDP）与 trojan（TLS CONNECT），独立 Python 对端跨实现 512KB 逐字节一致；协议/offload 互斥与 UDP 回退显式化（详情见 ADR-0016）<br>
+  v2.1：P5-G2 完成——vless（TCP/UDP，tls/none）与 vmess AEAD（aid=0，KDF/SHAKE128 分块/终止块）；UDP 会话拨号不再持锁；三方交叉验收（真实 Go 客户端 ↔ 独立 Python 服务端）（详情见 ADR-0017）<br>
+  v2.2：P5-G3a 完成——tuic v5（QUIC：tokio/quinn、exporter 认证、双向流、DATAGRAM 分片/重组）；与 Go/quic-go 独立参考服务端跨实现验收；hysteria2 归 G3b（详情见 ADR-0018）<br>
+  v2.3：P5-G3b 完成——hysteria2（QUIC + 最小 HTTP/3 认证：QPACK 编解码 + HPACK Huffman、0x401 TCP 流帧、SessionID DATAGRAM 分片/重组）；与 Go/http3 独立参考服务端跨实现验收；Brutal CC / salamander 混淆如实不做（详情见 ADR-0019）<br>
+  v2.4：P5-G3b+ 完成——salamander 混淆（BLAKE2b XOR）、Brutal 近似（速率目标窗口，如实标注 pacer 偏差）、udphop（端口并集 + 换 socket + 谎报地址，含 quinn driver 唤醒坑）；Go 参考服务端支持 -obfs-password/-hop-ports；新增 hysteria2 字节级规格文档（详情见 ADR-0020）<br>
+  v2.5：P6 完成——运维面（SIGHUP reload / SIGUSR2 suspend 的 eBPF no-load、状态面控制命令、Prometheus 文本导出、sysdump/trace、日志轮转、整配置热重载与回滚、DNS 上游热切换）（详情见 ADR-0021）<br>
+  v2.6：P7 完成——剖面口径（如实：无 perf，墙钟+counters+/proc）、C 基准端点与六路径表、offload 生命周期修复（半关闭超时/fast_sock 键注销/注册前排空，新回归用例）、TCP_NODELAY（ss p50 43.3ms→55µs）、soak 三模式、glibc crt-static 静态发布 + alpine 冒烟（musl 直构边界如实标注）（详情见 ADR-0022）<br>
+  v2.8：P9 完成——数据面全量 Rust 化：7 个 TC classifier + 规则 VM + offload verdict 全部移植到 aya-ebpf（BTF maps 含 map-in-map 的 LPM 内层模板），8 程序/14 map 单对象、loader 零分支；默认数据面切 Rust（USE_EBPF_C 回退 C）；全量回归（verify/DNS/协议梯/运维/soak）在 Rust 数据面通过；路线调整：bpf_loop 因 aya-obj 的 PSEUDO_FUNC relocation 缺口改用有界循环（规则≤64，语义等价）（详情见 ADR-0024）<br>
+  v2.9：P9+ 移除 C 数据面——删 <code>ebpf/mini_dae.c</code>/<code>build/mini_dae.o</code> 与全部 <code>USE_EBPF_*</code> 回退分支（loader 去掉 <code>--ebpf-offload</code> 双对象；lab 删 <code>offload-rs-up</code>/<code>rs-up</code>/<code>rs-dual-up</code> 会话；bench 删 <code>offload-rs</code> 路径）；Rust 对象为唯一数据面，回退=从 <code>dae/</code> 重建；复跑验收：标准 verify 9/9、单臂 verify 9/9、DNS/转发面/协议栈抽查全过、<code>cargo test</code> 73/73；六路径基准（`bench.sh all`）：direct 30.6Gbps/10µs、relay 23.8/18µs、offload 7.5/24µs（单次方差大，同对象另两次 12.4/19µs 与 8.3/30µs）、ss 2.45/59µs、UDP 丢包与 C 同数值；并完成 P9+ 完整性回归：DNS 6/6、转发面 6/6、协议梯 15 会话 17/17、K3/运维 5/5、对拍 5/5 逐字节 + 跨实现联调 3/4（1 为已知 Go 客户端偏差）、双内核矩阵 9/9、soak 三模式无泄漏（详情见 ADR-0025 与 `mini-dae/NOTES.md` §11.16）
+</p>
+</main>
+
+<script>
+(function(){
+  document.documentElement.classList.add('js');
+
+  // ---------- scroll progress + scroll-spy ----------
+  var bar = document.getElementById('progress');
+  var navLinks = Array.prototype.slice.call(document.querySelectorAll('#nav a'));
+  var sections = navLinks.map(function(a){ return document.querySelector(a.getAttribute('href')); });
+  function onScroll(){
+    var h = document.documentElement;
+    var p = h.scrollTop / Math.max(1, (h.scrollHeight - h.clientHeight));
+    bar.style.width = (p*100).toFixed(2) + '%';
+    var idx = 0;
+    for (var i=0;i<sections.length;i++){
+      if (sections[i] && sections[i].getBoundingClientRect().top <= 140) idx = i;
+    }
+    navLinks.forEach(function(a,i){ a.classList.toggle('active', i===idx); });
+  }
+  document.addEventListener('scroll', onScroll, {passive:true});
+  onScroll();
+
+  // ---------- reveal on scroll ----------
+  var io = ('IntersectionObserver' in window) ? new IntersectionObserver(function(es){
+    es.forEach(function(e){ if(e.isIntersecting){ e.target.classList.add('in'); io.unobserve(e.target);} });
+  }, {rootMargin:'0px 0px -8% 0px', threshold:0.04}) : null;
+  Array.prototype.forEach.call(document.querySelectorAll('.reveal'), function(el){
+    if (io) io.observe(el); else el.classList.add('in');
+  });
+  // 安全网：无论如何 1.5s 后全部可见（防止 IO 未触发）
+  setTimeout(function(){
+    Array.prototype.forEach.call(document.querySelectorAll('.reveal'), function(el){ el.classList.add('in'); });
+  }, 1500);
+
+  // ---------- decisions (localStorage) ----------
+  var DECISIONS = [
+    { id:'D1', title:'目标定位', q:'这次重构要达成什么？',
+      opts:[
+        {k:'learn', t:'学习型复刻', d:'以看懂/验证技术为主，功能覆盖可以不完整'},
+        {k:'prod',  t:'生产可替换', d:'最终取代 Go 版在真实网络里跑，要求全功能 + 运维面 + 协议栈'},
+        {k:'hybrid',t:'混合：按生产质量写、但允许分批交付', d:'先做核心闭环（配置/路由/数据面/DNS），后续按需扩展'}
+      ], rec:'hybrid',
+      why:'<b>为什么建议 hybrid</b>：Rust 版最大的沉没成本风险是「做到一半发现要重来」。按生产质量写核心闭环（可对拍、可发布），把协议栈与运维面作为可选项后置，任何时点停下来都保留价值。' },
+    { id:'D2', title:'eBPF 程序的实现语言', q:'数据面 4,403 行 C 怎么处理？',
+      opts:[
+        {k:'c',    t:'保持 C（clang 构建，与 dae 一致）', d:'零移植风险，verifier 行为一致；Rust 只做加载器/控制面'},
+        {k:'rust', t:'迁移到 aya-ebpf（Rust）', d:'类型安全、与用户态共享结构体；但需 nightly + build-std，且要重学 verifier 友好写法'},
+        {k:'later',t:'先 C 后迁（渐进）', d:'先用 C 对齐行为并建立基准，再逐个程序迁移并用差分测试保护'}
+      ], rec:'later',
+      why:'<b>为什么建议渐进</b>：mini-dae 已证明 aya 加载 C 对象这条路完全可行（已实测）；当时 aya-ebpf 因 nightly 不可用未验证。<b>2026-10-04 结果（ADR-0023/0024/0025）</b>：nightly + rust-src + bpf-linker 装通后，8 程序/14 map 已全量迁到 aya-ebpf（BTF maps、map-in-map、有界循环替代 bpf_loop），全量回归在 Rust 数据面上与 C 同口径通过，随后 C 数据面已删除（P9+）——“后迁”已按预期收尾。' },
+    { id:'D3', title:'用户态运行时模型', q:'转发热路径用什么跑？',
+      opts:[
+        {k:'tokio', t:'tokio 多线程 + 专用线程做 splice', d:'生态最全，先拿正确性'},
+        {k:'tpc',   t:'thread-per-core（monoio/glommio）+ SO_REUSEPORT', d:'共享内存为零，无跨核锁；复杂度高'},
+        {k:'kern',  t:'尽量依赖内核 offload，用户态只做兜底', d:'与 dae 设计一致，Rust 优化收益有限'}
+      ], rec:'tokio',
+      why:'<b>为什么建议 tokio 起步</b>：dae 的主路径已经是内核 offload，用户态 relay 是兜底；在没有基准之前为它引入 per-core 复杂度不划算。先 tokio，等 P7 用真实剖面决定是否换。' },
+    { id:'D4', title:'outbound 协议栈策略', q:'代理协议怎么落地？',
+      opts:[
+        {k:'subset',t:'Rust 生态 + 自研子集，按梯度推进', d:'direct/socks5/ss/trojan → vmess/vless → QUIC 系'},
+        {k:'all',   t:'一开始就对齐全部协议', d:'工期与不确定性最高'},
+        {k:'defer', t:'本期不做协议栈，只做数据面/路由/DNS', d:'把最大不确定性排除在范围外'}
+      ], rec:'subset',
+      why:'<b>为什么建议梯度</b>：协议栈是唯一无法从本仓库读取规格的部分（实现不在仓库内）。梯度推进可以在每个档位停下来评估收益，也便于与 Go 版双跑对拍。' },
+    { id:'D5', title:'配置兼容性', q:'.dae 配置格式怎么办？',
+      opts:[
+        {k:'compat', t:'100% 兼容 .dae（含 include/merge/patch 语义）', d:'用户零迁移成本；需复刻既有语义与怪癖'},
+        {k:'new',    t:'新格式（TOML/YAML）+ 迁移工具', d:'实现更简单，但破坏订阅/面板/文档生态'},
+        {k:'dual',   t:'兼容 .dae + 提供新格式可选', d:'两条路都维护'}
+      ], rec:'compat',
+      why:'<b>为什么建议兼容</b>：配置是用户唯一直接接触的接口，也是订阅/面板生态的契约。而且配置+路由是纯用户态、最适合用 Go 版对拍的模块——兼容反而让验证更容易。' },
+    { id:'D6', title:'交付范围', q:'只做 dae 还是含 daed/API？',
+      opts:[
+        {k:'dae',  t:'只做 dae（单机网关本体）', d:'范围可控'},
+        {k:'daed', t:'含 daed（API/面板/多节点）', d:'范围与 Go 侧相当翻倍'},
+        {k:'api',  t:'daed 仅做兼容只读/最小 API', d:'满足观测与自动化，不做完整面板'}
+      ], rec:'dae',
+      why:'<b>为什么建议先只做 dae</b>：daed 是独立工程；先把网关本体做对，API 层可以后补且不阻塞核心价值。' },
+    { id:'D7', title:'推进优先级', q:'先做哪块？', status:'revised',
+      opts:[
+        {k:'dp',   t:'内核切片先行（数据面 + 最小驱动 + 最小对拍器）', d:'风险最集中、ABI 最难改；mini-dae 已验证最小闭环'},
+        {k:'sem',  t:'配置 + 路由语义（可对拍、无需 root）', d:'风险最低，但推迟内核侧的确定性'},
+        {k:'dns',  t:'DNS 引擎（control/ 最大子系统）', d:'工作量最大但可独立测试'},
+        {k:'perf', t:'先建性能基准与剖面', d:'数据驱动后续所有优化取舍'}
+      ], rec:'dp',
+      why:'<b>2026-10-03 修订（ADR-0009 取代 ADR-0007）</b>：改为内核切片先行。「内核攻坚」= 数据面 + 最小驱动 + 最小对拍器（只做数据面无法验证）；对拍范围缩到 map dump + 包级 e2e。代价是 <code>validate/export</code> 这类可用产物推迟 2–3 个月，用 ADR-0002 的 C 数据面兜底控制风险；生态接入走契约级/进程级边界，不用 FFI。' },
+    { id:'D8', title:'部署形态', q:'常驻 worker 怎么切？',
+      opts:[
+        {k:'single', t:'单进程多线程（tokio + 专用 relay 线程 + per-netns socket 工厂）', d:'复杂度最低；worker 边界先做成任务边界'},
+        {k:'sup',    t:'supervisor + N workers（listener fd 继承、map pin 共享）', d:'崩溃隔离与独立重启；需要 fd/netns/map 共享基建'},
+        {k:'perns',  t:'per-netns worker（每个 netns 独立数据面）', d:'容器/K8s 场景友好；宿主级功能需要额外协调'}
+      ], rec:'single',
+      why:'<b>为什么建议单进程起步</b>：eBPF 已经承担主路径，拆进程的收益（隔离/独立重启）有限，而代价（fd、netns、map 的共享复杂度）真实存在。关键是<b>不接管 direct 数据面</b>——只接管所有流量的决策，只接管需要代理的数据；同时 netns 亲和改用 per-netns socket 工厂，避开 tokio task 跨线程迁移与 dae 的 LockOSThread 模式冲突。' }
+  ];
+  var root = document.getElementById('decisions-root');
+  var store = {};
+  try { store = JSON.parse(localStorage.getItem('dae-rs-decisions') || '{}'); } catch(e){ store = {}; }
+  DECISIONS.forEach(function(d){
+    var el = document.createElement('div');
+    el.className = 'dec';
+    var badge = (d.status === 'revised')
+      ? '<span class="b b-warn" style="margin-left:auto">已修订（ADR-0009）</span>'
+      : '<span class="b b-ok" style="margin-left:auto">已采纳建议</span>';
+    var html = '<header><span class="id">'+d.id+'</span><h3>'+d.title+' <span style="color:var(--muted);font-weight:400">— '+d.q+'</span></h3>'
+             + badge + '</header><div class="body"><div class="opts">';
+    d.opts.forEach(function(o){
+      var checked = (store[d.id] === o.k) || (!store[d.id] && d.rec === o.k);
+      html += '<label class="opt '+(d.rec===o.k?'rec':'')+'"><input type="radio" name="'+d.id+'" value="'+o.k+'"'+(checked?' checked':'')+'>'
+            + '<span><span class="t">'+o.t+(d.rec===o.k?'<span class="rec-tag">建议</span>':'')+'</span><span class="d">'+o.d+'</span></span></label>';
+    });
+    html += '</div><div class="why">'+d.why+'</div></div>';
+    el.innerHTML = html;
+    root.appendChild(el);
+  });
+  root.addEventListener('change', function(e){
+    if (e.target && e.target.name) {
+      store[e.target.name] = e.target.value;
+      try { localStorage.setItem('dae-rs-decisions', JSON.stringify(store)); } catch(err){}
+    }
+  });
+})();
+</script>
+</body>
+</html>

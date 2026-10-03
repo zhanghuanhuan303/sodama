@@ -1,0 +1,27 @@
+[package]
+name = "mini-dae-ebpf"
+version = "0.1.0"
+edition = "2021"
+description = "Rust eBPF datapath for dae-rust (aya-ebpf, BTF maps)"
+license = "AGPL-3.0-only"
+repository = "https://github.com/zhanghuanhuan303/dae-rust"
+
+# 数据面 Rust 迁移（P8/P9）：完整数据面（7 个 classifier + offload verdict）。
+# 构建（需要 nightly + rust-src + bpf-linker，见 .cargo/config.toml）：
+#   PATH=$HOME/.cargo/bin:$PATH cargo +nightly build --release
+[dependencies]
+aya-ebpf = "0.2.1"
+aya-ebpf-bindings = "0.2.0"
+
+[[bin]]
+name = "mini-dae-ebpf"
+path = "src/main.rs"
+
+[profile.dev]
+panic = "abort"
+debug = 2
+
+[profile.release]
+panic = "abort"
+# bpf-linker --btf 从 DWARF 生成 .BTF（BTF map 与 verifier 需要），所以必须带 debuginfo。
+debug = 2

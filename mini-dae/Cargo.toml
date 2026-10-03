@@ -1,0 +1,8 @@
+[workspace]
+resolver = "2"
+members = ["loader"]
+# 数据面 Rust 迁移（P8）：BPF 目标需要 nightly + build-std，不随主 workspace 构建。
+exclude = ["ebpf-rs"]
+
+[profile.release]
+lto = true

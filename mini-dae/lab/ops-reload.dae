@@ -1,0 +1,18 @@
+# P6 热重载实验配置模板（test-config-reload 会把它复制到 /tmp 后运行中改写：
+# routing 端口用于验证「整配置重载生效」，upstream 用于验证「DNS 上游热切换」）。
+global {
+    tproxy_port: 12345
+}
+
+dns {
+    upstream {
+        fake: 'udp://127.0.0.1:5353'
+    }
+}
+
+routing {
+    dip(1.1.1.1/32) && dport(8080) -> proxy
+    dip(10.9.9.0/24, 10.9.10.0/24) && dport(9999) -> direct
+
+    fallback: direct
+}

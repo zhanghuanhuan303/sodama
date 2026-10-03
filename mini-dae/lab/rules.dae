@@ -1,0 +1,35 @@
+# mini-dae 路由规则（dae `.dae` 语法的子集，每条规则一行）
+#
+# 支持的函数：
+#   dip(<v4 cidr>, ...)      目的 IP 集合（折叠成一个 LPM trie）
+#   sip(<v4 cidr>, ...)      源 IP 集合
+#   mac('<aa:bb:..>', ...)   源 MAC（必须加引号，同 dae 文档）
+#   dport(<port|a-b>, ...)   目的端口（每个参数一个 match_set，OR）
+#   sport(<port|a-b>, ...)   源端口
+#   l4proto(tcp|udp|tcp_udp) L4 协议掩码
+#   ipversion(4|6)           IP 版本掩码
+#   dscp(<0-63>)             DSCP
+#   fallback                 兜底
+#
+# 运算符：`!` 取反、`&&` 连接函数；函数内逗号分隔的多个参数是 OR。
+# outbound：direct / block / proxy（唯一用户组）/ must_rules，
+#           支持参数 `mark: 0xNNN` 与 `must`。
+# 规则按顺序优先匹配（先命中先算），与 dae 相同。
+
+# 1) 代理：目的 1.1.1.1:8080（覆盖 dip 单前缀 + dport）
+dip(1.1.1.1/32) && dport(8080) -> proxy
+
+# 2) 直连：10.9.9.0/24 与 10.9.10.0/24 的 9999 端口（覆盖 LPM 集合 OR 折叠；
+#    只存第一个前缀的话，10.9.10.2 会落到第 5 条兜底，测试能立刻看出来）
+dip(10.9.9.0/24, 10.9.10.0/24) && dport(9999) -> direct
+
+# 3) 屏蔽：来自客户端网段、目的端口不是 9999 的连接
+#    （覆盖 NOT + AND 编码 + block 判决；顺序在第 1 条之后，所以 8080 仍走代理）
+!dport(9999) && sip(10.0.0.0/24) -> block
+
+# 4) must + mark：443 直连并打 fwmark（覆盖 mark/must 编码；测试流量不会命中）
+l4proto(tcp) && dport(443) -> direct(mark: 0x800, must)
+
+# 5) 兜底：故意设成 proxy —— 前面的规则一旦漏判，流量会表现为"被代理"，
+#    测试用例据此直接报错（比默默直连更容易发现问题）
+fallback -> proxy

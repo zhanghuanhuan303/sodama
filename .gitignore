@@ -1,0 +1,27 @@
+# 上游 dae clone（仅规则对拍工具使用，见 README「上游与许可」）
+/dae/
+
+# Rust 构建产物
+/target/
+/mini-dae/target/
+/mini-dae/ebpf-rs/target/
+/mini-dae/build/
+**/*.o
+**/*.o.tmp
+
+# lab 生成物（都可由脚本重建，见 mini-dae/README.md）
+/mini-dae/lab/parity/dae-work/
+/mini-dae/lab/parity/.parity-out.*
+/mini-dae/lab/parity/.parity-test-log.*
+/mini-dae/lab/matrix/out/
+/mini-dae/lab/matrix/initramfs-*/
+/mini-dae/lab/proto-check/bin/
+/mini-dae/lab/certs/
+/mini-dae/lab/*.log
+/mini-dae/lab/proto-check/*.log
+
+# 杂项
+__pycache__/
+*.pyc
+.DS_Store
+nohup.out

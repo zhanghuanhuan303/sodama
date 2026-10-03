@@ -1,0 +1,4 @@
+# P7 基准规则：直连基线（10.9.9.0/24 全部 direct，不经过 tproxy）。
+# 仅供 lab/bench.sh 的 direct / udp-direct 路径使用。
+dip(10.9.9.0/24) -> direct
+fallback -> direct

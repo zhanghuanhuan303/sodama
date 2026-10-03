@@ -1,0 +1,68 @@
+# K3 真实用户风格配置（演示「全量解析 + 子集编译 + deferred 显式上报」）。
+#
+# 注意权限：dae 要求配置文件同组不可写、其他用户不可读（mode & 0o037 == 0），
+# 因此本文件为 0640。include 的文件同样受此约束，且必须在入口文件目录下。
+#
+# 路由段与 lab 用例对齐的可编译规则会真正下发给数据面；
+# domain/geoip 两类规则按 ADR-0011 显式列入 deferred，不会静默丢弃。
+
+global {
+    wan_interface: auto
+    log_level: info
+    tproxy_port: 12345
+    dial_mode: domain
+    tcp_check_url: 'http://cp.cloudflare.com,1.1.1.1,2606:4700:4700::1111'
+    udp_check_dns: 'dns.google:53,8.8.8.8'
+    check_interval: 30s
+    sniffing_timeout: 30ms
+}
+
+subscription {
+    my_sub: 'https://example.com/subscription/link'
+}
+
+node {
+    hk_node: 'ss://YWVzLTI1Ni1nY206cGFzcw@hk.example.com:8388#HK-01'
+    us_node: 'trojan://pass@us.example.com:443?sni=us.example.com#US-01'
+}
+
+group {
+    proxy {
+        filter: name(keyword: 'HK') && !name(keyword: 'Expire')
+        policy: min_moving_avg
+    }
+    us {
+        filter: subtag(my_sub) && name(regex: '^US')
+        policy: fixed(0)
+    }
+}
+
+dns {
+    upstream {
+        alidns: 'udp://dns.alidns.com:53'
+    }
+    routing {
+        request {
+            qname(geosite:cn) -> alidns
+            fallback: alidns
+        }
+        response {
+            fallback: alidns
+        }
+    }
+}
+
+routing {
+    # ---- 数据面可编译（K3 真正生效的部分）----
+    dip(1.1.1.1/32) && dport(8080) -> proxy
+    dip(10.9.9.0/24, 10.9.10.0/24) && dport(9999) -> direct
+    !dport(9999) && sip(10.0.0.0/24) -> block
+    l4proto(udp) && dport(443) -> proxy(must)
+    l4proto(tcp) && dport(443) -> direct(mark: 0x800, must)
+
+    # ---- 真实用户常见、但需要 P3/P5 的能力：解析且显式 deferred ----
+    domain(suffix: example.com) -> proxy
+    dip(geoip: cn) -> direct
+
+    fallback: proxy
+}

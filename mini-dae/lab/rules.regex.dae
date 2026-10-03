@@ -1,0 +1,9 @@
+# P3b-2a：domain(regex:) 端到端（regex 匹配在小写化 qname 上、模式保持原大小写）。
+#
+# 说明：
+# - dport(53) -> proxy：DNS 查询进控制面（与 P3a 同路径，便于测试）。
+# - api1/api2.regex.test 命中 regex 规则 → 解析出的 IP 走 tproxy；
+#   web.regex.test 不命中 → fallback direct，IP 直转。
+dport(53) -> proxy
+domain(regex: '^api[0-9]+\.regex\.test$') && dport(9999) -> proxy
+fallback -> direct

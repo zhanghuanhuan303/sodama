@@ -1,0 +1,17 @@
+# BPF 目标构建配置（仅在 ebpf-rs 目录内生效）。
+#
+# 依赖前提：
+#   - nightly 工具链 + rust-src 组件（-Z build-std=core 需要）；
+#   - bpf-linker 在 PATH（默认 ~/.cargo/bin）。
+# 构建命令（在 ebpf-rs 目录）：
+#   PATH=$HOME/.cargo/bin:$PATH cargo +nightly build --release
+# 产物：target/bpfel-unknown-none/release/mini-dae-ebpf
+[build]
+target = "bpfel-unknown-none"
+
+[unstable]
+build-std = ["core"]
+
+[target.bpfel-unknown-none]
+linker = "bpf-linker"
+rustflags = ["-C", "link-arg=--btf"]

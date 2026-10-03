@@ -1,0 +1,9 @@
+# 故障注入（reload 打流）用的规则集：与 rules.dae 对 8080 的判决保持一致，
+# 只增加一条无关规则，让 epoch 槽真的换内容，同时 8080 路径行为不变。
+dip(1.1.1.1/32) && dport(8080) -> proxy
+dip(10.9.9.0/24, 10.9.10.0/24) && dport(9999) -> direct
+!dport(9999) && sip(10.0.0.0/24) -> block
+l4proto(udp) && dport(443) -> proxy(must)
+l4proto(tcp) && dport(443) -> direct(mark: 0x800, must)
+dip(10.9.10.2/32) && dport(9998) -> block
+fallback -> direct

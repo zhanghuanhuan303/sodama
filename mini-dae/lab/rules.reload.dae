@@ -1,0 +1,18 @@
+# 热重载用的规则集：把 1.1.1.1:8080 从 proxy 改成 block
+# （lab.sh test-reload 会把本文件覆盖到 rules.dae，SIGHUP 后验证：
+#   已建立连接仍走旧判决；新连接走新规则被丢弃）
+
+# 1') 变化点：8080 由 proxy 改成 block
+dip(1.1.1.1/32) && dport(8080) -> block
+
+# 2) 直连集合（不变）
+dip(10.9.9.0/24, 10.9.10.0/24) && dport(9999) -> direct
+
+# 3) 客户端网段非 9999 流量（不变）
+!dport(9999) && sip(10.0.0.0/24) -> block
+
+# 4) mark/must（不变）
+l4proto(tcp) && dport(443) -> direct(mark: 0x800, must)
+
+# 5) 兜底（不变）
+fallback -> proxy

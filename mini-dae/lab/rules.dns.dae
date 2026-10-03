@@ -1,0 +1,11 @@
+# P3a 域位图端到端：DNS 由 dae 接管，应答经过时写域位图，随后按目的 IP 命中 domain 规则。
+#
+# 说明：
+# - fallback 是非 must → 所有匹配到的 DNS 查询（UDP 53）进入控制面（对照 dae
+#   ROUTE_STATE_DNS_QUERY）；数据面把它们交给 UDP tproxy 监听。
+# - 上游查询从宿主 netns 发出（127.0.0.1:5353 的假上游），不经钩子。
+# - 第一条规则演示 must：5353 直连不拦截（实验里用不到，留作对照）。
+dport(5353) -> direct(must)
+domain(suffix: 'proxy.test') && dport(9999) -> proxy
+domain(full: 'direct.test') && dport(9999) -> direct
+fallback -> proxy
