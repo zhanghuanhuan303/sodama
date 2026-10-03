@@ -40,8 +40,14 @@ pub static domain_routing_map: HashMap<
     { BPF_F_NO_PREALLOC as usize },
 > = HashMap::new();
 
+/// P17b：socket cookie → {pname, pid, last_seen}（cgroup 钩子写入，TC 反查）。
+/// 对照 dae `cookie_pid_map`（HASH，BPF_F_NO_PREALLOC，65536，tproxy.c:87）。
 #[btf_map]
-pub static mini_stats_map: PerCpuArray<u64, 4> = PerCpuArray::new();
+pub static cookie_pid_map: HashMap<u64, MiniPidPname, 65536, { BPF_F_NO_PREALLOC as usize }> =
+    HashMap::new();
+
+#[btf_map]
+pub static mini_stats_map: PerCpuArray<u64, 5> = PerCpuArray::new();
 
 #[btf_map]
 pub static control_flags_map: Array<u32, 1> = Array::new();

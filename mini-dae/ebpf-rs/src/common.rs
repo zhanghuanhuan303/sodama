@@ -33,6 +33,8 @@ pub const MINI_MATCH_SOURCE_PORT: u8 = 4;
 pub const MINI_MATCH_L4_PROTO: u8 = 5;
 pub const MINI_MATCH_IP_VERSION: u8 = 6;
 pub const MINI_MATCH_MAC: u8 = 7;
+/// P17b：pname（= dae `MatchType_Pname`；进程名 16 字节精确比较）
+pub const MINI_MATCH_PNAME: u8 = 8;
 pub const MINI_MATCH_DSCP: u8 = 9;
 pub const MINI_MATCH_FALLBACK: u8 = 10;
 
@@ -53,6 +55,7 @@ pub const MINI_STAT_REBIND_REJECTED: u32 = 0;
 pub const MINI_STAT_REDIRECT_UPDATE_FAILED: u32 = 1;
 pub const MINI_STAT_OFFLOAD_REDIRECTS: u32 = 2;
 pub const MINI_STAT_OFFLOAD_VERDICTS: u32 = 3;
+pub const MINI_STAT_PNAME_HITS: u32 = 4;
 
 pub const IPPROTO_TCP: u8 = 6;
 pub const IPPROTO_UDP: u8 = 17;
@@ -135,6 +138,9 @@ pub struct MiniRouteCtx {
     pub domain_word_bits: u32,
     pub domain_word_cached: u8,
     pub pad_domain: [u8; 3],
+    /// P17b：本次报文的进程名（仅 WAN egress 新连接由 cookie_pid_map 反查；
+    /// 其它路径全 0 → `pname()` 正规则不命中，与 dae 语义一致）
+    pub pname: [u8; 16],
     pub result: i64,
     pub lpm_saddr: MiniLpmKey,
     pub lpm_daddr: MiniLpmKey,
@@ -181,6 +187,18 @@ pub struct MiniRedirectEntry {
     pub dmac: [u8; 6],
     pub from_wan: u8,
     pub pad: [u8; 3],
+    pub last_seen_ns: u64,
+}
+
+/// P17b：pname 采集（cgroup 钩子写入，TC 侧按 socket cookie 反查）。
+/// 对照 dae `struct pid_pname`（tproxy.c:403-417）：pname 16 字节（含 NUL）、
+/// pid（tgid）、last_seen_ns。
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct MiniPidPname {
+    pub pname: [u8; 16],
+    pub pid: u32,
+    pub pad: [u8; 4],
     pub last_seen_ns: u64,
 }
 

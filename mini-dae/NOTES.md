@@ -918,6 +918,58 @@ P4 稳定性 → P3 内核矩阵）：
   UDP relay 目标仍是 `SocketAddr`）；ICMPv6 与会话分片未处理（放行）；控制对用 veth
   （上游新版 netkit）但配方等价；解析不处理 fragment 头。
 
+### 11.24 P17（geoip/geosite 展开 + pname）已验收的行为
+
+（决策与边界见 ADR-0033；实现 `loader/src/geodata.rs`、`ebpf-rs/src/cgroup.rs`；
+夹具 `lab/gen-geo-dat.py`、`lab/rules.geo.dae`、`lab/rules.geoip.dae`、`lab/rules.pname.dae`。）
+
+**A. geoip/geosite（P17a）**
+
+- 读取：手写极简 protobuf（varint + length-delimited；无新依赖）扫 `GeoIPList/GeoSiteList`；
+  code 大小写不敏感；`code@attr` 按 `Domain.attribute.key` 过滤；`ext:file[:code]`
+  文件名缺 `.dat` 自动补；`inverse_match` 硬错误；`--geodata-dir` > `$DAE_LOCATION_ASSET`
+  > 配置目录 > `/etc/dae` > share/dae；懒加载 + (文件,code) 缓存（无 geo 规则不碰磁盘）。
+- 展开：`dip(geoip:…)`→裸前缀（v4-mapped+96；**排序+去重**后再入 LPM，对齐 dae
+  MergeAndSort/Deduplicate）；`domain(geosite:…)`→域名参数（Plain→keyword、
+  RootDomain→suffix、Full→full、Regex→regex），首次出现顺序分组、组内去重；
+  展开会写 `geoexp:` 日志（reload 时）。
+- 容量：`lpm_array_map` 内层模板 1024 → **2,048,000**（= dae `tproxy.c:75`；
+  NO_PREALLOC 不预分配内存）；loader 侧同为 2,048,000 并有超限预检。
+- 匹配：domain 走编译期索引（suffix/full Hash 集合；qname 枚举点后缀 O(labels)；
+  **支持前导点**：`.example.com` 只匹配子域）；keyword/regex 仍线性。
+- `.dae` 语法两处放宽（对拍需要）：值允许 `file:code` 多段冒号；词内 `!` 当普通字符
+  （`geolocation-!cn`）——只在“前一个字符是裸词字符”时并词。另解禁 `ipversion(6)`。
+- 真实数据清点（`--compile-dump` + `/usr/share/v2ray/*.dat`）：geoip:cn **15,357** 前缀、
+  geosite:cn **6,576 suffix + 44 full + 3 regex**、`geolocation-!cn` **25,024** 域，
+  ~40ms/集合；与上游清点数值一致（数据版本差异 ±几项）。
+- 对拍：Go harness 改用 `assets.NewLocationFinder`；`parity.sh` 生成夹具并 export
+  `DAE_LOCATION_ASSET`；`rules.geoip.dae`（CN v4+v6 / US）**逐字节一致**。
+
+**B. pname（P17b）**
+
+- eBPF（`cgroup.rs`）：6 钩子 `cgroup/sock_create|sock_release|connect4|connect6|sendmsg4|sendmsg6`
+  全部返回 1；`bpf_get_socket_cookie(ctx)` → `cookie_pid_map`（HASH+NO_PREALLOC，65536；
+  `{pname[16],pid,pad,last_seen}`）；已存在只刷新 last_seen，release 删除；
+  pname 取 `bpf_get_current_comm`。
+- TC（`flow.rs`/`route.rs`）：仅 `is_wan && new_flow` 反查 cookie → `MiniRouteCtx.pname`；
+  match 类型 **8**（= dae ProcessName），值区即 16B pname（dae match_set union 同布局）；
+  `is_wan && 16B 相等`；命中计数 `mini_stats_map[4]`（数组 4→5）。
+- 控制面：多值 OR + NOT；>16B 截断并记 note（dae 记日志）；挂载失败只告警（
+  `pname: cgroup2 钩子 x/6`）；状态面 `pname{driver,enabled,hooks,map_entries,hits}`、
+  metrics `mini_dae_pname_{hooks,map_entries,hits}`。
+- 实测：`cargo test` **131/131**；对拍 `rules.pname.dae` 逐字节（含多值排序/NOT）；
+  lab `pname-up`+`test-pname`：python3 命中直连（WAN echo）、curl 不命中走 fallback
+  代理（tproxy 回显）、`cookie_pid_map` 可见 `python3`（活连接；关闭即被 release 清掉）、
+  状态面 hooks=6/hits≥1；真机网关重启后 cgroup2 **6/6** 挂载、v4 204/v6 200 不回归。
+- **踩坑**：
+  - 对拍发现 dae `MergeAndSortRulesOptimizer` 对非 ip/sip 函数参数按 **(key,val) 字符串序**
+    重排（`pname(wget,bash)` → `bash,wget`；dport 多值同）——已对齐，否则 pname 对拍必
+    失败（match_set 下标不同）。
+  - cgroup attach 需要 root + cgroup2 挂载；容器里 cgroup namespace 会改变可见层级；
+    attach 失败是**静默降级**，排障先看 `status .pname.hooks`。
+  - tproxy 回显不是 HTTP 响应，curl≥8 默认拒 HTTP/0.9：测试用 `curl --http0.9`。
+  - pname 来源差异（comm vs argv basename）与 geosite 未入对拍写在 ADR-0033。
+
 ## 12. 用 Rust 重写这套东西的可行性
 
 已验证（本仓库 mini-dae，实测跑通）：

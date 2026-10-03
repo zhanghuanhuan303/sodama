@@ -79,6 +79,13 @@ P6（suspend/reload/metrics/sysdump/日志轮转/整配置热重载）已完成*
   协议目标 v6 编码（ss 0x04/vray 0x03/tuic 0x02/hy2 `[v6]:port`）、v6 嗅探远端解析、
   AAAA 入域位图；控制对 fe80 静态邻居（动态 NDP 会被 dae0peer_ingress 丢弃）；
   lab `v6-up`/`test-v6`；真机网关 v6 域名/字面量均实测通过（ADR-0032、NOTES §11.23）
+- **P17 geoip/geosite/pname（规则语言收尾）**：v2ray `.dat` 手工 protobuf 读取（无新依赖），
+  `dip(geoip:cn)`/`domain(geosite:cn[@attr])`/`ext:file:code` 编译期展开（类型映射与 dae 一致），
+  搜索目录含 `DAE_LOCATION_ASSET`/`--geodata-dir`；LPM 内层容量 2,048,000（对齐 dae）；
+  domain 匹配预计算索引 + 前导点语义；pname 走 6 个 cgroup2 钩子（sock_create/release、
+  connect4/6、sendmsg4/6）采集 comm → `cookie_pid_map`，TC 仅 WAN egress 新连接反查，
+  16B 定长匹配；状态面/metrics 新增 pname 面；对拍 5/5 逐字节（含 geoip/pname）
+  （ADR-0033、NOTES §11.24）
 - **P5-G3a QUIC（tuic v5）**：惰性 tokio 运行时 + quinn（阻塞 relay 用 block_on 桥接）；
   认证 token = TLS exporter（label=uuid 裸字节、context=password）；TCP 每条中继一条 QUIC
   双向流，UDP 走 QUIC DATAGRAM（含分片/重组）；上游 socket 用自建 `Endpoint` 打 `SO_MARK`；
@@ -120,7 +127,8 @@ P6（suspend/reload/metrics/sysdump/日志轮转/整配置热重载）已完成*
 ## 目录
 
 ```
-ebpf-rs/src/         Rust/aya-ebpf 数据面（唯一）：8 个 tc 程序 + 规则 VM + conn_state + 单写者 + sk_skb offload；BTF maps（含 map-in-map）
+ebpf-rs/src/         Rust/aya-ebpf 数据面（唯一）：8 个 tc 程序 + 6 个 cgroup 程序（P17b pname 采集）
+                     + 规则 VM + conn_state + 单写者 + sk_skb offload；BTF maps（含 map-in-map）
 loader/src/main.rs   Rust + aya：加载、挂钩子、setns、tproxy/UDP socket、规则下发/热重载、
                      relay/Dialer、UDP NAT、offload 注册、janitor、只读状态面、DNS 线程
 loader/src/rules.rs  迷你规则解析 + 编译（match_set 编码 + LPM trie + regex 编译 + dump/对拍）
@@ -128,6 +136,7 @@ loader/src/target.rs P14：拨号目标类型（IPv4/IPv6/域名）+ 逐协议�
 loader/src/sniffer.rs P14：TLS SNI / HTTP Host 嗅探（纯解析函数 + MSG_PEEK 采集循环）
 loader/src/subscribe.rs P15：订阅拉取（HTTP(S)/file、重定向/chunked/base64）+ 链接解析
 loader/src/group.rs   P15：节点组 filter/policy/健康探测/失败切换（GroupRuntime）
+loader/src/geodata.rs P17a：v2ray .dat 读取（手写 protobuf）+ geoip/geosite 展开/搜索目录/缓存
 loader/src/config.rs 全量 .dae 解析（词法/语法、include 合并、schema 校验、deferred 提取）
 loader/src/status.rs 状态面（Unix socket：status/rules/config/maps/metrics + reload/suspend/resume 控制命令）
 loader/src/socks5.rs 最小 SOCKS5 客户端（relay 的一种 dialer，握手 + CONNECT）
@@ -302,6 +311,10 @@ sudo lab/lab.sh subscribe-up && sudo lab/lab.sh test-subscribe
 # 真机订阅：sudo lab/gateway.sh up --subscribe /tmp/mini-dae-sub.url [--group proxy]
 # P16：IPv6（tproxy v6 → relay → ss(ATYP=4)、v6 direct 对照）：
 sudo lab/lab.sh v6-up && sudo lab/lab.sh test-v6
+# P17a：geoip/geosite（小型 .dat 夹具 + 假 DNS；geoip 集合内直连/集合外代理，geosite 位图代理）：
+sudo lab/lab.sh geo-up && sudo lab/lab.sh test-geo
+# P17b：pname（cgroup2 采集；python3 命中直连、curl 不命中走 fallback 代理）：
+sudo lab/lab.sh pname-up && sudo lab/lab.sh test-pname
 sudo lab/lab.sh ops-up      # P6：运维面会话（--log-file + 状态面控制命令）
 sudo lab/lab.sh test-ops         # suspend(fail-open)/reload/metrics/sysdump/日志轮转
 sudo lab/lab.sh ops-reload-up    # P6：整配置热重载会话（/tmp 配置副本 + 假 DNS）
@@ -356,12 +369,14 @@ domain(regex: '^api[0-9]+\\.example\\.com$') && dport(9999) -> proxy
 fallback -> direct
 ```
 
-- 支持函数：`dip sip mac l4proto ipversion dport sport dscp domain fallback`
+- 支持函数：`dip sip mac l4proto ipversion dport sport dscp domain pname fallback`
+  （P17 起 dae 现有 routing 函数全覆盖；`geoip:`/`geosite:`/`ext:` 为参数 key，编译期展开）
 - `domain` 支持 `suffix:` / `full:` / `keyword:` / `regex:` 四种 key，带 key 参数需与 DNS 接管配合（P3a）
 - `regex:` 在规则编译期编译（非法正则硬失败）；匹配小写化 qname、模式保持原大小写（与 dae 一致）
 - 运算符：`!`（取反）、`&&`（连接函数）；函数内逗号 = OR
 - outbound：`direct / block / proxy / must_rules`，参数 `mark: 0xNNN`、`must`
-- 未支持：`pname()`、`domain(geosite:)`（IPv6 前缀自 P16 起支持）
+- 未支持：无（dae 现有 routing 函数全覆盖）；`geoip` 的 `inverse_match` 是硬错误（dae 同）；
+  pname 用 comm 而非 argv basename（见 ADR-0033）
 
 **编码与 dae 完全一致**（`component/routing/matcher_builder.go:60-73`）：
 整条规则最后一个 match_set 拿真实 outbound；同一函数内非最后一个 match_set 用
@@ -811,8 +826,9 @@ MATRIX-RESULT kernel=7.2.8-arch1-2 verify=PASS
 
 ## 尚未复现（后续）
 
-数据面：DNS 嗅探 punt（`ROUTE_STATE_DNS_QUERY` 强制控制面路径）、geoip/geosite 数据、
-进程名匹配（cgroup cookie）、事件 ringbuf、IPv6 剩余项（UDP v6/DNS over UDP6 接管、ICMPv6/分片）。
+数据面：DNS 嗅探 punt（`ROUTE_STATE_DNS_QUERY` 强制控制面路径）、事件 ringbuf、
+IPv6 剩余项（UDP v6/DNS over UDP6 接管、ICMPv6/分片）；P17 剩余：pname argv basename（CO-RE）、
+geodata XDG 搜索目录/流式解析、geosite 负载入对拍。
 转发面：offload 的 backlog fuse / tcp_info 精确计费 / SK_PASS 用户态回退协调（ADR-0022 已补：
 （ADR-0022 已补：半关闭超时看门狗、fast_sock 键注销、注册前排空队列；已 offload 的连接可回收）；UDP 跨目标
 full-cone；嗅探的剩余形态（QUIC/UDP、h2c、sniff-punt；TLS/HTTP1 已做见 ADR-0030）；relay 并发上限。

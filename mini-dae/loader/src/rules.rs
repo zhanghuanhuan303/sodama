@@ -54,6 +54,8 @@ pub const MATCH_SOURCE_PORT: u8 = 4;
 pub const MATCH_L4_PROTO: u8 = 5;
 pub const MATCH_IP_VERSION: u8 = 6;
 pub const MATCH_MAC: u8 = 7;
+/// P17b：pname（= dae `MatchType_Pname`，值区存 16 字节进程名，NUL 补全）
+pub const MATCH_PNAME: u8 = 8;
 pub const MATCH_DSCP: u8 = 9;
 pub const MATCH_FALLBACK: u8 = 10;
 
@@ -679,6 +681,52 @@ fn expand_func(
                 desc: format!("mac({})", vals.join(",")),
             }])
         }
+        // P17b：进程名。16 字节定长（含 NUL 补全），超长截断（dae 同：日志提醒后截断）；
+        // 多参数 = OR（每个值一个 match_set，与 dport 同形）。匹配只在 WAN egress
+        // 新连接（本机发起的流量），语义见 route.rs。
+        "pname" => {
+            // dae 对非 ip/sip 函数参数按字符串序排序；多值 = OR，顺序影响 match_set 下标。
+            let mut vals: Vec<String> = f
+                .args
+                .iter()
+                .map(|a| {
+                    if a.key.is_some() {
+                        return Err(format!("pname 不支持带 key 参数（{}）", a.display()));
+                    }
+                    Ok(a.val.clone())
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            vals.sort();
+            let mut out = Vec::new();
+            for v in &vals {
+                let raw = v.as_bytes();
+                if raw.is_empty() {
+                    return Err("pname(...) 参数为空".into());
+                }
+                if raw.contains(&0) {
+                    return Err("pname(...) 不能包含 NUL".into());
+                }
+                let mut value = [0u8; 16];
+                let n = raw.len().min(16);
+                value[..n].copy_from_slice(&raw[..n]);
+                if raw.len() > 16 {
+                    notes.push(format!(
+                        "pname({}) 超过 16 字节，截断为 {}",
+                        v,
+                        String::from_utf8_lossy(&raw[..n])
+                    ));
+                }
+                out.push(Partial {
+                    type_: MATCH_PNAME,
+                    value,
+                    lpm: None,
+                    not,
+                    domain: None,
+                    desc: format!("pname({v})"),
+                });
+            }
+            Ok(out)
+        }
         "l4proto" => {
             let vals = bare_values(f)?;
             let mut mask = 0u32;
@@ -802,7 +850,10 @@ fn expand_func(
             } else {
                 MATCH_SOURCE_PORT
             };
-            let vals = bare_values(f)?;
+            let mut vals = bare_values(f)?;
+            // 对照 dae MergeAndSortRulesOptimizer：非 ip/sip 函数的参数按 (key, val)
+            // 排序（字符串序；dae 的 val 是字符串，保持逐字节一致）。
+            vals.sort();
             let mut out = Vec::new();
             for a in &vals {
                 let (start, end) = parse_port_range(a)?;
@@ -821,7 +872,8 @@ fn expand_func(
             Ok(out)
         }
         "dscp" => {
-            let vals = bare_values(f)?;
+            let mut vals = bare_values(f)?;
+            vals.sort(); // 同 dport：dae 对非 ip/sip 参数按字符串序排序
             let mut out = Vec::new();
             for a in &vals {
                 let v: u8 = a.parse().map_err(|_| format!("dscp 非法: {a}"))?;
@@ -847,7 +899,7 @@ fn expand_func(
             desc: "fallback".into(),
         }]),
         other => Err(format!(
-            "mini-dae 不支持的函数: {other}（目前支持 domain/dip/sip/mac/l4proto/ipversion/dport/sport/dscp/fallback）"
+            "mini-dae 不支持的函数: {other}（目前支持 domain/dip/sip/mac/l4proto/ipversion/dport/sport/dscp/pname/fallback）"
         )),
     }
 }
@@ -999,10 +1051,16 @@ pub fn type_name(t: u8) -> &'static str {
         MATCH_L4_PROTO => "L4Proto",
         MATCH_IP_VERSION => "IpVersion",
         MATCH_MAC => "Mac",
+        MATCH_PNAME => "Pname",
         MATCH_DSCP => "Dscp",
         MATCH_FALLBACK => "Fallback",
         _ => "Unknown",
     }
+}
+
+fn fmt_pname(value: &[u8; 16]) -> String {
+    let end = value.iter().position(|b| *b == 0).unwrap_or(16);
+    String::from_utf8_lossy(&value[..end]).into_owned()
 }
 
 fn fmt_lpm_key(data: &[u8; 16], plen: u32) -> String {
@@ -1065,6 +1123,9 @@ impl CompiledRules {
                 MATCH_DSCP => {
                     let _ = write!(s, " dscp={}", m.dscp());
                 }
+                MATCH_PNAME => {
+                    let _ = write!(s, " pname={}", fmt_pname(&m.value));
+                }
                 _ => {}
             }
             let _ = writeln!(s);
@@ -1124,6 +1185,9 @@ impl CompiledRules {
                 }
                 MATCH_DSCP => {
                     let _ = write!(s, " dscp={}", m.dscp());
+                }
+                MATCH_PNAME => {
+                    let _ = write!(s, " pname={}", fmt_pname(&m.value));
                 }
                 _ => {}
             }
@@ -1222,5 +1286,34 @@ mod tests {
         assert_eq!(c.sets[1].lpm_index(), 1);
         assert_eq!(c.lpm_tries[&0].len(), 1);
         assert_eq!(c.lpm_tries[&1].len(), 1);
+    }
+
+    #[test]
+    fn pname_compile_forms() {
+        // 单值 / 多值 OR（字符串序：bash < wget）/ NOT
+        let c = parse_and_compile(
+            "pname(curl) -> direct\npname(wget, bash) -> block\n!pname(sshd) && dport(22) -> direct\nfallback -> direct\n",
+        )
+        .unwrap();
+        assert_eq!(c.sets[0].type_, MATCH_PNAME);
+        assert_eq!(c.sets[0].not, 0);
+        assert_eq!(&c.sets[0].value[..4], b"curl");
+        assert_eq!(c.sets[0].outbound, OUTBOUND_DIRECT); // 单 match_set = 整条规则最后一个
+        assert_eq!(&c.sets[1].value[..4], b"bash");
+        assert_eq!(&c.sets[2].value[..4], b"wget");
+        assert_eq!(c.sets[3].type_, MATCH_PNAME);
+        assert_eq!(c.sets[3].not, 1);
+        assert_eq!(&c.sets[3].value[..4], b"sshd");
+        assert_eq!(c.sets[3].outbound, OUTBOUND_LOGICAL_AND); // 后面还有 dport
+                                                              // NUL 补全
+        assert_eq!(c.sets[0].value[4], 0);
+        // 16 字节截断（dae 同：trim 后使用）
+        let t =
+            parse_and_compile("pname(0123456789abcdefGH) -> direct\nfallback -> direct\n").unwrap();
+        assert_eq!(&t.sets[0].value, b"0123456789abcdef");
+        assert!(t.notes.iter().any(|n| n.contains("截断")));
+        // 带 key / 空值是错误
+        assert!(parse_and_compile("pname(x: curl) -> direct\nfallback -> direct\n").is_err());
+        assert!(parse_and_compile("pname() -> direct\nfallback -> direct\n").is_err());
     }
 }

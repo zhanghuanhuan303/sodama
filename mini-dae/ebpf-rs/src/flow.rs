@@ -60,6 +60,20 @@ unsafe fn stat_inc(key: u32) {
     }
 }
 
+/// P17b：按 socket cookie 反查进程名（仅 WAN egress 新连接调用；全 0 = 不可得）。
+/// 对照 dae tproxy.c:3476-3488：TCP 仅 SYN、UDP 首包查一次；已建立连接走 conn_state。
+#[inline(always)]
+unsafe fn lookup_pname(ctx: &TcContext) -> [u8; 16] {
+    let cookie = aya_ebpf_bindings::helpers::bpf_get_socket_cookie(ctx.skb.skb as *mut c_void);
+    if cookie == 0 {
+        return [0u8; 16];
+    }
+    match cookie_pid_map.get(&cookie) {
+        Some(v) => v.pname,
+        None => [0u8; 16],
+    }
+}
+
 fn mac_equal(a: &[u8; 6], b: &[u8; 6]) -> bool {
     a == b
 }
@@ -165,7 +179,7 @@ pub unsafe fn split_flow(ctx: &mut TcContext, pkt: &MiniParseResult, is_wan: u8)
             }
         }
 
-        let result = mini_route(pkt, is_wan);
+        let result = mini_route(pkt, is_wan, &lookup_pname(ctx));
         if result < 0 {
             bpf_printk!(c"mini-dae: shot routing %d\n", result as i32);
             return TC_ACT_SHOT as i32;

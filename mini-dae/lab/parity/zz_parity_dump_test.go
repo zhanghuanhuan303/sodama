@@ -192,6 +192,8 @@ func parityTypeName(t uint8) string {
 		return "IpVersion"
 	case consts.MatchType_Mac:
 		return "Mac"
+	case consts.MatchType_ProcessName:
+		return "Pname"
 	case consts.MatchType_Dscp:
 		return "Dscp"
 	case consts.MatchType_Fallback:
@@ -238,6 +240,13 @@ func parityFormatDump(t *testing.T, rules []bpfMatchSet, lpmTries [][]netip.Pref
 			fmt.Fprintf(&b, " mask=0x%x", nativeBpfABI.uint32(m.Value[:4]))
 		case consts.MatchType_Dscp:
 			fmt.Fprintf(&b, " dscp=%d", m.Value[0])
+		case consts.MatchType_ProcessName:
+			// P17b：pname 16B 定长（NUL 截断渲染），与 Rust fmt_pname 一致。
+			v := m.Value[:]
+			if i := bytes.IndexByte(v, 0); i >= 0 {
+				v = v[:i]
+			}
+			fmt.Fprintf(&b, " pname=%s", string(v))
 		case consts.MatchType_Fallback:
 			// No payload.
 		default:

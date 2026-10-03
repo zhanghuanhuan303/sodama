@@ -205,7 +205,7 @@
     <span class="chip">代码量 <b>~65k 非测试 LOC / ~40k 测试</b></span>
     <span class="chip">数据面 <b>tproxy.c 4403 行 · 23 个程序 · 24 个 map</b></span>
     <span class="chip">许可 <b>AGPL-3.0</b></span>
-    <span class="chip">文档版本 <b>v2.17 · 2026-10-04</b></span>
+    <span class="chip">文档版本 <b>v2.18 · 2026-10-04</b></span>
   </div>
 </header>
 
@@ -616,6 +616,7 @@ wait signal → reload / suspend / shutdown</pre>
       <li>sysctl 组合：<code>ip_forward</code>、<code>rp_filter=0</code>、<code>tcp_early_demux=1</code>、<code>disable_ipv6</code>/<code>forwarding</code>（dae0）等 13 个键</li>
       <li>netkit vs veth 的选择条件、<code>bpf_redirect_peer</code> 的 CVE-2025-37959 版本门槛</li>
       <li>IPv4-mapped-IPv6 的五元组归一化（redirect_track 的 key 语义）<span class="stamp">已实测（P16，ADR-0032）</span></li>
+      <li>pname 的 cgroup2 采集链：sock_create/connect/sendmsg 六钩子写入 cookie→pname 表，TC 仅在 WAN egress 新连接反查（LAN 无 skb-&gt;sk，正规则必不命中）<span class="stamp">已实测（P17，ADR-0033）</span></li>
     </ul>
   </div>
 </section>
@@ -1184,7 +1185,7 @@ wait signal → reload / suspend / shutdown</pre>
     <tbody>
       <tr><td><b>1 · eBPF 数据面</b>（程序/hook）</td><td>23 程序（13×TC L2/L3 变体 + <code>sk_skb</code> offload + 5×cgroup + kprobe/fentry）· 24 map · 4,403 行 C</td><td>8 程序（7×TC 含单臂 dual-role + <code>sk_skb</code>）· 14 map（BTF）· ~1.1k 行 Rust</td><td><span class="b b-warn">≈65%</span></td><td>主路径语义逐一对齐；缺 L2/桥接变体、cgroup 钩子、ringbuf。优势：C 已退役（ADR-0025）、TCX 退出即摘钩</td></tr>
       <tr><td><b>2 · 分流主链路</b></td><td>tproxy/direct/block、控制面 DNS override、五钩子角色、conn_state、双 epoch 热重载、redirect_track 单写者</td><td>同上全有</td><td><span class="b b-ok">≈95%</span></td><td>K0–K3 九用例 ×2 拓扑全过；<code>verify</code> 9/9（ADR-0009/0010）</td></tr>
-      <tr><td><b>3 · 规则引擎</b></td><td>dip/sip/dport/sport/l4proto/ipversion/dscp/mac/<b>pname</b>/domain/<b>geoip/geosite</b>/fallback + not/and + mark/must + sub/subnode</td><td>除 pname/geo/subnode 外全有；domain 走 DNS 位图 + regex</td><td><span class="b b-warn">≈75%</span></td><td><b>编译产物与 dae 逐字节对拍 5/5</b>（ADR-0010）；缺 geo 数据、进程名、subnode</td></tr>
+      <tr><td><b>3 · 规则引擎</b></td><td>dip/sip/dport/sport/l4proto/ipversion/dscp/mac/<b>pname</b>/domain/<b>geoip/geosite</b>/fallback + not/and + mark/must + sub/subnode</td><td>dae 现有函数集全覆盖：geoip/geosite 自 <code>.dat</code> 编译期展开（attr/ext/2M LPM），pname 走 cgroup2 采集，domain 预计算索引</td><td><span class="b b-ok">≈95%</span></td><td><b>编译产物与 dae 逐字节对拍 5/5</b>（ADR-0010/0033，含 geoip 与 pname）；真实 .dat 计数与上游一致；余：geosite 负载未对拍、pname 用 comm 非 argv、无 XDG/流式</td></tr>
       <tr><td><b>4 · 配置系统</b></td><td>全量 <code>.dae</code>（global/dns/routing/group/subscription/node/include）<b>全部生效</b></td><td>全量解析 + schema 校验 + 行级诊断；生效 routing 子集 + dns.upstream；group/node/subscription 仅解析（无运行时）</td><td><span class="b b-warn">≈60%</span></td><td>解析面与 <code>config_merger/parser</code> 语义逐条对齐；deferred 显式列出不静默丢（ADR-0011）</td></tr>
       <tr><td><b>5 · DNS 子系统</b></td><td>透明 UDP/TCP、缓存、EDNS、regex、<b>DoT/DoH/DoQ/H3 上游</b>、<b>dns.routing 请求/应答分流</b>、ECS、嗅探 punt</td><td>透明 UDP/TCP、正负缓存 TTL、域位图、regex、EDNS/截断、reload 重投影、TCP keep-alive</td><td><span class="b b-warn">≈55%</span></td><td>明文 DNS 全对齐（6 专项，ADR-0012/0013/0014）；安全上游与请求分流缺</td></tr>
       <tr><td><b>6 · 出站协议栈</b></td><td>ss（含 2022/插件/shadowtls）、ssr、trojan、vmess、vless、tuic、hysteria2、<b>juicity</b>、<b>naive</b>、http、socks5、anytls</td><td>ss classic、trojan(TCP)、vmess(AEAD)、vless(tcp/ws)、tuic v5、hy2(+obfs/Brutal/udphop)、anytls、socks5、direct（TCP 目标已支持域名，逐协议 ATYP 对齐）</td><td><span class="b b-warn">≈60% 家族</span> <span class="b b-ok">≈85% 主流</span></td><td>主流 7 协议全覆盖且纯 Rust 跨实现验收（ADR-0016–0020/0026/0027）；域名目标见 ADR-0030；缺 ss2022/ssr/juicity/naive/http、REALITY/Vision/uTLS、gecko</td></tr>
@@ -1208,7 +1209,7 @@ wait signal → reload / suspend / shutdown</pre>
     <tbody>
       <tr><td>研究目标（可行性验证）</td><td><span class="b b-ok">100%</span></td><td>aya 全栈可行、规则逐字节对拍、C 数据面退役、真实节点浏览器可用——结论闭环</td></tr>
       <tr><td>核心主链路（分流/规则/明文 DNS/主流协议/转发/运维）</td><td><span class="b b-ok">≈80–85%</span></td><td>日常「tproxy 网关 + 主流节点」已可用（P13 真网关本机实测 204 / YouTube 200）</td></tr>
-      <tr><td>dae 全功能面（嗅探/多节点/geo/IPv6/安全 DNS/系统集成）</td><td><span class="b b-warn">≈62%（±5%）</span></td><td>差距集中在结构性 3–4 项，非零散细节；IPv6（TCP 全链）已从 ≈5% 补齐至 ≈80%</td></tr>
+      <tr><td>dae 全功能面（嗅探/多节点/geo/IPv6/安全 DNS/系统集成）</td><td><span class="b b-warn">≈66%（±5%）</span></td><td>差距集中在结构性 3 项；规则语言 ≈95%、IPv6（TCP 全链）≈80%</td></tr>
     </tbody>
   </table>
   </div>
@@ -1218,7 +1219,7 @@ wait signal → reload / suspend / shutdown</pre>
     <li><del>嗅探 + dial_mode（远端域名解析）</del> <b>已完成（P14，ADR-0030）</b>；余项：QUIC/UDP 与 h2c 嗅探、sniff-punt（按嗅探域名重判路由）；</li>
     <li><del>多节点/订阅/组 + 健康检查</del> <b>已完成（P15，ADR-0031）</b>；余项：按规则分派不同组（数据面 outbound id）、订阅热更新、sticky IP/udp_check；</li>
     <li><del>IPv6 数据面</del> <b>已完成（P16，ADR-0032）</b>；余项：UDP v6（含 DNS over UDP6 接管，需 sockmap key 3）、ICMPv6/分片；</li>
-    <li>geoip/geosite/pname；</li>
+    <li><del>geoip/geosite/pname</del> <b>已完成（P17，ADR-0033）</b>；余项：geosite 负载对拍覆盖、pname argv basename（CO-RE）、geodata XDG/流式解析；</li>
     <li>DoH/DoQ + <code>dns.routing</code>；</li>
     <li>协议细节：REALITY/Vision/uTLS、ss2022/插件、juicity/naive/ssr、gecko、tuic 0-RTT；</li>
     <li>systemd/打包/daed；</li>
@@ -1234,11 +1235,12 @@ wait signal → reload / suspend / shutdown</pre>
     <li><b>状态面/可观测</b>：JSON socket + Prometheus + sysdump/trace（dae 主线没有，daed 才有 Web UI）；</li>
     <li>单臂 dual-role 程序、<code>--lan none</code> 一键真网关（ADR-0029）、本地 SOCKS5 入口（ADR-0028）；</li>
     <li><b>工程化验收</b>：QEMU 双内核矩阵、soak 三模式、六路径基准、协议三方交叉（Go 客户端/Python+Go 参考服务端）。</li>
+    <li><b>规则语言对齐</b>（P17）：v2ray <code>.dat</code> 编译期展开（attr/ext、v4+v6、2M LPM）+ cgroup2 pname 采集；对拍 5/5 逐字节（含 geoip/pname）。</li>
   </ul>
 </section>
 
 <p style="color:var(--dim);font-family:var(--mono);font-size:.78rem;margin-top:56px;border-top:1px solid var(--line);padding-top:14px">
-  dae → Rust 决策档案 · v2.17 · 生成于 2026-10-04 · 基于 dae main@e3fee8f（nightly）· 本文件自包含，可离线打开<br>
+  dae → Rust 决策档案 · v2.18 · 生成于 2026-10-04 · 基于 dae main@e3fee8f（nightly）· 本文件自包含，可离线打开<br>
   v1.1：新增 4.5 部署形态、4.6 常驻与故障语义、决策点 D8<br>
   v1.2：按 ADR-0009 改为 K 轨道路线图；D7 修订为内核切片先行；K0 第一步（规则 VM + LPM）已实测<br>
   v1.3：K0、K1 均已完成并实测（双 epoch 热重载、conn_state 缓存、五钩子角色、本机 WAN 流量与回程）<br>
@@ -1265,6 +1267,7 @@ wait signal → reload / suspend / shutdown</pre>
         v2.15：P14 用户态嗅探 + dial_mode——`sniffer`（TLS ClientHello SNI / HTTP/1.x Host，MSG_PEEK 只读采集、超时回退 IP）+ `target::Target` 类型化（vless/vmess 0x02、tuic 0x00、RFC1928 0x03、hy2 字符串；direct 本地解析）；`--dial-mode ip|domain|domain+`（CLI > config global.dial_mode > 默认 ip；gateway.sh 默认 domain）；SOCKS 入口同享远端解析；状态面 `sniffing` 计数。实测：lab `DIAL_MODE=domain` 真实节点 e2e 204（嗅探 gstatic 成功）、真机网关 sniffing 10/10 hits、YouTube 200；`cargo test` 108/108（对标表缺口 #1 已补，余 QUIC/UDP 嗅探与 sniff-punt）（详情见 ADR-0030 与 `mini-dae/NOTES.md` §11.21）<br>
         v2.16：P15 订阅/节点组——`config` 的 `subscription/node/group` 生效；极小 HTTP(S) 订阅拉取（3 跳重定向/chunked/webpki/优先 IPv4/marked socket）+ base64/明文解码 + 逐行容错；group filter（name/keyword/regex/subtag/!，行内 AND / 行间 OR）与 policy（min/min_moving_avg/min_avg10/random/fixed）；经节点健康探测（last/EMA/hist10、tolerance 标死）+ 拨号失败自动切换；`--subscribe/--group`、gateway.sh 透传；状态面 `group`。实测：lab 订阅组 e2e（kill 节点 A → 4s 标死 → failover 经 B 成功）；真机订阅#2：48×REALITY 逐行跳过 + 18×anytls 入组、alive 18/18、EMA 最快 SG 287ms、204/YouTube 200；`cargo test` 121/121（对标表缺口 #2 已补，余按规则分派/热更新）（详情见 ADR-0031 与 `mini-dae/NOTES.md` §11.22）<br>
         v2.17：P16 IPv6 数据面（TCP 全链）——五元组统一 16 字节（v4-mapped + is_v6）贯穿 eBPF/loader；`parse_v6`（固定头 + 跳过 hop-by-hop/routing/dest-opts，分片不处理）+ sockmap key 2（TCP6）/key 3 预留；`IPV6_TRANSPARENT`+V6ONLY 监听 `[::]:port`；控制对 IPv6 路由（dae0 fe80 网关 + **静态永久邻居**——动态 NDP 的 NA 会被 `dae0peer_ingress` 的 cb 检查 SHOT 丢弃，详见 NOTES §11.23）；规则 LPM v6 前缀（v4 +96）与 `dip('fe80::/10')` 引号语法；协议目标 v6（ss 0x04 / vray 0x03 / tuic 0x02 / hy2 `[v6]:port`）；DNS AAAA 入域位图。实测：`cargo test` 122/122；lab `test-v6` 3 断言（tproxy v6→relay→ss(ATYP=4)→v6 echo；v6 direct；listener 注册）；verify 9/9 + DNS 6/6 + 订阅 3/3 无回归；规则对拍 `parity.sh` 3/3 逐字节一致（新增 v6 规则集）；真机网关 v6：嗅探 `[2001::1]:443 → www.google.com` RELAY 远端解析 204、字面量 v6 目标 200（对标表缺口 #3 已补，余 UDP v6/ICMPv6）（详情见 ADR-0032 与 `mini-dae/NOTES.md` §11.23）<br>
+        v2.18：P17 规则语言收尾——**geoip/geosite**：手写极简 protobuf 读 v2ray `.dat`（无新依赖），`dip(geoip:cn)`/`domain(geosite:cn[@attr])`/`ext:file:code` 编译期展开（类型映射 Plain→keyword/RootDomain→suffix/Full→full/Regex→regex；搜索目录含 DAE_LOCATION_ASSET；inverse_match 硬错误）；LPM 内层容量 1024→2,048,000（对齐 dae）；domain 匹配改预计算索引（suffix/full Hash 集合 + 前导点语义）；**.dae 语法**支持 `ext:file:code` 多段冒号与词内 `!`（geolocation-!cn）、解禁 `ipversion(6)`；**pname**：6 个 cgroup2 钩子（sock_create/release、connect4/6、sendmsg4/6）按 socket cookie 采集 comm→`cookie_pid_map`，TC 仅 WAN egress 新连接反查，match 类型 8（16B 定长），状态面/metrics 新增 pname 面。实测：`cargo test` 131/131；对拍 **5/5 逐字节**（新增 rules.geoip/rules.pname）；lab `geo-up`/`test-geo`、`pname-up`/`test-pname` 全过；真实数据 geoip:cn 15,357 前缀 / geosite:cn 6,576+44+3 域 / geolocation-!cn 25,024 域（~40ms）；回归 verify 9/9、DNS 6/6、订阅 3/3、v6 3/3；真机网关 cgroup2 6/6 + v4/v6 不回归（对标表缺口 #4 已补，余 argv basename/XDG/流式）（详情见 ADR-0033 与 `mini-dae/NOTES.md` §11.24）<br>
 </p>
 </main>
 

@@ -1813,7 +1813,26 @@ fn translate_function(f: &Function, parts: &mut Vec<String>) -> Result<(), Strin
             parts.push(format!("{bang}domain({})", inner.join(", ")));
             Ok(())
         }
-        "pname" => Err("pname 进程名匹配尚未在数据面实现".into()),
+        "pname" => {
+            // P17b：进程名匹配（WAN egress 新连接）。多参数 = OR（对照 dae
+            // addProcessName：每个值一个 match_set）。16 字节定长（TaskCommLen，
+            // 超长在 rules.rs 截断并记 note）。
+            let vals = param_values(f)?;
+            if vals.is_empty() {
+                return Err("pname(...) 需要至少一个参数".into());
+            }
+            let quoted: Vec<String> = vals
+                .iter()
+                .map(|v| {
+                    if v.is_empty() || v.contains('\'') {
+                        return Err(format!("pname({v}) 参数非法"));
+                    }
+                    Ok(format!("'{v}'"))
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            parts.push(format!("{bang}pname({})", quoted.join(", ")));
+            Ok(())
+        }
         "fallback" => {
             parts.push("fallback".into());
             Ok(())

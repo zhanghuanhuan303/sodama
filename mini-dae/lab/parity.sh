@@ -18,7 +18,7 @@ LOADER="$ROOT/target/release/mini-dae"
 
 files=("$@")
 if [ "${#files[@]}" = 0 ]; then
-  files=("$HERE/rules.dae" "$HERE/rules.reload.dae" "$HERE/rules.v6.dae" "$HERE/rules.geoip.dae")
+  files=("$HERE/rules.dae" "$HERE/rules.reload.dae" "$HERE/rules.v6.dae" "$HERE/rules.geoip.dae" "$HERE/rules.pname.dae")
 fi
 
 # P17a：geoip 展开对拍需要夹具 geoip.dat/geosite.dat；DAE_LOCATION_ASSET 同时作用于

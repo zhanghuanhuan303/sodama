@@ -1,6 +1,6 @@
 # 对标进度：dae（Go）↔ mini-dae（全 Rust）
 
-- **版本**：v1.3 · 2026-10-04（P16 IPv6 数据面（TCP 全链）清点）
+- **版本**：v1.4 · 2026-10-04（P17 geoip/geosite/pname 清点）
 - **口径**：「覆盖度」= 该域**功能点覆盖**的粗估（我方可用 ÷ dae 等价能力），
   **不是代码行数、不是性能等价**；数字是判断值，逐行给出证据出处。
   按口径分两档汇总：主链路（日常代理网关）与 dae 全功能面。
@@ -13,7 +13,7 @@
 |---|---|---|---|---|---|
 | 1 | **eBPF 数据面（程序/hook）** | 23 程序（13×TC L2/L3 变体 + `sk_skb` offload + 5×cgroup + kprobe/fentry）、24 map、4,403 行 C（HTML §2.1） | 8 程序（7×TC 含单臂 dual-role + `sk_skb` offload）、14 map（BTF）、~1.1k 行 Rust | **≈65%** | 主路径语义逐一对齐；缺 L2/桥接变体、cgroup 钩子、ringbuf。优势：C 已退役（ADR-0025）、TCX 退出即摘钩 |
 | 2 | **分流主链路** | tproxy/direct/block、控制面 DNS override、五钩子角色、conn_state、双 epoch 热重载、redirect_track 单写者 | 同上全有 | **≈95%** | K0–K3 九用例 ×2 拓扑全过；`verify` 9/9（ADR-0009/0010，NOTES §11.16） |
-| 3 | **规则引擎** | dip/sip/dport/sport/l4proto/ipversion/dscp/mac/pname/domain/geoip/geosite/fallback + not/and + mark/must + sub/subnode | 除 pname/geo/subnode 外全有；domain 走 DNS 位图 + regex | **≈75%** | **编译产物与 dae 逐字节对拍 5/5**（ADR-0010）；缺 geo 数据、进程名、subnode |
+| 3 | **规则引擎** | dip/sip/dport/sport/l4proto/ipversion/dscp/mac/pname/domain/geoip/geosite/fallback + not/and + mark/must + sub/subnode | dae 现有函数集全覆盖（geoip/geosite 自 `.dat` 编译期展开，含 attr/ext；pname 走 cgroup2 采集；domain 走 DNS 位图 + 预计算索引）；`sub/subnode` 本版 dae 无此函数 | **≈95%** | **编译产物与 dae 逐字节对拍 5/5**（ADR-0010/0033）；真实 `.dat` 计数与上游清点一致（geoip:cn 15,357 / geosite:cn 6,623）；余项：geosite 负载未纳入对拍、无 XDG 搜索目录/流式解析、pname 用 comm 非 argv basename |
 | 4 | **配置系统** | 全量 `.dae`（global/dns/routing/group/subscription/node/include）全部生效 | 全量解析 + schema 校验 + 行级诊断；生效 routing 子集 + dns.upstream；group/node/subscription 仅解析（无运行时） | **≈60%** | 解析面与 `config_merger/parser` 语义逐条对齐；执行面为子集，deferred 显式列出不静默丢（ADR-0011） |
 | 5 | **DNS 子系统** | 透明 UDP/TCP、缓存、EDNS、regex、DoT/DoH/DoQ/H3 上游、`dns.routing` 请求/应答分流、ECS、嗅探 punt | 透明 UDP/TCP、正负缓存 TTL、域位图、regex、EDNS/截断、reload 重投影、TCP keep-alive | **≈55%** | 明文 DNS 全对齐（6 专项，ADR-0012/0013/0014）；安全上游与请求分流缺 |
 | 6 | **出站协议栈** | ss（含 2022/插件/shadowtls）、ssr、trojan、vmess、vless、tuic、hysteria2、juicity、naive、http、socks5、anytls | ss classic、trojan(TCP)、vmess(AEAD aid=0)、vless(tcp/ws)、tuic v5、hy2(+obfs/Brutal 近似/udphop)、anytls、socks5、direct（TCP 目标已支持域名，逐协议 ATYP 对齐） | **≈60%**（家族）· **≈85%**（主流可用性） | 主流 7 协议全覆盖且纯 Rust 跨实现验收（ADR-0016–0020/0026/0027）；域名目标编码见 ADR-0030；缺 ss2022/ssr/juicity/naive/http、REALITY/Vision/uTLS、gecko |
@@ -33,14 +33,14 @@
 |---|---|---|
 | 研究目标（可行性验证） | **100%** | aya 全栈可行、规则逐字节对拍、C 数据面退役、真实节点浏览器可用——结论闭环 |
 | 核心主链路（分流/规则/明文 DNS/主流协议/转发/运维） | **≈80–85%** | 日常「tproxy 网关 + 主流节点」已可用（P13 真网关实测 204 / YouTube 200；P14 嗅探远端解析实测 hits 10/10；P15 订阅组真机 18/18 alive） |
-| dae 全功能面（嗅探/多节点/geo/IPv6/安全 DNS/系统集成） | **≈62%（±5%）** | 差距集中在结构性 3–4 项；IPv6（TCP 全链）已从 ≈5% 补齐至 ≈80% |
+| dae 全功能面（嗅探/多节点/geo/IPv6/安全 DNS/系统集成） | **≈66%（±5%）** | 差距集中在结构性 3 项；IPv6（TCP 全链）≈80%、规则语言（geo/pname）≈95% |
 
 ## Top 缺口（按优先级）
 
 1. ~~嗅探 + dial_mode（远端域名解析）~~ **已完成（P14，ADR-0030）**；余项：QUIC/UDP 与 h2c 嗅探、sniff-punt（按嗅探域名重判路由）；
 2. ~~多节点/订阅/组 + 健康检查~~ **已完成（P15，ADR-0031）**；余项：按规则分派不同组（数据面 outbound id）、订阅热更新、sticky IP/udp_check；
 3. ~~IPv6 数据面~~ **已完成（P16，ADR-0032，TCP 全链）**；余项：UDP v6（含 DNS over UDP6 接管，需 sockmap key 3）、ICMPv6/分片；
-4. **geoip/geosite/pname**；
+4. ~~geoip/geosite/pname~~ **已完成（P17，ADR-0033）**；余项：geosite 对拍覆盖、pname argv basename（CO-RE）、geodata XDG/流式；
 5. **DoH/DoQ + `dns.routing`**；
 6. 协议细节：REALITY/Vision/uTLS、ss2022/插件、juicity/naive/ssr、gecko、tuic 0-RTT；
 7. **systemd/打包/daed**；
@@ -55,6 +55,7 @@
 - **状态面/可观测**：JSON socket + Prometheus + sysdump/trace（dae 主线没有，daed 才有 Web UI）；
 - **单臂 dual-role 程序**、`--lan none` 一键真网关（ADR-0029）、本地 SOCKS5 入口（ADR-0028）；
 - **IPv6 TCP 全链**（P16，ADR-0032）：v4-mapped 统一五元组 + sockmap key 2 + 协议目标 v6 编码 + v6 嗅探，真机实测通过；
+- **规则语言与 dae 对齐**（P17，ADR-0033）：`.dat` 编译期展开（attr/ext、2M LPT 容量）、cgroup2 pname 采集；对拍 5/5 逐字节（含 geoip/pname）；
 - **工程化验收**：QEMU 双内核矩阵、soak 三模式、六路径基准、协议三方交叉（Go 客户端/Python+Go 参考服务端）。
 
 ## 维护说明

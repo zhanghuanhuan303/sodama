@@ -8,6 +8,7 @@
 #![no_main]
 #![allow(non_upper_case_globals)]
 
+mod cgroup;
 mod common;
 mod flow;
 mod maps;

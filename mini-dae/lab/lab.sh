@@ -21,6 +21,8 @@
 #   sudo lab/lab.sh test-v6
 #   sudo lab/lab.sh geo-up     # P17a：geoip/geosite 展开（小型夹具 + 假 DNS）
 #   sudo lab/lab.sh test-geo
+#   sudo lab/lab.sh pname-up   # P17b：pname（cgroup2 采集 + WAN egress 匹配）
+#   sudo lab/lab.sh test-pname
 #   sudo lab/lab.sh relay-up     # P4：TCP relay（--dialer direct）+ 短 idle 回收
 #   sudo lab/lab.sh test-relay        # 真实转发 + 512KB 完整性 + 状态面
 #   sudo lab/lab.sh test-relay-idle   # janitor 回收空闲连接
@@ -1408,6 +1410,62 @@ test_geo() {
   echo "PASS: geosite:cn 展开进域位图，geo.test 命中代理"
 }
 
+# P17b：pname（cgroup2 采集 → WAN egress 新连接按进程名匹配）。
+test_pname() {
+  require_root
+  echo "== P17b：pname 采集与匹配（host 发起流量）=="
+  grep -q "pname: cgroup2 钩子" "$LOG" || { echo "FAIL: cgroup2 钩子未挂载"; tail -20 "$LOG"; exit 1; }
+
+  # 1) python3 → pname(python3) 命中 → direct（WAN echo）
+  local out
+  out="$(timeout 6 python3 "$HERE/client_probe.py" 1.1.1.1 8080 2>&1 || true)"
+  echo "python3: $out"
+  echo "$out" | grep -q "wan-echo-ok" || { echo "FAIL: pname(python3) 未命中（应为 direct）"; exit 1; }
+
+  # 2) curl → 不命中 → fallback proxy（tproxy 回显；回显不是 HTTP 响应，须 --http0.9）
+  out="$(curl --http0.9 -sS -m 6 http://1.1.1.1:8080/ 2>&1 || true)"
+  echo "curl: $out"
+  echo "$out" | grep -q "mini-dae tproxy" || { echo "FAIL: curl 未走 fallback 代理"; exit 1; }
+
+  # 3) cookie→pname 表：用一个「活着的」连接验证采集（socket 关闭会被 sock_release 清掉，
+  #    清理本身也是预期行为）
+  (timeout 8 python3 -c 'import socket,time; s=socket.create_connection(("1.1.1.1",8080),timeout=3); time.sleep(6); s.close()' >/dev/null 2>&1 &)
+  sleep 1.5
+  local mid
+  mid="$(python3 "$HERE/map_id.py" cookie_pid_map)"
+  [ -n "$mid" ] || { echo "FAIL: 找不到 cookie_pid_map"; exit 1; }
+  bpftool -j map dump id "$mid" >/tmp/mini-dae-cookie.json
+  python3 - /tmp/mini-dae-cookie.json <<'PY'
+import json, sys
+val = json.load(open(sys.argv[1]))
+names = set()
+for e in val:
+    v = e.get("value")
+    if not isinstance(v, list) or len(v) < 16:
+        continue
+    b = bytes(int(x, 16) if isinstance(x, str) else x for x in v)
+    p = b[:16].split(b"\x00")[0].decode(errors="replace")
+    if p:
+        names.add(p)
+assert "python3" in names, names
+print("cookie_pid_map pname 条目:", sorted(names)[:8])
+PY
+
+  # 4) 状态面：driver/hooks/enabled/hits
+  "$LOADER" status --socket "$STATUS_SOCK" --json >/tmp/mini-dae-status.json
+  python3 - /tmp/mini-dae-status.json <<'PY'
+import json, sys
+v = json.load(open(sys.argv[1]))
+p = v["pname"]
+assert p["enabled"], p
+assert p["hooks"] == 6, p
+assert p["hits"] >= 1, p
+assert p["map_entries"] >= 1, p
+print("status pname:", p)
+PY
+  echo "PASS: pname 采集/匹配/状态面均生效"
+}
+
 # P15：订阅 + 节点组会话——两个 ss 后端（A 可被 kill 验证 failover）
 # + 一个不支持协议行（验证订阅逐行容错）+ 本地订阅 HTTP 服务器。
 subscribe_up() {
@@ -2201,6 +2259,8 @@ case "${1:-}" in
     USE_SS_PASSWORD=testpass USE_DIALER="ss://chacha20-ietf-poly1305:testpass@127.0.0.1:$SS_PORT" \
     USE_RELAY_IDLE=600 up ;;
   test-v6) test_v6 ;;
+  pname-up) USE_RULES="$HERE/rules.pname.dae" up ;;
+  test-pname) test_pname ;;
   forward-up) USE_FORWARD="socks5://127.0.0.1:$SOCKS5_PORT" up ;;
   dns-up) USE_RULES="$HERE/rules.dns.dae" USE_DNS_UPSTREAM="127.0.0.1:$FAKE_DNS_PORT" USE_FAKE_DNS=1 up ;;
   geo-up) USE_RULES="$HERE/rules.geo.dae" USE_DNS_UPSTREAM="127.0.0.1:$FAKE_DNS_PORT" USE_FAKE_DNS=1 \
@@ -2292,5 +2352,5 @@ case "${1:-}" in
   status) status ;;
   trace) trace ;;
   down) down ;;
-  *) echo "usage: $0 {build|up|dual-up|config-up|forward-up|dns-up|geo-up|regex-up|relay-up|offload-up|udp-up|ss-up|ss-udp-up|trojan-up|vless-up|vless-tls-up|vless-udp-up|vmess-up|vmess-tls-up|vmess-udp-up|tuic-up|tuic-udp-up|hy2-up|hy2-udp-up|hy2-obfs-up|hy2-obfs-udp-up|hy2-brutal-up|hy2-hop-up|ops-up|ops-reload-up|bench-up|test-proxy|test-direct|test-block|test-host-proxy|test-reload|test-rebind|test-status|test-config|test-forward|test-domain|test-dns-cache|test-dns-tcp|test-dns-reload|test-domain-regex|test-dns-edns|test-geo|test-v6|test-relay|test-relay-idle|test-relay-offload|test-offload-lifecycle|test-udp-relay|test-udp-idle|test-ss|test-trojan|test-ss-udp|test-vless|test-vless-udp|test-vmess|test-vmess-udp|test-tuic|test-tuic-udp|test-hy2|test-hy2-udp|test-hy2-obfs|test-hy2-obfs-udp|test-hy2-brutal|test-hy2-hop|test-ops|test-config-reload|test-fault-reload|test-fault-kill|reload|verify|status|trace|down}"; exit 2 ;;
+  *) echo "usage: $0 {build|up|dual-up|config-up|forward-up|dns-up|geo-up|pname-up|regex-up|relay-up|offload-up|udp-up|ss-up|ss-udp-up|trojan-up|vless-up|vless-tls-up|vless-udp-up|vmess-up|vmess-tls-up|vmess-udp-up|tuic-up|tuic-udp-up|hy2-up|hy2-udp-up|hy2-obfs-up|hy2-obfs-udp-up|hy2-brutal-up|hy2-hop-up|ops-up|ops-reload-up|bench-up|test-proxy|test-direct|test-block|test-host-proxy|test-reload|test-rebind|test-status|test-config|test-forward|test-domain|test-dns-cache|test-dns-tcp|test-dns-reload|test-domain-regex|test-dns-edns|test-geo|test-pname|test-v6|test-relay|test-relay-idle|test-relay-offload|test-offload-lifecycle|test-udp-relay|test-udp-idle|test-ss|test-trojan|test-ss-udp|test-vless|test-vless-udp|test-vmess|test-vmess-udp|test-tuic|test-tuic-udp|test-hy2|test-hy2-udp|test-hy2-obfs|test-hy2-obfs-udp|test-hy2-brutal|test-hy2-hop|test-ops|test-config-reload|test-fault-reload|test-fault-kill|reload|verify|status|trace|down}"; exit 2 ;;
 esac

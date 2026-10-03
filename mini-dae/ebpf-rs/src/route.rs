@@ -111,6 +111,17 @@ unsafe fn route_eval_match(ctx: *mut MiniRouteCtx, ms: &MiniMatchSet, index: u32
             }
             0
         }
+        MINI_MATCH_PNAME => {
+            // P17b，对照 dae tproxy.c:1784-1792：仅 WAN egress 参与，16 字节精确
+            // 比较（短名已在控制面按 NUL 补全）；pname 为空（LAN/降级）时不命中。
+            if (*ctx).is_wan != 0 && (*ctx).pname == ms.u.value {
+                (*ctx).state |= MINI_STATE_GOOD_SUBRULE;
+                if let Some(v) = mini_stats_map.get_ptr_mut(MINI_STAT_PNAME_HITS) {
+                    *v += 1;
+                }
+            }
+            0
+        }
         MINI_MATCH_FALLBACK => {
             (*ctx).state |= MINI_STATE_GOOD_SUBRULE;
             0
@@ -177,7 +188,8 @@ fn fill_lpm_mac(key: &mut MiniLpmKey, mac: &[u8; 6]) {
 }
 
 /// 规则 VM 入口（对照 C `mini_route`）：返回 >=0 = outbound 编码，<0 = errno。
-pub unsafe fn mini_route(pkt: &MiniParseResult, is_wan: u8) -> i64 {
+/// P17b：`pname` 为本报文所属进程名（仅 WAN egress 新连接非零；见 flow.rs）。
+pub unsafe fn mini_route(pkt: &MiniParseResult, is_wan: u8, pname: &[u8; 16]) -> i64 {
     let Some(ctx) = route_ctx_scratch_map.get_ptr_mut(0) else {
         return EFAULT;
     };
@@ -201,6 +213,7 @@ pub unsafe fn mini_route(pkt: &MiniParseResult, is_wan: u8) -> i64 {
     (*ctx).h_dport = pkt.h_dport;
     (*ctx).dscp = pkt.dscp;
     (*ctx).is_wan = is_wan;
+    (*ctx).pname = *pname;
     (*ctx).result = ENOEXEC;
     fill_lpm_addr(&mut (*ctx).lpm_saddr, &pkt.tuples.sip);
     fill_lpm_addr(&mut (*ctx).lpm_daddr, &pkt.tuples.dip);

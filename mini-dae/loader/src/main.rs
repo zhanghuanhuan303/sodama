@@ -19,9 +19,10 @@
  *
  * 与 dae 的差异：
  *   - 监听 socket 由本进程直接 accept（dae 交给 session manager/relay）；
- *   - 规则是 dae 路由语法的子集（见 rules.rs）；domain/geoip/pname 等能力
- *     解析但显式列入 deferred（不静默丢弃，见 config.rs extract_routing）；
- *   - 不做 DNS/嗅探/offload/进程归因。
+ *   - 规则是 dae 路由语法的子集（见 rules.rs）；无法编译的能力显式列入 deferred
+ *     （不静默丢弃，见 config.rs extract_routing）；P17a/P17b 后 dae 现有
+ *     routing 函数已全部覆盖；
+ *   - pname 由 cgroup2 钩子采集（comm，非 argv basename；见 cgroup.rs / ADR-0033）。
  */
 use std::ffi::CString;
 use std::io::{Read, Write};
@@ -35,7 +36,8 @@ use std::time::{Duration, Instant};
 use aya::maps::lpm_trie::Key;
 use aya::maps::{Array, ArrayOfMaps, HashMap, LpmTrie, MapData, SockHash, SockMap};
 use aya::programs::tc::{self, TcAttachType};
-use aya::programs::{SchedClassifier, SkSkb};
+use aya::programs::{CgroupAttachMode, CgroupSock, CgroupSockAddr, SchedClassifier, SkSkb};
+use aya::programs::{CgroupSockAddrAttachType, CgroupSockAttachType};
 use aya::Ebpf;
 use serde_json::json;
 
@@ -352,6 +354,17 @@ impl Default for MiniDomainRouting {
 }
 
 /// 与 ebpf-rs/src/common.rs 的 `MiniRedirectEntry` 同位（32 字节，含对齐填充）。
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+struct MiniPidPname {
+    /// P17b：cgroup 钩子采集的进程名（16B，NUL 补全）
+    pname: [u8; 16],
+    pid: u32,
+    pad: [u8; 4],
+    last_seen_ns: u64,
+}
+unsafe impl aya::Pod for MiniPidPname {}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 struct MiniRedirectEntry {
@@ -825,6 +838,113 @@ fn attach(
         hooks.push(format!("{name}@{ifname}"));
     }
     Ok(())
+}
+
+/// P17b：找第一个 cgroup2 挂载点（对照 dae bpf_utils.go:261-290）。
+fn find_cgroup2_mount() -> Option<std::path::PathBuf> {
+    let mounts = std::fs::read_to_string("/proc/self/mounts").ok()?;
+    for line in mounts.lines() {
+        let mut it = line.split_whitespace();
+        let _dev = it.next()?;
+        let mp = it.next()?;
+        let fstype = it.next()?;
+        if fstype == "cgroup2" {
+            return Some(std::path::PathBuf::from(mp));
+        }
+    }
+    None
+}
+
+/// P17b：挂载 pname 采集钩子（cgroup2）。失败只告警继续（对照 dae
+/// control_plane_datapath.go:149-152：cgroup2 不可用时 pname 规则静默不命中）。
+fn attach_pname_hooks(ebpf: &mut Ebpf) {
+    let Some(mnt) = find_cgroup2_mount() else {
+        log("pname: 未找到 cgroup2 挂载点，pname 路由不可用（需要 cgroup2）");
+        return;
+    };
+    let dir = match std::fs::File::open(&mnt) {
+        Ok(d) => d,
+        Err(e) => {
+            log(&format!(
+                "pname: 打开 cgroup2 挂载点 {} 失败: {e}；pname 路由不可用",
+                mnt.display()
+            ));
+            return;
+        }
+    };
+
+    // (程序名, 类型)：六个钩子，返回 1 放行（同 dae）。
+    let sock_specs: [(&str, CgroupSockAttachType); 2] = [
+        ("mini_cgroup_sock_create", CgroupSockAttachType::SockCreate),
+        (
+            "mini_cgroup_sock_release",
+            CgroupSockAttachType::SockRelease,
+        ),
+    ];
+    let addr_specs: [(&str, CgroupSockAddrAttachType); 4] = [
+        ("mini_cgroup_connect4", CgroupSockAddrAttachType::Connect4),
+        ("mini_cgroup_connect6", CgroupSockAddrAttachType::Connect6),
+        (
+            "mini_cgroup_sendmsg4",
+            CgroupSockAddrAttachType::UDPSendMsg4,
+        ),
+        (
+            "mini_cgroup_sendmsg6",
+            CgroupSockAddrAttachType::UDPSendMsg6,
+        ),
+    ];
+    let mut attached = 0usize;
+    for (name, _ty) in sock_specs {
+        let r = (|| -> Result<(), Box<dyn std::error::Error>> {
+            let p: &mut CgroupSock = ebpf
+                .program_mut(name)
+                .ok_or_else(|| format!("program {name} not found"))?
+                .try_into()?;
+            p.load()?;
+            p.attach(&dir, CgroupAttachMode::Single)?;
+            Ok(())
+        })();
+        match r {
+            Ok(()) => {
+                attached += 1;
+                if let Ok(mut hooks) = HOOKS.lock() {
+                    hooks.push(format!("{name}@{}", mnt.display()));
+                }
+            }
+            Err(e) => log(&format!("pname: 挂载 {name} 失败: {e}")),
+        }
+    }
+    for (name, ty) in addr_specs {
+        let r = (|| -> Result<(), Box<dyn std::error::Error>> {
+            let p: &mut CgroupSockAddr = ebpf
+                .program_mut(name)
+                .ok_or_else(|| format!("program {name} not found"))?
+                .try_into()?;
+            // aya-obj 的 attach_type 来自 section 名（connect4/sendmsg4/…），
+            // CgroupSockAddr 会在 load 时从 section 取；这里类型仅作校验。
+            let _ = ty;
+            p.load()?;
+            p.attach(&dir, CgroupAttachMode::Single)?;
+            Ok(())
+        })();
+        match r {
+            Ok(()) => {
+                attached += 1;
+                if let Ok(mut hooks) = HOOKS.lock() {
+                    hooks.push(format!("{name}@{}", mnt.display()));
+                }
+            }
+            Err(e) => log(&format!("pname: 挂载 {name} 失败: {e}")),
+        }
+    }
+    if attached > 0 {
+        log(&format!(
+            "pname: cgroup2 钩子 {attached}/6 已挂载（{}），WAN egress 新连接可按进程名分流",
+            mnt.display()
+        ));
+    } else {
+        log("pname: cgroup2 钩子均未挂载，pname 路由不可用");
+    }
 }
 
 /// tproxy 服务端：accept 后打印原始目的地址（tproxy 可见性），并对每行输入回显，
@@ -2143,6 +2263,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         TcAttachType::Ingress,
     )?;
 
+    // P17b：pname 采集（cgroup2）。失败不致命（规则不命中，同 dae）。
+    attach_pname_hooks(&mut ebpf);
+
     // ---------- 2) dae netns：dae0peer ingress + tproxy listener ----------
     setns(&dae_ns, libc::CLONE_NEWNET)?;
     log(&format!("entered netns {}", args.daens));
@@ -3317,6 +3440,21 @@ fn count_fast_sock(ebpf: &mut Ebpf) -> Option<usize> {
     Some(guard.iter().count())
 }
 
+fn read_pname_hits(ebpf: &mut Ebpf) -> u64 {
+    use aya::maps::PerCpuArray;
+    let Some(map) = ebpf.map_mut("mini_stats_map") else {
+        return 0;
+    };
+    let arr: PerCpuArray<_, u64> = match PerCpuArray::try_from(map) {
+        Ok(a) => a,
+        Err(_) => return 0,
+    };
+    // 索引 4 = MINI_STAT_PNAME_HITS（与 ebpf-rs/common.rs 对齐）
+    arr.get(&4u32, 0)
+        .map(|values| values.iter().copied().sum::<u64>())
+        .unwrap_or(0)
+}
+
 fn read_stats(ebpf: &mut Ebpf) -> (u64, u64, u64, u64) {
     use aya::maps::PerCpuArray;
     let Some(map) = ebpf.map_mut("mini_stats_map") else {
@@ -3342,6 +3480,9 @@ fn status_json(ebpf: &mut Ebpf) -> serde_json::Value {
     let conn_state = count_map::<MiniTuple, MiniConnState>(ebpf, "conn_state_map");
     let redirect_track = count_map::<MiniTuple, MiniRedirectEntry>(ebpf, "redirect_track");
     let domain_routing = count_map::<MiniEpochIp, MiniDomainRouting>(ebpf, "domain_routing_map");
+    // P17b：cookie→pname 条目数 + 规则 VM 的 pname 命中计数
+    let cookie_pid = count_map::<u64, MiniPidPname>(ebpf, "cookie_pid_map");
+    let pname_hits = read_pname_hits(ebpf);
     // P7：offload 键计数（0 = 无泄漏；连接回收后必须归零）
     let fast_sock = count_fast_sock(ebpf);
     let (rebind_rejected, redirect_update_failed, offload_redirects, offload_verdicts) =
@@ -3396,6 +3537,14 @@ fn status_json(ebpf: &mut Ebpf) -> serde_json::Value {
             "attempts": SNIFF_STATS.attempts.load(Ordering::Relaxed),
             "hits": SNIFF_STATS.hits.load(Ordering::Relaxed),
             "misses": SNIFF_STATS.misses.load(Ordering::Relaxed),
+        },
+        // P17b：pname 采集面（cgroup2 钩子 + cookie→pname map）
+        "pname": {
+            "driver": "cgroup2",
+            "enabled": HOOKS.lock().map(|h| h.iter().any(|x| x.starts_with("mini_cgroup_"))).unwrap_or(false),
+            "hooks": HOOKS.lock().map(|h| h.iter().filter(|x| x.starts_with("mini_cgroup_")).count()).unwrap_or(0),
+            "map_entries": cookie_pid,
+            "hits": pname_hits,
         },
         "group": match ACTIVE_GROUP.get() {
             Some(g) => {
@@ -3629,6 +3778,25 @@ fn metrics_text(v: &serde_json::Value) -> String {
         "gauge",
         "mini_dae_dns_domain_sets",
         get(v, &["dns", "domain_sets"]),
+    );
+    // P17b：pname（cgroup2）
+    emit(
+        &mut s,
+        "gauge",
+        "mini_dae_pname_hooks",
+        get(v, &["pname", "hooks"]),
+    );
+    emit(
+        &mut s,
+        "gauge",
+        "mini_dae_pname_map_entries",
+        get(v, &["pname", "map_entries"]),
+    );
+    emit(
+        &mut s,
+        "counter",
+        "mini_dae_pname_hits",
+        get(v, &["pname", "hits"]),
     );
     emit(
         &mut s,
