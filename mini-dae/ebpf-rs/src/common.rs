@@ -57,7 +57,17 @@ pub const MINI_STAT_OFFLOAD_VERDICTS: u32 = 3;
 pub const IPPROTO_TCP: u8 = 6;
 pub const IPPROTO_UDP: u8 = 17;
 pub const ETH_P_IP: u16 = 0x0800;
+pub const ETH_P_IPV6: u16 = 0x86dd;
 pub const ETH_HLEN: u32 = 14;
+
+/// IPv4 地址 → v4-mapped 16 字节形式（网络序字节；LPM/元组统一用 16 字节地址）。
+pub fn v4_mapped_bytes(addr: u32) -> [u8; 16] {
+    let mut out = [0u8; 16];
+    out[10] = 0xff;
+    out[11] = 0xff;
+    out[12..16].copy_from_slice(&addr.to_ne_bytes());
+    out
+}
 
 /* errno（负值，与 C 的返回一致） */
 pub const EPERM: i64 = -1;
@@ -139,12 +149,15 @@ pub struct MiniRouteLoopCtx {
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct MiniTuple {
-    pub sip: u32,
-    pub dip: u32,
+    /// 统一 16 字节地址：IPv4 为 v4-mapped（::ffff:a.b.c.d），IPv6 为原始 16 字节。
+    pub sip: [u8; 16],
+    pub dip: [u8; 16],
     pub sport: u16,
     pub dport: u16,
     pub l4proto: u8,
-    pub pad: [u8; 3],
+    /// 0=IPv4 / 1=IPv6（用于 sockmap key 选路与会话一致性）
+    pub is_v6: u8,
+    pub pad: [u8; 2],
 }
 
 #[repr(C)]
@@ -219,6 +232,18 @@ pub struct IpHdr {
     pub check: u16,
     pub saddr: u32,
     pub daddr: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct Ipv6Hdr {
+    /// version(4) + traffic class(8) + flow label(20)，NBO
+    pub vtc_flow: u32,
+    pub payload_len: u16,
+    pub next_header: u8,
+    pub hop_limit: u8,
+    pub saddr: [u8; 16],
+    pub daddr: [u8; 16],
 }
 
 #[repr(C)]

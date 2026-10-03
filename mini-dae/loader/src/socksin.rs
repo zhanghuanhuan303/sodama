@@ -107,11 +107,13 @@ pub fn server_handshake<S: Read + Write>(s: &mut S) -> io::Result<SocksTarget> {
             Ok(SocksTarget::Domain(host, port))
         }
         ATYP_V6 => {
-            let _ = reply(s, REP_ATYP_UNSUPPORTED);
-            Err(io::Error::new(
-                ErrorKind::Unsupported,
-                "socks: IPv6 目标未支持",
-            ))
+            let mut a = [0u8; 16];
+            s.read_exact(&mut a)?;
+            let port = read_port(s)?;
+            Ok(SocksTarget::Ip(SocketAddr::from((
+                std::net::Ipv6Addr::from(a),
+                port,
+            ))))
         }
         other => {
             let _ = reply(s, REP_ATYP_UNSUPPORTED);
@@ -203,16 +205,15 @@ mod tests {
     }
 
     #[test]
-    fn reject_ipv6_target() {
+    fn accept_ipv6_target() {
         let mut stream = Vec::new();
         stream.extend(greet(&[0x00]));
         stream.extend_from_slice(&[VER, CMD_CONNECT, 0x00, ATYP_V6]);
-        stream.extend_from_slice(&[0u8; 16]);
+        stream.extend_from_slice(&std::net::Ipv6Addr::LOCALHOST.octets());
         stream.extend_from_slice(&80u16.to_be_bytes());
         let mut io = split(stream);
-        let e = server_handshake(&mut io).unwrap_err();
-        assert!(e.to_string().contains("IPv6"), "{e}");
-        assert_eq!(io.w[3], REP_ATYP_UNSUPPORTED);
+        let t = server_handshake(&mut io).unwrap();
+        assert_eq!(t.display(), "[::1]:80");
     }
 
     #[test]

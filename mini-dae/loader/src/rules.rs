@@ -420,26 +420,37 @@ struct Partial {
     desc: String,
 }
 
-fn parse_v4_prefix(s: &str) -> Result<(u32, [u8; 16]), String> {
+/// 前缀解析：IPv4（v4-mapped，前缀 +96）或 IPv6（原始 16 字节，0..=128）。
+fn parse_ip_prefix(s: &str) -> Result<(u32, [u8; 16]), String> {
     let (addr_s, plen_s) = match s.split_once('/') {
         Some((a, p)) => (a, Some(p)),
         None => (s, None),
     };
-    let v4: Ipv4Addr = addr_s.parse().map_err(|_| {
-        format!("mini-dae 目前只支持 IPv4 前缀（{s} 不是合法 IPv4；IPv6 待 K0 下一步）")
-    })?;
-    let plen: u32 = match plen_s {
-        Some(p) => p.parse().map_err(|_| format!("前缀长度非法: {s}"))?,
-        None => 32,
-    };
-    if plen > 32 {
-        return Err(format!("IPv4 前缀长度越界: {s}"));
+    if let Ok(v4) = addr_s.parse::<Ipv4Addr>() {
+        let plen: u32 = match plen_s {
+            Some(p) => p.parse().map_err(|_| format!("前缀长度非法: {s}"))?,
+            None => 32,
+        };
+        if plen > 32 {
+            return Err(format!("IPv4 前缀长度越界: {s}"));
+        }
+        let mut data = [0u8; 16];
+        data[10] = 0xff;
+        data[11] = 0xff;
+        data[12..16].copy_from_slice(&v4.octets());
+        return Ok((96 + plen, data));
     }
-    let mut data = [0u8; 16];
-    data[10] = 0xff;
-    data[11] = 0xff;
-    data[12..16].copy_from_slice(&v4.octets());
-    Ok((96 + plen, data))
+    if let Ok(v6) = addr_s.parse::<std::net::Ipv6Addr>() {
+        let plen: u32 = match plen_s {
+            Some(p) => p.parse().map_err(|_| format!("前缀长度非法: {s}"))?,
+            None => 128,
+        };
+        if plen > 128 {
+            return Err(format!("IPv6 前缀长度越界: {s}"));
+        }
+        return Ok((plen, v6.octets()));
+    }
+    Err(format!("前缀非法（不是 IPv4/IPv6 CIDR）: {s}"))
 }
 
 fn parse_mac(s: &str) -> Result<[u8; 16], String> {
@@ -487,7 +498,7 @@ fn expand_func(f: &Func) -> Result<Vec<Partial>, String> {
             let vals = bare_values(f)?;
             let mut prefixes = Vec::new();
             for a in &vals {
-                prefixes.push(parse_v4_prefix(a)?);
+                prefixes.push(parse_ip_prefix(a)?);
             }
             Ok(vec![Partial {
                 type_,
@@ -793,10 +804,8 @@ fn fmt_lpm_key(data: &[u8; 16], plen: u32) -> String {
         let v4plen = plen.saturating_sub(96);
         format!("{addr}/{v4plen}")
     } else {
-        format!(
-            "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} plen={plen}",
-            data[10], data[11], data[12], data[13], data[14], data[15]
-        )
+        let addr = std::net::Ipv6Addr::from(*data);
+        format!("{addr}/{plen}")
     }
 }
 
@@ -807,10 +816,8 @@ fn fmt_prefix_parity(data: &[u8; 16], plen: u32) -> String {
         let addr = Ipv4Addr::new(data[12], data[13], data[14], data[15]);
         format!("{addr}/{}", plen.saturating_sub(96))
     } else {
-        format!(
-            "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}/{plen}",
-            data[10], data[11], data[12], data[13], data[14], data[15]
-        )
+        let addr = std::net::Ipv6Addr::from(*data);
+        format!("{addr}/{plen}")
     }
 }
 

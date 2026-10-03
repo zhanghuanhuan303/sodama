@@ -260,7 +260,7 @@ struct DnsStats {
     responses: AtomicU64,
     published_ips: AtomicU64,
     upstream_errors: AtomicU64,
-    aaaa_skipped: AtomicU64,
+    aaaa_published: AtomicU64,
     tcp_unsupported: AtomicU64,
     tcp_queries: AtomicU64,
     tcp_responses: AtomicU64,
@@ -271,7 +271,7 @@ static DNS_STATS: DnsStats = DnsStats {
     responses: AtomicU64::new(0),
     published_ips: AtomicU64::new(0),
     upstream_errors: AtomicU64::new(0),
-    aaaa_skipped: AtomicU64::new(0),
+    aaaa_published: AtomicU64::new(0),
     tcp_unsupported: AtomicU64::new(0),
     tcp_queries: AtomicU64::new(0),
     tcp_responses: AtomicU64::new(0),
@@ -300,12 +300,14 @@ unsafe impl aya::Pod for MiniConfig {}
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 struct MiniTuple {
-    sip: u32,
-    dip: u32,
+    /// 与 ebpf-rs 同位：16 字节地址（IPv4 为 v4-mapped），is_v6 区分家族。
+    sip: [u8; 16],
+    dip: [u8; 16],
     sport: u16,
     dport: u16,
     l4proto: u8,
-    pad: [u8; 3],
+    is_v6: u8,
+    pad: [u8; 2],
 }
 unsafe impl aya::Pod for MiniTuple {}
 
@@ -730,6 +732,73 @@ fn make_transparent_listener(port: u16) -> Result<TcpListener, Box<dyn std::erro
     Ok(fd.into())
 }
 
+/// P16：IPV6_TRANSPARENT 的 TCP 监听 socket（`[::]:port`，V6ONLY）。
+fn make_transparent_listener6(port: u16) -> Result<TcpListener, Box<dyn std::error::Error>> {
+    let raw = unsafe { libc::socket(libc::AF_INET6, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+    if raw < 0 {
+        return Err(format!(
+            "socket(AF_INET6) failed: {}",
+            std::io::Error::last_os_error()
+        )
+        .into());
+    }
+    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+    let one: libc::c_int = 1;
+    for (level, opt, name, value) in [
+        (
+            libc::IPPROTO_IPV6,
+            libc::IPV6_TRANSPARENT,
+            "IPV6_TRANSPARENT",
+            one,
+        ),
+        (libc::IPPROTO_IPV6, libc::IPV6_V6ONLY, "IPV6_V6ONLY", one),
+        (libc::SOL_SOCKET, libc::SO_REUSEADDR, "SO_REUSEADDR", one),
+        (libc::SOL_SOCKET, libc::SO_MARK, "SO_MARK", DAE_SOCKET_MARK),
+    ] {
+        let rc = unsafe {
+            libc::setsockopt(
+                fd.as_raw_fd(),
+                level,
+                opt,
+                &value as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        if rc != 0 {
+            return Err(format!(
+                "setsockopt({name}) failed: {}",
+                std::io::Error::last_os_error()
+            )
+            .into());
+        }
+    }
+    let addr = libc::sockaddr_in6 {
+        sin6_family: libc::AF_INET6 as libc::sa_family_t,
+        sin6_port: port.to_be(),
+        sin6_flowinfo: 0,
+        sin6_addr: libc::in6_addr { s6_addr: [0; 16] },
+        sin6_scope_id: 0,
+    };
+    let rc = unsafe {
+        libc::bind(
+            fd.as_raw_fd(),
+            &addr as *const _ as *const libc::sockaddr,
+            std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
+        )
+    };
+    if rc != 0 {
+        return Err(format!(
+            "bind([::]:{port}) failed: {}",
+            std::io::Error::last_os_error()
+        )
+        .into());
+    }
+    if unsafe { libc::listen(fd.as_raw_fd(), 128) } != 0 {
+        return Err(format!("listen failed: {}", std::io::Error::last_os_error()).into());
+    }
+    Ok(fd.into())
+}
+
 fn attach(
     ebpf: &mut Ebpf,
     name: &str,
@@ -956,18 +1025,34 @@ fn offload_monitor(client_fd: RawFd, upstream_fd: RawFd, handle: Arc<RelayHandle
 }
 
 /// 构造 fast_sock 键：元组取「remote → local」方向（对照 dae makeTuplesKey）。
-/// 仅 IPv4（mini 数据面只做 IPv4）。
+/// 地址统一为 16 字节形式（v4-mapped / v6 原始）；offload 目前仅 v4 路径生效。
+fn addr16(ip: std::net::IpAddr) -> ([u8; 16], u8) {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            let mut b = [0u8; 16];
+            b[10] = 0xff;
+            b[11] = 0xff;
+            b[12..16].copy_from_slice(&v4.octets());
+            (b, 0)
+        }
+        std::net::IpAddr::V6(v6) => (v6.octets(), 1),
+    }
+}
+
 fn mini_tuple_of(remote: SocketAddr, local: SocketAddr) -> Option<MiniTuple> {
-    let (std::net::IpAddr::V4(rip), std::net::IpAddr::V4(lip)) = (remote.ip(), local.ip()) else {
+    if remote.is_ipv4() != local.is_ipv4() {
         return None;
-    };
+    }
+    let (sip, v6) = addr16(remote.ip());
+    let (dip, _) = addr16(local.ip());
     Some(MiniTuple {
-        sip: u32::from_ne_bytes(rip.octets()),
-        dip: u32::from_ne_bytes(lip.octets()),
+        sip,
+        dip,
         sport: remote.port().to_be(),
         dport: local.port().to_be(),
         l4proto: 6, // IPPROTO_TCP
-        pad: [0; 3],
+        is_v6: v6,
+        pad: [0; 2],
     })
 }
 
@@ -976,12 +1061,11 @@ fn tuple_hex(t: &MiniTuple) -> String {
     let mut s = String::new();
     for b in t
         .sip
-        .to_ne_bytes()
         .iter()
-        .chain(t.dip.to_ne_bytes().iter())
+        .chain(t.dip.iter())
         .chain(t.sport.to_ne_bytes().iter())
         .chain(t.dport.to_ne_bytes().iter())
-        .chain([t.l4proto, 0, 0, 0].iter())
+        .chain([t.l4proto, t.is_v6, 0, 0].iter())
     {
         let _ = write!(s, "{b:02x}");
     }
@@ -2045,6 +2129,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         args.tproxy_port
     ));
 
+    // P16：IPv6 tproxy 监听（sockmap key 2）；IPv6 不可用/被禁用时降级为仅 v4。
+    match make_transparent_listener6(args.tproxy_port) {
+        Ok(l6) => {
+            {
+                let map = ebpf
+                    .map_mut("listen_socket_map")
+                    .ok_or("map listen_socket_map not found")?;
+                let mut sockmap: SockMap<_> = SockMap::try_from(map)?;
+                sockmap.set(2, &l6, 0)?;
+            }
+            log(&format!(
+                "tproxy listener registered: [::]:{} (sockmap key 2, IPv6)",
+                args.tproxy_port
+            ));
+            let accept6 = l6.try_clone()?;
+            std::thread::spawn(move || serve(accept6));
+        }
+        Err(e) => log(&format!("IPv6 tproxy listener 未启用（降级为仅 v4）: {e}")),
+    }
+
     // P3a：UDP tproxy/DNS 监听（sockmap key 1）。DNS 查询被数据面判为控制面时
     // 经 dae0peer ingress 交付到这里；IP_ORIGDSTADDR 用于回包源地址。
     let udp_listener = make_transparent_udp(args.tproxy_port)?;
@@ -2418,8 +2522,8 @@ fn domain_updates_for(
     if hits == 0 {
         return (Vec::new(), 0);
     }
-    let (addrs, _) = dns::answer_a_records(response);
-    let updates = addrs
+    let (addrs, v6addrs) = dns::answer_a_and_aaaa_records(response);
+    let mut updates: Vec<status::DnsUpdate> = addrs
         .iter()
         .map(|ip| status::DnsUpdate {
             slot,
@@ -2427,6 +2531,13 @@ fn domain_updates_for(
             bits: bits.clone(),
         })
         .collect();
+    for ip in &v6addrs {
+        updates.push(status::DnsUpdate {
+            slot,
+            addr: *ip,
+            bits: bits.clone(),
+        });
+    }
     (updates, hits)
 }
 
@@ -2449,7 +2560,7 @@ fn publish_live(
         let (_, aaaa) = dns::answer_a_records(response);
         if aaaa > 0 {
             DNS_STATS
-                .aaaa_skipped
+                .aaaa_published
                 .fetch_add(aaaa as u64, Ordering::Relaxed);
         }
     }
@@ -3299,7 +3410,7 @@ fn status_json(ebpf: &mut Ebpf) -> serde_json::Value {
             "responses": DNS_STATS.responses.load(Ordering::Relaxed),
             "published_ips": DNS_STATS.published_ips.load(Ordering::Relaxed),
             "bitmap_matched": DNS_STATS.bitmap_matched.load(Ordering::Relaxed),
-            "aaaa_skipped": DNS_STATS.aaaa_skipped.load(Ordering::Relaxed),
+            "aaaa_published": DNS_STATS.aaaa_published.load(Ordering::Relaxed),
             "upstream_errors": DNS_STATS.upstream_errors.load(Ordering::Relaxed),
             "tcp_queries": DNS_STATS.tcp_queries.load(Ordering::Relaxed),
             "tcp_responses": DNS_STATS.tcp_responses.load(Ordering::Relaxed),

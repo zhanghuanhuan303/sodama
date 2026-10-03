@@ -119,6 +119,7 @@ unsafe fn redirect_to_control_plane(
         cb[0] = TPROXY_MARK;
         cb[1] = pkt.l4proto as u32;
         cb[2] = pkt.new_flow as u32;
+        cb[3] = if pkt.is_v4 != 0 { 0 } else { 1 };
     }
     bpf_redirect(cfg.dae0_ifindex, 0) as i32
 }
@@ -203,7 +204,8 @@ pub unsafe fn refresh_reverse_state(pkt: &MiniParseResult) {
         sport: pkt.tuples.dport,
         dport: pkt.tuples.sport,
         l4proto: pkt.tuples.l4proto,
-        pad: [0; 3],
+        is_v6: pkt.tuples.is_v6,
+        pad: [0; 2],
     };
     if let Some(st) = conn_state_map.get_ptr_mut(&rev) {
         (*st).last_seen_ns = bpf_ktime_get_ns();

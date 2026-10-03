@@ -169,8 +169,10 @@ func parityRenderKey(k parityLpmKey) string {
 		}
 		return fmt.Sprintf("%d.%d.%d.%d/%d", k.data[12], k.data[13], k.data[14], k.data[15], plen)
 	}
-	return fmt.Sprintf("%02x:%02x:%02x:%02x:%02x:%02x/%d",
-		k.data[10], k.data[11], k.data[12], k.data[13], k.data[14], k.data[15], k.plen)
+	// P16: real IPv6 prefix (non-v4-mapped) — canonical RFC5952 text, same
+	// rendering as the Rust dumper's Ipv6Addr Display.
+	addr := netip.AddrFrom16(k.data)
+	return fmt.Sprintf("%s/%d", addr.String(), k.plen)
 }
 
 func parityTypeName(t uint8) string {

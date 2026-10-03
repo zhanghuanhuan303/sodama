@@ -222,6 +222,20 @@ up() {
   run ip -n "$DAE_NS" rule add fwmark 0x8000000/0x8000000 table 2023
   run ip -n "$DAE_NS" route add local default dev lo table 2023
 
+  # P16：IPv6 数据面（对照 dae control/netns_utils.go setupIPv6Datapath）。
+  # 静态 fe80 邻居不可省：动态 NDP 的 NA 回包会被 dae0peer_ingress
+  # （非 TPROXY_MARK → SHOT）丢弃，网关邻居停在 INCOMPLETE，v6 回包发不出去。
+  # 本机 IPv6 不可用时自动降级为仅 v4（loader 侧同样会降级）。
+  if [ "$NO_IPV6" -eq 0 ] && run ip -6 addr add fe80::ecee:eeff:feee:eeee/128 dev "$DAE0" scope link nodad; then
+    run sysctl -qw "net.ipv6.conf.$DAE0.forwarding=1"
+    run ip -n "$DAE_NS" -6 route add default via fe80::ecee:eeff:feee:eeee dev "$DAE0PEER"
+    run ip -n "$DAE_NS" -6 neigh add fe80::ecee:eeff:feee:eeee lladdr "$mac" dev "$DAE0PEER" nud permanent
+    run ip -n "$DAE_NS" -6 rule add fwmark 0x8000000/0x8000000 table 2023
+    run ip -n "$DAE_NS" -6 route add local default dev lo table 2023
+  elif [ "$NO_IPV6" -eq 0 ]; then
+    echo "   注意：$DAE0 的 IPv6 地址配置失败（本机 IPv6 可能已禁用），本次运行仅 IPv4 代理。"
+  fi
+
   info "内核开关（rp_filter 放宽）"
   run sysctl -qw net.ipv4.conf.all.rp_filter=0
   run sysctl -qw net.ipv4.conf.default.rp_filter=0
@@ -262,8 +276,10 @@ up() {
   fi
   echo "   loader pid=$(cat "$PID_FILE")"
 
-  if [ "$NO_IPV6" -eq 0 ] && ip -6 route show default 2>/dev/null | grep -q .; then
-    echo "   注意：本机有 IPv6 默认路由；数据面仅 IPv4，IPv6 流量不会被代理（可用 --no-ipv6 关闭网卡 IPv6）。"
+  if [ "$NO_IPV6" -eq 1 ]; then
+    echo "   已按 --no-ipv6 关闭 $IFACE 的 IPv6；数据面仅 IPv4。"
+  elif ip -6 route show default 2>/dev/null | grep -q .; then
+    echo "   IPv6 数据面已启用（v6 流量一并透明代理；如需关闭网卡 IPv6 可用 --no-ipv6）。"
   fi
   echo "完成：浏览器直接访问即可，无需任何代理设置。"
   echo "   sudo $0 test    # 连通性快检   sudo $0 down    # 停止并恢复"

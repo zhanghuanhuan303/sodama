@@ -29,7 +29,8 @@ MARK = 0x233
 
 
 def dial_tcp(ip, port, timeout=5):
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    fam = socket.AF_INET6 if ":" in ip else socket.AF_INET
+    s = socket.socket(fam, socket.SOCK_STREAM)
     s.setsockopt(socket.SOL_SOCKET, SO_MARK, MARK)
     s.settimeout(timeout)
     s.connect((ip, port))
@@ -230,6 +231,10 @@ def serve_udp():
             threading.Thread(target=udp_reply_loop, args=(us, peer, s), daemon=True).start()
         us, _, _ = out[peer]
         log_line(f"UDP target={ip}:{port}")
+        if ":" in ip:
+            # lab 参考服务端的 UDP 出口固定 v4；v6 UDP 目标不在 P16 范围。
+            log_line(f"UDP v6 target unsupported by lab server: {ip}:{port}")
+            continue
         us.sendto(plain[off:], (ip, port))
 
 

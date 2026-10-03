@@ -869,6 +869,55 @@ P4 稳定性 → P3 内核矩阵）：
   outbound id，未做）；订阅仅启动时拉取（无 update_interval 热更新）；gzip 订阅报错；
   `add_latency`/`region`/多 check URL/`udp_check_dns` 未实现；check 判定 = 拨号 + 任意响应。
 
+### 11.23 P16（IPv6 数据面，TCP 全链）已验收的行为
+
+（决策与边界见 ADR-0032；实现分散在 `ebpf-rs/{common,parse,route,flow,progs,offload}.rs`、
+`loader/src/{main,target,outbound,socksin,rules,config,dns}.rs`；lab 夹具 `rules.v6.dae` +
+`wan_echo.py`/`ss_server.py` 双栈。）
+
+- **统一元组**：`MiniTuple` 16 字节地址（v4-mapped）+ `is_v6`，eBPF 与 loader 镜像同步
+  （40 字节）；`conn_state_map`/`redirect_track`/`fast_sock` 行 key 全量跟随；
+  loader 侧 `addr16()`/`mini_tuple_of()`/`tuple_hex()` 支持 v6，状态面 `tuple_hex` 输出不变形状。
+- **解析**：`parse_v6`（固定头 + 跳过 hop-by-hop/routing/dest-opts ≤ 4 个；分片返回 None
+  走原路径）+ `parse_ip` 统一入口；四个解析函数 `#[inline(always)]`——**别删**：verifier 会报
+  `cannot return stack pointer to the caller`（嵌套调用返回 16B 结构体触发 sret 真调用）。
+- **交付**：`cb[3]` 携带 v6 标志；sockmap key = `(tcp?0:1) + (v6?2:0)`；loader 建
+  `[::]:port`（`IPV6_TRANSPARENT`+`V6ONLY`+`SO_MARK`）注册 key 2（失败降级仅 v4，日志明示）。
+- **控制对（最大坑）**：必须照抄上游 `setupIPv6Datapath`：host 侧 `fe80::ecee:eeff:feee:eeee/128
+  dev dae0 scope link nodad` + `net.ipv6.conf.dae0.forwarding=1`；daens 侧默认路由 + **静态永久邻居
+  `fe80::ecee... lladdr <dae0 MAC>`** + `fwmark→2023/local default`。
+  若只配路由不写静态邻居：daens 发 NS、host 回 NA，而 NA 进 daens 会被 `dae0peer_ingress`
+  的 `cb[0] != TPROXY_MARK → SHOT` 丢弃（上游 C 同样如此），邻居停在 INCOMPLETE，
+  tproxy 的 SYN-ACK 永远发不出去——现象是 `ss` 里 SYN-RECV、用户态 accept 永不返回，
+  极易误诊为 listener/sk_assign 问题（实际 sk_assign 的 ftrace 是成功的）。
+- **规则**：LPM 键 16B，v4 前缀 +96；`dip/sip` 接受 v6 CIDR；手写 mini 规则 v6 前缀
+  必须加引号（`dip('2001:db8:aa::1/128')`），`.dae` 提取器自动加。
+- **协议目标**：RFC1928 0x04 / v2ray 0x03 / tuic 0x02 / hy2 `[v6]:port` 字符串；
+  `marked_tcp_connect` v6（sockaddr 走 `[u8;128]` 栈缓冲 + `copy_nonoverlapping`，
+  注意 `transmute_copy` 不能放大）；SOCKS5 入口接受 ATYP=6；DNS AAAA 同时发布域位图。
+- **lab 夹具**：`v6-up`/`test-v6`；拓扑加 LAN/WAN/假公网 v6（`2001:db8:1::/64`、`2001:db8:9::/64`、
+  `2001:db8:aa::1/128`），`wan_echo.py` 双栈（v6 socket 必须 `V6ONLY`，否则抢 v4 的 0.0.0.0 绑定）；
+  `ss_server.py` 出站 `dial_tcp` 按目标选 family（ATYP=4 支持）。
+- **实测**：`cargo test` **122/122**；lab `test-v6` 3 断言全过；回归 `verify` **9/9**、
+  DNS **6/6**、订阅组 **3/3**；规则对拍 `parity.sh` **3/3 逐字节一致**（新增
+  `rules.v6.dae`：与 dae Go 编译器编译出的 16B LPM 键完全一致）；真机网关 v6：嗅探
+  `[2001::1]:443 → www.google.com` `RELAY（远端解析）` 204、字面量 `[2606:4700:4700::1111]:443` 200
+  （节点侧 v6 出口可用）。
+- **测试基建经验（多实例 + 宿主环境）**：
+  - lab 与真网关同时跑时 **map 名字重复**：按名字 `bpftool map list | head -1` 会拿到另一个实例
+    （rebind/DNS 位图测试都中过），已新增 `lab/map_id.py`（loader pid 的 `fdinfo` → `map_id`
+    ∩ `bpftool map list`）并在 `rebind_tool.py` 复用；内核还会把 map 名截断到 15 字符，匹配要截断。
+  - `rebind` 测试时序：2s 陈旧窗口内必须先 dump 绑定（否则 TCP 重传在窗口外合法改绑，必误报），
+    stats 放到窗口过后再读（保证两次读取间无新增拒绝）；工具解析要快（早期逐 fd 调 `map show`
+    十六个子进程直接吃满窗口）。
+  - 宿主 Docker 会把 `FORWARD` 策略设为 DROP：内核直转/故障 fail-open 用例需要按接口
+    精确放行（lab `forward_allow/forward_disallow` 在 up/cleanup 成对增删，不碰全局策略）。
+  - `test-reload` 会用 reload 变体覆盖 `lab/rules.dae`，早期失败路径不恢复会造成后续 `up`
+    加载错规则（症状：代理全挂）；已加 `trap ... EXIT` 恢复。
+- **边界（如实）**：UDP v6 未做（sockmap key 3 预留未注册，DNS over UDP6 不接管；
+  UDP relay 目标仍是 `SocketAddr`）；ICMPv6 与会话分片未处理（放行）；控制对用 veth
+  （上游新版 netkit）但配方等价；解析不处理 fragment 头。
+
 ## 12. 用 Rust 重写这套东西的可行性
 
 已验证（本仓库 mini-dae，实测跑通）：

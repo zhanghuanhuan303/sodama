@@ -63,9 +63,51 @@ fn sockaddr_in_of(addr: SocketAddr) -> Option<libc::sockaddr_in> {
 /// 带 SO_MARK 的 TCP 连接（非阻塞 connect + poll 超时）。
 /// 数据面（mini_wan_egress/mini_lan_ingress）见 mark 直接放行，避免代理出口自环。
 pub fn marked_tcp_connect(addr: SocketAddr, timeout: Duration) -> io::Result<TcpStream> {
+    let (family, storage, sa_len) = match addr {
+        SocketAddr::V4(_) => {
+            let sin = sockaddr_in_of(addr).unwrap();
+            let mut st = [0u8; 128];
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    &sin as *const _ as *const u8,
+                    st.as_mut_ptr(),
+                    std::mem::size_of::<libc::sockaddr_in>(),
+                );
+            }
+            (
+                libc::AF_INET,
+                st,
+                std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+            )
+        }
+        SocketAddr::V6(v6) => {
+            let sin6 = libc::sockaddr_in6 {
+                sin6_family: libc::AF_INET6 as libc::sa_family_t,
+                sin6_port: v6.port().to_be(),
+                sin6_flowinfo: v6.flowinfo(),
+                sin6_addr: libc::in6_addr {
+                    s6_addr: v6.ip().octets(),
+                },
+                sin6_scope_id: v6.scope_id(),
+            };
+            let mut st = [0u8; 128];
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    &sin6 as *const _ as *const u8,
+                    st.as_mut_ptr(),
+                    std::mem::size_of::<libc::sockaddr_in6>(),
+                );
+            }
+            (
+                libc::AF_INET6,
+                st,
+                std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
+            )
+        }
+    };
     let raw = unsafe {
         libc::socket(
-            libc::AF_INET,
+            family,
             libc::SOCK_STREAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
             0,
         )
@@ -75,16 +117,8 @@ pub fn marked_tcp_connect(addr: SocketAddr, timeout: Duration) -> io::Result<Tcp
     }
     let fd = unsafe { OwnedFd::from_raw_fd(raw) };
     set_mark_fd(fd.as_raw_fd())?;
-    let Some(sin) = sockaddr_in_of(addr) else {
-        return Err(io::Error::new(io::ErrorKind::Unsupported, "只有 IPv4"));
-    };
-    let rc = unsafe {
-        libc::connect(
-            fd.as_raw_fd(),
-            &sin as *const _ as *const libc::sockaddr,
-            std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
-        )
-    };
+    let sa = storage;
+    let rc = unsafe { libc::connect(fd.as_raw_fd(), sa.as_ptr() as *const libc::sockaddr, sa_len) };
     if rc != 0 {
         let err = io::Error::last_os_error();
         if err.raw_os_error() != Some(libc::EINPROGRESS) {

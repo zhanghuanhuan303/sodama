@@ -18,7 +18,7 @@ LOADER="$ROOT/target/release/mini-dae"
 
 files=("$@")
 if [ "${#files[@]}" = 0 ]; then
-  files=("$HERE/rules.dae" "$HERE/rules.reload.dae")
+  files=("$HERE/rules.dae" "$HERE/rules.reload.dae" "$HERE/rules.v6.dae")
 fi
 
 fails=0

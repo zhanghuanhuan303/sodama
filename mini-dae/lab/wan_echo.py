@@ -17,9 +17,26 @@ def serve(port, first_line):
     s.bind(("0.0.0.0", port))
     s.listen(16)
     print(f"wan-echo listening on 0.0.0.0:{port}", flush=True)
-    while True:
-        conn, _ = s.accept()
-        threading.Thread(target=handle, args=(conn, first_line), daemon=True).start()
+    # P16：并行监听 IPv6（V6ONLY，不抢 v4 的绑定）
+    try:
+        s6 = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+        s6.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s6.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+        s6.bind(("::", port))
+        s6.listen(16)
+        print(f"wan-echo listening on [::]:{port}", flush=True)
+    except OSError as e:  # 内核无 IPv6 时降级为仅 v4
+        print(f"wan-echo IPv6 不可用，仅 v4: {e}", flush=True)
+        s6 = None
+
+    def accept_loop(sock):
+        while True:
+            conn, _ = sock.accept()
+            threading.Thread(target=handle, args=(conn, first_line), daemon=True).start()
+
+    if s6 is not None:
+        threading.Thread(target=accept_loop, args=(s6,), daemon=True).start()
+    accept_loop(s)
 
 
 def handle(conn, first_line):

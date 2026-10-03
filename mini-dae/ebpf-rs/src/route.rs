@@ -161,14 +161,11 @@ unsafe fn route_finalize_match(ctx: *mut MiniRouteCtx, ms: &MiniMatchSet) -> i32
     0
 }
 
-fn fill_lpm_v4(key: &mut MiniLpmKey, addr: u32) {
+fn fill_lpm_addr(key: &mut MiniLpmKey, addr: &[u8; 16]) {
     *key = MiniLpmKey {
         prefixlen: MINI_IPV6_BYTE_LENGTH as u32 * 8,
-        data: [0; 16],
+        data: *addr,
     };
-    key.data[10] = 0xff;
-    key.data[11] = 0xff;
-    key.data[12..16].copy_from_slice(&addr.to_ne_bytes());
 }
 
 fn fill_lpm_mac(key: &mut MiniLpmKey, mac: &[u8; 6]) {
@@ -205,8 +202,8 @@ pub unsafe fn mini_route(pkt: &MiniParseResult, is_wan: u8) -> i64 {
     (*ctx).dscp = pkt.dscp;
     (*ctx).is_wan = is_wan;
     (*ctx).result = ENOEXEC;
-    fill_lpm_v4(&mut (*ctx).lpm_saddr, pkt.tuples.sip);
-    fill_lpm_v4(&mut (*ctx).lpm_daddr, pkt.tuples.dip);
+    fill_lpm_addr(&mut (*ctx).lpm_saddr, &pkt.tuples.sip);
+    fill_lpm_addr(&mut (*ctx).lpm_daddr, &pkt.tuples.dip);
     fill_lpm_mac(&mut (*ctx).lpm_mac, &pkt.smac);
 
     if pkt.h_dport == 53 && (pkt.l4proto == IPPROTO_TCP || pkt.l4proto == IPPROTO_UDP) {

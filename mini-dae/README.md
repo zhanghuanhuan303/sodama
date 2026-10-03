@@ -74,6 +74,11 @@ P6（suspend/reload/metrics/sysdump/日志轮转/整配置热重载）已完成*
   subtag/`!`，行内 AND / 行间 OR）；policy（min/min_moving_avg/min_avg10/random/fixed）；
   经节点健康探测（last/EMA/hist10，tolerance 标死）+ 拨号失败自动切换；状态面 `group`
   （ADR-0031、NOTES §11.22）
+- **P16 IPv6 数据面（TCP 全链）**：五元组统一 16 字节（v4-mapped + `is_v6`）；`parse_v6`
+  （跳扩展头、分片放行）+ `IPV6_TRANSPARENT` 双监听（sockmap key 2）；规则 v6 前缀、
+  协议目标 v6 编码（ss 0x04/vray 0x03/tuic 0x02/hy2 `[v6]:port`）、v6 嗅探远端解析、
+  AAAA 入域位图；控制对 fe80 静态邻居（动态 NDP 会被 dae0peer_ingress 丢弃）；
+  lab `v6-up`/`test-v6`；真机网关 v6 域名/字面量均实测通过（ADR-0032、NOTES §11.23）
 - **P5-G3a QUIC（tuic v5）**：惰性 tokio 运行时 + quinn（阻塞 relay 用 block_on 桥接）；
   认证 token = TLS exporter（label=uuid 裸字节、context=password）；TCP 每条中继一条 QUIC
   双向流，UDP 走 QUIC DATAGRAM（含分片/重组）；上游 socket 用自建 `Endpoint` 打 `SO_MARK`；
@@ -119,7 +124,7 @@ ebpf-rs/src/         Rust/aya-ebpf 数据面（唯一）：8 个 tc 程序 + 规
 loader/src/main.rs   Rust + aya：加载、挂钩子、setns、tproxy/UDP socket、规则下发/热重载、
                      relay/Dialer、UDP NAT、offload 注册、janitor、只读状态面、DNS 线程
 loader/src/rules.rs  迷你规则解析 + 编译（match_set 编码 + LPM trie + regex 编译 + dump/对拍）
-loader/src/target.rs P14：拨号目标类型（IPv4/域名）+ 逐协议域名编码（vless/vmess/tuic/RFC1928/字符串）
+loader/src/target.rs P14：拨号目标类型（IPv4/IPv6/域名）+ 逐协议编码（vless/vmess/tuic/RFC1928/字符串；v6 形式见 P16）
 loader/src/sniffer.rs P14：TLS SNI / HTTP Host 嗅探（纯解析函数 + MSG_PEEK 采集循环）
 loader/src/subscribe.rs P15：订阅拉取（HTTP(S)/file、重定向/chunked/base64）+ 链接解析
 loader/src/group.rs   P15：节点组 filter/policy/健康探测/失败切换（GroupRuntime）
@@ -131,7 +136,7 @@ loader/src/outbound.rs 拨号器梯度：direct / socks5 / shadowsocks / trojan 
 loader/src/ss.rs    shadowsocks classic AEAD（SIP004：evp_bytes_to_key + HKDF-SHA1，
                    TCP 分块 / UDP 包，读写两半）
 loader/src/tls.rs   共享 TLS 层（rustls：握手 + 读路径 pending/抽干不变量，ALPN）
-loader/src/trojan.rs trojan（TLS + CONNECT 头；仅 TCP/IPv4/无 close_notify 半关闭）
+loader/src/trojan.rs trojan（TLS + CONNECT 头；仅 TCP；无 close_notify 半关闭）
 loader/src/vless.rs vless（TCP/UDP，tls/none，tcp/ws 传输，UUID 解析含 UUID5 回退，惰性响应头）
 loader/src/ws.rs    VLESS over WebSocket：RFC6455 客户端传输（Upgrade 握手 + 掩码帧，可拆半）
 loader/src/anytls.rs AnyTLS 客户端（anytls-go v2：sha256 认证 + 帧 + paddingScheme，单 Stream）
@@ -215,7 +220,7 @@ target/release/mini-dae export-config <config.dae>   # 合并后的配置（JSON
 target/release/mini-dae extract-routing <config.dae> # 数据面可编译的规则（deferred 到 stderr）
 target/release/mini-dae status [--socket <path>] [--cmd status|rules|config|maps] [--json]
 
-sudo lab/lab.sh config-up  # 用 lab/real-user.dae 启动（K3）
+sudo lab/lab.sh config-up  # 用 lab/real-user.dae 启动（K3；该文件需 chmod 640，loader 会校验权限）
 sudo lab/lab.sh test-config # 全量解析 + 子集编译 + deferred 上报
 sudo lab/lab.sh test-status # 只读状态面
 sudo lab/lab.sh forward-up  # 标准拓扑 + SOCKS5 过渡一跳（K3）
@@ -286,7 +291,7 @@ sudo lab/lab.sh test-hy2-hop     # 两轮 512KB 跨跳存活
 #   lab/gateway.sh test                         # 204 / 出口 IP / DNS 快检
 #   sudo lab/gateway.sh down                    # 停止并恢复（幂等）
 #   sudo lab/gateway.sh up --dry-run            # 只预览命令，零副作用
-#   （IPv6 会绕过数据面；--no-ipv6 可临时关闭网卡 IPv6，down 时恢复）
+#   （P16 起 IPv6 TCP 也会被透明代理；--no-ipv6 仍可临时关闭网卡 IPv6，down 时恢复）
 # P10：真实节点端到端（节点 URL 只经环境变量传入，不落盘）：
 #   REAL_NODE_URL='vless://…type=ws…' 或 'anytls://…' 或 'socks5://…'（桥接） \
 #     sudo lab/real-node-e2e.sh    # client ns → tproxy → relay → 真实节点 → gstatic 204
@@ -295,6 +300,8 @@ sudo lab/lab.sh test-hy2-hop     # 两轮 512KB 跨跳存活
 # P15：订阅 + 节点组（两个 ss 后端；kill A 验证健康标死与 failover）：
 sudo lab/lab.sh subscribe-up && sudo lab/lab.sh test-subscribe
 # 真机订阅：sudo lab/gateway.sh up --subscribe /tmp/mini-dae-sub.url [--group proxy]
+# P16：IPv6（tproxy v6 → relay → ss(ATYP=4)、v6 direct 对照）：
+sudo lab/lab.sh v6-up && sudo lab/lab.sh test-v6
 sudo lab/lab.sh ops-up      # P6：运维面会话（--log-file + 状态面控制命令）
 sudo lab/lab.sh test-ops         # suspend(fail-open)/reload/metrics/sysdump/日志轮转
 sudo lab/lab.sh ops-reload-up    # P6：整配置热重载会话（/tmp 配置副本 + 假 DNS）
@@ -354,7 +361,7 @@ fallback -> direct
 - `regex:` 在规则编译期编译（非法正则硬失败）；匹配小写化 qname、模式保持原大小写（与 dae 一致）
 - 运算符：`!`（取反）、`&&`（连接函数）；函数内逗号 = OR
 - outbound：`direct / block / proxy / must_rules`，参数 `mark: 0xNNN`、`must`
-- 未支持：`pname()`、IPv6 前缀、`domain(geosite:)`
+- 未支持：`pname()`、`domain(geosite:)`（IPv6 前缀自 P16 起支持）
 
 **编码与 dae 完全一致**（`component/routing/matcher_builder.go:60-73`）：
 整条规则最后一个 match_set 拿真实 outbound；同一函数内非最后一个 match_set 用
@@ -785,7 +792,7 @@ MATRIX-RESULT kernel=7.2.8-arch1-2 verify=PASS
 | `mini_stats_map`（rebind 拒绝 / update 失败计数） | `bpf_stats_map`（:539）的子集 |
 | `config_map` | `struct dae_param`（:214）+ `dae_ifindex_map`（:241） |
 | `lab/rules.dae` + `rules.rs` | `.dae` 路由规则 + `routing_matcher_builder.go`（子集，已逐字节对拍） |
-| `lab.sh` 里 daens 的路由 | `control/netns_utils.go:871 setupIPv4Datapath` |
+| `lab.sh` / `gateway.sh` 里 daens 的路由 | `control/netns_utils.go:871 setupIPv4Datapath` / `setupIPv6Datapath`（P16；含静态 fe80 邻居） |
 | `lab.sh` 里 fwmark/local 规则 | `control/netns_utils.go:560 setupRoutingPolicy`（同 `tproxy.c:2904` 注释） |
 | `config.rs` 全量解析 + include + schema | `pkg/config_parser` + `config/config_merger.go` + `config/parser.go`（错误语义已对齐） |
 | `mini_route_match_domain_set` / `domain_routing_map` / `rules.rs` 的 domain 编译 | `route_match_domain_set`（`tproxy.c:1673`）/ `domain_routing_map`（:388）/ `routing_matcher_builder.go addDomain`（:375） |
@@ -805,7 +812,7 @@ MATRIX-RESULT kernel=7.2.8-arch1-2 verify=PASS
 ## 尚未复现（后续）
 
 数据面：DNS 嗅探 punt（`ROUTE_STATE_DNS_QUERY` 强制控制面路径）、geoip/geosite 数据、
-进程名匹配（cgroup cookie）、IPv6、事件 ringbuf。
+进程名匹配（cgroup cookie）、事件 ringbuf、IPv6 剩余项（UDP v6/DNS over UDP6 接管、ICMPv6/分片）。
 转发面：offload 的 backlog fuse / tcp_info 精确计费 / SK_PASS 用户态回退协调（ADR-0022 已补：
 （ADR-0022 已补：半关闭超时看门狗、fast_sock 键注销、注册前排空队列；已 offload 的连接可回收）；UDP 跨目标
 full-cone；嗅探的剩余形态（QUIC/UDP、h2c、sniff-punt；TLS/HTTP1 已做见 ADR-0030）；relay 并发上限。

@@ -109,6 +109,22 @@ DIRECT_DST_2=10.9.10.2
 # 当前拓扑下被分流接口的名字（dual-up 里改为 single）
 LAN_IFACE=landae
 
+# Docker 会把宿主 FORWARD 链策略设为 DROP。实验室的内核转发（direct / fault fail-open）
+# 需要按接口精确放行；up 时加、cleanup 时删，不碰全局策略。
+forward_allow() {
+  command -v iptables >/dev/null 2>&1 || return 0
+  iptables -C FORWARD -i "$1" -o "$2" -j ACCEPT 2>/dev/null ||
+    iptables -I FORWARD 1 -i "$1" -o "$2" -j ACCEPT 2>/dev/null || true
+  iptables -C FORWARD -i "$2" -o "$1" -j ACCEPT 2>/dev/null ||
+    iptables -I FORWARD 1 -i "$2" -o "$1" -j ACCEPT 2>/dev/null || true
+}
+
+forward_disallow() {
+  command -v iptables >/dev/null 2>&1 || return 0
+  iptables -D FORWARD -i "$1" -o "$2" -j ACCEPT 2>/dev/null || true
+  iptables -D FORWARD -i "$2" -o "$1" -j ACCEPT 2>/dev/null || true
+}
+
 # K3：只读状态面 / 过渡一跳
 STATUS_SOCK=/tmp/mini-dae-status.sock
 SOCKS5_PORT=1081
@@ -259,6 +275,8 @@ cleanup() {
   fi
   rm -f "$OPS_LOG" "$OPS_LOG.1"
   rm -f "$STATUS_SOCK"
+  forward_disallow landae wan
+  forward_disallow single single
   ip netns del "$CLIENT_NS" 2>/dev/null || true
   ip netns del "$WAN_NS" 2>/dev/null || true
   ip netns del "$DAE_NS" 2>/dev/null || true
@@ -292,6 +310,10 @@ up() {
   ip -n "$CLIENT_NS" addr add 10.0.0.2/24 dev lanclient
   ip -n "$CLIENT_NS" link set lanclient up
   ip -n "$CLIENT_NS" route add default via 10.0.0.1
+  # P16：LAN IPv6
+  ip -6 addr add 2001:db8:1::1/64 dev landae nodad
+  ip -n "$CLIENT_NS" -6 addr add 2001:db8:1::2/64 dev lanclient nodad
+  ip -n "$CLIENT_NS" -6 route add default via 2001:db8:1::1
 
   # WAN: wan <-> wanpeer
   ip link add wan type veth peer name wanpeer
@@ -315,6 +337,13 @@ up() {
   ip -n "$WAN_NS" addr add "$PROXY_DST/32" dev wanpeer
   ip -n "$WAN_NS" link set wanpeer up
   ip -n "$WAN_NS" route add 10.0.0.0/24 via 10.9.9.1
+  # P16：WAN IPv6（2001:db8:aa::1 为“假公网”目标，wan_echo 双栈监听）
+  ip -6 addr add 2001:db8:9::1/64 dev wan nodad
+  ip -n "$WAN_NS" -6 addr add 2001:db8:9::2/64 dev wanpeer nodad
+  ip -n "$WAN_NS" -6 addr add 2001:db8:aa::1/128 dev wanpeer nodad
+  ip -n "$WAN_NS" -6 route add 2001:db8:1::/64 via 2001:db8:9::1
+  # 对照 v4 的 1.1.1.1 兜底路由：未拦住时从 WAN 出去（fail-open 可观测）
+  ip -6 route add 2001:db8:aa::1/128 via 2001:db8:9::2 dev wan
 
   # 控制面对：dae0 <-> dae0peer（dae0peer 在 daens）
   ip link add dae0 type veth peer name dae0peer
@@ -334,6 +363,20 @@ up() {
   [ -n "$dae0_mac" ] || die "拿不到 dae0 的 MAC"
   ip -n "$DAE_NS" neigh add 169.254.0.1 lladdr "$dae0_mac" \
     dev dae0peer nud permanent
+  # P16：IPv6 控制面对照 dae netns_utils.go:setupIPv6Datapath（fe80 网关联到 dae0）。
+  # 关键：必须像 v4 一样写静态邻居。若靠 NDP 动态解析，NA 回包会被
+  # dae0peer_ingress 的「cb[0] != TPROXY_MARK → SHOT」丢弃（上游 C 同样如此），
+  # 邻居永远 INCOMPLETE，tproxy v6 回包（SYN-ACK）发不出去。
+  if sysctl -qw net.ipv6.conf.all.disable_ipv6=0 2>/dev/null; then
+    sysctl -qw net.ipv6.conf.dae0.forwarding=1
+    ip -6 addr add fe80::ecee:eeff:feee:eeee/128 dev dae0 scope link nodad 2>/dev/null || true
+    ip -n "$DAE_NS" -6 route add default via fe80::ecee:eeff:feee:eeee dev dae0peer 2>/dev/null || true
+    ip -n "$DAE_NS" -6 neigh add fe80::ecee:eeff:feee:eeee lladdr "$dae0_mac" \
+      dev dae0peer nud permanent
+    ip -n "$DAE_NS" -6 rule add fwmark 0x8000000/0x8000000 table 2023 2>/dev/null || true
+    ip -n "$DAE_NS" -6 route add local default dev lo table 2023 2>/dev/null || true
+    sysctl -qw net.ipv6.conf.all.forwarding=1
+  fi
   # 对照 dae control/netns_utils.go:863-867：accept_local 防止内核按
   # “martian source” 丢掉源地址是本机地址的包
   ip netns exec "$DAE_NS" sysctl -qw net.ipv4.conf.dae0peer.accept_local=1
@@ -347,6 +390,8 @@ up() {
   sysctl -qw net.ipv4.conf.default.rp_filter=0
   # 对照 dae netns_utils.go:841（dae0.accept_local=1）
   sysctl -qw net.ipv4.conf.dae0.accept_local=1
+  # 宿主若装了 Docker（FORWARD 策略 drop），按接口放行实验网段的转发
+  forward_allow landae wan
   ip netns exec "$WAN_NS" sysctl -qw net.ipv4.conf.all.rp_filter=0 2>/dev/null || true
   ip netns exec "$DAE_NS" sysctl -qw net.ipv4.ip_nonlocal_bind=1 2>/dev/null || true
 
@@ -604,6 +649,8 @@ dual_up() {
   sysctl -qw net.ipv4.conf.default.rp_filter=0
   sysctl -qw net.ipv4.conf.dae0.accept_local=1
   sysctl -qw net.ipv4.conf.single.rp_filter=0
+  # 宿主若装了 Docker（FORWARD 策略 drop），按接口放行实验网段的转发
+  forward_allow single single
   ip netns exec "$WAN_NS" sysctl -qw net.ipv4.conf.all.rp_filter=0 2>/dev/null || true
   ip netns exec "$DAE_NS" sysctl -qw net.ipv4.ip_nonlocal_bind=1 2>/dev/null || true
 
@@ -713,11 +760,12 @@ reload() {
 test_reload() {
   require_root
   echo "== 测试热重载（conn_state 缓存 + epoch 槽切换）=="
-  local orig back
-  orig="$(mktemp)"; back="$(mktemp)"
+  local orig
+  orig="$(mktemp)"
   cp "$HERE/rules.dae" "$orig"
-  # 先确保是初始规则（8080 -> proxy）
-  cp "$HERE/rules.dae" "$back" 2>/dev/null || true
+  # 任何退出路径（包括中途失败）都恢复规则文件，避免把 reload 变体留在
+  # rules.dae 上（后续 up 会加载错规则，症状是代理路径全挂）。
+  trap "cp '$orig' '$HERE/rules.dae' 2>/dev/null || true" EXIT
 
   # 后台跑长连接探针：连接后先发一条，4 秒后再发一条
   (ip netns exec "$CLIENT_NS" timeout 12 python3 "$HERE/hold_conn.py" "$PROXY_DST" 8080 4 \
@@ -741,7 +789,7 @@ test_reload() {
   cp "$orig" "$HERE/rules.dae"
   kill -HUP "$(cat "$PID_FILE")"
   sleep 0.5
-  rm -f "$orig" "$back"
+  rm -f "$orig"
 
   local ok=1
   if [ "$replies" -lt 2 ]; then
@@ -795,8 +843,13 @@ test_rebind() {
     --ifindex "$ifindex" --smac 02:00:00:00:00:99 --dmac "$router_mac"
 
   touch "$sig1"
-  sleep 2
+  # 时序：2s 新鲜窗口内先看绑定（竞争条目必须保持，单写者拒绝生效）；
+  # 若像早期版本那样 sleep 2 后再 dump，首次 TCP 重传已到窗口之外、
+  # 会被合法改绑，检查必然误报（P16 复跑时踩到）。
+  sleep 0.5
   entry_after="$(python3 "$HERE/rebind_tool.py" dump)"
+  # 统计要在窗口完全过去后读：窗口内被拒的重传都已计入，之后不再增加。
+  sleep 1.8
   rejected_after="$(python3 "$HERE/rebind_tool.py" stats | sed -n 's/^stat 0.*= \([0-9]*\)$/\1/p')"
   if ! echo "$entry_after" | grep -q "smac=02:00:00:00:00:99"; then
     echo "FAIL: 新鲜条目的绑定被竞争发布者改掉了（单写者未生效）"
@@ -934,9 +987,15 @@ PY
 test_config() {
   require_root
   echo "== 测试完整 .dae 配置模式（全量解析 + 子集编译）=="
-  local out
-  out="$(ip netns exec "$CLIENT_NS" timeout 5 python3 "$HERE/client_probe.py" \
-    "$PROXY_DST" 8080 2>&1 || true)"
+  # up 只保证进程活着；首版规则下发/上游 DNS 解析可能晚于它的 sleep，
+  # 此时探测会得到“直连回落”（实测竞态，真网关同时在跑时更明显）。轮询等待生效。
+  local out i
+  for i in $(seq 1 6); do
+    out="$(ip netns exec "$CLIENT_NS" timeout 5 python3 "$HERE/client_probe.py" \
+      "$PROXY_DST" 8080 2>&1 || true)"
+    echo "$out" | grep -q "orig_dst=$PROXY_DST:8080" && break
+    sleep 0.5
+  done
   echo "$out" | grep -q "orig_dst=$PROXY_DST:8080" || {
     echo "FAIL: 配置驱动的 proxy 规则未生效"; echo "$out"; exit 1; }
   grep -q "deferred rule" "$LOG" || {
@@ -1097,9 +1156,9 @@ test_dns_reload() {
   after="$("$LOADER" status --socket "$STATUS_SOCK" --json | python3 -c 'import json,sys;print(json.load(sys.stdin)["active_slot"])')"
   [ "$before" != "$after" ] || { echo "FAIL: SIGHUP 后 epoch 未切换（$before -> $after）"; exit 1; }
   # 注意：BPF map 名在内核里截断到 15 字符（domain_routing_map -> domain_routing_），
-  # 所以按 id dump（name 查找会 can't parse name）。
+  # 且 lab 与真网关可能同名并存，所以按 loader pid 的 fdinfo 锁 id 后 dump。
   local map_id
-  map_id="$(bpftool map list 2>/dev/null | sed -n 's/^\([0-9][0-9]*\):.*domain_routing.*/\1/p' | head -1)"
+  map_id="$(python3 "$HERE/map_id.py" domain_routing_map)"
   [ -n "$map_id" ] || { echo "FAIL: 找不到 domain_routing map"; exit 1; }
   bpftool -j map dump id "$map_id" >/tmp/mini-dae-domain.json
   python3 - "$after" /tmp/mini-dae-domain.json <<'PY'
@@ -1287,6 +1346,25 @@ test_udp_idle() {
   sleep 8  # 超过 --udp-idle-timeout=2s，janitor（5s 周期）回收
   "$LOADER" status --socket "$STATUS_SOCK" --json | python3 -c 'import json,sys;v=json.load(sys.stdin);u=v["udp_nat"];assert u["sessions_active"]==0,u;assert u["evicted"]>=1,u;print("udp nat janitor: evicted=%d active=%d" % (u["evicted"],u["sessions_active"]))'
   echo "PASS: UDP NAT janitor 回收空闲会话"
+}
+
+# P16：IPv6 全链（tproxy v6 → relay → ss v6 目标；v6 direct 内核转发对照）。
+test_v6() {
+  require_root
+  echo "== P16：IPv6 代理路径（client → landae v6 → tproxy v6 → ss → v6 echo）=="
+  local out
+  out="$(ip netns exec "$CLIENT_NS" timeout 8 python3 "$HERE/client_probe.py" 2001:db8:aa::1 9999 2>&1 || true)"
+  echo "$out"
+  echo "$out" | grep -q "wan-echo-ok" || { echo "FAIL: IPv6 代理路径不通"; exit 1; }
+  echo "PASS: IPv6 报文经 tproxy v6 → relay → ss(ATYP=4) → v6 echo"
+  grep -q "sockmap key 2, IPv6" "$LOG" || { echo "FAIL: 未见 IPv6 tproxy listener 注册"; tail -5 "$LOG"; exit 1; }
+  echo "PASS: IPv6 tproxy listener 已注册（sockmap key 2）"
+
+  echo "== P16：IPv6 direct（内核三层转发到 wan echo）=="
+  out="$(ip netns exec "$CLIENT_NS" timeout 8 python3 "$HERE/client_probe.py" 2001:db8:9::2 9999 2>&1 || true)"
+  echo "$out"
+  echo "$out" | grep -q "wan-echo-ok" || { echo "FAIL: IPv6 direct 路径不通"; exit 1; }
+  echo "PASS: IPv6 direct 由内核转发（未经 tproxy）"
 }
 
 # P15：订阅 + 节点组会话——两个 ss 后端（A 可被 kill 验证 failover）
@@ -2071,9 +2149,16 @@ case "${1:-}" in
   build) build ;;
   up) up ;;
   dual-up) dual_up ;;
-  config-up) USE_CONFIG="$HERE/real-user.dae" up ;;
+  config-up)
+    # loader 校验配置文件权限（≤0640，防敏感配置泄露）；新 clone 默认 0644，这里统一收紧。
+    chmod 640 "$HERE/real-user.dae" 2>/dev/null || true
+    USE_CONFIG="$HERE/real-user.dae" up ;;
   subscribe-up) subscribe_up ;;
   test-subscribe) test_subscribe ;;
+  v6-up) USE_RULES="$HERE/rules.v6.dae" USE_SS=1 USE_SS_METHOD=chacha20-ietf-poly1305 \
+    USE_SS_PASSWORD=testpass USE_DIALER="ss://chacha20-ietf-poly1305:testpass@127.0.0.1:$SS_PORT" \
+    USE_RELAY_IDLE=600 up ;;
+  test-v6) test_v6 ;;
   forward-up) USE_FORWARD="socks5://127.0.0.1:$SOCKS5_PORT" up ;;
   dns-up) USE_RULES="$HERE/rules.dns.dae" USE_DNS_UPSTREAM="127.0.0.1:$FAKE_DNS_PORT" USE_FAKE_DNS=1 up ;;
   regex-up) USE_RULES="$HERE/rules.regex.dae" USE_DNS_UPSTREAM="127.0.0.1:$FAKE_DNS_PORT" USE_FAKE_DNS=1 up ;;

@@ -12,7 +12,7 @@
 
 use std::fmt;
 use std::io::{self, ErrorKind};
-use std::net::{Ipv4Addr, SocketAddr, ToSocketAddrs};
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 
 fn push_domain(out: &mut Vec<u8>, name: &str) -> io::Result<()> {
     if name.is_empty() || name.len() > 255 {
@@ -28,7 +28,7 @@ fn push_domain(out: &mut Vec<u8>, name: &str) -> io::Result<()> {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Target {
-    Ip(Ipv4Addr, u16),
+    Ip(IpAddr, u16),
     Domain(String, u16),
 }
 
@@ -37,15 +37,9 @@ impl Target {
         Self::Domain(name.into(), port)
     }
 
-    /// 从 `SocketAddr` 构造；IPv6 显式拒绝（数据面只支持 IPv4）。
+    /// 从 `SocketAddr` 构造（v4/v6 均可）。
     pub fn from_socket_addr(a: SocketAddr) -> io::Result<Self> {
-        match a {
-            SocketAddr::V4(v4) => Ok(Self::Ip(*v4.ip(), v4.port())),
-            SocketAddr::V6(_) => Err(io::Error::new(
-                ErrorKind::Unsupported,
-                "目标只支持 IPv4（数据面 IPv4 only）",
-            )),
-        }
+        Ok(Self::Ip(a.ip(), a.port()))
     }
 
     pub fn port(&self) -> u16 {
@@ -61,7 +55,7 @@ impl Target {
     /// 本地解析（域名 → 优先 IPv4 地址）；仅 direct 拨号与回退路径使用。
     pub fn resolve_local(&self) -> io::Result<SocketAddr> {
         match self {
-            Self::Ip(ip, port) => Ok(SocketAddr::new((*ip).into(), *port)),
+            Self::Ip(ip, port) => Ok(SocketAddr::new(*ip, *port)),
             Self::Domain(name, port) => {
                 let addrs: Vec<SocketAddr> = (name.as_str(), *port).to_socket_addrs()?.collect();
                 addrs
@@ -77,10 +71,15 @@ impl Target {
     }
 
     /// RFC1928 风格 ATYP+ADDR（不含端口；ss/trojan/anytls 用）。
+    /// IPv4=0x01、IPv6=0x04、域名=0x03。
     pub fn encode_socks_addr(&self, out: &mut Vec<u8>) -> io::Result<()> {
         match self {
-            Self::Ip(ip, _) => {
+            Self::Ip(IpAddr::V4(ip), _) => {
                 out.push(0x01);
+                out.extend_from_slice(&ip.octets());
+            }
+            Self::Ip(IpAddr::V6(ip), _) => {
+                out.push(0x04);
                 out.extend_from_slice(&ip.octets());
             }
             Self::Domain(name, _) => {
@@ -97,11 +96,15 @@ impl Target {
         Ok(())
     }
 
-    /// vless/vmess 地址编码：0x01=IPv4、0x02=域名（不含端口）。
+    /// vless/vmess 地址编码：0x01=IPv4、0x02=域名、0x03=IPv6（不含端口）。
     pub fn encode_v2ray_addr(&self, out: &mut Vec<u8>) -> io::Result<()> {
         match self {
-            Self::Ip(ip, _) => {
+            Self::Ip(IpAddr::V4(ip), _) => {
                 out.push(0x01);
+                out.extend_from_slice(&ip.octets());
+            }
+            Self::Ip(IpAddr::V6(ip), _) => {
+                out.push(0x03);
                 out.extend_from_slice(&ip.octets());
             }
             Self::Domain(name, _) => {
@@ -112,11 +115,15 @@ impl Target {
         Ok(())
     }
 
-    /// tuic v5 地址编码：0x00=域名、0x01=IPv4（含端口）。
+    /// tuic v5 地址编码：0x00=域名、0x01=IPv4、0x02=IPv6（含端口）。
     pub fn encode_tuic_addr(&self, out: &mut Vec<u8>) -> io::Result<()> {
         match self {
-            Self::Ip(ip, _) => {
+            Self::Ip(IpAddr::V4(ip), _) => {
                 out.push(0x01);
+                out.extend_from_slice(&ip.octets());
+            }
+            Self::Ip(IpAddr::V6(ip), _) => {
+                out.push(0x02);
                 out.extend_from_slice(&ip.octets());
             }
             Self::Domain(name, _) => {
@@ -132,7 +139,8 @@ impl Target {
 impl fmt::Display for Target {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Ip(ip, port) => write!(f, "{ip}:{port}"),
+            Self::Ip(IpAddr::V4(ip), port) => write!(f, "{ip}:{port}"),
+            Self::Ip(IpAddr::V6(ip), port) => write!(f, "[{ip}]:{port}"),
             Self::Domain(name, port) => write!(f, "{name}:{port}"),
         }
     }
@@ -199,6 +207,26 @@ mod tests {
         assert!(Target::Domain(String::new(), 1)
             .encode_socks_addr(&mut v)
             .is_err());
+    }
+
+    #[test]
+    fn encode_v6_forms() {
+        let t: Target = "[2001:db8::1]:443".parse().unwrap();
+        assert_eq!(t.to_string(), "[2001:db8::1]:443");
+        let mut v = Vec::new();
+        t.encode_socks_addr_port(&mut v).unwrap();
+        assert_eq!(v[0], 0x04); // RFC1928 IPv6
+        assert_eq!(
+            &v[1..17],
+            &std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1).octets()
+        );
+        assert_eq!(&v[17..19], &443u16.to_be_bytes());
+        let mut v = Vec::new();
+        t.encode_v2ray_addr(&mut v).unwrap();
+        assert_eq!(v[0], 0x03); // vless/vmess IPv6
+        let mut v = Vec::new();
+        t.encode_tuic_addr(&mut v).unwrap();
+        assert_eq!(v[0], 0x02); // tuic IPv6
     }
 
     #[test]

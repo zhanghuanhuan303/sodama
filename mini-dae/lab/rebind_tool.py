@@ -12,19 +12,32 @@ key/value 原始字节数组是权威来源，formatted 只是 BTF 解码视图�
   stats  汇总 mini_stats_map（PERCPU_ARRAY）各 key 的总计数
   set    伪造一条 redirect_track 条目（模拟竞争发布者 / 陈旧条目），时间戳
          用 /proc/uptime 近似 CLOCK_MONOTONIC（2s 窗口，误差 ms 级）
+
+多实例（lab + 真网关同时运行）时 map 名字会重复：默认从 /tmp/mini-dae.pid
+的 loader 进程 fdinfo 反查 map_id 精确锁定本条实例；如需指定其它实例，
+用环境变量 MINI_DAE_PID_FILE（如 /tmp/mini-dae-gw.pid）。
 """
 import argparse
+import glob
+import ipaddress
 import json
+import os
 import socket
 import struct
 import subprocess
 import sys
 
-# struct mini_tuple: sip4 + dip4 + sport2 + dport2 + l4proto1 + pad3
-KEY_LEN = 16
+from map_id import resolve_map_ids
+
+# struct mini_tuple: sip16 + dip16 + sport2 + dport2 + l4proto1 + is_v6 1 + pad2
+# （P16 起地址统一 16 字节：IPv4 = v4-mapped ::ffff:a.b.c.d）
+KEY_LEN = 40
 # struct mini_redirect_entry: ifindex4 + smac6 + dmac6 + from_wan1 + pad3
 #                             + 对齐 4B + last_seen8
 VAL_LEN = 32
+
+_MAP_IDS = {}
+_RESOLVED = False
 
 
 def bpftool(*args):
@@ -38,6 +51,48 @@ def bpftool(*args):
         return json.loads(r.stdout)
     except json.JSONDecodeError:
         return []  # map update 等命令没有结构化输出
+
+
+def _resolve_map_ids():
+    """一次读完本实例的 name→map_id（实现见 map_id.py：fdinfo ∩ map list）。
+
+    必须很快（rebind 测试只有 2s 陈旧窗口）：早期版本逐 fd 调用 map show，
+    16 个子进程直接吃满窗口，导致误报「改绑被改掉」。
+    """
+    global _RESOLVED
+    if _RESOLVED:
+        return
+    _RESOLVED = True
+    pid_file = os.environ.get("MINI_DAE_PID_FILE", "/tmp/mini-dae.pid")
+    _MAP_IDS.update(resolve_map_ids(pid_file))
+
+
+def map_id(name):
+    """精确定位本条实例的 map id；解析失败返回 None（回退按名字）。"""
+    _resolve_map_ids()
+    return _MAP_IDS.get(name[:15])  # map_id.py 的键是内核截断后的 15 字符名
+
+
+def map_dump(name):
+    mid = map_id(name)
+    if mid is not None:
+        return bpftool("map", "dump", "id", str(mid))
+    return bpftool("map", "dump", "name", name)
+
+
+def map_update(name, key, value):
+    mid = map_id(name)
+    tail = (
+        "key",
+        "hex",
+        *(f"{b:02x}" for b in key),
+        "value",
+        "hex",
+        *(f"{b:02x}" for b in value),
+    )
+    if mid is not None:
+        return bpftool("map", "update", "id", str(mid), *tail)
+    return bpftool("map", "update", "name", name, *tail)
 
 
 def raw_bytes(x):
@@ -61,8 +116,20 @@ def raw_bytes(x):
     return None
 
 
-def ip4(b):
-    return socket.inet_ntoa(b)
+def fmt_addr(b):
+    """16 字节地址 → 文本：v4-mapped 显示点分，其余显示 IPv6。"""
+    a = ipaddress.IPv6Address(bytes(b))
+    if a.ipv4_mapped is not None:
+        return str(a.ipv4_mapped)
+    return str(a)
+
+
+def addr_bytes(s):
+    """点分 IPv4 或 IPv6 文本 → 16 字节（v4 走 v4-mapped）。"""
+    a = ipaddress.ip_address(s)
+    if a.version == 4:
+        return b"\x00" * 10 + b"\xff\xff" + a.packed
+    return a.packed
 
 
 def mac(b):
@@ -70,18 +137,18 @@ def mac(b):
 
 
 def fmt_entry(key, value):
-    sip, dip = ip4(key[0:4]), ip4(key[4:8])
-    sport, dport = struct.unpack("!HH", key[8:12])
+    sip, dip = fmt_addr(key[0:16]), fmt_addr(key[16:32])
+    sport, dport = struct.unpack("!HH", key[32:36])
     ifindex = struct.unpack("<I", value[0:4])[0]
     return (
-        f"{sip}:{sport} -> {dip}:{dport} proto={key[12]} "
+        f"{sip}:{sport} -> {dip}:{dport} proto={key[36]} "
         f"ifindex={ifindex} smac={mac(value[4:10])} dmac={mac(value[10:16])} "
         f"from_wan={value[16]} last_seen_ns={struct.unpack('<Q', value[24:32])[0]}"
     )
 
 
 def cmd_dump(_):
-    entries = bpftool("map", "dump", "name", "redirect_track")
+    entries = map_dump("redirect_track")
     shown = 0
     for e in entries:
         key, value = raw_bytes(e.get("key")), raw_bytes(e.get("value"))
@@ -109,13 +176,32 @@ def _sum_numbers(x):
     return 0
 
 
+def _counter_sum(vals):
+    """PERCPU 值求和：兼容 [{"cpu":N,"value":M}]（BTF 解码）与原始字节列表。"""
+    if not isinstance(vals, list):
+        return _sum_numbers(vals)
+    total = 0
+    for v in vals:
+        if isinstance(v, dict):
+            total += _counter_sum(v.get("value"))
+        elif isinstance(v, int):
+            total += v
+        elif isinstance(v, str):
+            b = raw_bytes([v])
+            if b is not None:
+                total += struct.unpack("<Q", b[:8].ljust(8, b"\x00"))[0]
+        elif isinstance(v, list):
+            total += _counter_sum(v)
+    return total
+
+
 def cmd_stats(_):
     names = {0: "rebind_rejected", 1: "redirect_update_failed"}
-    for e in bpftool("map", "dump", "name", "mini_stats_map"):
+    for e in map_dump("mini_stats_map"):
         key_raw = raw_bytes(e.get("key")) or b"\x00\x00\x00\x00"
         key = struct.unpack("<I", key_raw[:4].ljust(4, b"\x00"))[0]
         vals = e.get("formatted", {}).get("values", e.get("values", 0))
-        print(f"stat {key} ({names.get(key, '?')}) = {_sum_numbers(vals)}")
+        print(f"stat {key} ({names.get(key, '?')}) = {_counter_sum(vals)}")
     return 0
 
 
@@ -125,11 +211,13 @@ def cmd_set(a):
 
     last_seen = uptime_ns - int(a.age_sec * 1e9)
     key = (
-        bytes(int(x) for x in a.sip.split("."))
-        + bytes(int(x) for x in a.dip.split("."))
+        addr_bytes(a.sip)
+        + addr_bytes(a.dip)
         + struct.pack("!H", a.sport)
         + struct.pack("!H", a.dport)
-        + bytes([a.proto, 0, 0, 0])
+        + bytes([a.proto])
+        + bytes([1 if ":" in a.sip or ":" in a.dip else 0])
+        + b"\x00\x00"
     )
     smac = bytes(int(x, 16) for x in a.smac.split(":"))
     dmac = bytes(int(x, 16) for x in a.dmac.split(":"))
@@ -141,18 +229,7 @@ def cmd_set(a):
         + struct.pack("<Q", last_seen)
     )
     assert len(key) == KEY_LEN and len(value) == VAL_LEN, (len(key), len(value))
-    bpftool(
-        "map",
-        "update",
-        "name",
-        "redirect_track",
-        "key",
-        "hex",
-        *(f"{b:02x}" for b in key),
-        "value",
-        "hex",
-        *(f"{b:02x}" for b in value),
-    )
+    map_update("redirect_track", key, value)
     print(
         f"set ok: sport={a.sport} ifindex={a.ifindex} smac={a.smac} "
         f"age_sec={a.age_sec} (uptime_ns={uptime_ns}, wall_ns≈{time.time_ns()})"

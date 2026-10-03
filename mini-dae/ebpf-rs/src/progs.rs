@@ -11,7 +11,7 @@ use aya_ebpf_bindings::{
 use crate::common::*;
 use crate::flow::*;
 use crate::maps::*;
-use crate::parse::parse_v4;
+use crate::parse::parse_ip;
 
 /// 控制面自己的 socket：直接放行（防自环）。
 #[inline(always)]
@@ -27,7 +27,7 @@ pub fn mini_lan_ingress(mut ctx: TcContext) -> i32 {
     if suspended() {
         return tc_ok();
     }
-    let Some(p) = parse_v4(&ctx) else {
+    let Some(p) = parse_ip(&ctx) else {
         return tc_ok();
     };
     unsafe { split_flow(&mut ctx, &p, 0) }
@@ -41,7 +41,7 @@ pub fn mini_wan_egress(mut ctx: TcContext) -> i32 {
     if suspended() {
         return tc_ok();
     }
-    let Some(p) = parse_v4(&ctx) else {
+    let Some(p) = parse_ip(&ctx) else {
         return tc_ok();
     };
     unsafe { split_flow(&mut ctx, &p, 1) }
@@ -49,7 +49,7 @@ pub fn mini_wan_egress(mut ctx: TcContext) -> i32 {
 
 #[classifier]
 pub fn mini_wan_ingress(ctx: TcContext) -> i32 {
-    let Some(p) = parse_v4(&ctx) else {
+    let Some(p) = parse_ip(&ctx) else {
         return tc_ok();
     };
     unsafe { refresh_reverse_state(&p) };
@@ -61,7 +61,7 @@ pub fn mini_wan_lan_ingress(mut ctx: TcContext) -> i32 {
     if suspended() {
         return tc_ok();
     }
-    let Some(p) = parse_v4(&ctx) else {
+    let Some(p) = parse_ip(&ctx) else {
         return tc_ok();
     };
     unsafe { refresh_reverse_state(&p) };
@@ -73,7 +73,7 @@ pub fn mini_lan_wan_egress(mut ctx: TcContext) -> i32 {
     if suspended() {
         return tc_ok();
     }
-    let Some(p) = parse_v4(&ctx) else {
+    let Some(p) = parse_ip(&ctx) else {
         return tc_ok();
     };
     unsafe { refresh_reverse_state(&p) };
@@ -82,16 +82,17 @@ pub fn mini_lan_wan_egress(mut ctx: TcContext) -> i32 {
 
 #[classifier]
 pub fn mini_dae0peer_ingress(ctx: TcContext) -> i32 {
-    let (cb0, cb1, cb2) = {
+    let (cb0, cb1, cb2, cb3) = {
         let cb = ctx.cb();
-        (cb[0], cb[1], cb[2])
+        (cb[0], cb[1], cb[2], cb[3])
     };
     unsafe {
         bpf_printk!(
-            c"mini-dae: dae0peer_ingress cb0=%u cb1=%u cb2=%u\n",
+            c"mini-dae: dae0peer_ingress cb0=%u cb1=%u cb2=%u cb3=%u\n",
             cb0,
             cb1,
-            cb2
+            cb2,
+            cb3
         );
     }
 
@@ -107,7 +108,8 @@ pub fn mini_dae0peer_ingress(ctx: TcContext) -> i32 {
         return tc_ok();
     }
 
-    let key: u32 = if cb1 == IPPROTO_UDP as u32 { 1 } else { 0 };
+    // sockmap key：0/1 = TCP/UDP IPv4，2/3 = TCP/UDP IPv6（cb3=1 表示 v6）
+    let key: u32 = (if cb1 == IPPROTO_UDP as u32 { 1 } else { 0 }) + (if cb3 != 0 { 2 } else { 0 });
     let sk = unsafe {
         map_lookup_raw(
             &listen_socket_map as *const _ as *const c_void,
@@ -130,7 +132,7 @@ pub fn mini_dae0peer_ingress(ctx: TcContext) -> i32 {
 
 #[classifier]
 pub fn mini_dae0_ingress(ctx: TcContext) -> i32 {
-    let Some(p) = parse_v4(&ctx) else {
+    let Some(p) = parse_ip(&ctx) else {
         return tc_ok();
     };
 
@@ -140,7 +142,8 @@ pub fn mini_dae0_ingress(ctx: TcContext) -> i32 {
         sport: p.tuples.dport,
         dport: p.tuples.sport,
         l4proto: p.tuples.l4proto,
-        pad: [0; 3],
+        is_v6: p.tuples.is_v6,
+        pad: [0; 2],
     };
     let Some(entry) = redirect_track.get_ptr_mut(&rev) else {
         return tc_ok();

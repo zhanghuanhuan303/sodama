@@ -1,0 +1,7 @@
+# P16：IPv6 用例规则（lab）
+#
+# 2001:db8:aa::1:9999（假公网 v6）→ proxy：走 tproxy v6 → relay → ss(ATYP=4)。
+# 其余目的（含 2001:db8:9::2:9999）→ direct：内核 v6 三层转发对照。
+# 注：mini 规则里 v6 前缀含 ':'，需加引号；.dae 配置由提取器自动加。
+dip('2001:db8:aa::1/128') && dport(9999) -> proxy
+fallback -> direct

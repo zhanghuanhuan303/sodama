@@ -205,7 +205,7 @@
     <span class="chip">代码量 <b>~65k 非测试 LOC / ~40k 测试</b></span>
     <span class="chip">数据面 <b>tproxy.c 4403 行 · 23 个程序 · 24 个 map</b></span>
     <span class="chip">许可 <b>AGPL-3.0</b></span>
-    <span class="chip">文档版本 <b>v2.16 · 2026-10-04</b></span>
+    <span class="chip">文档版本 <b>v2.17 · 2026-10-04</b></span>
   </div>
 </header>
 
@@ -615,7 +615,7 @@ wait signal → reload / suspend / shutdown</pre>
       <li>fwmark <code>0x8000000</code> → table 2023 → <code>local default dev lo</code>；以及控制面 socket 的 <code>SO_MARK</code> 隔离</li>
       <li>sysctl 组合：<code>ip_forward</code>、<code>rp_filter=0</code>、<code>tcp_early_demux=1</code>、<code>disable_ipv6</code>/<code>forwarding</code>（dae0）等 13 个键</li>
       <li>netkit vs veth 的选择条件、<code>bpf_redirect_peer</code> 的 CVE-2025-37959 版本门槛</li>
-      <li>IPv4-mapped-IPv6 的五元组归一化（redirect_track 的 key 语义）</li>
+      <li>IPv4-mapped-IPv6 的五元组归一化（redirect_track 的 key 语义）<span class="stamp">已实测（P16，ADR-0032）</span></li>
     </ul>
   </div>
 </section>
@@ -1008,7 +1008,7 @@ wait signal → reload / suspend / shutdown</pre>
       <tr><td>R3</td><td><b>eBPF 内核矩阵回归</b>（verifier 版本差异、netkit/redirect_peer 门槛）</td><td><span class="b b-warn">中高</span></td><td><span class="b b-warn">中</span></td><td>CI 跑多内核（≥5.17/6.1/6.6/6.14+）的加载与 e2e；保留 C 数据面作为可回退路径；ABI 单源减少漂移</td></tr>
       <tr><td>R4</td><td><b>热重载语义不一致</b>（epoch 切换、失败回滚、map 复用 vs 重建）</td><td><span class="b b-warn">中</span></td><td><span class="b b-warn">中</span></td><td>直接翻译 Go 的 reload 测试用例；故障注入（重载中打流、重载后立即校验）</td></tr>
       <tr><td>R5</td><td><b>运维面缺口</b>（suspend/sysdump/trace/daed API/systemd 通知/信号语义）</td><td><span class="b b-warn">中</span></td><td><span class="b b-ok">低</span></td><td>按清单逐项对齐；<code>validate/export</code> 先做，天然成为对拍工具</td></tr>
-      <tr><td>R6</td><td><b>IPv6 / NDP / ICMP / 双栈边界情形</b></td><td><span class="b b-warn">中</span></td><td><span class="b b-warn">中</span></td><td>把 <code>wan_lan_ingress</code>、ICMPv6、分片相关 Go 测试作为必过清单</td></tr>
+      <tr><td>R6</td><td><b>IPv6 / NDP / ICMP / 双栈边界情形</b></td><td><span class="b b-warn">中</span></td><td><span class="b b-warn">中</span></td><td>把 <code>wan_lan_ingress</code>、ICMPv6、分片相关 Go 测试作为必过清单。<span class="stamp">P16 已缓解 TCP 全链（v6 tproxy/sockmap key 2/协议 ATYP/direct；NDP 静态邻居踩坑已固化）；UDP v6 与 ICMPv6 会话仍未做</span></td></tr>
       <tr><td>R7</td><td><b>许可传染</b>：读 AGPL 代码写出的 Rust 版是衍生作品</td><td><span class="b b-bad">高</span>（若计划闭源分发）</td><td><span class="b b-ok">确定</span></td><td>按 AGPL-3.0 发布（与 dae 一致）；若不能接受，需要 clean-room 设计而非「翻译」</td></tr>
       <tr><td>R8</td><td><b>工期与人力低估</b>：本仓库 65k 行 + 外部栈 + 40k 行测试规格</td><td><span class="b b-bad">高</span></td><td><span class="b b-warn">中高</span></td><td>按节 07 里程碑推进，每阶段可停可交付；不做「大爆炸」</td></tr>
       <tr><td>R9</td><td><b>性能假设未经验证</b>（io_uring/per-core 收益可能被内核 offload 掩盖）</td><td><span class="b b-info">低中</span></td><td><span class="b b-warn">中</span></td><td>先建基准再优化；以「offload 命中率」为核心指标，用户态路径只做兜底优化</td></tr>
@@ -1191,7 +1191,7 @@ wait signal → reload / suspend / shutdown</pre>
       <tr><td><b>7 · 转发面</b></td><td>relay（并发上限/backlog fuse/计费）、UDP endpoint pool（full-cone）、offload 完整</td><td>relay（SO_MARK/半关闭/janitor）、UDP NAT、offload 最小实现</td><td><span class="b b-warn">≈75%</span></td><td>512KB 逐字节、UDP 会话复用、offload 用户态零字节均实测（ADR-0015/0022）；缺 fuse/计费/并发上限</td></tr>
       <tr><td><b>8 · 多节点·订阅·健康检查</b></td><td>subscription + node + group（min/max/random/fixed）+ alive set + 间隔/容忍度 + sticky IP</td><td><code>--subscribe</code>/config 订阅（HTTP(S)/file、base64/明文、逐行容错）+ group filter/policy + 经节点健康探测（tolerance 标死）+ 拨号失败切换；<b>按规则分派不同组未做</b>（数据面单代理槽）</td><td><span class="b b-warn">≈50%</span></td><td>ADR-0031、NOTES §11.22；真机订阅#2：18×anytls 入组 18/18 alive、204/YouTube 200；缺热更新/多组分派/sticky/udp_check</td></tr>
       <tr><td><b>9 · 嗅探与域名策略（dial_mode）</b></td><td>内核侧 TLS/HTTP/QUIC 嗅探 → <code>domain/domain+</code> 拨号（<b>远端解析，绕 DNS 污染</b>）、sniff-punt</td><td>用户态嗅探（TLS SNI / HTTP Host，MSG_PEEK 不消费）+ <code>dial_mode ip/domain/domain+</code>，命中即域名交节点；<b>无</b> QUIC/UDP 嗅探与 sniff-punt</td><td><span class="b b-warn">≈55%</span></td><td>ADR-0030、NOTES §11.21；<code>domain</code> 等价 dae <code>domain+</code> 的“总是使用”行为（无 DNS 缓存门槛）；h2c 不做</td></tr>
-      <tr><td><b>10 · IPv6</b></td><td>数据面 + 规则 + 协议全支持</td><td>仅 IPv4（显式边界）</td><td><span class="b b-bad">≈5%</span></td><td><code>--no-ipv6</code> 只是规避不是支持</td></tr>
+      <tr><td><b>10 · IPv6</b></td><td>数据面 + 规则 + 协议全支持</td><td>TCP 全链：v6 解析 + tproxy（sockmap key 2）+ 全部协议 v6 目标编码（ss 0x04/v2ray 0x03/tuic 0x02/hy2 字符串）+ v6 direct + v6 嗅探远端解析；<b>UDP v6 / ICMPv6 未做</b></td><td><span class="b b-ok">≈80%</span> <span class="b b-warn">（TCP）</span></td><td>ADR-0032、NOTES §11.23；lab <code>test-v6</code> 3 断言（tproxy→ss(ATYP=4)→v6 echo、direct、listener 注册）；真机网关 v6：嗅探 <code>[2001::1] → RELAY 远端解析</code> 204、字面量 <code>[2606:4700:4700::1111]</code> 200；静态 fe80 邻居不可省（NA 会被 dae0peer_ingress 丢弃）</td></tr>
       <tr><td><b>11 · 部署自动化</b></td><td>netns 自动搭建（移网卡/sysctl/tproxy 规则）、systemd（<code>install/dae.service</code>）、Docker、发行包、shell 补全</td><td><code>lab.sh</code> / <code>gateway.sh</code> 脚本级一键；无 systemd/打包</td><td><span class="b b-bad">≈40%</span></td><td>真网关一键脚本体验接近（ADR-0029）；脚本代劳、安全性更高但自动化深度不同</td></tr>
       <tr><td><b>12 · 运维面</b></td><td>主线较弱（daed 独立项目提供 GraphQL/Web UI）</td><td>SIGHUP/USR2、状态 socket（status/rules/config/maps/metrics/reload/suspend/resume）、Prometheus、sysdump/trace、日志轮转</td><td><span class="b b-ok">≈90%</span></td><td>相对 dae 主线领先；daed 的 UI/鉴权不在范围（ADR-0021）</td></tr>
       <tr><td><b>13 · 质量工程</b></td><td>Go 单测 244 文件/3.9 万行 + CI（bpf-test/build/docker/go-test…）+ fuzz</td><td>95 单测 + verify 9×2 拓扑 + 6 专项 + 协议梯 17 + 对拍 5 逐字节 + QEMU 双内核矩阵 + soak + 六路径基准；<b>无 CI</b></td><td><span class="b b-warn">≈70%</span></td><td>方法学密度高、绝对规模小（ADR-0010/0022/0025）</td></tr>
@@ -1208,7 +1208,7 @@ wait signal → reload / suspend / shutdown</pre>
     <tbody>
       <tr><td>研究目标（可行性验证）</td><td><span class="b b-ok">100%</span></td><td>aya 全栈可行、规则逐字节对拍、C 数据面退役、真实节点浏览器可用——结论闭环</td></tr>
       <tr><td>核心主链路（分流/规则/明文 DNS/主流协议/转发/运维）</td><td><span class="b b-ok">≈80–85%</span></td><td>日常「tproxy 网关 + 主流节点」已可用（P13 真网关本机实测 204 / YouTube 200）</td></tr>
-      <tr><td>dae 全功能面（嗅探/多节点/geo/IPv6/安全 DNS/系统集成）</td><td><span class="b b-warn">≈60%（±5%）</span></td><td>差距集中在结构性 4–5 项，非零散细节</td></tr>
+      <tr><td>dae 全功能面（嗅探/多节点/geo/IPv6/安全 DNS/系统集成）</td><td><span class="b b-warn">≈62%（±5%）</span></td><td>差距集中在结构性 3–4 项，非零散细节；IPv6（TCP 全链）已从 ≈5% 补齐至 ≈80%</td></tr>
     </tbody>
   </table>
   </div>
@@ -1217,7 +1217,7 @@ wait signal → reload / suspend / shutdown</pre>
   <ol style="color:var(--muted);line-height:1.9">
     <li><del>嗅探 + dial_mode（远端域名解析）</del> <b>已完成（P14，ADR-0030）</b>；余项：QUIC/UDP 与 h2c 嗅探、sniff-punt（按嗅探域名重判路由）；</li>
     <li><del>多节点/订阅/组 + 健康检查</del> <b>已完成（P15，ADR-0031）</b>；余项：按规则分派不同组（数据面 outbound id）、订阅热更新、sticky IP/udp_check；</li>
-    <li><b>IPv6 数据面</b>；</li>
+    <li><del>IPv6 数据面</del> <b>已完成（P16，ADR-0032）</b>；余项：UDP v6（含 DNS over UDP6 接管，需 sockmap key 3）、ICMPv6/分片；</li>
     <li>geoip/geosite/pname；</li>
     <li>DoH/DoQ + <code>dns.routing</code>；</li>
     <li>协议细节：REALITY/Vision/uTLS、ss2022/插件、juicity/naive/ssr、gecko、tuic 0-RTT；</li>
@@ -1238,7 +1238,7 @@ wait signal → reload / suspend / shutdown</pre>
 </section>
 
 <p style="color:var(--dim);font-family:var(--mono);font-size:.78rem;margin-top:56px;border-top:1px solid var(--line);padding-top:14px">
-  dae → Rust 决策档案 · v2.16 · 生成于 2026-10-04 · 基于 dae main@e3fee8f（nightly）· 本文件自包含，可离线打开<br>
+  dae → Rust 决策档案 · v2.17 · 生成于 2026-10-04 · 基于 dae main@e3fee8f（nightly）· 本文件自包含，可离线打开<br>
   v1.1：新增 4.5 部署形态、4.6 常驻与故障语义、决策点 D8<br>
   v1.2：按 ADR-0009 改为 K 轨道路线图；D7 修订为内核切片先行；K0 第一步（规则 VM + LPM）已实测<br>
   v1.3：K0、K1 均已完成并实测（双 epoch 热重载、conn_state 缓存、五钩子角色、本机 WAN 流量与回程）<br>
@@ -1263,7 +1263,8 @@ wait signal → reload / suspend / shutdown</pre>
         v2.13：P13 真网关模式（host gateway）——`--lan none` + `lab/gateway.sh`（up/down/status/test/--dry-run）：物理网卡不移动，只挂 wan egress/ingress 钩子透明接管**宿主自身流量**，浏览器零配置；规则纪律实测确定：DNS `direct(must)` 置顶、禁用 `sip()`（宿主机源地址即私网，否则全部误判直连）、QUIC 阻断回落 TCP；真机验收 gstatic 204 / YouTube 200 / 出口 IP=节点侧 / relay 931KB、`down` 后无钩子无残留（详情见 ADR-0029 与 `mini-dae/NOTES.md` §11.20）<br>
         v2.14：新增「10 · 对标进度」——dae ↔ mini-dae 分域覆盖度对照（15 域 + 汇总 + Top 缺口 + 优势项，逐行附证据锚点）；同文固化 `docs/parity-status.md`（研究目标 100%、主链路 ≈80–85%、dae 全功能面 ≈60%）<br>
         v2.15：P14 用户态嗅探 + dial_mode——`sniffer`（TLS ClientHello SNI / HTTP/1.x Host，MSG_PEEK 只读采集、超时回退 IP）+ `target::Target` 类型化（vless/vmess 0x02、tuic 0x00、RFC1928 0x03、hy2 字符串；direct 本地解析）；`--dial-mode ip|domain|domain+`（CLI > config global.dial_mode > 默认 ip；gateway.sh 默认 domain）；SOCKS 入口同享远端解析；状态面 `sniffing` 计数。实测：lab `DIAL_MODE=domain` 真实节点 e2e 204（嗅探 gstatic 成功）、真机网关 sniffing 10/10 hits、YouTube 200；`cargo test` 108/108（对标表缺口 #1 已补，余 QUIC/UDP 嗅探与 sniff-punt）（详情见 ADR-0030 与 `mini-dae/NOTES.md` §11.21）<br>
-        v2.16：P15 订阅/节点组——`config` 的 `subscription/node/group` 生效；极小 HTTP(S) 订阅拉取（3 跳重定向/chunked/webpki/优先 IPv4/marked socket）+ base64/明文解码 + 逐行容错；group filter（name/keyword/regex/subtag/!，行内 AND / 行间 OR）与 policy（min/min_moving_avg/min_avg10/random/fixed）；经节点健康探测（last/EMA/hist10、tolerance 标死）+ 拨号失败自动切换；`--subscribe/--group`、gateway.sh 透传；状态面 `group`。实测：lab 订阅组 e2e（kill 节点 A → 4s 标死 → failover 经 B 成功）；真机订阅#2：48×REALITY 逐行跳过 + 18×anytls 入组、alive 18/18、EMA 最快 SG 287ms、204/YouTube 200；`cargo test` 121/121（对标表缺口 #2 已补，余按规则分派/热更新）（详情见 ADR-0031 与 `mini-dae/NOTES.md` §11.22）
+        v2.16：P15 订阅/节点组——`config` 的 `subscription/node/group` 生效；极小 HTTP(S) 订阅拉取（3 跳重定向/chunked/webpki/优先 IPv4/marked socket）+ base64/明文解码 + 逐行容错；group filter（name/keyword/regex/subtag/!，行内 AND / 行间 OR）与 policy（min/min_moving_avg/min_avg10/random/fixed）；经节点健康探测（last/EMA/hist10、tolerance 标死）+ 拨号失败自动切换；`--subscribe/--group`、gateway.sh 透传；状态面 `group`。实测：lab 订阅组 e2e（kill 节点 A → 4s 标死 → failover 经 B 成功）；真机订阅#2：48×REALITY 逐行跳过 + 18×anytls 入组、alive 18/18、EMA 最快 SG 287ms、204/YouTube 200；`cargo test` 121/121（对标表缺口 #2 已补，余按规则分派/热更新）（详情见 ADR-0031 与 `mini-dae/NOTES.md` §11.22）<br>
+        v2.17：P16 IPv6 数据面（TCP 全链）——五元组统一 16 字节（v4-mapped + is_v6）贯穿 eBPF/loader；`parse_v6`（固定头 + 跳过 hop-by-hop/routing/dest-opts，分片不处理）+ sockmap key 2（TCP6）/key 3 预留；`IPV6_TRANSPARENT`+V6ONLY 监听 `[::]:port`；控制对 IPv6 路由（dae0 fe80 网关 + **静态永久邻居**——动态 NDP 的 NA 会被 `dae0peer_ingress` 的 cb 检查 SHOT 丢弃，详见 NOTES §11.23）；规则 LPM v6 前缀（v4 +96）与 `dip('fe80::/10')` 引号语法；协议目标 v6（ss 0x04 / vray 0x03 / tuic 0x02 / hy2 `[v6]:port`）；DNS AAAA 入域位图。实测：`cargo test` 122/122；lab `test-v6` 3 断言（tproxy v6→relay→ss(ATYP=4)→v6 echo；v6 direct；listener 注册）；verify 9/9 + DNS 6/6 + 订阅 3/3 无回归；规则对拍 `parity.sh` 3/3 逐字节一致（新增 v6 规则集）；真机网关 v6：嗅探 `[2001::1]:443 → www.google.com` RELAY 远端解析 204、字面量 v6 目标 200（对标表缺口 #3 已补，余 UDP v6/ICMPv6）（详情见 ADR-0032 与 `mini-dae/NOTES.md` §11.23）<br>
 </p>
 </main>
 

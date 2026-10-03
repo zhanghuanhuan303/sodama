@@ -56,6 +56,7 @@
 | [0029](./ADR-0029-host-gateway-mode.md) | 真网关模式（host gateway）：`--lan none` + `lab/gateway.sh`，宿主流量透明接管；DNS `direct(must)`、禁 `sip` 规则、QUIC 阻断 | 已采纳 | —（P13 执行） |
 | [0030](./ADR-0030-sniffing-dial-mode.md) | 用户态嗅探 + dial_mode：TLS SNI/HTTP Host（MSG_PEEK）→ 域名交节点远端解析；Target 类型化（逐协议域名 ATYP） | 已采纳 | —（P14 执行） |
 | [0031](./ADR-0031-subscription-groups.md) | 订阅 / 节点组 / 健康检查：filter + policy（min/min_moving_avg/min_avg10/random/fixed）+ 探测标死 + 拨号失败切换；数据面仍单代理槽 | 已采纳 | —（P15 执行） |
+| [0032](./ADR-0032-p16-ipv6-dataplane.md) | IPv6 数据面（TCP 全链）：16B 统一五元组 + sockmap key 2 + IPV6_TRANSPARENT 双监听 + 协议目标 v6 编码 + 静态 fe80 邻居（NDP 陷阱）；UDP v6/ICMPv6 未做 | 已采纳 | —（P16 执行；对标表缺口 #3） |
 
 ## 新增一条 ADR
 

@@ -175,10 +175,16 @@ pub fn parse_rrs(buf: &[u8]) -> Option<Vec<Rr>> {
 
 /// 从应答报文中取出 A 记录 IPv4 地址（跳过 CNAME 等；AAAA 忽略并计数）。
 pub fn answer_a_records(buf: &[u8]) -> (Vec<[u8; 4]>, usize) {
+    let (a, aaaa) = answer_a_and_aaaa_records(buf);
+    (a, aaaa.len())
+}
+
+/// 取应答中的 A 与 AAAA 地址（跳过 CNAME 等；供域位图发布）。
+pub fn answer_a_and_aaaa_records(buf: &[u8]) -> (Vec<[u8; 4]>, Vec<[u8; 16]>) {
     let mut out = Vec::new();
-    let mut aaaa = 0usize;
+    let mut v6 = Vec::new();
     let Some(rrs) = parse_rrs(buf) else {
-        return (out, aaaa);
+        return (out, v6);
     };
     for rr in rrs.iter().filter(|r| r.section == SEC_ANSWER) {
         if rr.rclass != 1 {
@@ -188,11 +194,15 @@ pub fn answer_a_records(buf: &[u8]) -> (Vec<[u8; 4]>, usize) {
             if let Some(b) = buf.get(rr.rdata_off..rr.rdata_off + 4) {
                 out.push([b[0], b[1], b[2], b[3]]);
             }
-        } else if rr.rtype == 28 {
-            aaaa += 1;
+        } else if rr.rtype == 28 && rr.rdlen == 16 {
+            if let Some(b) = buf.get(rr.rdata_off..rr.rdata_off + 16) {
+                let mut a = [0u8; 16];
+                a.copy_from_slice(b);
+                v6.push(a);
+            }
         }
     }
-    (out, aaaa)
+    (out, v6)
 }
 
 /// 构造一个 A 记录应答（供单测与假上游使用；保留问题段）。

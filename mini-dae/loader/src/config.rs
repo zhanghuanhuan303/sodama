@@ -1623,6 +1623,25 @@ fn is_v4_cidr(v: &str) -> bool {
     }
 }
 
+/// P16：IPv4/IPv6 CIDR（dip/sip 用）。
+fn is_ip_cidr(v: &str) -> bool {
+    let (addr, plen) = match v.split_once('/') {
+        Some((a, p)) => (a, Some(p)),
+        None => (v, None),
+    };
+    let max = if addr.parse::<std::net::Ipv4Addr>().is_ok() {
+        32
+    } else if addr.parse::<std::net::Ipv6Addr>().is_ok() {
+        128
+    } else {
+        return false;
+    };
+    match plen {
+        Some(p) => p.parse::<u32>().map(|n| n <= max).unwrap_or(false),
+        None => true,
+    }
+}
+
 fn is_mac(v: &str) -> bool {
     let parts: Vec<&str> = v.split(':').collect();
     parts.len() == 6 && parts.iter().all(|p| u8::from_str_radix(p, 16).is_ok())
@@ -1637,14 +1656,25 @@ fn translate_function(f: &Function, parts: &mut Vec<String>) -> Result<(), Strin
             if vals.is_empty() {
                 return Err(format!("{}(...) 需要至少一个参数", f.name));
             }
-            if !vals.iter().all(|v| is_v4_cidr(v)) {
+            if !vals.iter().all(|v| is_ip_cidr(v)) {
                 return Err(format!(
-                    "{}({}) 含 IPv6 或非法前缀；mini-dae 目前只编译 IPv4",
+                    "{}({}) 含非法前缀（需 IPv4/IPv6 CIDR）",
                     f.name,
                     vals.join(", ")
                 ));
             }
-            parts.push(format!("{bang}{}({})", f.name, vals.join(", ")));
+            // P16：v6 前缀含 ':'，mini 规则语法里需要加引号（dae 语法本身不要求）
+            let quoted: Vec<String> = vals
+                .iter()
+                .map(|v| {
+                    if v.contains(':') {
+                        format!("'{v}'")
+                    } else {
+                        v.clone()
+                    }
+                })
+                .collect();
+            parts.push(format!("{bang}{}({})", f.name, quoted.join(", ")));
             Ok(())
         }
         "dport" | "sport" => {

@@ -10,6 +10,8 @@
 # 参数是规则文件（mini 语法，见下），输出契约格式的 dump 到 stdout
 mini-dae/lab/parity/run.sh mini-dae/lab/rules.dae
 mini-dae/lab/parity/run.sh mini-dae/lab/rules.reload.dae
+# P16：IPv6 前缀（quoted mini 语法）也逐字节对拍
+mini-dae/lab/parity/run.sh mini-dae/lab/rules.v6.dae
 
 # 自检（expected/ 下是本机已验证的黄金输出）
 mini-dae/lab/parity/run.sh mini-dae/lab/rules.dae \

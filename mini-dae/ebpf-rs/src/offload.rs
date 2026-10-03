@@ -22,12 +22,13 @@ pub fn mini_tcp_offload(skb: SkBuffContext) -> u32 {
     let sport = rport_raw as u16;
 
     let mut peer = MiniTuple {
-        sip: skb.skb.remote_ipv4(),
-        dip: skb.skb.local_ipv4(),
+        sip: v4_mapped_bytes(skb.skb.remote_ipv4()),
+        dip: v4_mapped_bytes(skb.skb.local_ipv4()),
         sport,
         dport: (skb.skb.local_port() as u16).to_be(),
         l4proto: IPPROTO_TCP,
-        pad: [0; 3],
+        is_v6: 0,
+        pad: [0; 2],
     };
 
     /* 预检镜像：未命中必须 SK_PASS（redirect 未命中会丢包） */

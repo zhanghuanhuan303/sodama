@@ -9,8 +9,8 @@
 #     被数据面自动送进控制面）。私网判断只用 dip。
 #   - DNS 规则必须放在 dip 私网规则之前：eBPF 数据面对任何命中的非 must 规则
 #     会自动把 53 端口改为送控制面 DNS 模块；`direct(must)` 才能保住直连。
-#   - 数据面 eBPF 只解析 IPv4；IPv6 流量不会被代理（gateway.sh --no-ipv6 可
-#     临时关闭网卡 IPv6）。
+#   - 数据面自 P16 起解析 IPv4/IPv6；IPv6 与 v4 同样策略（默认代理 TCP，
+#     私网/链路本地/组播直连）。--no-ipv6 会在网卡上临时关闭 IPv6。
 #   - UDP 除 53 外暂一律直连（mini-dae 的 UDP 节点侧支持尚不完整）；
 #     QUIC(443/udp) 显式阻断，促使浏览器回落到可被代理的 TCP。
 
@@ -26,6 +26,10 @@ dip(169.254.0.0/16) -> direct
 dip(224.0.0.0/4) -> direct
 dip(240.0.0.0/4) -> direct
 dip(255.255.255.255/32) -> direct
+# P16：IPv6 私网/链路本地/组播同样直连（前缀含 ':'，mini 语法需加引号）
+dip('fe80::/10') -> direct
+dip('fc00::/7') -> direct
+dip('ff00::/8') -> direct
 
 # --- QUIC：阻断 UDP/443，浏览器回落 TCP ---
 l4proto(udp) && dport(443) -> block

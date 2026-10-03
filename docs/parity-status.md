@@ -1,6 +1,6 @@
 # 对标进度：dae（Go）↔ mini-dae（全 Rust）
 
-- **版本**：v1.2 · 2026-10-04（P13 网关 + P14 嗅探 + P15 订阅/组后清点）
+- **版本**：v1.3 · 2026-10-04（P16 IPv6 数据面（TCP 全链）清点）
 - **口径**：「覆盖度」= 该域**功能点覆盖**的粗估（我方可用 ÷ dae 等价能力），
   **不是代码行数、不是性能等价**；数字是判断值，逐行给出证据出处。
   按口径分两档汇总：主链路（日常代理网关）与 dae 全功能面。
@@ -20,7 +20,7 @@
 | 7 | **转发面** | relay（并发上限/backlog fuse/计费）、UDP endpoint pool（full-cone）、offload 完整 | relay（SO_MARK/半关闭/janitor）、UDP NAT（ss/vless/vmess/tuic/hy2 协议侧可用；网关策略默认 UDP 直连）、offload 最小实现 | **≈75%** | 512KB 逐字节、UDP 会话复用、offload 用户态零字节均实测（ADR-0015/0022）；缺 fuse/计费/并发上限 |
 | 8 | **多节点·订阅·健康检查** | subscription + node + group（min/max/random/fixed）+ alive set + 间隔/容忍度 + 延迟策略 + sticky IP 等 | `--subscribe`/config 订阅（HTTP(S)/file；base64/明文；逐行容错）；group filter（name/keyword/regex/subtag/!）、policy（min/min_moving_avg/min_avg10/random/fixed）、经节点健康探测（last/EMA/hist10、tolerance 标死）、拨号失败切换；**按规则分派不同组未做**（数据面单代理槽） | **≈50%** | ADR-0031、NOTES §11.22；真机订阅#2：18×anytls 入组 18/18 alive、gstatic 204 / YouTube 200；缺热更新/多组分派/sticky/udp_check |
 | 9 | **嗅探与域名策略（dial_mode）** | 内核侧 TLS/HTTP/QUIC 嗅探 → `domain/domain+` 拨号（**远端解析，绕 DNS 污染**）、sniff-punt | 用户态嗅探（TLS SNI / HTTP Host，MSG_PEEK 不消费）+ `dial_mode ip/domain/domain+`，命中即域名交节点；**无** QUIC/UDP 嗅探与 sniff-punt | **≈55%** | ADR-0030、NOTES §11.21；`domain` 等价 dae `domain+` 的“总是使用”行为（无 DNS 缓存门槛）；h2c 不做 |
-| 10 | **IPv6** | 数据面 + 规则 + 协议全支持 | 仅 IPv4（显式边界） | **≈5%** | `--no-ipv6` 只是规避不是支持 |
+| 10 | **IPv6** | 数据面 + 规则 + 协议全支持 | TCP 全链：v6 解析/tproxy（sockmap key 2）/全部协议 v6 目标编码/v6 direct/v6 嗅探远端解析/AAAA 入域位图；**UDP v6（含 DNS over UDP6）与 ICMPv6/分片未做** | **≈80%**（TCP） | ADR-0032、NOTES §11.23；lab `test-v6` 3 断言全过（tproxy→ss(ATYP=4)→v6 echo；v6 direct）；真机网关 v6：嗅探 `[2001::1]→RELAY 远端解析` 204、字面量 `[2606:4700:4700::1111]` 200；静态 fe80 邻居不可省（NA 被 dae0peer_ingress 丢弃，上游同样要求） |
 | 11 | **部署自动化** | netns 自动搭建（移网卡/sysctl/tproxy 规则，`netns_utils.go`）、systemd（`install/dae.service`）、Docker、发行包、shell 补全 | `lab.sh` / `gateway.sh` 脚本级一键；无 systemd/打包 | **≈40%** | 真网关一键脚本体验接近（ADR-0029），自动化深度不同（脚本代劳，安全性更高） |
 | 12 | **运维面** | 主线较弱（daed 独立项目提供 GraphQL/Web UI） | SIGHUP/USR2、状态 socket（status/rules/config/maps/metrics/reload/suspend/resume）、Prometheus、sysdump/trace、日志轮转 | **≈90%** | 相对 dae 主线领先；daed 的 UI/鉴权不在范围（ADR-0021） |
 | 13 | **质量工程** | Go 单测 244 文件/3.9 万行 + CI（bpf-test/build/docker/go-test…）+ fuzz | 95 单测 + verify 9×2 拓扑 + 6 专项 + 协议梯 17 + 对拍 5 逐字节 + QEMU 双内核矩阵 + soak + 六路径基准；无 CI | **≈70%** | 方法学密度高、绝对规模小（ADR-0010/0022/0025） |
@@ -33,13 +33,13 @@
 |---|---|---|
 | 研究目标（可行性验证） | **100%** | aya 全栈可行、规则逐字节对拍、C 数据面退役、真实节点浏览器可用——结论闭环 |
 | 核心主链路（分流/规则/明文 DNS/主流协议/转发/运维） | **≈80–85%** | 日常「tproxy 网关 + 主流节点」已可用（P13 真网关实测 204 / YouTube 200；P14 嗅探远端解析实测 hits 10/10；P15 订阅组真机 18/18 alive） |
-| dae 全功能面（嗅探/多节点/geo/IPv6/安全 DNS/系统集成） | **≈60%（±5%）** | 差距集中在结构性 4–5 项，非零散细节 |
+| dae 全功能面（嗅探/多节点/geo/IPv6/安全 DNS/系统集成） | **≈62%（±5%）** | 差距集中在结构性 3–4 项；IPv6（TCP 全链）已从 ≈5% 补齐至 ≈80% |
 
 ## Top 缺口（按优先级）
 
 1. ~~嗅探 + dial_mode（远端域名解析）~~ **已完成（P14，ADR-0030）**；余项：QUIC/UDP 与 h2c 嗅探、sniff-punt（按嗅探域名重判路由）；
 2. ~~多节点/订阅/组 + 健康检查~~ **已完成（P15，ADR-0031）**；余项：按规则分派不同组（数据面 outbound id）、订阅热更新、sticky IP/udp_check；
-3. **IPv6 数据面**；
+3. ~~IPv6 数据面~~ **已完成（P16，ADR-0032，TCP 全链）**；余项：UDP v6（含 DNS over UDP6 接管，需 sockmap key 3）、ICMPv6/分片；
 4. **geoip/geosite/pname**；
 5. **DoH/DoQ + `dns.routing`**；
 6. 协议细节：REALITY/Vision/uTLS、ss2022/插件、juicity/naive/ssr、gecko、tuic 0-RTT；
@@ -54,6 +54,7 @@
 - **TCX 生命周期**：进程退出即摘钩，回滚天然安全；
 - **状态面/可观测**：JSON socket + Prometheus + sysdump/trace（dae 主线没有，daed 才有 Web UI）；
 - **单臂 dual-role 程序**、`--lan none` 一键真网关（ADR-0029）、本地 SOCKS5 入口（ADR-0028）；
+- **IPv6 TCP 全链**（P16，ADR-0032）：v4-mapped 统一五元组 + sockmap key 2 + 协议目标 v6 编码 + v6 嗅探，真机实测通过；
 - **工程化验收**：QEMU 双内核矩阵、soak 三模式、六路径基准、协议三方交叉（Go 客户端/Python+Go 参考服务端）。
 
 ## 维护说明
