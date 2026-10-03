@@ -59,6 +59,10 @@ P6（suspend/reload/metrics/sysdump/日志轮转/整配置热重载）已完成*
 - **P12 本地 SOCKS5 入口（浏览器验收）**：`--listen-socks 127.0.0.1:11080 --dialer anytls://…`
   ——不加载 eBPF、不需 root，浏览器直接指 socks5 即可走真实节点（ADR-0028）；
   DNS 本地解析为 v1 边界；`resolve()` 已改为优先 IPv4（双栈节点域名踩坑）
+- **P13 真网关模式（host gateway）**：`--lan none` + `lab/gateway.sh`——物理网卡不移动，
+  只挂 wan egress/ingress 钩子接管**宿主自身流量**（浏览器零配置）；规则纪律：
+  DNS `direct(must)` 置顶、禁用任何 `sip()`（宿主机源地址即私网）、QUIC 阻断回落 TCP；
+  一键 up/down/status/test，一键回滚无残留（ADR-0029、NOTES §11.20）
 - **P5-G3a QUIC（tuic v5）**：惰性 tokio 运行时 + quinn（阻塞 relay 用 block_on 桥接）；
   认证 token = TLS exporter（label=uuid 裸字节、context=password）；TCP 每条中继一条 QUIC
   双向流，UDP 走 QUIC DATAGRAM（含分片/重组）；上游 socket 用自建 `Endpoint` 打 `SO_MARK`；
@@ -152,6 +156,8 @@ lab/rules.dns.dae    P3a 域分流规则（proxy.test / direct.test 的 domain �
 lab/rules.regex.dae  P3b-2a regex 域分流规则（api[0-9]+.regex.test 命中）
 lab/rules.udp.dae    P4b UDP NAT 规则（所有 UDP:9998 判 proxy，验证 mark 防自环）
 lab/lab.sh           建/拆 netns 拓扑（标准 + 单臂）、跑测试、热重载、故障注入
+lab/gateway.sh       P13：真网关模式一键脚本（up/down/status/test/--dry-run；宿主流量透明接管）
+lab/rules.gateway.dae P13：网关模式规则（DNS must 置顶、无私网 sip、QUIC block、fallback proxy）
 ebpf-rs/             P9：完整 Rust 数据面（7 classifier + offload verdict + 规则 VM；BTF maps；
                      不属主 workspace，构建：lab/build-ebpf-rs.sh，产物 target/bpfel-unknown-none/release/）
 lab/wan_echo.py      WAN 侧 echo（9999/8080 TCP；8082 纯回显；9998 UDP）
@@ -258,6 +264,13 @@ sudo lab/lab.sh test-hy2-hop     # 两轮 512KB 跨跳存活
 # P12：本地 SOCKS5 入口（浏览器验收；不加载 eBPF、不需 root）：
 # target/release/mini-dae --listen-socks 127.0.0.1:11080 --dialer 'anytls://…' --dial-timeout 15
 # 浏览器：SOCKS5 127.0.0.1:11080（Firefox 勾“SOCKS v5 时代理 DNS”）；停止：pkill -f listen-socks
+# P13：真网关模式（宿主流量透明接管；浏览器零配置）——需 root：
+#   节点 URL 写入 /tmp/mini-dae-node.url（chmod 600），或 --node <文件|URL>：
+#   sudo lab/gateway.sh up                      # 默认接口 = 默认路由网卡（如 wlan0）
+#   lab/gateway.sh test                         # 204 / 出口 IP / DNS 快检
+#   sudo lab/gateway.sh down                    # 停止并恢复（幂等）
+#   sudo lab/gateway.sh up --dry-run            # 只预览命令，零副作用
+#   （IPv6 会绕过数据面；--no-ipv6 可临时关闭网卡 IPv6，down 时恢复）
 # P10：真实节点端到端（节点 URL 只经环境变量传入，不落盘）：
 #   REAL_NODE_URL='vless://…type=ws…' 或 'anytls://…' 或 'socks5://…'（桥接） \
 #     sudo lab/real-node-e2e.sh    # client ns → tproxy → relay → 真实节点 → gstatic 204
@@ -882,6 +895,13 @@ CONNECT；ss 不支持插件与 2022 版；trojan 不支持 UDP 与域名目标�
     pkt1 的 padding 只作用于这一批；拆开写会与真实客户端特征不一致。
 32. **AnyTLS pkt1 的尾部 waste 帧长度随机**：mock/测试里读尾帧要用短超时探测，
     不能无条件 read；另 UpdatePaddingScheme 只影响**下一次写**（已用定长 scheme 钉住）。
+33. **真网关规则不能有 `sip(...)`**：宿主机模式的流量源地址就是本机私网地址，
+    `sip(192.168.0.0/16) -> direct` 会把全部出站 TCP 判成直连（症状：TCP 被墙/超时，
+    而 DNS 因数据面 DNS override 仍进控制面，很容易误判“已跑通”）。见 `lab/rules.gateway.dae` 头部。
+34. **网关模式 DNS 直连要 `direct(must)` 且置顶**：`route.rs` 对任何命中的非 must 规则会自动把
+    53 端口改送控制面 DNS 模块；且缺省上游 `8.8.8.8:53` 在受限网络不可达。
+35. **真网关不必移动网卡**：`--lan none --wan wlan0` 即可（复用 `test-host-proxy` 路径）；
+    移动网卡会闪断且惊扰 NetworkManager。status/日志输出对 `--dialer`（含凭据）要 redact。
 
 ## Rust 化的边界
 

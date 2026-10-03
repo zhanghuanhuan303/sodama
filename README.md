@@ -11,11 +11,12 @@ byte-exact parity tests against dae's Go rule compiler and a netns test lab.*
   透明 DNS 接管（缓存/TCP/regex/EDNS）、TCP relay / UDP NAT / TCP offload、
   协议栈 shadowsocks / trojan / vless（tcp/ws）/ vmess / tuic / hysteria2 / **anytls**（含 UDP 与会话）、
   状态面 / 热重载 / 指标导出；vless 的 **WebSocket 传输**与 **AnyTLS** 已接入真实订阅节点
-  （ADR-0026 / ADR-0027）。
+  （ADR-0026 / ADR-0027），并支持 **真网关模式**（宿主流量透明接管，浏览器零配置，ADR-0029）。
 - **lab**：netns 拓扑（标准 + 单臂）、`verify` 9 用例、DNS / 转发面 / 协议梯 / 运维专项、
   soak、与 dae 原版 Go 规则编译器的**逐字节对拍**、真实 Go 客户端跨实现联调、
   双内核矩阵（宿主 + QEMU 第二内核）；**本地 SOCKS5 入口**（`--listen-socks`，零 root/零 eBPF，
-  浏览器可直接指向验证真实节点，ADR-0028）。
+  浏览器可直接指向验证真实节点，ADR-0028）；**真网关模式**（`lab/gateway.sh`，物理网卡不移动、
+  eBPF 透明接管宿主流量，ADR-0029）。
 
 最新一轮完整回归（唯一 Rust 数据面，2026-10-04）：
 
@@ -26,7 +27,7 @@ byte-exact parity tests against dae's Go rule compiler and a netns test lab.*
 | 转发面专项（relay/idle/offload/lifecycle/udp） | 6/6 |
 | K3 + 运维（config/status/forward/整配置热重载/ops） | 5/5 |
 | 协议梯（ss/trojan/vless/vmess/tuic/hysteria2 全变体） | 15 会话、17/17 |
-| 单元测试 `cargo test --release` | 73/73 |
+| 单元测试 `cargo test --release` | 95/95 |
 | 规则对拍 vs dae Go 编译器 | 5/5 逐字节一致 |
 | soak（tcp 60s / ss 30s / udp 30s） | 无失败轮、无泄漏 |
 | 内核矩阵（6.18.54-lts 宿主 + 7.2.8 QEMU） | 9/9 · 9/9 |
@@ -36,7 +37,7 @@ byte-exact parity tests against dae's Go rule compiler and a netns test lab.*
 ```
 docs/                        决策与架构文档
 ├── architecture-decision.html   主决策档案（自包含 HTML，可离线打开）
-├── adr/                         ADR-0001..0025（背景/决策/后果/验证方式）
+├── adr/                         ADR-0001..0029（背景/决策/后果/验证方式）
 └── modules/                     协议字节级规格（tuic-v5 / hysteria2）
 
 mini-dae/                    可运行工程（构建、实验、测试都在这里）
@@ -44,6 +45,7 @@ mini-dae/                    可运行工程（构建、实验、测试都在这
 ├── ebpf-rs/                   Rust eBPF 数据面（aya-ebpf，bpfel-unknown-none + BTF maps）
 ├── lab/                       netns 实验环境与全部测试脚本
 │   ├── lab.sh                 拓扑 / 会话 / 9 用例 verify / 各专项
+│   ├── gateway.sh             真网关模式一键脚本（up/down/status/test；宿主流量透明接管）
 │   ├── bench.sh bench_io.c    性能剖面（六路径）
 │   ├── soak.sh                长时打流 + reload/suspend 泄漏检查
 │   ├── parity.sh + parity/   与 dae Go 编译器的规则编译对拍（逐字节）
@@ -68,6 +70,10 @@ lab/lab.sh build           # 构建 Rust 加载器 + Rust eBPF 对象（不需�
 sudo lab/lab.sh up         # 建 netns 拓扑并启动
 sudo lab/lab.sh verify     # 9 个用例（含单写者、状态面与故障注入）
 sudo lab/lab.sh down
+
+# 真网关模式（真实节点，浏览器零配置；节点 URL 放 /tmp，详见 mini-dae/README.md）
+#   sudo lab/gateway.sh up --node /tmp/mini-dae-node.url
+#   lab/gateway.sh test && sudo lab/gateway.sh down    # 快检后回滚
 ```
 
 详细的拓扑说明、全部会话/测试清单与实测输出见 [`mini-dae/README.md`](./mini-dae/README.md)；
@@ -77,10 +83,10 @@ sudo lab/lab.sh down
 
 - [`docs/architecture-decision.html`](./docs/architecture-decision.html) — 主决策档案：
   上游 dae 的模块/规模分析、Rust 重写的收益与风险、部署形态（Rust worker + eBPF 分流）、
-  决策点 D1–D8 与迁移路线（K0–K3、P3–P9+）。
-- [`docs/adr/`](./docs/adr/) — 25 条已采纳 ADR：每个决策的背景、选项、理由、后果、
+  决策点 D1–D8 与迁移路线（K0–K3、P3–P13）。
+- [`docs/adr/`](./docs/adr/) — 29 条已采纳 ADR：每个决策的背景、选项、理由、后果、
   **实测验证方式**与修订条件。重要节点：0002（eBPF 程序语言：先 C 后迁）、
-  0023/0024/0025（数据面 Rust 全量迁移 → C 对象退场）。
+  0023/0024/0025（数据面 Rust 全量迁移 → C 对象退场）、0029（真网关模式：宿主流量透明接管）。
 - [`docs/modules/`](./docs/modules/) — tuic v5 / hysteria2 的字节级客户端规格。
 
 ## 上游与许可

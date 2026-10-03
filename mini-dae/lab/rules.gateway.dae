@@ -1,0 +1,37 @@
+# mini-dae 真网关模式规则（本机全量接管；配合 lab/gateway.sh）
+#
+# 策略：默认全部 TCP 走代理（fallback -> proxy）；私网/本地/组播/广播直连。
+#
+# 注意（实测踩坑）：
+#   - 本文件不要写任何 `sip(...)` 规则！宿主机模式下所有被接管流量源地址
+#     都是本机地址（如 192.0.2.254），`sip(192.168.0.0/16) -> direct`
+#     会把本机全部出站流量判成直连（表现为：TCP 直连被墙、只有 DNS 碰巧
+#     被数据面自动送进控制面）。私网判断只用 dip。
+#   - DNS 规则必须放在 dip 私网规则之前：eBPF 数据面对任何命中的非 must 规则
+#     会自动把 53 端口改为送控制面 DNS 模块；`direct(must)` 才能保住直连。
+#   - 数据面 eBPF 只解析 IPv4；IPv6 流量不会被代理（gateway.sh --no-ipv6 可
+#     临时关闭网卡 IPv6）。
+#   - UDP 除 53 外暂一律直连（mini-dae 的 UDP 节点侧支持尚不完整）；
+#     QUIC(443/udp) 显式阻断，促使浏览器回落到可被代理的 TCP。
+
+# --- DNS：保持系统解析路径直连（必须在 dip 私网规则之前，且带 must） ---
+l4proto(udp) && dport(53) -> direct(must)
+l4proto(tcp) && dport(53) -> direct(must)
+
+# --- 私网/特殊地址（目的）：直连 ---
+dip(192.168.0.0/16) -> direct
+dip(10.0.0.0/8) -> direct
+dip(172.16.0.0/12) -> direct
+dip(169.254.0.0/16) -> direct
+dip(224.0.0.0/4) -> direct
+dip(240.0.0.0/4) -> direct
+dip(255.255.255.255/32) -> direct
+
+# --- QUIC：阻断 UDP/443，浏览器回落 TCP ---
+l4proto(udp) && dport(443) -> block
+
+# --- 其余 UDP：直连（暂不做 UDP 代理） ---
+l4proto(udp) -> direct
+
+# --- 兜底：全部 TCP 走代理 ---
+fallback -> proxy

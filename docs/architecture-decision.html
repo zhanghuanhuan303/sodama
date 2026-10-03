@@ -199,13 +199,13 @@
 <header class="hero reveal">
   <p class="kicker">Architecture Review &amp; Rewrite Plan</p>
   <h1>dae → Rust 重构决策档案</h1>
-  <p class="sub">对 Go 版 <code>daeuniverse/dae</code> 的模块、架构与运行时机制做完整拆解，给出全 Rust 目标架构、可落地的优化点、风险登记册与分期路线图。所有「已实测」条目来自本仓库 <code>mini-dae</code> 的实验（C 数据面 + Rust/aya 加载器，K0–K3 九用例 × 两种拓扑实测通过；规则编译与 dae 原版逐字节对拍一致；全量配置解析与 dae schema/include 语义对齐；P3a/b DNS 与 P4 转发面（relay/UDP NAT/offload）已端到端跑通，P5-G1 原生协议栈（shadowsocks classic AEAD + trojan）、P5-G2（vless + vmess AEAD）、P5-G3a（tuic v5 / QUIC）、P5-G3b（hysteria2 / QUIC + 最小 HTTP/3 认证）与 P5-G3b+（salamander 混淆 / Brutal 近似 / udphop）已跨实现实测（含真实 Go 客户端与 Go 参考服务端三方交叉）；P6 运维面（suspend/reload/metrics/sysdump/日志轮转/整配置热重载）已端到端实测）。</p>
+  <p class="sub">对 Go 版 <code>daeuniverse/dae</code> 的模块、架构与运行时机制做完整拆解，给出全 Rust 目标架构、可落地的优化点、风险登记册与分期路线图。所有「已实测」条目来自本仓库 <code>mini-dae</code> 的实验（C 数据面 + Rust/aya 加载器，K0–K3 九用例 × 两种拓扑实测通过；规则编译与 dae 原版逐字节对拍一致；全量配置解析与 dae schema/include 语义对齐；P3a/b DNS 与 P4 转发面（relay/UDP NAT/offload）已端到端跑通，P5-G1 原生协议栈（shadowsocks classic AEAD + trojan）、P5-G2（vless + vmess AEAD）、P5-G3a（tuic v5 / QUIC）、P5-G3b（hysteria2 / QUIC + 最小 HTTP/3 认证）与 P5-G3b+（salamander 混淆 / Brutal 近似 / udphop）已跨实现实测（含真实 Go 客户端与 Go 参考服务端三方交叉）；P6 运维面（suspend/reload/metrics/sysdump/日志轮转/整配置热重载）已端到端实测；P7–P9+ 完成数据面全量 Rust 化与 C 对象退场；P10–P12 接入真实订阅节点（vless-ws / AnyTLS）与本地 SOCKS5 入口；P13 真网关模式实现宿主流量 eBPF 透明接管（浏览器零配置，实测 204 / YouTube 200 / 一键回滚无残留））。</p>
   <div class="meta">
     <span class="chip">分析对象 <b>dae @ e3fee8f (nightly)</b></span>
     <span class="chip">代码量 <b>~65k 非测试 LOC / ~40k 测试</b></span>
     <span class="chip">数据面 <b>tproxy.c 4403 行 · 23 个程序 · 24 个 map</b></span>
     <span class="chip">许可 <b>AGPL-3.0</b></span>
-    <span class="chip">文档版本 <b>v2.12 · 2026-10-04</b></span>
+    <span class="chip">文档版本 <b>v2.13 · 2026-10-04</b></span>
   </div>
 </header>
 
@@ -1020,7 +1020,7 @@ wait signal → reload / suspend / shutdown</pre>
 <!-- ============================================================ -->
 <section id="roadmap" class="reveal" style="margin-top:64px">
   <h2><span style="color:var(--dim);font-size:.62em">07 · </span>迁移路线图</h2>
-  <p style="color:var(--muted)">原则：每阶段都产出「可运行、可对拍、可停」的成果。工期为<b>单人粗估</b>（假设熟悉 Rust 与 Linux 网络，不含协议栈全量），仅作量级参考。<b>2026-10-03 修订</b>：按 ADR-0009 改为 K 轨道先行（取代原 P0–P2 顺序）；<b>K0–K3 与 P3a/P3b（a/b-1/b-2a）、P4、P5 G1/G2/G3a/G3b/G3b+、P6、P7 均已完成并实测通过；P8/P9（数据面 Rust 化）已完成——8 程序/14 map 全量移植；P9+ 已移除 C 数据面，Rust 对象为唯一数据面（ADR-0025）</b>（对拍/矩阵见 ADR-0010，配置/一跳见 ADR-0011，DNS 见 0012/0013/0014，转发面见 ADR-0015，协议栈见 ADR-0016–0020，运维面见 ADR-0021，P7 见 ADR-0022，P8/P9 见 ADR-0023/0024）。</p>
+  <p style="color:var(--muted)">原则：每阶段都产出「可运行、可对拍、可停」的成果。工期为<b>单人粗估</b>（假设熟悉 Rust 与 Linux 网络，不含协议栈全量），仅作量级参考。<b>2026-10-03 修订</b>：按 ADR-0009 改为 K 轨道先行（取代原 P0–P2 顺序）；<b>K0–K3 与 P3a/P3b（a/b-1/b-2a）、P4、P5 G1/G2/G3a/G3b/G3b+、P6、P7 均已完成并实测通过；P8/P9（数据面 Rust 化）已完成——8 程序/14 map 全量移植；P9+ 已移除 C 数据面，Rust 对象为唯一数据面（ADR-0025）</b>（对拍/矩阵见 ADR-0010，配置/一跳见 ADR-0011，DNS 见 0012/0013/0014，转发面见 ADR-0015，协议栈见 ADR-0016–0020，运维面见 ADR-0021，P7 见 ADR-0022，P8/P9 见 ADR-0023/0024，P10–P13（真实节点接入 / 真网关）见 ADR-0026–0029）。</p>
 
   <div class="card" style="padding:8px 22px">
     <div class="phase"><div class="p">K0 · 数据面工作台<small>2–4 周 · 已完成</small></div><div>
@@ -1066,6 +1066,10 @@ wait signal → reload / suspend / shutdown</pre>
     <div class="phase"><div class="p">P9 · 数据面全量 Rust 化<small>已完成（8 程序/14 map；唯一数据面）</small></div><div>
       <p>产出：单一完整 Rust 数据面对象（7 个 TC classifier + 规则 VM + offload verdict；BTF maps），与 C 同名同型，loader 零分支。<b>P9+（ADR-0025）：C 对象退场</b>——删 <code>ebpf/mini_dae.c</code> 与 <code>USE_EBPF_*</code> 回退分支，Rust 对象是唯一数据面（回退=从 <code>dae/</code> 重建 C，非常规路径）。</p>
       <p><em>验收：全量回归在 Rust 数据面上与 C 同口径通过；性能同量级。</em> <span class="stamp">已实测</span> 规则 VM 用有界循环（<code>bpf_loop</code> 因 aya-obj 的 <code>PSEUDO_FUNC</code> relocation 缺口被 verifier 拒，规则 ≤64 语义等价）；BTF map-in-map（<code>ArrayOfMaps&lt;LpmTrie&lt;[u8;16],u32,1024&gt;,128&gt;</code>）；实测：标准 verify 9/9、单臂 verify 9/9（P9+ 串行复跑）、DNS 六专项、转发面六专项、G1/G2/G3 全量协议梯、test-ops/config-reload、soak 30s（RSS +372kB/fd +0）、<code>cargo test</code> 73/73；性能：direct 30.4Gbps/10µs、relay 20.4Gbps/18µs、offload 12.4Gbps/19µs（C 同轮 11.9Gbps/21µs）（详情见 ADR-0024/0025）。</p>
+    </div></div>
+    <div class="phase"><div class="p">P10–P13 · 真实节点生态与真网关<small>已完成（2026-10-04）</small></div><div>
+      <p>产出：把「实验室协议栈」推进到「真实用户可用」——P10 vless WebSocket 传输接入真实订阅（ADR-0026）；P11 AnyTLS 客户端（ADR-0027）；P12 本地 SOCKS5 入口（零 root 浏览器验收，ADR-0028）；P13 真网关模式：物理网卡不移动，只挂 wan egress/ingress 钩子透明接管宿主流量（ADR-0029）。</p>
+      <p><em>验收：真实订阅节点浏览器/整机可用，启停可回滚无残留。</em> <span class="stamp">已实测</span> P10 真实节点 50×vless-ws 端到端 gstatic 204；P11 与 sing-box 跨实现 + 真实节点 204；P12 浏览器 YouTube 200（relay 918KB）；P13 本机 Arch（wlan0）<code>lab/gateway.sh up</code>：钩子 4 个、规则 15 match_set，gstatic 204 / YouTube 200 / 出口 IP=节点侧（203.0.113.45）/ relay 931KB / dial_errors=0；<code>down</code> 后 <code>bpftool net show</code> 无钩子、直连恢复、二次 up 幂等。回归：<code>cargo test</code> 95/95。</p>
     </div></div>
   </div>
   <p style="color:var(--muted);font-size:.86rem">合计单人 <b>11–18 个月</b>（K 轨道比原 P0–P2 略长，因为路由编译与生态接入提前；不含协议栈全量）；2–3 人可压到 5–8 个月。若只做「内核切片 + DNS」，约 K0–K3 + P3 = 6–11 个月单人。</p>
@@ -1170,7 +1174,7 @@ wait signal → reload / suspend / shutdown</pre>
 </section>
 
 <p style="color:var(--dim);font-family:var(--mono);font-size:.78rem;margin-top:56px;border-top:1px solid var(--line);padding-top:14px">
-  dae → Rust 决策档案 · v2.12 · 生成于 2026-10-04 · 基于 dae main@e3fee8f（nightly）· 本文件自包含，可离线打开<br>
+  dae → Rust 决策档案 · v2.13 · 生成于 2026-10-04 · 基于 dae main@e3fee8f（nightly）· 本文件自包含，可离线打开<br>
   v1.1：新增 4.5 部署形态、4.6 常驻与故障语义、决策点 D8<br>
   v1.2：按 ADR-0009 改为 K 轨道路线图；D7 修订为内核切片先行；K0 第一步（规则 VM + LPM）已实测<br>
   v1.3：K0、K1 均已完成并实测（双 epoch 热重载、conn_state 缓存、五钩子角色、本机 WAN 流量与回程）<br>
@@ -1191,7 +1195,8 @@ wait signal → reload / suspend / shutdown</pre>
   v2.9：P9+ 移除 C 数据面——删 <code>ebpf/mini_dae.c</code>/<code>build/mini_dae.o</code> 与全部 <code>USE_EBPF_*</code> 回退分支（loader 去掉 <code>--ebpf-offload</code> 双对象；lab 删 <code>offload-rs-up</code>/<code>rs-up</code>/<code>rs-dual-up</code> 会话；bench 删 <code>offload-rs</code> 路径）；Rust 对象为唯一数据面，回退=从 <code>dae/</code> 重建；复跑验收：标准 verify 9/9、单臂 verify 9/9、DNS/转发面/协议栈抽查全过、<code>cargo test</code> 73/73；六路径基准（`bench.sh all`）：direct 30.6Gbps/10µs、relay 23.8/18µs、offload 7.5/24µs（单次方差大，同对象另两次 12.4/19µs 与 8.3/30µs）、ss 2.45/59µs、UDP 丢包与 C 同数值；并完成 P9+ 完整性回归：DNS 6/6、转发面 6/6、协议梯 15 会话 17/17、K3/运维 5/5、对拍 5/5 逐字节 + 跨实现联调 3/4（1 为已知 Go 客户端偏差）、双内核矩阵 9/9、soak 三模式无泄漏（详情见 ADR-0025 与 `mini-dae/NOTES.md` §11.16）<br>
     v2.10：P10 vless WebSocket 传输——接入真实订阅节点（50×vless+ws+tls+CF CDN）：RFC6455 客户端传输层（Upgrade 握手 + 掩码帧，可拆半）、`type=ws`+`host`/`path` 参数；验收：`cargo test` 80/80、标准 verify 9/9、vless tcp/tls/udp 回归全过、`lab/real-node-e2e.sh` 端到端 gstatic 204；与参照客户端（v2ray）同目标对拍排除节点侧黑洞干扰（详情见 ADR-0026 与 `mini-dae/NOTES.md` §11.17）；另对第二份真实订阅做形态普查：**REALITY+Vision / anytls 在边界外**（解析期显式拒绝，测试钉住），sing-box 1.14 参照 204、SOCKS5 桥接模式 gateway e2e 204<br>
       v2.11：P11 AnyTLS——anytls-go v2 客户端子集（sha256 认证、帧、默认 paddingScheme 逐字节对齐与 UpdatePaddingScheme、单 Stream）；跨实现对拍 sing-box、真实订阅节点 e2e gstatic 204；同批 `--dial-timeout` 可配；REALITY+Vision 仍在边界外（详情见 ADR-0027 与 `mini-dae/NOTES.md` §11.18）<br>
-        v2.12：P12 本地 SOCKS5 入口——`--listen-socks`（零 root、零 eBPF，浏览器直接指向 127.0.0.1 即走真实节点）；真机验收 gstatic 204 / YouTube 200（down 918KB）；顺手修 `resolve()` 优先 IPv4（双栈节点域名踩坑）（详情见 ADR-0028 与 `mini-dae/NOTES.md` §11.19）
+        v2.12：P12 本地 SOCKS5 入口——`--listen-socks`（零 root、零 eBPF，浏览器直接指向 127.0.0.1 即走真实节点）；真机验收 gstatic 204 / YouTube 200（down 918KB）；顺手修 `resolve()` 优先 IPv4（双栈节点域名踩坑）（详情见 ADR-0028 与 `mini-dae/NOTES.md` §11.19）<br>
+        v2.13：P13 真网关模式（host gateway）——`--lan none` + `lab/gateway.sh`（up/down/status/test/--dry-run）：物理网卡不移动，只挂 wan egress/ingress 钩子透明接管**宿主自身流量**，浏览器零配置；规则纪律实测确定：DNS `direct(must)` 置顶、禁用 `sip()`（宿主机源地址即私网，否则全部误判直连）、QUIC 阻断回落 TCP；真机验收 gstatic 204 / YouTube 200 / 出口 IP=节点侧 / relay 931KB、`down` 后无钩子无残留（详情见 ADR-0029 与 `mini-dae/NOTES.md` §11.20）
 </p>
 </main>
 

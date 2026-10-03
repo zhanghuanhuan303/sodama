@@ -792,6 +792,34 @@ P4 稳定性 → P3 内核矩阵）：
 - **验收**：`cargo test` 95/95；真机跑订阅#2 anytls 节点：gstatic 204（域名/本地两种
   socks 形态）、YouTube 200（relay down 918KB）；日志 `/tmp/mini-dae-socks.log`。
 
+### 11.20 P13（真网关模式 / host gateway）已验收的行为
+
+（决策与取舍见 ADR-0029；实现 = loader `--lan none` + `lab/gateway.sh` + `lab/rules.gateway.dae`。）
+
+- **入口**：`sudo lab/gateway.sh up [--iface wlan0] [--node /tmp/mini-dae-node.url]`；
+  `down`/`status`/`test`/`--dry-run`；节点 URL 仅从文件/参数读取（不入库）。
+- **拓扑**：物理网卡留在宿主 netns（只挂 wan egress/ingress）；控制面对 netns `gwdae` +
+  veth `dae0gw/dae0gwpeer`（169.254.0.11/32、静态邻居 169.254.0.1、`fwmark 0x8000000 → table 2023`，与 lab 拓扑一致）。
+- **数据面路径**（与 lab `test-host-proxy` 同源）：wlan0 egress 判 proxy → 改 dst MAC 为 dae0peer MAC +
+  `redirect_track(smac,dmac,from_wan=1,ifindex=wlan0)` → redirect dae0 → dae0peer ingress
+  `bpf_sk_assign` → tproxy（daens）→ relay 在 host ns 拨号（`SO_MARK=0x233` 跳过钩子）→
+  回程 dae0 ingress 还原 MAC + `BPF_F_INGRESS` 注回 wlan0（`progs.rs` `mini_dae0_ingress` L132-196）。
+- **实测坑 1（最重要）**：网关规则里不能写任何 `sip(...)`——宿主机流量源地址就是本机私网地址，
+  `sip(192.168.0.0/16) -> direct` 会把全部出站 TCP 判直连（症状：TCP 直连被墙/超时，
+  而 DNS 因数据面 DNS override 仍进控制面，容易误判「链路已通」）。
+- **实测坑 2**：DNS(53) 想直连必须 `direct(must)` 且排在私网 `dip` 规则之前——`route.rs:146`
+  对任何命中的非 must 规则会强制 `CONTROL_PLANE`（送 DNS 模块）；而缺省上游 `8.8.8.8:53`
+  在受限网络不可达。
+- **实测坑 3**：状态输出不要回显进程 argv 里的 `--dialer`（含节点凭据）；脚本 status 已 redact。
+- **验收**（本机 Arch / 6.18.54-lts / wlan0 192.0.2.254 / anytls 真实节点）：
+  钩子 4 个（`mini_wan_egress@wlan0`、`mini_wan_ingress@wlan0`、`mini_dae0_ingress@dae0gw`、
+  `mini_dae0peer_ingress@dae0gwpeer`）、规则 15 条 match_set；`generate_204` **204**、
+  YouTube **200**、出口 IP 为节点侧（203.0.113.45）；relay `conns_total=4 / active=1 / dial_errors=0`、
+  下行 931KB；`down` 后 `bpftool net show dev wlan0` 无钩子、直连 baidu 200；二次 `up` 幂等；
+  `--dry-run` 零副作用。
+- **边界**：IPv6 不代理（`--no-ipv6` 可临时关网卡 v6）；UDP 不代理（QUIC 显式 block，引导浏览器回落 TCP）；
+  无 systemd 常驻/崩溃自愈（未做，重启后需重新 up）；Docker/容器流量同样经 wlan0 被接管。
+
 ## 12. 用 Rust 重写这套东西的可行性
 
 已验证（本仓库 mini-dae，实测跑通）：

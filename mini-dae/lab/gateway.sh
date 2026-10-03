@@ -1,0 +1,314 @@
+#!/usr/bin/env bash
+# mini-dae 真网关模式：在宿主 netns 用 eBPF 透明接管本机流量（浏览器零配置）。
+#
+#   sudo lab/gateway.sh up [--iface wlan0] [--node <文件|URL>] [--rules <文件>] [--no-ipv6]
+#   sudo lab/gateway.sh down          # 停止并恢复（幂等）
+#   sudo lab/gateway.sh status        # 查看进程/钩子/日志
+#   lab/gateway.sh test               # 连通性快检（可直接用当前用户跑）
+#   sudo lab/gateway.sh up --dry-run  # 只打印将要执行的命令
+#
+# 原理（复用 lab.sh test-host-proxy 已验证的宿主流量路径，网卡不移动、不断网）：
+#   - 物理网卡（默认路由网卡）留在宿主 netns，只挂 tc 钩子：
+#       被判 proxy 的 TCP -> bpf_redirect 到 dae0 -> dae0peer ingress -> tproxy(daens)
+#       被判 direct 的报文原样放行（内核正常收发）
+#   - relay 在 host ns 拨号，出口 socket 打 SO_MARK=0x233，数据面跳过（不自环）；
+#   - 回程由 dae0 ingress 按 redirect_track 还原 MAC 后 BPF_F_INGRESS 注回 WAN；
+#   - DNS 默认被数据面自动送控制面 DNS 模块；本脚本配套规则用 direct(must)
+#     把它压回系统解析路径（见 lab/rules.gateway.dae 的说明）。
+#
+# 安全与回滚：
+#   - 不移动网卡、不碰 NetworkManager；loader 异常退出时 tc 钩子随进程自动拆除，
+#     网络立即恢复直连。
+#   - 恢复：sudo lab/gateway.sh down（杀进程、删 netns/veth、恢复 sysctl）。
+#   - 节点 URL 只从 --node 参数或文件读取，绝不写进仓库；建议放 /tmp（权限 600）。
+#
+# 依赖：root；mini-dae loader 与 eBPF 对象已构建（lab/lab.sh build 或 lab/build-ebpf-rs.sh）。
+
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(dirname "$HERE")"
+LOADER="$ROOT/target/release/mini-dae"
+OBJ="$ROOT/ebpf-rs/target/bpfel-unknown-none/release/mini-dae-ebpf"
+
+# 与 lab.sh 区分开的专用名字（可同时存在互不干扰；pkill 依据 --daens 参数精确匹配）
+DAE_NS=gwdae
+DAE0=dae0gw
+DAE0PEER=dae0gwpeer
+
+LOG=/tmp/mini-dae-gw.log
+PID_FILE=/tmp/mini-dae-gw.pid
+STATUS_SOCK=/tmp/mini-dae-gw.sock
+STATE_FILE=/tmp/mini-dae-gw.state
+DEFAULT_NODE_FILE=/tmp/mini-dae-node.url
+
+IFACE=""
+RULES="$HERE/rules.gateway.dae"
+NODE=""
+NO_IPV6=0
+DRY_RUN=0
+
+die() { echo "错误：$*" >&2; exit 1; }
+info() { echo "== $* =="; }
+
+require_root() { [ "$(id -u)" -eq 0 ] || die "需要 root：sudo $0 $*"; }
+
+run() {
+  if [ "$DRY_RUN" -eq 1 ]; then
+    printf '  +'
+    printf ' %q' "$@"
+    printf '\n'
+  else
+    "$@"
+  fi
+}
+
+usage() {
+  sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'
+}
+
+detect_iface() {
+  ip route show default 2>/dev/null |
+    awk '{for (i = 1; i <= NF; i++) if ($i == "dev") {print $(i + 1); exit}}'
+}
+
+detect_dns() {
+  awk '/^nameserver/ {print $2; exit}' /etc/resolv.conf 2>/dev/null
+}
+
+save_sysctl() {
+  local k="$1" v
+  v="$(sysctl -n "$k" 2>/dev/null || echo NA)"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    echo "  + 记录 $k=$v"
+    return 0
+  fi
+  printf '%s=%s\n' "$k" "$v" >>"$STATE_FILE"
+}
+
+restore_sysctls() {
+  [ -f "$STATE_FILE" ] || return 0
+  local line k v
+  while IFS='=' read -r k v; do
+    [ -n "$k" ] || continue
+    [ "$v" != "NA" ] || continue
+    run sysctl -qw "$k=$v" 2>/dev/null || true
+  done <"$STATE_FILE"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    echo "  + 删除 $STATE_FILE"
+  else
+    rm -f "$STATE_FILE"
+  fi
+}
+
+cleanup() {
+  if [ "$DRY_RUN" -eq 1 ]; then
+    echo "  + （dry-run）停止旧实例、删 netns $DAE_NS / veth $DAE0"
+    return 0
+  fi
+  local pid=""
+  if [ -f "$PID_FILE" ]; then
+    pid="$(cat "$PID_FILE" 2>/dev/null || true)"
+  fi
+  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+    info "停止 mini-dae（pid $pid）"
+    kill "$pid" 2>/dev/null || true
+    for _ in $(seq 1 30); do
+      kill -0 "$pid" 2>/dev/null || break
+      sleep 0.1
+    done
+    kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null || true
+  fi
+  rm -f "$PID_FILE"
+  # 兜底：pid 文件丢失时按该实例独有的 --daens 参数匹配
+  pkill -f "daens $DAE_NS" 2>/dev/null || true
+  sleep 0.2
+  if ip netns list 2>/dev/null | grep -qw "$DAE_NS"; then
+    run ip netns del "$DAE_NS" || true
+  fi
+  if ip link show dev "$DAE0" >/dev/null 2>&1; then
+    run ip link del "$DAE0" || true
+  fi
+  rm -f "$STATUS_SOCK"
+}
+
+up() {
+  [ "$DRY_RUN" -eq 1 ] || require_root up
+  [ -x "$LOADER" ] || die "缺 loader：$LOADER（先 lab/lab.sh build）"
+  [ -f "$OBJ" ] || die "缺 eBPF 对象：$OBJ（先 lab/build-ebpf-rs.sh）"
+  [ -f "$RULES" ] || die "缺规则文件：$RULES"
+
+  [ -n "$IFACE" ] || IFACE="$(detect_iface)"
+  [ -n "$IFACE" ] || die "拿不到默认路由网卡，请用 --iface 指定"
+  ip link show dev "$IFACE" >/dev/null 2>&1 || die "网卡 $IFACE 不存在"
+
+  if [ -z "$NODE" ]; then NODE="$DEFAULT_NODE_FILE"; fi
+  local node_url
+  if [ -f "$NODE" ]; then
+    node_url="$(tr -d ' \t\r\n' <"$NODE")"
+  else
+    node_url="$NODE"
+  fi
+  [ -n "$node_url" ] || die "缺少节点 URL（--node <文件|URL>，或写入 $DEFAULT_NODE_FILE）"
+  case "$node_url" in
+  *://*) ;;
+  *) die "节点 URL 无效（缺少 scheme）：$NODE" ;;
+  esac
+
+  local dns_up
+  dns_up="$(detect_dns)"
+  [ -n "$dns_up" ] || dns_up="127.0.0.1"
+
+  info "真网关模式 iface=$IFACE dns=$dns_up:53 rules=$RULES"
+  echo "   节点：$(printf '%s' "$node_url" | cut -d: -f1)://…（敏感信息不回显）"
+
+  cleanup
+  restore_sysctls
+  save_sysctl net.ipv4.conf.all.rp_filter
+  save_sysctl net.ipv4.conf.default.rp_filter
+  if [ "$NO_IPV6" -eq 1 ]; then
+    save_sysctl "net.ipv6.conf.$IFACE.disable_ipv6"
+  fi
+
+  info "建立控制面对 netns=$DAE_NS veth=$DAE0/$DAE0PEER"
+  run ip netns add "$DAE_NS"
+  run ip link add "$DAE0" type veth peer name "$DAE0PEER"
+  run ip link set "$DAE0PEER" netns "$DAE_NS"
+  run ip link set "$DAE0" up
+  run ip -n "$DAE_NS" link set lo up
+  run ip -n "$DAE_NS" link set "$DAE0PEER" up
+  # 对照 dae control/netns_utils.go（同 lab.sh）：169.254.0.11/32 生成正确 L3 头，
+  # 默认路由走静态邻居 169.254.0.1（dae0 的 MAC），保证 tproxy 回包可发出。
+  run ip -n "$DAE_NS" addr add 169.254.0.11/32 dev "$DAE0PEER"
+  run ip -n "$DAE_NS" route add 169.254.0.1/32 dev "$DAE0PEER" scope link
+  run ip -n "$DAE_NS" route add default via 169.254.0.1 dev "$DAE0PEER"
+  local mac=""
+  if [ "$DRY_RUN" -eq 1 ]; then
+    mac="02:00:00:00:00:01"
+  else
+    mac="$(ip link show dev "$DAE0" | awk '/link\/ether/ {print $2; exit}')"
+    [ -n "$mac" ] || die "拿不到 $DAE0 的 MAC"
+  fi
+  run ip -n "$DAE_NS" neigh add 169.254.0.1 lladdr "$mac" dev "$DAE0PEER" nud permanent
+  run ip netns exec "$DAE_NS" sysctl -qw "net.ipv4.conf.$DAE0PEER.accept_local=1"
+  run ip netns exec "$DAE_NS" sysctl -qw net.ipv4.ip_nonlocal_bind=1
+  run ip -n "$DAE_NS" rule add fwmark 0x8000000/0x8000000 table 2023
+  run ip -n "$DAE_NS" route add local default dev lo table 2023
+
+  info "内核开关（rp_filter 放宽）"
+  run sysctl -qw net.ipv4.conf.all.rp_filter=0
+  run sysctl -qw net.ipv4.conf.default.rp_filter=0
+  run sysctl -qw "net.ipv4.conf.$DAE0.accept_local=1"
+  if [ "$NO_IPV6" -eq 1 ]; then
+    run sysctl -qw "net.ipv6.conf.$IFACE.disable_ipv6=1"
+    echo "   已临时关闭 $IFACE 的 IPv6（down 时恢复）"
+  fi
+
+  info "启动 loader（log=$LOG）"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    echo "  + nohup $LOADER --ebpf $OBJ --lan none --wan $IFACE --dae0 $DAE0 --dae0peer $DAE0PEER --daens $DAE_NS --rules $RULES --dialer '<node-url>' --dial-timeout 15 --dns-upstream $dns_up:53 --status-socket $STATUS_SOCK --log-file $LOG >>$LOG 2>&1 &"
+    echo "（dry-run：未执行任何变更）"
+    return 0
+  fi
+  : >"$LOG"
+  nohup "$LOADER" --ebpf "$OBJ" --lan none --wan "$IFACE" \
+    --dae0 "$DAE0" --dae0peer "$DAE0PEER" --daens "$DAE_NS" \
+    --rules "$RULES" --dialer "$node_url" --dial-timeout 15 \
+    --dns-upstream "$dns_up:53" \
+    --status-socket "$STATUS_SOCK" --log-file "$LOG" >>"$LOG" 2>&1 &
+  echo $! >"$PID_FILE"
+  sleep 1.2
+  if ! kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+    echo "--- 启动失败，日志尾部 ---" >&2
+    tail -n 20 "$LOG" >&2 || true
+    cleanup
+    restore_sysctls
+    die "loader 启动失败"
+  fi
+  echo "   loader pid=$(cat "$PID_FILE")"
+
+  if [ "$NO_IPV6" -eq 0 ] && ip -6 route show default 2>/dev/null | grep -q .; then
+    echo "   注意：本机有 IPv6 默认路由；数据面仅 IPv4，IPv6 流量不会被代理（可用 --no-ipv6 关闭网卡 IPv6）。"
+  fi
+  echo "完成：浏览器直接访问即可，无需任何代理设置。"
+  echo "   sudo $0 test    # 连通性快检   sudo $0 down    # 停止并恢复"
+}
+
+down() {
+  require_root down
+  info "停止并恢复"
+  cleanup
+  restore_sysctls
+  info "当前默认路由"
+  ip route show default || true
+  ip -6 route show default 2>/dev/null || true
+  echo "完成：本机网络已恢复为直连。"
+}
+
+status() {
+  info "进程"
+  local pid=""
+  [ -f "$PID_FILE" ] && pid="$(cat "$PID_FILE" 2>/dev/null || true)"
+  if [ -n "$pid" ] && [ -d "/proc/$pid" ]; then
+    ps -o pid=,etime=,args= -p "$pid" 2>/dev/null | sed 's#--dialer [^ ]*#--dialer <redacted>#' || true
+  else
+    echo "  mini-dae 未运行（或不是本脚本启动的实例）"
+  fi
+  info "netns / veth"
+  ip netns list 2>/dev/null | grep -w "$DAE_NS" || echo "  无 $DAE_NS"
+  ip -br link show "$DAE0" 2>/dev/null || echo "  无 $DAE0"
+  info "tc 钩子（需要 root；bpftool）"
+  local ifc="${IFACE:-$(detect_iface)}"
+  if command -v bpftool >/dev/null 2>&1; then
+    bpftool net show dev "$ifc" 2>/dev/null || echo "  （权限不足或网卡 $ifc 无钩子）"
+  else
+    echo "  未安装 bpftool"
+  fi
+  info "日志尾部（$LOG）"
+  tail -n 8 "$LOG" 2>/dev/null || echo "  无日志"
+}
+
+test_conn() {
+  local code exitip
+  code="$(env -u http_proxy -u https_proxy -u all_proxy \
+    curl -s -o /dev/null -w '%{http_code}' --max-time 20 \
+    https://www.gstatic.com/generate_204 || true)"
+  echo "generate_204 -> ${code:-失败}"
+  exitip="$(env -u http_proxy -u https_proxy -u all_proxy \
+    curl -s --max-time 20 https://api.ipify.org || true)"
+  echo "出口 IP      -> ${exitip:-失败}"
+  if getent hosts www.google.com >/dev/null 2>&1; then
+    echo "DNS 解析     -> ok（www.google.com）"
+  else
+    echo "DNS 解析     -> 失败"
+  fi
+  if [ "$code" = "204" ]; then
+    echo "PASS：本机流量已由 mini-dae 接管（eBPF 透明代理）"
+  else
+    echo "FAIL：请检查 sudo $0 status 与 $LOG"
+    return 1
+  fi
+}
+
+cmd="${1:-}"
+[ $# -gt 0 ] && shift || true
+while [ $# -gt 0 ]; do
+  case "$1" in
+  --iface) IFACE="$2"; shift 2 ;;
+  --node) NODE="$2"; shift 2 ;;
+  --rules) RULES="$2"; shift 2 ;;
+  --no-ipv6) NO_IPV6=1; shift ;;
+  --dry-run) DRY_RUN=1; shift ;;
+  -h | --help) usage; exit 0 ;;
+  *) die "未知参数：$1" ;;
+  esac
+done
+
+case "$cmd" in
+up) up ;;
+down) down ;;
+status) status ;;
+test) test_conn ;;
+"" | help | -h | --help) usage ;;
+*) die "未知子命令：$cmd" ;;
+esac

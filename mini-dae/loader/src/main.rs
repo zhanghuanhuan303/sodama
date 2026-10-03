@@ -328,8 +328,10 @@ unsafe impl aya::Pod for MiniRedirectEntry {}
 
 struct Args {
     ebpf: String,
-    /// LAN 侧接口（ingress 分流）
+    /// LAN 侧接口（ingress 分流）；`--lan none` = 不挂 LAN 钩子（纯本机网关）
     lan: Vec<String>,
+    /// 是否显式声明不挂 LAN 钩子（`--lan none`；阻止默认值 landae）
+    no_lan: bool,
     /// WAN 侧接口（egress 分流 + ingress 状态刷新）
     wan: Vec<String>,
     /// 单臂模式：同一接口同时挂 LAN/WAN 合用程序（mini_wan_lan_ingress + mini_lan_wan_egress）
@@ -422,7 +424,7 @@ fn usage() -> ! {
          \n\
          options:\n\
            --ebpf <path>         eBPF object（默认 ebpf-rs/target/bpfel-unknown-none/release/mini-dae-ebpf）\n\
-           --lan <ifname>        LAN 侧接口，可重复（默认 landae）\n\
+           --lan <ifname>        LAN 侧接口，可重复（默认 landae；`--lan none` = 不挂 LAN 钩子，本机网关模式）\n\
            --wan <ifname>        WAN 侧接口，可重复（默认 wan）\n\
            --dual <ifname>       单臂模式：同一接口同时挂 LAN/WAN 合用程序，可重复\n\
            --dae0 <ifname>       控制面设备（默认 dae0）\n\
@@ -467,6 +469,7 @@ fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
     let mut args = Args {
         ebpf: "ebpf-rs/target/bpfel-unknown-none/release/mini-dae-ebpf".into(),
         lan: Vec::new(),
+        no_lan: false,
         wan: Vec::new(),
         dual: Vec::new(),
         dae0: "dae0".into(),
@@ -495,7 +498,14 @@ fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
         let mut next = || it.next().ok_or_else(|| format!("missing value for {a}"));
         match a.as_str() {
             "--ebpf" => args.ebpf = next()?,
-            "--lan" => args.lan.push(next()?),
+            "--lan" => {
+                let v = next()?;
+                if v == "none" {
+                    args.no_lan = true;
+                } else {
+                    args.lan.push(v);
+                }
+            }
             "--wan" => args.wan.push(next()?),
             "--dual" => args.dual.push(next()?),
             "--dae0" => args.dae0 = next()?,
@@ -525,7 +535,7 @@ fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
             other => return Err(format!("unknown option: {other}").into()),
         }
     }
-    if args.lan.is_empty() && args.dual.is_empty() {
+    if args.lan.is_empty() && !args.no_lan && args.dual.is_empty() {
         args.lan.push("landae".into());
     }
     if args.wan.is_empty() && args.dual.is_empty() {
