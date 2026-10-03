@@ -205,7 +205,7 @@
     <span class="chip">代码量 <b>~65k 非测试 LOC / ~40k 测试</b></span>
     <span class="chip">数据面 <b>tproxy.c 4403 行 · 23 个程序 · 24 个 map</b></span>
     <span class="chip">许可 <b>AGPL-3.0</b></span>
-    <span class="chip">文档版本 <b>v2.13 · 2026-10-04</b></span>
+    <span class="chip">文档版本 <b>v2.14 · 2026-10-04</b></span>
   </div>
 </header>
 
@@ -1173,8 +1173,71 @@ wait signal → reload / suspend / shutdown</pre>
   </ul>
 </section>
 
+<!-- ============================================================ -->
+<section id="parity" class="reveal" style="margin-top:64px">
+  <h2><span style="color:var(--dim);font-size:.62em">10 · </span>对标进度（dae ↔ mini-dae）</h2>
+  <p style="color:var(--muted)">口径：「覆盖度」= 该域<b>功能点覆盖</b>的粗估（我方可用 ÷ dae 等价能力），<b>不是代码行数、不是性能等价</b>；数字是判断值，逐行给出证据锚点。清点时间 2026-10-04（P13 网关模式完成后，网关实测运行中）；完整版见 <code>docs/parity-status.md</code>。</p>
+
+  <div class="tbl-wrap">
+  <table>
+    <thead><tr><th># / 域</th><th>dae（Go 原版）</th><th>mini-dae（全 Rust）</th><th>覆盖度</th><th>关键差异 / 证据</th></tr></thead>
+    <tbody>
+      <tr><td><b>1 · eBPF 数据面</b>（程序/hook）</td><td>23 程序（13×TC L2/L3 变体 + <code>sk_skb</code> offload + 5×cgroup + kprobe/fentry）· 24 map · 4,403 行 C</td><td>8 程序（7×TC 含单臂 dual-role + <code>sk_skb</code>）· 14 map（BTF）· ~1.1k 行 Rust</td><td><span class="b b-warn">≈65%</span></td><td>主路径语义逐一对齐；缺 L2/桥接变体、cgroup 钩子、ringbuf。优势：C 已退役（ADR-0025）、TCX 退出即摘钩</td></tr>
+      <tr><td><b>2 · 分流主链路</b></td><td>tproxy/direct/block、控制面 DNS override、五钩子角色、conn_state、双 epoch 热重载、redirect_track 单写者</td><td>同上全有</td><td><span class="b b-ok">≈95%</span></td><td>K0–K3 九用例 ×2 拓扑全过；<code>verify</code> 9/9（ADR-0009/0010）</td></tr>
+      <tr><td><b>3 · 规则引擎</b></td><td>dip/sip/dport/sport/l4proto/ipversion/dscp/mac/<b>pname</b>/domain/<b>geoip/geosite</b>/fallback + not/and + mark/must + sub/subnode</td><td>除 pname/geo/subnode 外全有；domain 走 DNS 位图 + regex</td><td><span class="b b-warn">≈75%</span></td><td><b>编译产物与 dae 逐字节对拍 5/5</b>（ADR-0010）；缺 geo 数据、进程名、subnode</td></tr>
+      <tr><td><b>4 · 配置系统</b></td><td>全量 <code>.dae</code>（global/dns/routing/group/subscription/node/include）<b>全部生效</b></td><td>全量解析 + schema 校验 + 行级诊断；生效 routing 子集 + dns.upstream；group/node/subscription 仅解析（无运行时）</td><td><span class="b b-warn">≈60%</span></td><td>解析面与 <code>config_merger/parser</code> 语义逐条对齐；deferred 显式列出不静默丢（ADR-0011）</td></tr>
+      <tr><td><b>5 · DNS 子系统</b></td><td>透明 UDP/TCP、缓存、EDNS、regex、<b>DoT/DoH/DoQ/H3 上游</b>、<b>dns.routing 请求/应答分流</b>、ECS、嗅探 punt</td><td>透明 UDP/TCP、正负缓存 TTL、域位图、regex、EDNS/截断、reload 重投影、TCP keep-alive</td><td><span class="b b-warn">≈55%</span></td><td>明文 DNS 全对齐（6 专项，ADR-0012/0013/0014）；安全上游与请求分流缺</td></tr>
+      <tr><td><b>6 · 出站协议栈</b></td><td>ss（含 2022/插件/shadowtls）、ssr、trojan、vmess、vless、tuic、hysteria2、<b>juicity</b>、<b>naive</b>、http、socks5、anytls</td><td>ss classic、trojan(TCP)、vmess(AEAD)、vless(tcp/ws)、tuic v5、hy2(+obfs/Brutal/udphop)、anytls、socks5、direct</td><td><span class="b b-warn">≈60% 家族</span> <span class="b b-ok">≈85% 主流</span></td><td>主流 7 协议全覆盖且纯 Rust 跨实现验收（ADR-0016–0020/0026/0027）；缺 ss2022/ssr/juicity/naive/http、REALITY/Vision/uTLS、gecko</td></tr>
+      <tr><td><b>7 · 转发面</b></td><td>relay（并发上限/backlog fuse/计费）、UDP endpoint pool（full-cone）、offload 完整</td><td>relay（SO_MARK/半关闭/janitor）、UDP NAT、offload 最小实现</td><td><span class="b b-warn">≈75%</span></td><td>512KB 逐字节、UDP 会话复用、offload 用户态零字节均实测（ADR-0015/0022）；缺 fuse/计费/并发上限</td></tr>
+      <tr><td><b>8 · 多节点·订阅·健康检查</b></td><td>subscription + group（min/max/random）+ alive set + 延迟探测 + sticky IP + 故障恢复</td><td>单 <code>--dialer URL</code>；group 名仅解析映射</td><td><span class="b b-bad">≈10%</span></td><td><b>最大生态缺口</b></td></tr>
+      <tr><td><b>9 · 嗅探与域名策略（dial_mode）</b></td><td>TLS/HTTP/QUIC 嗅探 → <code>domain/domain+</code> 拨号（<b>远端解析，绕 DNS 污染</b>）、sniffing punt</td><td>无（target 一律 IP、本地解析）</td><td><span class="b b-bad">≈5%</span></td><td><b>第二大缺口</b>；浏览器场景暂靠 Secure DNS/DoH 规避</td></tr>
+      <tr><td><b>10 · IPv6</b></td><td>数据面 + 规则 + 协议全支持</td><td>仅 IPv4（显式边界）</td><td><span class="b b-bad">≈5%</span></td><td><code>--no-ipv6</code> 只是规避不是支持</td></tr>
+      <tr><td><b>11 · 部署自动化</b></td><td>netns 自动搭建（移网卡/sysctl/tproxy 规则）、systemd（<code>install/dae.service</code>）、Docker、发行包、shell 补全</td><td><code>lab.sh</code> / <code>gateway.sh</code> 脚本级一键；无 systemd/打包</td><td><span class="b b-bad">≈40%</span></td><td>真网关一键脚本体验接近（ADR-0029）；脚本代劳、安全性更高但自动化深度不同</td></tr>
+      <tr><td><b>12 · 运维面</b></td><td>主线较弱（daed 独立项目提供 GraphQL/Web UI）</td><td>SIGHUP/USR2、状态 socket（status/rules/config/maps/metrics/reload/suspend/resume）、Prometheus、sysdump/trace、日志轮转</td><td><span class="b b-ok">≈90%</span></td><td>相对 dae 主线领先；daed 的 UI/鉴权不在范围（ADR-0021）</td></tr>
+      <tr><td><b>13 · 质量工程</b></td><td>Go 单测 244 文件/3.9 万行 + CI（bpf-test/build/docker/go-test…）+ fuzz</td><td>95 单测 + verify 9×2 拓扑 + 6 专项 + 协议梯 17 + 对拍 5 逐字节 + QEMU 双内核矩阵 + soak + 六路径基准；<b>无 CI</b></td><td><span class="b b-warn">≈70%</span></td><td>方法学密度高、绝对规模小（ADR-0010/0022/0025）</td></tr>
+      <tr><td><b>14 · 性能</b></td><td>生产级优化（THP/内存上限/连接池/看门狗）</td><td>六路径基准：direct 31Gbps / relay 24.7Gbps / offload 14.6Gbps / ss 2.5Gbps</td><td><span class="b b-warn">≈55%</span></td><td>有数据、<b>缺与 Go 版同机对拍</b>（如实，ADR-0022）</td></tr>
+      <tr><td><b>15 · 真实订阅生态</b></td><td>全原生</td><td>订阅#1（50×vless-ws）✅；订阅#2：anytls ✅、<b>REALITY+Vision ❌</b>（SOCKS5 桥接兜底）</td><td><span class="b b-warn">≈70%</span></td><td>ADR-0026/0027/0028；边界外协议可桥接过渡</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h3>汇总</h3>
+  <div class="tbl-wrap">
+  <table>
+    <thead><tr><th>口径</th><th>完成度</th><th>说明</th></tr></thead>
+    <tbody>
+      <tr><td>研究目标（可行性验证）</td><td><span class="b b-ok">100%</span></td><td>aya 全栈可行、规则逐字节对拍、C 数据面退役、真实节点浏览器可用——结论闭环</td></tr>
+      <tr><td>核心主链路（分流/规则/明文 DNS/主流协议/转发/运维）</td><td><span class="b b-ok">≈80–85%</span></td><td>日常「tproxy 网关 + 主流节点」已可用（P13 真网关本机实测 204 / YouTube 200）</td></tr>
+      <tr><td>dae 全功能面（嗅探/多节点/geo/IPv6/安全 DNS/系统集成）</td><td><span class="b b-warn">≈60%（±5%）</span></td><td>差距集中在结构性 4–5 项，非零散细节</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h3>Top 缺口（按优先级）</h3>
+  <ol style="color:var(--muted);line-height:1.9">
+    <li><b>嗅探 + dial_mode（远端域名解析）</b>：直接解决 DNS 污染与真实体验，杠杆最大；</li>
+    <li><b>多节点/订阅/组 + 健康检查</b>：从「研究品」到「日用品」的门槛；</li>
+    <li><b>IPv6 数据面</b>；</li>
+    <li>geoip/geosite/pname；</li>
+    <li>DoH/DoQ + <code>dns.routing</code>；</li>
+    <li>协议细节：REALITY/Vision/uTLS、ss2022/插件、juicity/naive/ssr、gecko、tuic 0-RTT；</li>
+    <li>systemd/打包/daed；</li>
+    <li>offload 完整形态（fuse/计费）与 relay 并发上限。</li>
+  </ol>
+
+  <h3>优势项（相对 dae 主线）</h3>
+  <ul style="color:var(--muted);line-height:1.9">
+    <li><b>全栈 Rust</b>：数据面（aya-ebpf/BTF）已退役 C（ADR-0025），协议栈纯 Rust 跨实现验收；</li>
+    <li><b>规则编译逐字节对拍</b>：与 dae Go 编译器 5/5 一致，作为回归护栏（ADR-0010）；</li>
+    <li><b>TCX 生命周期</b>：进程退出即摘钩，回滚天然安全；</li>
+    <li><b>状态面/可观测</b>：JSON socket + Prometheus + sysdump/trace（dae 主线没有，daed 才有 Web UI）；</li>
+    <li>单臂 dual-role 程序、<code>--lan none</code> 一键真网关（ADR-0029）、本地 SOCKS5 入口（ADR-0028）；</li>
+    <li><b>工程化验收</b>：QEMU 双内核矩阵、soak 三模式、六路径基准、协议三方交叉（Go 客户端/Python+Go 参考服务端）。</li>
+  </ul>
+</section>
+
 <p style="color:var(--dim);font-family:var(--mono);font-size:.78rem;margin-top:56px;border-top:1px solid var(--line);padding-top:14px">
-  dae → Rust 决策档案 · v2.13 · 生成于 2026-10-04 · 基于 dae main@e3fee8f（nightly）· 本文件自包含，可离线打开<br>
+  dae → Rust 决策档案 · v2.14 · 生成于 2026-10-04 · 基于 dae main@e3fee8f（nightly）· 本文件自包含，可离线打开<br>
   v1.1：新增 4.5 部署形态、4.6 常驻与故障语义、决策点 D8<br>
   v1.2：按 ADR-0009 改为 K 轨道路线图；D7 修订为内核切片先行；K0 第一步（规则 VM + LPM）已实测<br>
   v1.3：K0、K1 均已完成并实测（双 epoch 热重载、conn_state 缓存、五钩子角色、本机 WAN 流量与回程）<br>
@@ -1196,7 +1259,8 @@ wait signal → reload / suspend / shutdown</pre>
     v2.10：P10 vless WebSocket 传输——接入真实订阅节点（50×vless+ws+tls+CF CDN）：RFC6455 客户端传输层（Upgrade 握手 + 掩码帧，可拆半）、`type=ws`+`host`/`path` 参数；验收：`cargo test` 80/80、标准 verify 9/9、vless tcp/tls/udp 回归全过、`lab/real-node-e2e.sh` 端到端 gstatic 204；与参照客户端（v2ray）同目标对拍排除节点侧黑洞干扰（详情见 ADR-0026 与 `mini-dae/NOTES.md` §11.17）；另对第二份真实订阅做形态普查：**REALITY+Vision / anytls 在边界外**（解析期显式拒绝，测试钉住），sing-box 1.14 参照 204、SOCKS5 桥接模式 gateway e2e 204<br>
       v2.11：P11 AnyTLS——anytls-go v2 客户端子集（sha256 认证、帧、默认 paddingScheme 逐字节对齐与 UpdatePaddingScheme、单 Stream）；跨实现对拍 sing-box、真实订阅节点 e2e gstatic 204；同批 `--dial-timeout` 可配；REALITY+Vision 仍在边界外（详情见 ADR-0027 与 `mini-dae/NOTES.md` §11.18）<br>
         v2.12：P12 本地 SOCKS5 入口——`--listen-socks`（零 root、零 eBPF，浏览器直接指向 127.0.0.1 即走真实节点）；真机验收 gstatic 204 / YouTube 200（down 918KB）；顺手修 `resolve()` 优先 IPv4（双栈节点域名踩坑）（详情见 ADR-0028 与 `mini-dae/NOTES.md` §11.19）<br>
-        v2.13：P13 真网关模式（host gateway）——`--lan none` + `lab/gateway.sh`（up/down/status/test/--dry-run）：物理网卡不移动，只挂 wan egress/ingress 钩子透明接管**宿主自身流量**，浏览器零配置；规则纪律实测确定：DNS `direct(must)` 置顶、禁用 `sip()`（宿主机源地址即私网，否则全部误判直连）、QUIC 阻断回落 TCP；真机验收 gstatic 204 / YouTube 200 / 出口 IP=节点侧 / relay 931KB、`down` 后无钩子无残留（详情见 ADR-0029 与 `mini-dae/NOTES.md` §11.20）
+        v2.13：P13 真网关模式（host gateway）——`--lan none` + `lab/gateway.sh`（up/down/status/test/--dry-run）：物理网卡不移动，只挂 wan egress/ingress 钩子透明接管**宿主自身流量**，浏览器零配置；规则纪律实测确定：DNS `direct(must)` 置顶、禁用 `sip()`（宿主机源地址即私网，否则全部误判直连）、QUIC 阻断回落 TCP；真机验收 gstatic 204 / YouTube 200 / 出口 IP=节点侧 / relay 931KB、`down` 后无钩子无残留（详情见 ADR-0029 与 `mini-dae/NOTES.md` §11.20）<br>
+        v2.14：新增「10 · 对标进度」——dae ↔ mini-dae 分域覆盖度对照（15 域 + 汇总 + Top 缺口 + 优势项，逐行附证据锚点）；同文固化 `docs/parity-status.md`（研究目标 100%、主链路 ≈80–85%、dae 全功能面 ≈60%）
 </p>
 </main>
 

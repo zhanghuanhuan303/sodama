@@ -918,3 +918,6 @@ CONNECT；ss 不支持插件与 2022 版；trojan 不支持 UDP 与域名目标�
   **vless+REALITY+Vision ❌**（解析期显式拒绝，测试钉住；需要 TLS 握手级控制，
   属独立档位，需先写 ADR）。边界外协议过渡期可用 SOCKS5 桥接：
   `--dialer socks5://127.0.0.1:<sing-box/mihomo 的 socks 端口>`（所有协议立即可用）。
+
+分域覆盖度对照（与 dae 原版逐项对标，含 Top 缺口与优先级）见
+[`docs/parity-status.md`](../docs/parity-status.md)（主文档 HTML 第 10 节同源）。

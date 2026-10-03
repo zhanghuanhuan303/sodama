@@ -87,6 +87,8 @@ sudo lab/lab.sh down
 - [`docs/adr/`](./docs/adr/) — 29 条已采纳 ADR：每个决策的背景、选项、理由、后果、
   **实测验证方式**与修订条件。重要节点：0002（eBPF 程序语言：先 C 后迁）、
   0023/0024/0025（数据面 Rust 全量迁移 → C 对象退场）、0029（真网关模式：宿主流量透明接管）。
+- [`docs/parity-status.md`](./docs/parity-status.md) — 对标进度：dae（Go）↔ mini-dae（全 Rust）
+  分域覆盖度对照（15 域 + 汇总 + Top 缺口 + 优势项，逐行附证据锚点）。
 - [`docs/modules/`](./docs/modules/) — tuic v5 / hysteria2 的字节级客户端规格。
 
 ## 上游与许可
