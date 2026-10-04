@@ -3,6 +3,11 @@
  * Python 探针（client_probe/stream_probe/wan_echo）作为端点会先于 sodama
  * 成为瓶颈，无法比较路径吞吐；这里用 C 实现热路径端点（零逐包分配）。
  *
+ * 服务端为**全双工 echo**（预分配 ring；BENCH_RING_MB 可调，默认 64MB）：
+ * 读线程按序写入 ring、写线程按序回放。单线程 read→write 的半双工实现
+ * 会在多跳大缓冲管道中与上游形成「都在写、都不读」的环形依赖（实测偶发
+ * 60s 级假死），fixture 不应成为死锁参与者。
+ *
  * 用法：
  *   bench_io serve <tcp_ports_csv> [udp_port]
  *   bench_io client <host> <port> <mb_per_stream> <streams>   # echo 回显校验
@@ -29,6 +34,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <sys/uio.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -117,27 +123,101 @@ static int dial_tcp(const char *host, int port) {
 
 /* ---------------------------------------------------------------- server */
 
+/* 全双工 echo：读线程把收到的数据按序写入预分配 ring，写线程按序回放。
+ * 原来的单线程 read→write 在半双工下会与上游实现的大缓冲管道形成
+ * 「双方都在写、都不读」的环形依赖，fixture 不应成为死锁参与者。
+ * ring 容量默认 64MB（BENCH_RING_MB 可调）；内存预分配，无逐包分配。 */
+#define RING_CHUNK (1u << 20)
+struct echo_conn {
+    int fd;
+    unsigned char *ring;
+    size_t cap;
+    size_t read_off;  /* 绝对偏移；读线程写、均在 mu 下 */
+    size_t write_off; /* 绝对偏移；写线程写、均在 mu 下 */
+    int eof;
+    pthread_mutex_t mu;
+    pthread_cond_t cv;
+};
+
+static size_t ring_cap(void) {
+    const char *e = getenv("BENCH_RING_MB");
+    long mb = e ? atol(e) : 64;
+    if (mb < 1) mb = 1;
+    return (size_t)mb << 20;
+}
+
+static void *echo_reader(void *arg) {
+    struct echo_conn *c = arg;
+    for (;;) {
+        pthread_mutex_lock(&c->mu);
+        while (c->read_off - c->write_off >= c->cap && !c->eof)
+            pthread_cond_wait(&c->cv, &c->mu);
+        size_t space = c->cap - (c->read_off - c->write_off);
+        int eof = c->eof;
+        pthread_mutex_unlock(&c->mu);
+        if (eof) break;
+        size_t start = c->read_off % c->cap;
+        size_t n1 = (space < c->cap - start) ? space : (c->cap - start);
+        size_t n2 = space - n1;
+        struct iovec iov[2] = {{c->ring + start, n1}, {c->ring, n2}};
+        ssize_t n = readv(c->fd, iov, n2 ? 2 : 1);
+        if (n <= 0) break;
+        pthread_mutex_lock(&c->mu);
+        c->read_off += (size_t)n;
+        pthread_cond_signal(&c->cv);
+        pthread_mutex_unlock(&c->mu);
+    }
+    pthread_mutex_lock(&c->mu);
+    c->eof = 1;
+    pthread_cond_broadcast(&c->cv);
+    pthread_mutex_unlock(&c->mu);
+    return NULL;
+}
+
 static void *tcp_conn(void *arg) {
     int fd = (int)(intptr_t)arg;
-    unsigned char *buf = malloc(BUF_SZ);
-    if (!buf) {
+    struct echo_conn c = {.fd = fd, .cap = ring_cap(), .read_off = 0, .write_off = 0, .eof = 0};
+    c.ring = malloc(c.cap);
+    if (!c.ring) {
         close(fd);
         return NULL;
     }
+    pthread_mutex_init(&c.mu, NULL);
+    pthread_cond_init(&c.cv, NULL);
+    pthread_t th;
+    if (pthread_create(&th, NULL, echo_reader, &c) != 0) {
+        free(c.ring);
+        close(fd);
+        return NULL;
+    }
+    size_t w = 0;
     for (;;) {
-        ssize_t n = read(fd, buf, BUF_SZ);
-        if (n <= 0) break;
-        ssize_t off = 0;
-        while (off < n) {
-            ssize_t w = write(fd, buf + off, (size_t)(n - off));
-            if (w <= 0) goto done;
-            off += w;
+        pthread_mutex_lock(&c.mu);
+        while (w >= c.read_off && !c.eof) pthread_cond_wait(&c.cv, &c.mu);
+        size_t r = c.read_off;
+        int eof = c.eof;
+        pthread_mutex_unlock(&c.mu);
+        while (w < r) {
+            size_t start = w % c.cap;
+            size_t n1 = (r - w < c.cap - start) ? (r - w) : (c.cap - start);
+            size_t n2 = (r - w) - n1;
+            struct iovec iov[2] = {{c.ring + start, n1}, {c.ring, n2}};
+            ssize_t n = writev(c.fd, iov, n2 ? 2 : 1);
+            if (n <= 0) goto done;
+            w += (size_t)n;
+            pthread_mutex_lock(&c.mu);
+            c.write_off = w;
+            pthread_mutex_unlock(&c.mu);
         }
+        if (eof && w >= r) break;
     }
 done:
-    shutdown(fd, SHUT_WR);
+    shutdown(fd, SHUT_RDWR);
+    pthread_join(th, NULL);
+    pthread_mutex_destroy(&c.mu);
+    pthread_cond_destroy(&c.cv);
+    free(c.ring);
     close(fd);
-    free(buf);
     return NULL;
 }
 

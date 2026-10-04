@@ -81,8 +81,8 @@
 
 | # | 事项 | 现状 | 验收标准 |
 |---|---|---|---|
-| G1 | 与 Go 版**同机对拍**（六路径基准） | **部分完成**：P33 四方对比（direct/ss；`docs/perf-report.md`）——sodama 与 dae 同机同拓扑 | 扩到 relay/offload/UDP 全路径 + 误差说明 |
-| G2 | 生产级优化（THP/连接池/看门狗内存上限） | 未做 | 各有开关与压测数据 |
+| G1 | 与 Go 版**同机对拍**（六路径基准） | **大部分完成**：P33.2 四方对比（direct/ss，ssserver 上游 + 全双工夹具 + 5 次中位数；并发扩展/内存/线程/perf 剖面齐备；`docs/perf-report.md`）——sodama 与 dae 同机同拓扑；余 relay/offload/UDP 同机对拍 | 补齐 relay/offload/UDP 路径对拍 + 误差说明 |
+| G2 | 生产级优化（THP/连接池/看门狗内存上限） | **方向已定**：基于 P33.2 剖面产出 `docs/optimization-roadmap.md`（O1–O8：AEAD 零分配 / syscall 合并 / splice 零拷贝 / worker 池 / printk 门控 / AES-GCM / UDP 批量 / 缓冲池），待实施 | 各优化项有开关与压测数据（基准：ss 8 流 ≥12 Gbps / ≤110 ms·Gbps⁻¹；relay ≥22 Gbps） |
 | G3 | fuzz（`.dae` 解析 / DNS 报文 / CH 解析） | 未做 | 至少 3 个 fuzz target 跑通 |
 | G4 | 特权内核加载类 CI | CI 只编译+单测 | self-hosted runner 或 QEMU 中跑 verify 子集 |
 | G5 | 长稳 soak 纳入 CI（夜间） | 手动 | 夜间任务 + 失败告警 |

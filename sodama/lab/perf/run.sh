@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # sodama 性能对比：sodama vs dae vs sing-box vs v2ray。
 #
-# 同一 lab 拓扑（client ns — 网关 — WAN ns）、同一 ss 上游（WAN ns 内 python ss）、
-# 同一 C 负载（bench_io）：direct 内核基线 + ss 代理路径 + RTT。
+# 同一 lab 拓扑（client ns — 网关 — WAN ns）、同一 ss 上游、同一 C 负载（bench_io）：
+# direct 内核基线 + ss 代理路径 + RTT。
 #
 # 用法：
 #   lab/perf/run.sh build                     # 构建 bench_io
@@ -14,6 +14,8 @@
 # 环境变量：
 #   DAE_BIN=/tmp/perf/usr/bin/dae   SINGBOX_BIN=sing-box   V2RAY_BIN=v2ray
 #   BENCH_MB=48（每流）BENCH_STREAMS=4 ROUNDS=3 WARMUP=1 BENCH_LAT=500
+#   SS_UPSTREAM=python|ssserver   # 默认 python；性能测量用 ssserver（shadowsocks-rust）
+#   BENCH_RING_MB=128             # 全双工 echo 夹具 ring 容量
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -69,14 +71,23 @@ prepare() {
   "$LAB" down >/dev/null 2>&1 || true
   TOPO_ONLY=1 "$LAB" up
   stop_wan_servers
-  ip netns exec "$WAN_NS" "$BENCH_BIN" serve 8080,9999 >/tmp/perf-bench.log 2>&1 &
+  ip netns exec "$WAN_NS" env BENCH_RING_MB="${BENCH_RING_MB:-128}" "$BENCH_BIN" serve 8080,9999 >/tmp/perf-bench.log 2>&1 &
   echo $! >/tmp/perf-bench.pid
   ip netns exec "$WAN_NS" python3 -m http.server "$HTTP_PORT" --bind 10.9.9.2 \
     >/tmp/perf-http.log 2>&1 &
   echo $! >/tmp/perf-http.pid
-  ip netns exec "$WAN_NS" python3 "$ROOT/lab/ss_server.py" /tmp/perf-ss.log \
-    chacha20-ietf-poly1305 testpass "$SS_PORT" 10.9.9.2 >/tmp/perf-ss.stdout 2>&1 &
-  echo $! >/tmp/perf-ss.pid
+  if [ "${SS_UPSTREAM:-python}" = ssserver ]; then
+    # 高速上游（shadowsocks-rust；性能测量用，python 上游有 GIL 〜2.4Gbps 上限）
+    command -v ssserver >/dev/null || die "SS_UPSTREAM=ssserver 但未安装 ssserver"
+    ip netns exec "$WAN_NS" ssserver -s "10.9.9.2:$SS_PORT" \
+      -k testpass -m chacha20-ietf-poly1305 --tcp-no-delay \
+      >/tmp/perf-ss.stdout 2>&1 &
+    echo $! >/tmp/perf-ss.pid
+  else
+    ip netns exec "$WAN_NS" python3 "$ROOT/lab/ss_server.py" /tmp/perf-ss.log \
+      chacha20-ietf-poly1305 testpass "$SS_PORT" 10.9.9.2 >/tmp/perf-ss.stdout 2>&1 &
+    echo $! >/tmp/perf-ss.pid
+  fi
   sleep 0.6
   # ss 上游就绪探测（从 host ns）
   timeout 3 bash -c ": >/dev/tcp/10.9.9.2/$SS_PORT" 2>/dev/null \
@@ -172,13 +183,17 @@ run_one() {
   out="$(in_client timeout 180 "$BENCH_BIN" client "$host" "$port" "$BENCH_MB" "$BENCH_STREAMS" 2>&1 || true)"
   lat="$(in_client timeout 120 "$BENCH_BIN" lat "$host" "$port" "$BENCH_LAT" 2>&1 || true)"
   cpu1="$(proc_cpu_ms "$pid")"
-  echo "$out" | grep -q '^tcp-ok' || { stop_impl; die "[$impl/$wl] client 失败：$out"; }
-  echo "$lat" | grep -q '^lat-ok' || { stop_impl; die "[$impl/$wl] lat 失败：$lat"; }
+  echo "$out" | grep -q '^tcp-ok' || { stop_impl; echo "!! [$impl/$wl] client 失败：$out"; return 1; }
+  echo "$lat" | grep -q '^lat-ok' || { stop_impl; echo "!! [$impl/$wl] lat 失败：$lat"; return 1; }
   mbps="$(kv "$out" oneway_mbps)"
   p50="$(kv "$lat" p50_us)"
   p99="$(kv "$lat" p99_us)"
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$impl" "$wl" "$mbps" "$p50" "$p99" \
-    "$(awk -v a="$cpu0" -v b="$cpu1" 'BEGIN{printf "%.1f", b-a}')" "$(kv "$out" wall_s)" | tee -a "$RESULTS"
+  local rss thr
+  rss="$(awk '/^VmRSS:/{print $2}' "/proc/$pid/status" 2>/dev/null || echo 0)"
+  thr="$(awk '/^Threads:/{print $2}' "/proc/$pid/status" 2>/dev/null || echo 0)"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$impl" "$wl" "$mbps" "$p50" "$p99" \
+    "$(awk -v a="$cpu0" -v b="$cpu1" 'BEGIN{printf "%.1f", b-a}')" "$(kv "$out" wall_s)" \
+    "$rss" "$thr" | tee -a "$RESULTS"
 }
 
 bench_impl() {
@@ -196,8 +211,8 @@ bench_impl() {
     in_client timeout 180 "$BENCH_BIN" client 1.1.1.1 8080 "$BENCH_MB" "$BENCH_STREAMS" >/dev/null 2>&1 || true
   done
   for i in $(seq 1 "$ROUNDS"); do
-    run_one "$impl" direct 10.9.9.2 9999
-    run_one "$impl" ss 1.1.1.1 8080
+    run_one "$impl" direct 10.9.9.2 9999 || return 1
+    run_one "$impl" ss 1.1.1.1 8080 || return 1
   done
   stop_impl
   echo "== $impl 完成 =="
@@ -205,22 +220,24 @@ bench_impl() {
 
 summarize() {
   echo
-  echo "== 汇总（中位吞吐 / 中位 p50 / 中位 CPU ms；单位 Mbps、µs） =="
-  printf '%-10s %-8s %10s %10s %10s\n' impl workload mbps p50_us cpu_ms
+  echo "== 汇总（中位吞吐 / 中位 p50 / 中位 CPU ms / 中位 RSS KB / 中位线程数） =="
+  printf '%-10s %-8s %10s %10s %10s %10s %8s\n' impl workload mbps p50_us cpu_ms rss_kb threads
   python3 - "$RESULTS" <<'PY'
 import statistics, sys
 rows = {}
 for line in open(sys.argv[1]):
     p = line.rstrip("\n").split("\t")
-    if len(p) != 7:
+    if len(p) < 9:
         continue
-    impl, wl, mbps, p50, _p99, cpu, _wall = p
-    rows.setdefault((impl, wl), []).append((float(mbps), float(p50), float(cpu)))
+    impl, wl, mbps, p50, _p99, cpu, _wall, rss, thr = p
+    rows.setdefault((impl, wl), []).append((float(mbps), float(p50), float(cpu), float(rss), float(thr)))
 for (impl, wl) in sorted(rows, key=lambda k: (k[0], k[1])):
     mb = [x[0] for x in rows[(impl, wl)]]
     la = [x[1] for x in rows[(impl, wl)]]
     cp = [x[2] for x in rows[(impl, wl)]]
-    print(f"{impl:<10} {wl:<8} {statistics.median(mb):>10.1f} {statistics.median(la):>10.1f} {statistics.median(cp):>10.1f}")
+    rs = [x[3] for x in rows[(impl, wl)]]
+    th = [x[4] for x in rows[(impl, wl)]]
+    print(f"{impl:<10} {wl:<8} {statistics.median(mb):>10.1f} {statistics.median(la):>10.1f} {statistics.median(cp):>10.1f} {statistics.median(rs):>10.0f} {statistics.median(th):>8.0f}")
 PY
 }
 
