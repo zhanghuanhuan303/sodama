@@ -227,6 +227,33 @@
 
 ---
 
+## P5 · 真实节点/公网口径（G1）——✅ 已完成（2026-10-05）
+
+- **夹具**：`lab/perf/real.sh`（client ns — 网关 tproxy — 宿主 — 真实订阅节点 — 公网目标）；
+  节点探测工具 `lab/perf/probe-node.sh` / `probe-nodes.py`（凭据只经文件传递、不打印）。
+- **对等性**：sodama / dae / sing-box 共用同一节点、同一目标、同一时段；节点域名多 A 记录，
+  `prepare` 将后端固定到实测可连 IP（`/tmp/perf-real-node-pinned.url`，0600，不入库）；
+  v2ray-core 不支持 VLESS-REALITY，显式 skip。
+- **口径**：8 MiB `speed.cloudflare.com/__down`（该端点 bytes≥16 MiB 返回 403+1B，
+  夹具用 `curl -f` 且校验 HTTP 200）；节点带宽（≈7–14 Mbps，宿主直连 ≈20.5 Mbps）为共同
+  上限，故对比核心指标为**客户端侧 CPU_ms/GB**（进程级、汇总全部线程 `schedstat`，ns 精度）。
+- **实测**（17 轮/实现，三轮独立 pass；第三轮固定同一后端）：
+
+  | 实现 | Mbps(med, 17 轮) | CPU_ms/GB(总) | 第三轮（同后端） |
+  |---|---|---|---|
+  | sodama | 7.3（第三轮 9.7，最高） | **6 233** | **4 987** |
+  | dae | 6.7 | 8 820 | 8 613 |
+  | sing-box | 7.6 | 8 557 | 10 290 |
+  | direct | 20.5 | 0 | — |
+
+  即真实节点口径下 sodama 客户端 CPU/GB 比 dae 低 ≈29%、比 sing-box 低 ≈27%；
+  同后端轮 -42% / -52%。
+- **踩坑修复**（复用备忘）：direct 轮曾共用并改写 sodama 规则文件→每轮启动重生成；
+  TOPO_ONLY 无 direct 通路→基线补 MASQUERADE+FORWARD；官方 dae 重建 dae0→`ensure_dae0`
+  自动补建；多后端 IP 不可比→固定后端。
+
+---
+
 ## 非目标（防止走偏）
 
 - 不为刷分绕过 redirect/tproxy/offload 语义（如伪造直连、跳过嗅探）；
@@ -239,6 +266,7 @@
 ```bash
 sudo SS_UPSTREAM=ssserver ROUNDS=5 lab/perf/run.sh all   # 四方对比不回退
 sudo lab/perf/scaling.sh all                             # ss CPU/Gbps 曲线改善
+sudo REAL_NODE_FILE=/tmp/real-node.url lab/perf/real.sh all  # 真实节点口径（G1，v2ray skip）
 sudo lab/perf/run.sh down
 perf record -F 1499 -g -p <sodama> -- sleep 12           # 热点搬家（AEAD→? 拷贝→?）
 ```

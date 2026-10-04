@@ -70,7 +70,7 @@
 
 <header class="top">
   <h1>sodama · VLESS 性能实测与优化提案 <span class="tag ok">M1–M4 已落地</span></h1>
-  <div class="sub">同机四方对拍（sodama / dae v2.1.1 / sing-box 1.14.2 / v2ray 5.52.0）· VLESS 明文/TLS/Vision/规模 · 5 轮中位数 · 2026-10-05 · v1.8（M1–M4 全部落地；O6：AEAD 实测定调——保留 chacha（16KB 块 1.73 vs aes-gcm 1.57 GB/s），vmess auto→chacha；O7：UDP 批量+分片会话表+大缓冲，20k pps 0 丢包 CPU 630ms/40k 包（dae 2140/sing-box 1580/v2ray 1780）；offload 看门狗单线程化（每连接 0 线程）；io_uring 结论不引入）</div>
+  <div class="sub">同机四方对拍（sodama / dae v2.1.1 / sing-box 1.14.2 / v2ray 5.52.0）· VLESS 明文/TLS/Vision/规模 · 5 轮中位数 · 2026-10-05 · v1.9（M1–M4 全部落地；O6：AEAD 实测定调——保留 chacha（16KB 块 1.73 vs aes-gcm 1.57 GB/s）；O7：UDP 批量+分片会话表+大缓冲；O8：缓冲池+有界退出；<b>G1：真实订阅节点/公网口径——客户端 CPU_ms/GB sodama 6 233 vs dae 8 820 / sing-box 8 557（同后端轮 4 987 vs 8 613 / 10 290），节点限速为共同上限</b>；io_uring 结论不引入）</div>
   <div class="chips">
     <span class="chip">数据口径 <b>5 轮中位</b></span>
     <span class="chip">夹具 <b>全双工 echo · 环回上限 ≈25 Gbps</b></span>
@@ -79,6 +79,7 @@
     <span class="chip">M2 验收 <b class="ok">memcpy 达标</b> · 吞吐/CPU <b class="warnc">夹具受限</b></span>
     <span class="chip">M3 验收 <b class="ok">Vision-over-TLS 全组合通过</b></span>
     <span class="chip">M4 验收 <b class="ok">10k=28 线程/32.1 MB · vless-tls 2k=27 线程/61 MB</b></span>
+    <span class="chip">G1 真实节点 <b class="ok">CPU/GB sodama 6 233 vs dae 8 820 / sing-box 8 557</b></span>
     <span class="chip">回归 <b>verify 9/9 · cargo test 240/240</b></span>
   </div>
 </header>
@@ -400,6 +401,32 @@ reactor 接管字节透明 splice 链路（Direct/VLESS 明文/kTLS TLS）。</p
 </section>
 
 <section>
+<h2>06c · 结果 E：真实订阅节点/公网口径（G1）</h2>
+<p class="sub">拓扑：client ns — 网关 tproxy（被测实现）— 宿主 — <b>真实订阅节点（异机）</b> — 公网目标。
+三方共用同一节点、同一后端 IP（域名多 A 记录，<code>prepare</code> 固定到实测可连 IP）、
+同一 8 MiB 目标（<code>speed.cloudflare.com/__down</code>，该端点 ≥16 MiB 会返回 403）、同一时段；
+v2ray-core 不支持 VLESS-REALITY，显式 skip。节点带宽（≈7–14 Mbps，宿主直连 ≈20.5 Mbps）是共同上限，
+对比核心指标为<b>客户端侧 CPU_ms/GB</b>（进程级、汇总全部线程 <code>schedstat</code>，ns 精度）。</p>
+<table>
+  <thead><tr><th>实现</th><th>Mbps（中位，17 轮）</th><th>CPU_ms/GB（总）</th><th>CPU_ms/GB（第三轮·同后端）</th><th>第三轮 Mbps</th></tr></thead>
+  <tbody>
+    <tr><td><b>sodama</b></td><td class="n">7.3</td><td class="n best">6 233</td><td class="n best">4 987</td><td class="n best">9.7</td></tr>
+    <tr><td>dae v2.1.1</td><td class="n">6.7</td><td class="n">8 820</td><td class="n">8 613</td><td class="n">7.2</td></tr>
+    <tr><td>sing-box 1.14.2</td><td class="n">7.6</td><td class="n">8 557</td><td class="n">10 290</td><td class="n">5.2</td></tr>
+    <tr><td>v2ray 5.52.0</td><td class="n" colspan="4">skip：不支持 VLESS-REALITY（需 Xray）</td></tr>
+    <tr><td>direct（基线）</td><td class="n">20.5</td><td class="n">0</td><td class="n">—</td><td class="n">25.1</td></tr>
+  </tbody>
+</table>
+<div class="note ok">
+<b>G1 结论：</b>真实节点口径下 sodama 客户端 CPU/GB 比 dae 低 <b>≈29%</b>、比 sing-box 低 <b>≈27%</b>；
+固定同一后端的一轮里差距扩大到 <b>−42% / −52%</b>（该轮 sodama 吞吐也是最高，9.7 Mbps）。
+原因与 M1/M3 一致：VISION DIRECT 切换后数据面走零拷贝/低拷贝路径，而 dae/sing-box 全程用户态泵；
+节点带宽是共同天花板（直连 20.5 vs 代理 7–10 Mbps），吞吐差异不可分辨，以 CPU/GB 为准。
+夹具与踩坑（direct 通路/规则文件隔离/dae0 补建/后端固定）见 <code>lab/perf/real.sh</code> 与 <code>docs/optimization-roadmap.md</code> P5。
+</div>
+</section>
+
+<section>
 <h2>07 · perf 剖面前后（VLESS 明文，8×64 MB）</h2>
 <div class="two">
   <div>
@@ -475,6 +502,9 @@ ChaCha20-Poly1305 分别为 1.76 / 2.87 GB/s（因此本机也不存在“换 ch
   stage 2 把同一状态机扩到 rustls/ss/vmess 会话（ADR-0058）。</li>
   <li><b>主流节点组合已齐（M3）</b>：Vision-over-TLS 交付——外层 tls/reality × 双向 XTLS DIRECT（裸 TCP）＋ws/wss；
   内层嗅探保守（TLS1.2/明文走 END），rustls 无 unsafe 反射（逐记录有界读）；M4 解决规模模型后，主链路（协议 × 规模）对齐完成。</li>
+  <li><b>真实口径验证（G1）</b>：把对比搬到真实订阅节点/公网链路（VLESS-REALITY+Vision，三方共用同一节点与固定后端），
+  sodama 客户端 CPU/GB 比 dae 低 ≈29%、比 sing-box 低 ≈27%（同后端轮 −42%/−52%）——同机结论在真实口径上复现；
+  节点带宽（≈7–14 Mbps）是共同上限，这类口径应以 CPU/GB 而非吞吐排序。</li>
 </ol>
 </section>
 
@@ -567,6 +597,10 @@ sudo PROXY_PROTO=vless-tls OUT=/tmp/ab-codec.tsv lab/perf/scaling.sh vless-tls  
 sudo bash lab/perf/codec-stress.sh                                                           # 4/8/64 流混合压力（0 失败；含长尾卡死回归）
 SODAMA_REACTOR_CODEC=0                                                                    # 运行开关：codec 回退线程模型
 
+# G1 验收（真实订阅节点/公网口径；REAL_NODE_FILE 不入库）
+sudo REAL_NODE_FILE=/tmp/real-node.url ROUNDS=6 lab/perf/real.sh all   # /tmp/perf-real-g1c.tsv
+lab/perf/probe-node.sh /tmp/pn19.url KR-19                             # 换节点/测速（凭据仅经文件）
+
 # 运行开关
 --ktls            尝试 kTLS（TLS1.3；默认关，需 modprobe tls；vision 连接自动旁路）
 SODAMA_KTLS_DEBUG=1 / SODAMA_KTLS_TXONLY=1                 # 安装调试 / TX-only 实验
@@ -587,8 +621,8 @@ status --cmd status --json | jq .relay.splice_total        # 命中/回退计数
 </section>
 
 <div class="foot">
-  sodama · VLESS 性能实测与优化提案 · v1.8（M1–M4 + O6/O7 版）· 2026-10-05 · Arch / 6.18.54-lts / i9-9900KF ·
-  数据为同机 lab 口径，5 轮中位数与 perf 剖面如实呈现；M2 验收对账（内存达标、吞吐/CPU 受夹具与硬件限制）见 05 节，M4 规模/风暴/codec A-B/offload 线程数/io_uring 结论见 06b 节与 ADR-0058；O6/O7 见 `docs/optimization-roadmap.md`。
+  sodama · VLESS 性能实测与优化提案 · v1.9（M1–M4 + O6/O7/O8 + G1 版）· 2026-10-05 · Arch / 6.18.54-lts / i9-9900KF ·
+  数据为同机 lab 口径 + G1 真实节点口径，5 轮中位数与 perf 剖面如实呈现；M2 验收对账（内存达标、吞吐/CPU 受夹具与硬件限制）见 05 节，M4 规模/风暴/codec A-B/offload 线程数/io_uring 结论见 06b 节与 ADR-0058；O6–O8 见 `docs/optimization-roadmap.md`，G1 真实节点口径见 06c 节。
 </div>
 
 </div>
