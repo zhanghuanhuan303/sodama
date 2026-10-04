@@ -143,6 +143,9 @@ pub struct AnyTlsWriter<W> {
     shared: Arc<Mutex<Shared>>,
     pkt: u32,
     send_padding: bool,
+    /// M4 stage 2：已组帧未写出的字节（WO 断点续写，padding 只打散一次）。
+    out: Vec<u8>,
+    out_off: usize,
 }
 
 impl<W: Write> AnyTlsWriter<W> {
@@ -151,16 +154,42 @@ impl<W: Write> AnyTlsWriter<W> {
         &self.inner
     }
 
-    /// 会话层一次写：带 paddingScheme 的打散/填充（对照 anytls-go `writeConn`）。
-    fn session_write(&mut self, bytes: &[u8]) -> io::Result<()> {
+    /// 把 `out` 中未写出的字节写到内层；WO/EINTR 时保留偏移（重试幂等）。
+    fn drain_out(&mut self) -> io::Result<()> {
+        while self.out_off < self.out.len() {
+            match self.inner.write(&self.out[self.out_off..]) {
+                Ok(0) => return Err(io::Error::new(io::ErrorKind::WriteZero, "anytls: 内层写 0")),
+                Ok(n) => self.out_off += n,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        self.out.clear();
+        self.out_off = 0;
+        Ok(())
+    }
+
+    /// 尽力冲刷：WO 视为「已接受」——字节留在 out，等 EPOLLOUT/下次 flush 续写。
+    fn try_drain(&mut self) -> io::Result<()> {
+        match self.drain_out() {
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(()),
+            r => r,
+        }
+    }
+
+    /// 会话层组帧：带 paddingScheme 的打散/填充（对照 anytls-go `writeConn`）。
+    /// 只把字节追加进 `out`（无 IO）；pkt 计数与随机量不重放。
+    fn build_session(&mut self, bytes: &[u8]) {
         if !self.send_padding {
-            return self.inner.write_all(bytes);
+            self.out.extend_from_slice(bytes);
+            return;
         }
         self.pkt += 1;
         let scheme = lock(&self.shared).padding.clone();
         if self.pkt >= scheme.stop {
             self.send_padding = false;
-            return self.inner.write_all(bytes);
+            self.out.extend_from_slice(bytes);
+            return;
         }
         let mut b: &[u8] = bytes;
         for spec in scheme.pkt_sizes(self.pkt) {
@@ -175,42 +204,37 @@ impl<W: Write> AnyTlsWriter<W> {
                     let l = rand_in(lo, hi);
                     if remain > l {
                         // 本包全是载荷
-                        self.inner.write_all(&b[..l])?;
+                        self.out.extend_from_slice(&b[..l]);
                         b = &b[l..];
                     } else if remain > 0 {
-                        // 载荷 + 填充一个 waste 帧，凑满 l 字节（一次写）
+                        // 载荷 + 填充一个 waste 帧，凑满 l 字节
                         let padding_len = l.saturating_sub(remain + HEADER);
+                        self.out.extend_from_slice(b);
                         if padding_len > 0 {
-                            let mut out = Vec::with_capacity(l);
-                            out.extend_from_slice(b);
-                            out.extend_from_slice(&waste_frame(padding_len));
-                            self.inner.write_all(&out)?;
-                        } else {
-                            self.inner.write_all(b)?;
+                            self.out.extend_from_slice(&waste_frame(padding_len));
                         }
                         b = &[];
                     } else {
                         // 整包填充
-                        self.inner.write_all(&waste_frame(l))?;
+                        self.out.extend_from_slice(&waste_frame(l));
                     }
                 }
             }
         }
         if !b.is_empty() {
-            self.inner.write_all(b)?;
+            self.out.extend_from_slice(b);
         }
-        Ok(())
     }
 
-    fn drain_controls(&mut self) -> io::Result<()> {
+    /// 取出待写控制帧并组帧入队（mem::take 取走一次，幂等）。
+    fn queue_controls(&mut self) {
         let frames = {
             let mut s = lock(&self.shared);
             std::mem::take(&mut s.pending_controls)
         };
         for f in frames {
-            self.session_write(&f)?;
+            self.build_session(&f);
         }
-        Ok(())
     }
 }
 
@@ -227,19 +251,24 @@ impl<W: Write> Write for AnyTlsWriter<W> {
         if buf.is_empty() {
             return Ok(0);
         }
-        self.drain_controls()?;
+        self.queue_controls();
+        // 先冲刷上次组帧；未清空前不消费新明文（WO 重试幂等）。
+        self.drain_out()?;
         let mut off = 0;
         while off < buf.len() {
             let n = (buf.len() - off).min(u16::MAX as usize);
             let fr = frame(CMD_PSH, SID, &buf[off..off + n]);
-            self.session_write(&fr)?;
+            self.build_session(&fr);
             off += n;
         }
+        // 尽力写出；WO 时帧留在 out，由 flush()/下次 write 续写（明文已接受）。
+        self.try_drain()?;
         Ok(buf.len())
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        self.drain_controls()?;
+        self.queue_controls();
+        self.drain_out()?;
         self.inner.flush()
     }
 }
@@ -249,42 +278,58 @@ pub struct AnyTlsReader<R> {
     shared: Arc<Mutex<Shared>>,
     pending: Vec<u8>,
     pos: usize,
+    /// M4 stage 2：原始帧字节缓冲（帧头/载荷跨 WO 续读，进度不丢）。
+    inbuf: Vec<u8>,
+    inoff: usize,
     eof: bool,
 }
 
 impl<R: Read> AnyTlsReader<R> {
-    fn read_exact_n(&mut self, out: &mut [u8]) -> io::Result<()> {
-        let mut off = 0;
-        while off < out.len() {
-            if self.pos < self.pending.len() {
-                let n = (out.len() - off).min(self.pending.len() - self.pos);
-                out[off..off + n].copy_from_slice(&self.pending[self.pos..self.pos + n]);
-                self.pos += n;
-                off += n;
-                continue;
+    /// 从 inbuf 解析一帧；不足则读入更多。
+    /// Ok(None)：非阻塞暂无完整帧且 `eof` 未置位，或流在帧边界 EOF（`eof` 置位）。
+    fn poll_frame(&mut self) -> io::Result<Option<(u8, u32, Vec<u8>)>> {
+        loop {
+            let avail = self.inbuf.len() - self.inoff;
+            if avail >= HEADER {
+                let (cmd, sid, len) = {
+                    let hdr = &self.inbuf[self.inoff..self.inoff + HEADER];
+                    (
+                        hdr[0],
+                        u32::from_be_bytes([hdr[1], hdr[2], hdr[3], hdr[4]]),
+                        u16::from_be_bytes([hdr[5], hdr[6]]) as usize,
+                    )
+                };
+                if avail >= HEADER + len {
+                    let start = self.inoff + HEADER;
+                    let data = self.inbuf[start..start + len].to_vec();
+                    self.inoff += HEADER + len;
+                    if self.inoff == self.inbuf.len() {
+                        self.inbuf.clear();
+                        self.inoff = 0;
+                    }
+                    return Ok(Some((cmd, sid, data)));
+                }
             }
-            self.pending.clear();
-            self.pos = 0;
-            let n = self.inner.read(&mut out[off..])?;
-            if n == 0 {
-                return Err(io::Error::new(ErrorKind::UnexpectedEof, "anytls: 帧被截断"));
+            // 需更多字节：保留未消费前缀，继续读。
+            if self.inoff > 0 {
+                self.inbuf.drain(..self.inoff);
+                self.inoff = 0;
             }
-            off += n;
+            let mut tmp = [0u8; 16 * 1024];
+            match self.inner.read(&mut tmp) {
+                Ok(0) => {
+                    if self.inbuf.is_empty() {
+                        self.eof = true;
+                        return Ok(None);
+                    }
+                    return Err(io::Error::new(ErrorKind::UnexpectedEof, "anytls: 帧被截断"));
+                }
+                Ok(n) => self.inbuf.extend_from_slice(&tmp[..n]),
+                Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                Err(e) if e.kind() == ErrorKind::WouldBlock => return Ok(None),
+                Err(e) => return Err(e),
+            }
         }
-        Ok(())
-    }
-
-    fn read_frame(&mut self) -> io::Result<(u8, u32, Vec<u8>)> {
-        let mut hdr = [0u8; HEADER];
-        self.read_exact_n(&mut hdr)?;
-        let cmd = hdr[0];
-        let sid = u32::from_be_bytes([hdr[1], hdr[2], hdr[3], hdr[4]]);
-        let len = u16::from_be_bytes([hdr[5], hdr[6]]) as usize;
-        let mut data = vec![0u8; len];
-        if len > 0 {
-            self.read_exact_n(&mut data)?;
-        }
-        Ok((cmd, sid, data))
     }
 }
 
@@ -304,7 +349,13 @@ impl<R: Read> Read for AnyTlsReader<R> {
                 }
                 return Ok(n);
             }
-            let (cmd, sid, data) = self.read_frame()?;
+            let Some((cmd, sid, data)) = self.poll_frame()? else {
+                if self.eof {
+                    return Ok(0);
+                }
+                // 非阻塞：帧未收齐。进度保留在 inbuf；上抛 WO（绝不能误报 EOF）。
+                return Err(io::Error::new(ErrorKind::WouldBlock, "anytls: 帧未收齐"));
+            };
             match cmd {
                 CMD_PSH => {
                     if sid == SID && !data.is_empty() {
@@ -389,6 +440,8 @@ pub fn connect_split<R: Read, W: Write>(
         shared: shared.clone(),
         pkt: 0,
         send_padding: true,
+        out: Vec::new(),
+        out_off: 0,
     };
 
     // 首包批：Settings + SYN + PSH(SocksAddr) —— 一帧一条 pkt（含 padding）
@@ -400,7 +453,8 @@ pub fn connect_split<R: Read, W: Write>(
     batch.extend_from_slice(&frame(CMD_SETTINGS, 0, settings.as_bytes()));
     batch.extend_from_slice(&frame(CMD_SYN, SID, &[]));
     batch.extend_from_slice(&frame(CMD_PSH, SID, &socks_addr(target)?));
-    w.session_write(&batch)?;
+    w.build_session(&batch);
+    w.drain_out()?;
 
     Ok((
         AnyTlsReader {
@@ -408,6 +462,8 @@ pub fn connect_split<R: Read, W: Write>(
             shared,
             pending: Vec::new(),
             pos: 0,
+            inbuf: Vec::new(),
+            inoff: 0,
             eof: false,
         },
         w,
@@ -783,5 +839,128 @@ mod tests {
         let head = String::from_utf8_lossy(&buf[..buf.len().min(200)]).to_string();
         eprintln!("status head: {}", head.lines().next().unwrap_or("(empty)"));
         assert!(head.starts_with("HTTP/1."), "未拿到 HTTP 响应: {head}");
+    }
+
+    // ------------------------------------------------ stage 2：WouldBlock 可重入
+
+    struct WobWrite {
+        wire: Arc<Mutex<Vec<u8>>>,
+        block_next: bool,
+    }
+
+    impl Write for WobWrite {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if self.block_next {
+                self.block_next = false;
+                return Err(io::ErrorKind::WouldBlock.into());
+            }
+            self.block_next = true;
+            // 限制单次写入量：强制部分写 + WO 交替。
+            let n = buf.len().min(83);
+            self.wire.lock().unwrap().extend_from_slice(&buf[..n]);
+            Ok(n)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct WobRead {
+        data: Vec<u8>,
+        off: usize,
+        block_next: bool,
+    }
+
+    impl Read for WobRead {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if self.block_next {
+                self.block_next = false;
+                return Err(io::ErrorKind::WouldBlock.into());
+            }
+            self.block_next = true;
+            if self.off >= self.data.len() {
+                return Ok(0);
+            }
+            // 限制单次读出量：强制帧头/载荷跨多次 read。
+            let n = buf.len().min(5).min(self.data.len() - self.off);
+            buf[..n].copy_from_slice(&self.data[self.off..self.off + n]);
+            self.off += n;
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn stream_survives_would_block() {
+        let wire = Arc::new(Mutex::new(Vec::new()));
+        let shared = Arc::new(Mutex::new(Shared {
+            padding: PaddingScheme::default_scheme(),
+            pending_controls: Vec::new(),
+        }));
+        // 写半：首调就 WO（模拟非阻塞 socket 未就绪），padding 打散只执行一次。
+        let mut w = AnyTlsWriter {
+            inner: WobWrite {
+                wire: wire.clone(),
+                block_next: true,
+            },
+            shared: shared.clone(),
+            pkt: 0,
+            send_padding: true,
+            out: Vec::new(),
+            out_off: 0,
+        };
+        let payload: Vec<u8> = (0..5000u32).map(|i| (i % 233) as u8).collect();
+        let mut off = 0;
+        let mut spins = 0;
+        while off < payload.len() {
+            match w.write(&payload[off..]) {
+                Ok(n) if n > 0 => off += n,
+                Ok(_) => panic!("write 返回 0"),
+                Err(e) if e.kind() == ErrorKind::WouldBlock => {}
+                Err(e) => panic!("非预期错误: {e}"),
+            }
+            spins += 1;
+            assert!(spins < 100_000, "WO 重试不收敛");
+        }
+        loop {
+            match w.flush() {
+                Ok(()) => break,
+                Err(e) if e.kind() == ErrorKind::WouldBlock => {}
+                Err(e) => panic!("非预期错误: {e}"),
+            }
+        }
+
+        // 读半：帧头/载荷跨 WO 续读，waste 帧跳过，PSH 载荷还原。
+        let bytes = wire.lock().unwrap().clone();
+        let rshared = Arc::new(Mutex::new(Shared {
+            padding: PaddingScheme::default_scheme(),
+            pending_controls: Vec::new(),
+        }));
+        let mut r = AnyTlsReader {
+            inner: WobRead {
+                data: bytes,
+                off: 0,
+                block_next: false,
+            },
+            shared: rshared,
+            pending: Vec::new(),
+            pos: 0,
+            inbuf: Vec::new(),
+            inoff: 0,
+            eof: false,
+        };
+        let mut got = vec![0u8; payload.len()];
+        let mut off = 0;
+        let mut spins = 0;
+        while off < got.len() {
+            match r.read(&mut got[off..]) {
+                Ok(0) => panic!("意外 EOF"),
+                Ok(n) => off += n,
+                Err(e) if e.kind() == ErrorKind::WouldBlock => {}
+                Err(e) => panic!("非预期错误: {e}"),
+            }
+            spins += 1;
+            assert!(spins < 200_000, "WO 重试不收敛");
+        }
+        assert_eq!(got, payload, "anytls WO 往返应逐字节一致");
     }
 }

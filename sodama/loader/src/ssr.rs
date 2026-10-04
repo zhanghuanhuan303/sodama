@@ -82,7 +82,8 @@ pub fn connect(
         sock,
         cipher: write_cipher,
         first: true,
-        scratch: Vec::new(),
+        out: Vec::new(),
+        out_off: 0,
     };
     let mut addr = Vec::with_capacity(19);
     target
@@ -94,27 +95,53 @@ pub fn connect(
             sock: read_sock,
             cipher: read_cipher,
             iv_done: false,
+            inbuf: Vec::new(),
+            inoff: 0,
         },
         w,
     ))
 }
 
 /// 读半：首读先取对端 IV，之后解密。
-pub struct SsrReadHalf {
-    sock: TcpStream,
+pub struct SsrReadHalf<W = TcpStream> {
+    sock: W,
     cipher: SsrCipher,
     iv_done: bool,
+    /// M4 stage 2：IV 跨 WouldBlock 续读缓冲（进度不丢）。
+    inbuf: Vec<u8>,
+    inoff: usize,
 }
 
-impl Read for SsrReadHalf {
+impl<W: Read> Read for SsrReadHalf<W> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         if buf.is_empty() {
             return Ok(0);
         }
         if !self.iv_done {
             let iv_len = self.cipher.iv_len();
-            let mut iv = vec![0u8; iv_len];
-            self.sock.read_exact(&mut iv)?;
+            while self.inbuf.len() - self.inoff < iv_len {
+                if self.inoff > 0 {
+                    self.inbuf.drain(..self.inoff);
+                    self.inoff = 0;
+                }
+                let missing = iv_len - self.inbuf.len();
+                let mut tmp = [0u8; 256];
+                let want = missing.min(tmp.len());
+                match self.sock.read(&mut tmp[..want]) {
+                    Ok(0) => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "ssr: IV 被截断",
+                        ))
+                    }
+                    Ok(n) => self.inbuf.extend_from_slice(&tmp[..n]),
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(e) => return Err(e),
+                }
+            }
+            let iv = self.inbuf[self.inoff..self.inoff + iv_len].to_vec();
+            self.inbuf.clear();
+            self.inoff = 0;
             self.cipher.init_decrypt(&iv)?;
             self.iv_done = true;
         }
@@ -127,11 +154,15 @@ impl Read for SsrReadHalf {
 }
 
 /// 写半：首写先发本端 IV（随机），之后加密。
-pub struct SsrWriteHalf {
-    sock: TcpStream,
+///
+/// M4 stage 2：明文先加密进 `out` 再断点续写；流密码状态只在加密时推进一步，
+/// WO 重试不得重新加密（否则对端解出乱码）。
+pub struct SsrWriteHalf<W = TcpStream> {
+    sock: W,
     cipher: SsrCipher,
     first: bool,
-    scratch: Vec<u8>,
+    out: Vec<u8>,
+    out_off: usize,
 }
 
 impl SsrWriteHalf {
@@ -140,22 +171,49 @@ impl SsrWriteHalf {
     }
 }
 
-impl Write for SsrWriteHalf {
+impl<W: Write> SsrWriteHalf<W> {
+    /// 把 `out` 中未写出的密文写到内层；WO/EINTR 时保留偏移（重试幂等）。
+    fn drain_out(&mut self) -> io::Result<()> {
+        while self.out_off < self.out.len() {
+            match self.sock.write(&self.out[self.out_off..]) {
+                Ok(0) => return Err(io::Error::new(io::ErrorKind::WriteZero, "ssr: 内层写 0")),
+                Ok(n) => self.out_off += n,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        self.out.clear();
+        self.out_off = 0;
+        Ok(())
+    }
+}
+
+impl<W: Write> Write for SsrWriteHalf<W> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        // 先冲刷上次未写完的帧；未清空前不消费新明文（WO 重试幂等）。
+        self.drain_out()?;
         if self.first {
             let iv = self.cipher.init_encrypt()?;
-            self.sock.write_all(&iv)?;
             self.first = false;
+            self.out.extend_from_slice(&iv);
         }
-        self.scratch.clear();
-        self.scratch.extend_from_slice(buf);
-        self.cipher.encrypt(&mut self.scratch);
-        self.sock.write_all(&self.scratch)?;
+        let start = self.out.len();
+        self.out.extend_from_slice(buf);
+        self.cipher.encrypt(&mut self.out[start..]);
+        // 尽力写出；WO 时密文留在 out，由 flush()/下次 write 续写（明文已接受）。
+        match self.drain_out() {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+            Err(e) => return Err(e),
+        }
         Ok(buf.len())
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        Ok(())
+        self.drain_out()
     }
 }
 
@@ -262,5 +320,121 @@ mod tests {
         let url = format!("ssr://{inner}");
         let e = parse_link(&url).unwrap_err();
         assert!(e.contains("暂不支持"), "{e}");
+    }
+
+    // ------------------------------------------------ stage 2：WouldBlock 可重入
+
+    use std::sync::{Arc, Mutex};
+
+    struct WobWrite {
+        wire: Arc<Mutex<Vec<u8>>>,
+        block_next: bool,
+    }
+
+    impl Write for WobWrite {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if self.block_next {
+                self.block_next = false;
+                return Err(io::ErrorKind::WouldBlock.into());
+            }
+            self.block_next = true;
+            // 限制单次写入量：强制部分写 + WO 交替。
+            let n = buf.len().min(97);
+            self.wire.lock().unwrap().extend_from_slice(&buf[..n]);
+            Ok(n)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct WobRead {
+        data: Vec<u8>,
+        off: usize,
+        block_next: bool,
+    }
+
+    impl Read for WobRead {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if self.block_next {
+                self.block_next = false;
+                return Err(io::ErrorKind::WouldBlock.into());
+            }
+            self.block_next = true;
+            if self.off >= self.data.len() {
+                return Ok(0);
+            }
+            // 限制单次读出量：强制 IV/载荷跨多次 read。
+            let n = buf.len().min(11).min(self.data.len() - self.off);
+            buf[..n].copy_from_slice(&self.data[self.off..self.off + n]);
+            self.off += n;
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn stream_survives_would_block() {
+        let cipher = SsrCipher::new("aes-256-cfb", "testpass").unwrap();
+        let plain: Vec<u8> = (0..4000u32).map(|i| (i % 239) as u8).collect();
+        let wire = Arc::new(Mutex::new(Vec::new()));
+
+        // 写半：WO 重试不得重复加密（流密码状态只推进一步）。
+        let mut w = SsrWriteHalf {
+            sock: WobWrite {
+                wire: wire.clone(),
+                block_next: true,
+            },
+            cipher,
+            first: true,
+            out: Vec::new(),
+            out_off: 0,
+        };
+        let mut off = 0;
+        let mut spins = 0;
+        while off < plain.len() {
+            match w.write(&plain[off..]) {
+                Ok(n) if n > 0 => off += n,
+                Ok(_) => panic!("write 返回 0"),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                Err(e) => panic!("非预期错误: {e}"),
+            }
+            spins += 1;
+            assert!(spins < 100_000, "WO 重试不收敛");
+        }
+        loop {
+            match w.flush() {
+                Ok(()) => break,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                Err(e) => panic!("非预期错误: {e}"),
+            }
+        }
+
+        // 读半：IV 与载荷跨 WO 续读，解密还原明文。
+        let bytes = wire.lock().unwrap().clone();
+        let mut r = SsrReadHalf {
+            sock: WobRead {
+                data: bytes,
+                off: 0,
+                block_next: false,
+            },
+            cipher: SsrCipher::new("aes-256-cfb", "testpass").unwrap(),
+            iv_done: false,
+            inbuf: Vec::new(),
+            inoff: 0,
+        };
+        let mut got = vec![0u8; plain.len()];
+        let mut off = 0;
+        let mut spins = 0;
+        while off < got.len() {
+            match r.read(&mut got[off..]) {
+                Ok(0) => panic!("意外 EOF"),
+                Ok(n) => off += n,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                Err(e) => panic!("非预期错误: {e}"),
+            }
+            spins += 1;
+            assert!(spins < 100_000, "WO 重试不收敛");
+        }
+        assert_eq!(got, plain, "ssr WO 往返应逐字节一致");
     }
 }

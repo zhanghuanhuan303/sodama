@@ -294,6 +294,11 @@ pub struct SsReader {
     request_salt: Vec<u8>,
     /// SIP022：响应固定头是否已解析（classic 初始为 true，逻辑不经过该分支）。
     ss2022_header_done: bool,
+    /// M4 stage 2：线字节缓冲（帧头/载荷跨 WouldBlock 续读，进度不丢）。
+    inbuf: Vec<u8>,
+    inoff: usize,
+    /// 当前帧的长度块已解密、nonce 已推进，等载荷收齐（WO 重试不得重读长度块）。
+    pending_len: Option<usize>,
 }
 
 /// 半关闭回调（写半持有；直接拨号时即底层 TcpStream 的 `shutdown(Write)`）。
@@ -309,6 +314,9 @@ pub struct SsWriter {
     pending_salt: Vec<u8>,
     /// SIP022：首块待发送；首块内容 = SOCKS5 目标地址，作为「变量长头」。
     ss2022_first: bool,
+    /// M4 stage 2：已密封未写出的密文（WO 后断点续写，重试不重复密封/nonce 不重推）。
+    out: Vec<u8>,
+    out_off: usize,
 }
 
 /// 建流并拆分：读半/写半各持一个 fd 副本，可并发。
@@ -355,6 +363,9 @@ pub fn connect_split_boxed(
             pos: 0,
             request_salt: salt.clone(),
             ss2022_header_done: false,
+            inbuf: Vec::new(),
+            inoff: 0,
+            pending_len: None,
         };
         let writer = SsWriter {
             inner: writer,
@@ -364,6 +375,8 @@ pub fn connect_split_boxed(
             nonce: 0,
             pending_salt: salt,
             ss2022_first: true,
+            out: Vec::new(),
+            out_off: 0,
         };
         return Ok((reader, writer));
     }
@@ -381,6 +394,9 @@ pub fn connect_split_boxed(
         pos: 0,
         request_salt: Vec::new(),
         ss2022_header_done: true,
+        inbuf: Vec::new(),
+        inoff: 0,
+        pending_len: None,
     };
     let writer = SsWriter {
         inner: writer,
@@ -390,6 +406,8 @@ pub fn connect_split_boxed(
         nonce: 0,
         pending_salt: Vec::new(),
         ss2022_first: false,
+        out: Vec::new(),
+        out_off: 0,
     };
     Ok((reader, writer))
 }
@@ -403,23 +421,32 @@ impl SsWriter {
     }
 
     fn write_classic(&mut self, buf: &[u8]) -> io::Result<usize> {
+        // 先冲刷上次未写完的帧；未清空前不消费新明文（WO 重试幂等）。
+        self.drain_out()?;
         let n = buf.len().min(MAX_CHUNK);
-        let lb = seal(
+        let mut frame = seal(
             self.method,
             &self.key,
             &nonce_of(self.nonce),
             &(n as u16).to_be_bytes(),
         );
         self.nonce += 1;
-        let payload = seal(self.method, &self.key, &nonce_of(self.nonce), &buf[..n]);
+        // 载荷帧一次入队：nonce 已按帧推进，WO 后断点续写不重复密封。
+        frame.extend_from_slice(&seal(
+            self.method,
+            &self.key,
+            &nonce_of(self.nonce),
+            &buf[..n],
+        ));
         self.nonce += 1;
-        self.inner.write_all(&lb)?;
-        self.inner.write_all(&payload)?;
-        self.inner.flush()?;
+        self.queue(&frame);
+        self.try_drain()?;
         Ok(n)
     }
 
     fn write_2022(&mut self, buf: &[u8]) -> io::Result<usize> {
+        // 先冲刷上次未写完的帧；未清空前不消费新明文（WO 重试幂等）。
+        self.drain_out()?;
         if self.ss2022_first {
             self.ss2022_first = false;
             // 首块 = 请求「变量长头」：目标地址 + 非零随机填充（无初始 payload 时）。
@@ -438,34 +465,65 @@ impl SsWriter {
             fixed.extend_from_slice(&(var.len() as u16).to_be_bytes());
 
             // salt + 固定头 + 变量头：一次 write（SIP022 §3.1.3）。
-            let mut out = std::mem::take(&mut self.pending_salt);
-            out.extend_from_slice(&seal(self.method, &self.key, &nonce_of(self.nonce), &fixed));
+            let mut frame = std::mem::take(&mut self.pending_salt);
+            frame.extend_from_slice(&seal(self.method, &self.key, &nonce_of(self.nonce), &fixed));
             self.nonce += 1;
-            out.extend_from_slice(&seal(self.method, &self.key, &nonce_of(self.nonce), &var));
+            frame.extend_from_slice(&seal(self.method, &self.key, &nonce_of(self.nonce), &var));
             self.nonce += 1;
-            self.inner.write_all(&out)?;
-            self.inner.flush()?;
+            self.queue(&frame);
+            self.try_drain()?;
             return Ok(buf.len());
         }
 
         let n = buf.len().min(MAX_CHUNK_2022);
-        let mut out = seal(
+        let mut frame = seal(
             self.method,
             &self.key,
             &nonce_of(self.nonce),
             &(n as u16).to_be_bytes(),
         );
         self.nonce += 1;
-        out.extend_from_slice(&seal(
+        frame.extend_from_slice(&seal(
             self.method,
             &self.key,
             &nonce_of(self.nonce),
             &buf[..n],
         ));
         self.nonce += 1;
-        self.inner.write_all(&out)?;
-        self.inner.flush()?;
+        self.queue(&frame);
+        self.try_drain()?;
         Ok(n)
+    }
+
+    /// 把 `out` 中未写出的密文写到内层；WO/EINTR 时保留偏移（重试幂等）。
+    fn drain_out(&mut self) -> io::Result<()> {
+        while self.out_off < self.out.len() {
+            match self.inner.write(&self.out[self.out_off..]) {
+                Ok(0) => return Err(io::Error::new(io::ErrorKind::WriteZero, "ss: 内层写 0")),
+                Ok(n) => self.out_off += n,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        self.out.clear();
+        self.out_off = 0;
+        Ok(())
+    }
+
+    /// 尽力冲刷：WO 视为「已接受」——密文留在 out，等 EPOLLOUT/下次 flush 续写。
+    fn try_drain(&mut self) -> io::Result<()> {
+        match self.drain_out() {
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(()),
+            r => r,
+        }
+    }
+
+    fn queue(&mut self, bytes: &[u8]) {
+        if self.out_off == self.out.len() {
+            self.out.clear();
+            self.out_off = 0;
+        }
+        self.out.extend_from_slice(bytes);
     }
 }
 
@@ -474,11 +532,16 @@ impl Read for SsReader {
         if buf.is_empty() {
             return Ok(0);
         }
-        if self.pos >= self.buf.len() {
-            if self.method.is_2022() {
-                self.read_chunk_2022()?;
+        while self.pos >= self.buf.len() {
+            let made = if self.method.is_2022() {
+                self.read_chunk_2022()?
             } else {
-                self.read_chunk_classic()?;
+                self.read_chunk_classic()?
+            };
+            if !made {
+                // 非阻塞：帧未收齐。进度已保留在 inbuf/pending_len；上抛 WO 让
+                // reactor 等 EPOLLIN 后从断点续读（绝不能返回 Ok(0) 误报 EOF）。
+                return Err(io::Error::new(io::ErrorKind::WouldBlock, "ss: 帧未收齐"));
             }
         }
         let n = buf.len().min(self.buf.len() - self.pos);
@@ -489,18 +552,65 @@ impl Read for SsReader {
 }
 
 impl SsReader {
-    fn read_chunk_classic(&mut self) -> io::Result<()> {
+    /// 确保 inbuf 中至少还有 `need` 个未消费字节。
+    /// 返回 Ok(false) = 非阻塞暂无数据（已读字节保留，进度不丢）。
+    fn fill_inbuf(&mut self, need: usize) -> io::Result<bool> {
+        while self.inbuf.len() - self.inoff < need {
+            if self.inoff > 0 {
+                self.inbuf.drain(..self.inoff);
+                self.inoff = 0;
+            }
+            let missing = need - self.inbuf.len();
+            let mut tmp = [0u8; 16 * 1024];
+            let want = missing.min(tmp.len());
+            match self.inner.read(&mut tmp[..want]) {
+                Ok(0) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "ss: 流在帧中途被截断",
+                    ))
+                }
+                Ok(n) => self.inbuf.extend_from_slice(&tmp[..n]),
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(false),
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(true)
+    }
+
+    /// 从 inbuf 取恰好 `n` 字节；不足时返回 Ok(None)（非阻塞，进度保留）。
+    fn take_exact(&mut self, n: usize) -> io::Result<Option<Vec<u8>>> {
+        if !self.fill_inbuf(n)? {
+            return Ok(None);
+        }
+        let start = self.inoff;
+        let v = self.inbuf[start..start + n].to_vec();
+        self.inoff += n;
+        if self.inoff == self.inbuf.len() {
+            self.inbuf.clear();
+            self.inoff = 0;
+        }
+        Ok(Some(v))
+    }
+
+    /// classic 分块：长度块已解密后把长度记入 `pending_len`，载荷跨 WO 可续。
+    /// 返回 Ok(true) = 已解出一段明文；Ok(false) = 非阻塞等数据。
+    fn read_chunk_classic(&mut self) -> io::Result<bool> {
         // 读服务器 salt（每方向一次）
         if self.key.is_none() {
-            let mut salt = vec![0u8; self.method.salt_len()];
-            self.inner.read_exact(&mut salt)?;
+            let sl = self.method.salt_len();
+            let Some(salt) = self.take_exact(sl)? else {
+                return Ok(false);
+            };
             self.key = Some(derive_subkey(&self.master, &salt).to_vec());
         }
-        let payload = {
-            let key = self.key.as_ref().expect("recv key");
+        if self.pending_len.is_none() {
             // 长度块：2 字节明文 + 16 字节 tag
-            let mut lb = [0u8; 2 + TAG_LEN];
-            self.inner.read_exact(&mut lb)?;
+            let Some(lb) = self.take_exact(2 + TAG_LEN)? else {
+                return Ok(false);
+            };
+            let key = self.key.as_ref().expect("recv key");
             let plain_len = open(self.method, key, &nonce_of(self.nonce), &lb)?;
             if plain_len.len() != 2 {
                 return Err(invalid("ss: 长度块非法"));
@@ -510,18 +620,24 @@ impl SsReader {
             if len == 0 || len > MAX_CHUNK {
                 return Err(invalid("ss: 分块长度非法"));
             }
-            let mut payload = vec![0u8; len + TAG_LEN];
-            self.inner.read_exact(&mut payload)?;
-            open(self.method, key, &nonce_of(self.nonce), &payload)?
+            self.pending_len = Some(len);
+        }
+        let len = self.pending_len.expect("pending_len");
+        let Some(payload) = self.take_exact(len + TAG_LEN)? else {
+            return Ok(false);
         };
+        let key = self.key.as_ref().expect("recv key");
+        let out = open(self.method, key, &nonce_of(self.nonce), &payload)?;
         self.nonce += 1;
-        self.buf = payload;
+        self.pending_len = None;
+        self.buf = out;
         self.pos = 0;
-        Ok(())
+        Ok(true)
     }
 
     /// SIP022 分块读取：首选固定头，然后按长度/载荷块循环（跳过 0 长块）。
-    fn read_chunk_2022(&mut self) -> io::Result<()> {
+    /// 返回 Ok(true) = 已解出一段明文；Ok(false) = 非阻塞等数据。
+    fn read_chunk_2022(&mut self) -> io::Result<bool> {
         // 调用方在 pos >= buf.len() 时才进来；先丢弃已读完的旧块。
         self.buf.clear();
         self.pos = 0;
@@ -529,8 +645,9 @@ impl SsReader {
             let sl = self.method.salt_len();
             let fixed_plain_len = 1 + 8 + sl + 2;
             // 一次读出 salt + 固定头（SIP022 §3.1.3 建议一次 read）。
-            let mut raw = vec![0u8; sl + fixed_plain_len + TAG_LEN];
-            self.inner.read_exact(&mut raw)?;
+            let Some(raw) = self.take_exact(sl + fixed_plain_len + TAG_LEN)? else {
+                return Ok(false);
+            };
             let key = derive_subkey_2022(self.method, &self.master, &raw[..sl]);
             let fixed = open(self.method, &key, &nonce_of(0), &raw[sl..])?;
             if fixed.len() != fixed_plain_len {
@@ -550,36 +667,40 @@ impl SsReader {
             self.key = Some(key);
             self.nonce = 1;
             self.ss2022_header_done = true;
-            self.buf = self.read_payload_2022(len)?;
+            self.pending_len = Some(len);
         }
-        while self.buf.is_empty() {
-            let plain = {
+        loop {
+            if let Some(len) = self.pending_len.take() {
+                if len > MAX_CHUNK_2022 {
+                    return Err(invalid("ss2022: 分块长度非法"));
+                }
+                let Some(ct) = self.take_exact(len + TAG_LEN)? else {
+                    self.pending_len = Some(len);
+                    return Ok(false);
+                };
                 let key = self.key.as_ref().expect("2022 recv key");
-                let mut lb = [0u8; 2 + TAG_LEN];
-                self.inner.read_exact(&mut lb)?;
-                let plain = open(self.method, key, &nonce_of(self.nonce), &lb)?;
-                plain
+                let out = open(self.method, key, &nonce_of(self.nonce), &ct)?;
+                self.nonce += 1;
+                if !out.is_empty() {
+                    self.buf = out;
+                    self.pos = 0;
+                    return Ok(true);
+                }
+                // 0 长块：继续下一帧（长度块）
+                continue;
+            }
+            let Some(lb) = self.take_exact(2 + TAG_LEN)? else {
+                return Ok(false);
             };
+            let key = self.key.as_ref().expect("2022 recv key");
+            let plain = open(self.method, key, &nonce_of(self.nonce), &lb)?;
             self.nonce += 1;
             if plain.len() != 2 {
                 return Err(invalid("ss2022: 长度块非法"));
             }
             let len = u16::from_be_bytes([plain[0], plain[1]]) as usize;
-            self.buf = self.read_payload_2022(len)?;
+            self.pending_len = Some(len);
         }
-        Ok(())
-    }
-
-    fn read_payload_2022(&mut self, len: usize) -> io::Result<Vec<u8>> {
-        if len > MAX_CHUNK_2022 {
-            return Err(invalid("ss2022: 分块长度非法"));
-        }
-        let key = self.key.as_ref().expect("2022 recv key");
-        let mut ct = vec![0u8; len + TAG_LEN];
-        self.inner.read_exact(&mut ct)?;
-        let out = open(self.method, key, &nonce_of(self.nonce), &ct)?;
-        self.nonce += 1;
-        Ok(out)
     }
 }
 
@@ -596,6 +717,7 @@ impl Write for SsWriter {
     }
 
     fn flush(&mut self) -> io::Result<()> {
+        self.drain_out()?;
         self.inner.flush()
     }
 }
@@ -1286,5 +1408,216 @@ mod tests {
         assert!(Ss2022UdpSession::new(SsMethod::Aes256Gcm, &[0u8; 32]).is_err());
         assert!(Ss2022UdpSession::new(M_128, &[0u8; 32]).is_err());
         assert!(Ss2022UdpSession::new(M_128, &[0u8; 16]).is_ok());
+    }
+
+    // ------------------------------------------------ stage 2：WouldBlock 可重入
+    //
+    // 判据：读半在帧中途遇 WO 不得丢进度；写半在 WO 重试时不得重复密封
+    // （nonce/随机 salt 只推进一次），且最终 wire 能被对端解码还原明文。
+
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Default)]
+    struct Wire(Arc<Mutex<Vec<u8>>>);
+
+    impl Wire {
+        fn bytes(&self) -> Vec<u8> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    /// 写 mock：隔次注入 WO，输出捕获。
+    struct WobWrite {
+        wire: Wire,
+        block_next: bool,
+    }
+
+    impl Write for WobWrite {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if self.block_next {
+                self.block_next = false;
+                return Err(io::ErrorKind::WouldBlock.into());
+            }
+            self.block_next = true;
+            // 限制单次写入量：强制部分写 + WO 交替（模拟未就绪的非阻塞 socket）。
+            let n = buf.len().min(97);
+            self.wire.0.lock().unwrap().extend_from_slice(&buf[..n]);
+            Ok(n)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// 读 mock：隔次注入 WO。
+    struct WobRead {
+        data: Vec<u8>,
+        off: usize,
+        block_next: bool,
+    }
+
+    impl Read for WobRead {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if self.block_next {
+                self.block_next = false;
+                return Err(io::ErrorKind::WouldBlock.into());
+            }
+            self.block_next = true;
+            if self.off >= self.data.len() {
+                return Ok(0);
+            }
+            // 限制单次读出量：强制帧头/载荷跨多次 read（模拟 TCP 分片）。
+            let n = buf.len().min(13).min(self.data.len() - self.off);
+            buf[..n].copy_from_slice(&self.data[self.off..self.off + n]);
+            self.off += n;
+            Ok(n)
+        }
+    }
+
+    fn wob_reader(
+        data: Vec<u8>,
+        method: SsMethod,
+        master: &[u8],
+        request_salt: Vec<u8>,
+        header_done: bool,
+    ) -> SsReader {
+        SsReader {
+            inner: Box::new(WobRead {
+                data,
+                off: 0,
+                block_next: false,
+            }),
+            method,
+            master: master.to_vec(),
+            key: None,
+            nonce: 0,
+            buf: Vec::new(),
+            pos: 0,
+            request_salt,
+            ss2022_header_done: header_done,
+            inbuf: Vec::new(),
+            inoff: 0,
+            pending_len: None,
+        }
+    }
+
+    /// 驱动写半直到全部明文被接受且密文刷空（WO 无限重试）。
+    fn drive_writer(w: &mut SsWriter, data: &[u8]) {
+        let mut off = 0;
+        let mut spins = 0;
+        while off < data.len() {
+            match w.write(&data[off..]) {
+                Ok(n) if n > 0 => off += n,
+                Ok(_) => panic!("write 返回 0"),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                Err(e) => panic!("非预期错误: {e}"),
+            }
+            spins += 1;
+            assert!(spins < 100_000, "WO 重试不收敛");
+        }
+        loop {
+            match w.flush() {
+                Ok(()) => break,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                Err(e) => panic!("非预期错误: {e}"),
+            }
+        }
+    }
+
+    fn read_exact_wob(r: &mut SsReader, want: &mut [u8]) {
+        let mut off = 0;
+        let mut spins = 0;
+        while off < want.len() {
+            match r.read(&mut want[off..]) {
+                Ok(0) => panic!("意外 EOF"),
+                Ok(n) => off += n,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                Err(e) => panic!("非预期错误: {e}"),
+            }
+            spins += 1;
+            assert!(spins < 100_000, "WO 重试不收敛");
+        }
+    }
+
+    #[test]
+    fn classic_stream_survives_would_block() {
+        let method = SsMethod::Chacha20IetfPoly1305;
+        let master = evp_bytes_to_key(b"secret", KEY_LEN);
+        let plain: Vec<u8> = (0..3000u32).map(|i| (i % 251) as u8).collect();
+
+        let wire = Wire::default();
+        let (_r0, mut w) = connect_split_boxed(
+            Box::new(io::empty()),
+            Box::new(WobWrite {
+                wire: wire.clone(),
+                block_next: false,
+            }),
+            None,
+            method,
+            &master,
+        )
+        .unwrap();
+        drive_writer(&mut w, &plain);
+
+        let mut r = wob_reader(wire.bytes(), method, &master, Vec::new(), true);
+        let mut got = vec![0u8; plain.len()];
+        read_exact_wob(&mut r, &mut got);
+        assert_eq!(got, plain, "classic WO 往返应逐字节一致");
+    }
+
+    #[test]
+    fn ss2022_stream_survives_would_block() {
+        let method = M_256;
+        let master = [0x42u8; 32];
+        let plain: Vec<u8> = (0..2500u32).map(|i| (i % 241) as u8).collect();
+        let sl = method.salt_len();
+
+        // 写半（客户端请求头）：WO 下重试不得重复密封/重置 nonce。
+        let wire = Wire::default();
+        let (_r0, mut w) = connect_split_boxed(
+            Box::new(io::empty()),
+            Box::new(WobWrite {
+                wire: wire.clone(),
+                block_next: false,
+            }),
+            None,
+            method,
+            &master,
+        )
+        .unwrap();
+        drive_writer(&mut w, &plain);
+        let bytes = wire.bytes();
+        let key = derive_subkey_2022(method, &master, &bytes[..sl]);
+        let fixed = open(method, &key, &nonce_of(0), &bytes[sl..sl + 11 + TAG_LEN]).unwrap();
+        assert_eq!(fixed[0], 0, "请求固定头 type 应为 0");
+        let vlen = u16::from_be_bytes([fixed[9], fixed[10]]) as usize;
+        let var = open(
+            method,
+            &key,
+            &nonce_of(1),
+            &bytes[sl + 11 + TAG_LEN..sl + 11 + TAG_LEN + vlen + TAG_LEN],
+        )
+        .unwrap();
+        assert_eq!(
+            &var[..plain.len()],
+            &plain[..],
+            "2022 请求变量头应含完整明文"
+        );
+
+        // 读半（服务端响应头）：固定头/载荷跨 WO 续读，request salt 校验不丢。
+        let request_salt = random_salt(sl);
+        let server_salt = random_salt(sl);
+        let rkey = derive_subkey_2022(method, &master, &server_salt);
+        let mut fixed = vec![1u8];
+        fixed.extend_from_slice(&now_unix().to_be_bytes());
+        fixed.extend_from_slice(&request_salt);
+        fixed.extend_from_slice(&(plain.len() as u16).to_be_bytes());
+        let mut resp = server_salt.clone();
+        resp.extend_from_slice(&seal(method, &rkey, &nonce_of(0), &fixed));
+        resp.extend_from_slice(&seal(method, &rkey, &nonce_of(1), &plain));
+        let mut r = wob_reader(resp, method, &master, request_salt, false);
+        let mut got = vec![0u8; plain.len()];
+        read_exact_wob(&mut r, &mut got);
+        assert_eq!(got, plain, "2022 WO 往返应逐字节一致");
     }
 }

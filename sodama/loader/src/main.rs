@@ -1493,8 +1493,8 @@ fn handle_tproxy_conn(mut stream: TcpStream) {
 /// 双向拷贝的一侧：记录字节数与活跃时间，EOF 后对写端半关闭。
 /// `offloaded` = 内核对拼已生效：注册前已入队的数据仍需本线程排空，
 /// 之后的任何 read 结果都不能当断连处理（psock 接管后 read 会返回 EAGAIN，
-/// 实测也可能是其它错误码），一律驻留重试；半关闭/终止由 offload_monitor
-/// 的 poll(RDHUP) 判定并置 stop，本线程只在 stop 后退出（避免 socket 泄漏）。
+/// 实测也可能是其它错误码），一律驻留重试。offload 连接不在本路径驻留：
+/// 看门狗（`offload_watch_loop`）统一判半关闭/超时并收尾（每连接 0 线程）。
 fn pump(
     mut r: Box<dyn outbound::ReadHalf>,
     mut w: Box<dyn outbound::WriteHalf>,
@@ -1792,82 +1792,148 @@ fn pump_or_splice_down(
     );
 }
 
-/// P7：offload 看门狗（被动观察 + 有界回收）。
-/// 实测定下的规则（C 基准 + 逐级实验）：
+/// P7/M4 stage 2：全局 offload 看门狗（单线程，每 offload 连接 0 线程）。
+///
+/// 取代原先「每连接一个 monitor 线程 + 两个驻留泵线程」的模型：注册后直接返回，
+/// 不再驻留用户态泵；由本线程统一 poll(RDHUP) 判定半关闭并在超时后强制回收，
+/// 并负责 fast_sock 键注销与 `relay_finish`。
+/// 实测规则（C 基准 + 逐级实验，不变）：
 ///   - 内核重定向会自行处理 FIN，但不会把 EOF 传给对端用户态；
 ///   - FIN 重定向尝试会在源 socket 上留下 POLLERR——这不是错误，**绝不能**
 ///     在传输中 force-close（会把在途重定向数据全部切断）；
 ///   - 用户态主动向对端传播 FIN 也会截断排队中的数据；
 /// 因此：只在两侧都 RDHUP 时干净退出；只有一侧 RDHUP 超过 10s
 /// （对照 dae relayHalfCloseTimeout）才强制关闭，保证连接最终可回收。
-/// 退出时置 stop，驻留的泵线程随之退出，主线程注销 fast_sock 键并回收 socket。
-fn offload_monitor(client_fd: RawFd, upstream_fd: RawFd, handle: Arc<RelayHandle>) {
+struct OffloadWatchEntry {
+    id: u64,
+    client_fd: RawFd,
+    upstream_fd: RawFd,
+    handle: Arc<RelayHandle>,
+    /// 注册时的 fast_sock/guard 键（清理时由看门狗注销）。
+    keys: Option<(SodaTuple, SodaTuple)>,
+    client_closed: bool,
+    upstream_closed: bool,
+    first_close: Option<Instant>,
+    err_logged: bool,
+}
+
+static OFFLOAD_WATCH: std::sync::LazyLock<(Mutex<Vec<OffloadWatchEntry>>, std::sync::Condvar)> =
+    std::sync::LazyLock::new(|| (Mutex::new(Vec::new()), std::sync::Condvar::new()));
+
+/// 注册一个 offload 连接（在 `handle_relay_conn` 内，注册后直接返回）。
+fn offload_watch_register(e: OffloadWatchEntry) {
+    let (m, cv) = &*OFFLOAD_WATCH;
+    match m.lock() {
+        Ok(mut v) => v.push(e),
+        Err(_) => return,
+    }
+    cv.notify_one();
+}
+
+/// offload 连接收尾：注销 fast_sock/guard 键 + 从 relay 注册表摘除。
+fn offload_watch_cleanup(id: u64, keys: &Option<(SodaTuple, SodaTuple)>) {
+    if let Some((k_up, k_cl)) = keys {
+        offload_guard_remove(k_up);
+        offload_guard_remove(k_cl);
+        if let Some(map) = RELAY_OFFLOAD.get() {
+            if let Ok(mut m) = map.lock() {
+                let _ = m.remove(k_up);
+                let _ = m.remove(k_cl);
+            }
+        }
+        log(&format!("offload: #{id} 已注销 fast_sock 键"));
+    }
+    relay_finish(id);
+}
+
+fn offload_watch_loop() {
     const HALF_CLOSE_TIMEOUT: Duration = Duration::from_secs(10);
-    fn poll_revents(fd: RawFd, timeout_ms: i32) -> i16 {
+    fn poll_revents(fd: RawFd) -> i16 {
         let mut pfd = libc::pollfd {
             fd,
             events: libc::POLLRDHUP | libc::POLLERR | libc::POLLHUP,
             revents: 0,
         };
-        let rc = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+        let rc = unsafe { libc::poll(&mut pfd, 1, 0) };
         if rc > 0 {
             pfd.revents
         } else {
             0
         }
     }
-    let mut client_closed = false;
-    let mut upstream_closed = false;
-    let mut first_close: Option<Instant> = None;
-    let mut err_logged = false;
+    let (m, cv) = &*OFFLOAD_WATCH;
     loop {
-        if handle.stop.load(Ordering::Relaxed) {
-            break;
-        }
-        let ce = if client_closed {
-            0
-        } else {
-            poll_revents(client_fd, 200)
-        };
-        let ue = if upstream_closed {
-            0
-        } else {
-            poll_revents(upstream_fd, 200)
-        };
-        if !err_logged && (ce | ue) & (libc::POLLERR | libc::POLLHUP) != 0 {
-            err_logged = true;
-            log(&format!(
-                "offload: 观察到 POLLERR/POLLHUP（client=0x{ce:x} upstream=0x{ue:x}），按被动策略忽略"
-            ));
-        }
-        if ce & libc::POLLRDHUP != 0 && !client_closed {
-            client_closed = true;
-            log("offload: 客户端半关闭（等待对端或 10s 超时）");
-        }
-        if ue & libc::POLLRDHUP != 0 && !upstream_closed {
-            upstream_closed = true;
-            log("offload: 上游半关闭（等待对端或 10s 超时）");
-        }
-        if client_closed && upstream_closed {
-            break;
-        }
-        if client_closed || upstream_closed {
-            match first_close {
-                None => first_close = Some(Instant::now()),
-                Some(t) if t.elapsed() > HALF_CLOSE_TIMEOUT => {
-                    unsafe {
-                        libc::shutdown(client_fd, libc::SHUT_RDWR);
-                        libc::shutdown(upstream_fd, libc::SHUT_RDWR);
+        {
+            let mut v = m.lock().unwrap_or_else(|p| p.into_inner());
+            let mut i = 0;
+            while i < v.len() {
+                let mut remove = false;
+                {
+                    let e = &mut v[i];
+                    if e.handle.stop.load(Ordering::Relaxed) {
+                        remove = true;
+                    } else {
+                        let ce = if e.client_closed {
+                            0
+                        } else {
+                            poll_revents(e.client_fd)
+                        };
+                        let ue = if e.upstream_closed {
+                            0
+                        } else {
+                            poll_revents(e.upstream_fd)
+                        };
+                        if !e.err_logged && (ce | ue) & (libc::POLLERR | libc::POLLHUP) != 0 {
+                            e.err_logged = true;
+                            log(&format!(
+                                "offload: 观察到 POLLERR/POLLHUP（client=0x{ce:x} upstream=0x{ue:x}），按被动策略忽略"
+                            ));
+                        }
+                        if ce & libc::POLLRDHUP != 0 && !e.client_closed {
+                            e.client_closed = true;
+                            log("offload: 客户端半关闭（等待对端或 10s 超时）");
+                        }
+                        if ue & libc::POLLRDHUP != 0 && !e.upstream_closed {
+                            e.upstream_closed = true;
+                            log("offload: 上游半关闭（等待对端或 10s 超时）");
+                        }
+                        if e.client_closed && e.upstream_closed {
+                            remove = true;
+                        } else if e.client_closed || e.upstream_closed {
+                            match e.first_close {
+                                None => e.first_close = Some(Instant::now()),
+                                Some(t) if t.elapsed() > HALF_CLOSE_TIMEOUT => {
+                                    unsafe {
+                                        libc::shutdown(e.client_fd, libc::SHUT_RDWR);
+                                        libc::shutdown(e.upstream_fd, libc::SHUT_RDWR);
+                                    }
+                                    log("offload: 半关闭超时，强制关闭两侧");
+                                    remove = true;
+                                }
+                                _ => {}
+                            }
+                        }
                     }
-                    log("offload: 半关闭超时，强制关闭两侧");
-                    break;
                 }
-                _ => {}
+                if remove {
+                    let e = v.swap_remove(i);
+                    offload_watch_cleanup(e.id, &e.keys);
+                    continue; // swap_remove 后 i 指向新元素，不递增
+                }
+                i += 1;
+            }
+            let empty = v.is_empty();
+            drop(v);
+            let wait = if empty {
+                Duration::from_millis(500)
+            } else {
+                Duration::from_millis(200)
+            };
+            if let Ok(g) = m.lock() {
+                let _ = cv.wait_timeout(g, wait);
             }
         }
     }
-    // 通知驻留的泵线程退出（连接已终结）；主线程在泵退出后注销 fast_sock 键。
-    handle.stop.store(true, Ordering::Relaxed);
 }
 
 /// 构造 fast_sock 键：元组取「remote → local」方向（对照 dae makeTuplesKey）。
@@ -2419,13 +2485,31 @@ fn handle_relay_conn(mut client: TcpStream) {
     if let Ok(mut m) = RELAY_CONNS.lock() {
         m.insert(id, handle.clone());
     }
-    // P7：offload 看门狗（被动观察 RDHUP + 有界回收；见 offload_monitor）
+    // P7/M4 stage 2：offload 连接交全局看门狗（单线程，每连接 0 线程；
+    // 半关闭判定/超时回收/fast_sock 注销均在 `offload_watch_loop` 统一完成）。
     if offloaded {
-        if let Some(up) = handle.upstream.as_ref() {
-            let h = handle.clone();
-            let cf = handle.client.as_raw_fd();
-            let uf = up.as_raw_fd();
-            std::thread::spawn(move || offload_monitor(cf, uf, h));
+        if let Some(keys) = offload_keys.take() {
+            let up_fd = handle.upstream.as_ref().map(|u| u.as_raw_fd());
+            if let Some(uf) = up_fd {
+                offload_watch_register(OffloadWatchEntry {
+                    id,
+                    client_fd: handle.client.as_raw_fd(),
+                    upstream_fd: uf,
+                    handle: handle.clone(),
+                    keys: Some(keys),
+                    client_closed: false,
+                    upstream_closed: false,
+                    first_close: None,
+                    err_logged: false,
+                });
+                return;
+            }
+            // offload 必有 upstream socket；防御性兑底：键已取出则直接回收，
+            // 不能落入驻留泵（无看门狗时无从置 stop）。
+            log("offload: 无 upstream socket，放弃内核路径并回收");
+            let _ = handle.client.shutdown(std::net::Shutdown::Both);
+            offload_watch_cleanup(id, &Some(keys));
+            return;
         }
     }
     // M4：splice 连接的 epoll worker 池（每连接 0 线程）。需要响应头前缀的链路
@@ -3806,6 +3890,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         });
         std::thread::spawn(relay_janitor_loop);
+        std::thread::spawn(offload_watch_loop);
         log("relay 线程池已启动（host ns）");
         // M4：splice 数据面的 epoll worker 池（每连接 0 线程；仅字节透明链路）
         if RELAY_SPLICE.load(Ordering::Relaxed) {

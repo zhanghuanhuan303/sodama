@@ -11,7 +11,7 @@
 | O1 | ss AEAD 零分配 + 原地加解密 | ss 剖面 AEAD ~38–41%、libc memcpy 3.4% | ss CPU -10~15% | 中 | 低 |
 | O2 | ss 读写 syscall 合并/预缓冲 | 每块 2×read_exact + 2×write；`rep_movs` 中 11.7% | ss CPU -5~10% | 中 | 低 |
 | ~~O3~~ | ~~relay splice 零拷贝~~ **（M1 已完成）** | relay 剖面 `rep_movs` 49.4% + 建页 18.5% | ✅ 实测：relay 8 流 14.9→**21.6 Gbps**、CPU 1100→**150ms**；vless 明文 12.2→**16.9 Gbps**、CPU 380→**60ms** | — | 已交付（`--no-splice` 可关） |
-| ~~O4~~ | ~~每连接线程 → epoll worker 池~~ **（M4 已完成，stage 1+2）** | hold 10k = 20 011 线程 / 763 MB；64 并发 = 123 线程、~175KB/conn | ✅ 实测：10k 连接 **28 线程 / 32.1 MB**、fail=0、建立 4 717/s；风暴 **25 606/s**（线程模型 20 860/s）；vless 吞吐无回退（64×1 MB +19%）；relay 64×1 MB **37.9 vs 13.6 Gbps**；**vless-tls 2 000 连接 27 线程 / 61 MB（线程模型 4 011 / 222 MB）** | — | 已交付：stage 1 splice + stage 2 codec（VLESS 全组合含 reality/vision/ws、Trojan、vmess 每连接 0 线程）；`SODAMA_NO_REACTOR=1` / `SODAMA_REACTOR_CODEC=0` 可关；余段见 O4 节与 ADR-0058 |
+| ~~O4~~ | ~~每连接线程 → epoll worker 池~~ **（M4 已完成，stage 1+2 全部）** | hold 10k = 20 011 线程 / 763 MB；64 并发 = 123 线程、~175KB/conn | ✅ 实测：10k 连接 **28 线程 / 32.1 MB**、fail=0、建立 4 717/s；风暴 **25 606/s**（线程模型 20 860/s）；vless 吞吐无回退（64×1 MB +19%）；relay 64×1 MB **37.9 vs 13.6 Gbps**；**vless-tls 2 000 连接 27 线程 / 61 MB（线程模型 4 011 / 222 MB）**；**offload 200 条 0 新增线程** | — | 已交付：stage 1 splice + stage 2 codec 全协议面（VLESS 全组合含 reality/vision/ws、Trojan、vmess、ss/ssr/anytls 每连接 0 线程）+ offload 看门狗单线程化；io_uring A/B 结论不引入；`SODAMA_NO_REACTOR=1` / `SODAMA_REACTOR_CODEC=0` 可关；细节见 O4 节与 ADR-0058 |
 | ~~O5~~ | ~~bpf_printk 门控~~ **（M1 已完成）** | direct 剖面 0.3–0.45% 纯开销 | ✅ 默认关：单次传输 trace 600+→**0 行**；`--ebpf-debug` 开 | — | 已交付 |
 | O6 | AES-GCM 方法优先（可选） | chacha20-poly1305 AVX2 ~1.5GB/s/core | ss CPU -30~50%（若节点支持） | 中 | 低 |
 | O7 | UDP 批量（recvmmsg/sendmmsg） | UDP 路径未同口径压测（backlog G1 缺口） | PPS 提升、CPU 降 | 中 | 低 |
@@ -128,18 +128,17 @@
 
 ## P2 · 线程与规模模型
 
-### O4 · epoll/io_uring worker 池替代「每连接线程」——✅ M4 已完成（stage 1）
+### O4 · epoll/io_uring worker 池替代「每连接线程」——✅ M4 已完成（stage 1+2 全部交付）
 
 > 2026-10-04 评估结论（用户问询 worker 化/async 的收益）：**worker 化买的是规模与效率，不是峰值吞吐**。
 > 依据：relay+splice 已 21.6 Gbps / CPU 仅 150ms（瓶颈是 syscall/内存带宽）；vless 明文 16.2 Gbps / 190ms；
 > TLS 受密码引擎限制（内核 2.89 GB/s、用户态 6.57 GB/s）；perf 剖面无单一大锁，线程模型零跨连接共享状态。
-> **async（tokio）不加数据面**：沿用 ADR-0003（relay 专用 OS 线程；tokio 仅 QUIC 桥接），
-> 唯一值得 A/B 的异步方向是 io_uring（IORING_OP_SPLICE + 注册缓冲），放在本项骨架落地后进行。
-> **M4 第一步**：新增连接规模/风暴基准（新建/s、10k 并发 RSS/线程曲线），作为本项验收口径。
+> **async（tokio）不加数据面**：沿用 ADR-0003（relay 专用 OS 线程；tokio 仅 QUIC 桥接）。
+> **io_uring A/B 已做（2026-10-05，ADR-0058）：收益在噪声内，结论为不引入**（详见下方）。
 
 - **交付（stage 1，2026-10-05，ADR-0058）**：epoll worker 池（核/2，clamp 2–8）接管 **splice 链路**
   （Direct / VLESS 明文 / kTLS 成功的 TLS；每连接 0 线程）；VLESS 响应头由短命 prelude 线程消费后 `resume`；
-  非 splice 链路（rustls/reality/ss/vmess）仍走线程模型，stage 2 再迁。
+  非 splice 链路（rustls/reality/ss/vmess）仍走线程模型，stage 2 已全部迁入（见下）。
 - **实测（`lab/scale`，direct→epoll 回显，hold 峰值采样）**：
 
   | 指标 | 线程模型 | reactor |
@@ -153,12 +152,20 @@
 
   （reactor 为 16 worker 配置——stage 2 起取完整并行度；stage 1 时 8 worker 为 20 线程 / 30.2 MB。）
 - **stage 2：codec 会话接入（2026-10-05，ADR-0058 stage 2 节）**：覆盖 **VLESS 全组合**（Tcp/Ws ×
-  明文/rustls/REALITY/±vision）、**Trojan** 与 **vmess**（每连接 0 线程；可重入前提：TlsWriter 待刷语义、
-  读半状态机（Vless/Vision/Ws）、写半待刷队列（Tls13/Vision/Ws/Vmess）、**预算耗尽自驱补泵**、
-  **vmess 终止帧幂等**）；vless-tls 长连接 2 000 条 = **27 线程 / 61 MB**（线程模型 4 011 / 222 MB）、fail=0；
-  vision 夹具 tls/reality/ws/wss 四模式逐字节全过；`SODAMA_REACTOR_CODEC=0` 可关。
-- **stage 2 余段待办**：ss/ssr/anytls 会话接入（读半/写半同模式改造）、
-  offload 看门狗/定时器统一、io_uring（IORING_OP_SPLICE + 注册缓冲）A/B；UDP 批量化属 O7。
+  明文/rustls/REALITY/±vision）、**Trojan**、**vmess**、**ss（classic+SIP022，非 shadow-tls）**、
+  **ssr（origin+plain）**、**anytls**（每连接 0 线程；可重入前提：TlsWriter 待刷语义、
+  读半状态机（Vless/Vision/Ws/ss/ssr/anytls）、写半待刷队列（Tls13/Vision/Ws/Vmess/ss/ssr/anytls）、
+  **预算耗尽自驱补泵**、**vmess 终止帧幂等**）；vless-tls 长连接 2 000 条 = **27 线程 / 61 MB**
+  （线程模型 4 011 / 222 MB）、fail=0；vision 夹具 tls/reality/ws/wss 四模式逐字节全过；
+  `test-ss`/`test-ss2022`/`test-ssr` 均 PASS 且 `SODAMA_REACTOR_DEBUG=1` 逐连接确认 `codec 投递`；
+  anytls 经 sing-box 本地服务端 + 公网目标 e2e HTTP 204、泵失败 0；`SODAMA_REACTOR_CODEC=0` 可关。
+- **stage 2 收尾：offload 看门狗单线程统一**：每 offload 连接从 3 线程（monitor+2 驻留泵）降为 **0 线程**——
+  hold 200 条 offloaded 连接 28→28 线程、`conns_active=200`，全部回收后 `active=0`/`fast_sock=0`
+  （`test-relay-offload` + `test-offload-lifecycle` PASS）。
+- **io_uring A/B（结论：不引入）**：微基准 `lab/perf/iou-splice-ab.c`（liburing）交叉配对 10 轮：
+  epoll+splice 1 MB 中位 **8.11 GB/s** vs `IORING_OP_SPLICE` **8.18 GB/s**（+0.9%，噪声内）；
+  64 KB 管道 io_uring **4.5 GB/s**（更差）；`IORING_OP_SPLICE` 无注册缓冲语义（仅 READ/WRITE_FIXED 有，
+  但会引入用户态拷贝）；收益不抵第二套事件后端的复杂度，保留 epoll+splice。
 
 ---
 
@@ -181,7 +188,7 @@
 - **DNS**：命中缓存路径的 syscall 数、并发上限；已独立线程，当前不是瓶颈
   （idle 11 线程、27MB）。
 - **半关闭/关闭语义**：splice 链路的 EOF→`SHUT_WR` 已随 O4 stage 1 状态机落地；
-  offload 看门狗仍独立（10s 有界），待 stage 2 统一。
+  offload 看门狗已随 stage 2 收尾统一为全局单线程（每 offload 连接 0 线程，ADR-0058）。
 
 ---
 
@@ -209,5 +216,8 @@ TLS：kTLS 全链路可用，48MB×4 中位 **12.3 Gbps / 400 ms**，memcpy 1.6%
 Vision-over-TLS 已交付（双向 DIRECT，ADR-0057）；
 M4（2026-10-05 更新）：✅ 线程数 O(核数)——10k 连接 **28 线程 / 32.1 MB**、fail=0；风暴 **25 606/s**；
 吞吐不回退（vless 8 流 16.2 vs 15.7 Gbps；64×1 MB +19%；relay +178%）；kTLS 链路逐字节无回归。
-stage 2 codec（VLESS 全组合含 reality/vision/ws、Trojan、vmess）已交付：vless-tls 2 000 连接 27 线程 / 61 MB（线程模型 4 011 / 222 MB）。
-余段（ss/ssr/anytls 会话接入、io_uring）见 O4；ss 8 流 CPU ≤460 ms、四方对比 ss 吞吐目标待 O1/O2/O6 落地后复测。
+stage 2 codec（VLESS 全组合含 reality/vision/ws、Trojan、vmess、ss/ssr/anytls）已全部交付：
+vless-tls 2 000 连接 27 线程 / 61 MB（线程模型 4 011 / 222 MB）；
+offload 看门狗单线程化后每 offload 连接 0 线程（200 条实测 28→28 线程）；
+io_uring A/B 结论为不引入（噪声内，见 O4 节与 ADR-0058）；
+ss 8 流 CPU ≤460 ms、四方对比 ss 吞吐目标待 O1/O2/O6 落地后复测。
