@@ -442,8 +442,8 @@ struct CodecDir {
     src: RawFd,
     dst: RawFd,
     side: CodecSide,
-    /// 已读出/已解出、待推送的明文字节。
-    out: Vec<u8>,
+    /// 已读出/已解出、待推送的明文字节（O8：缓冲池化，会话结束归还）。
+    out: crate::bufpool::PoolBuf,
     off: usize,
     eof: bool,
     /// 写半内部仍有密文未刷出（等 dst EPOLLOUT）。
@@ -1165,7 +1165,7 @@ fn new_codec_session(
                 src: cfd,
                 dst: ufd,
                 side: CodecSide::Sink(writer),
-                out: Vec::new(),
+                out: crate::bufpool::PoolBuf::empty(),
                 off: 0,
                 eof: false,
                 flush_pending: false,
@@ -1175,7 +1175,7 @@ fn new_codec_session(
                 src: ufd,
                 dst: cfd,
                 side: CodecSide::Source(reader),
-                out: Vec::new(),
+                out: crate::bufpool::PoolBuf::empty(),
                 off: 0,
                 eof: false,
                 flush_pending: false,

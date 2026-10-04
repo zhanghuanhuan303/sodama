@@ -522,20 +522,28 @@ fn sendmmsg_udp(fd: RawFd, name: Option<SocketAddr>, datas: &[&[u8]]) -> io::Res
 
 /// 一次 `recvmmsg` 收多个 UDP 报文（阻塞至首包，`MSG_WAITFORONE` 之后非阻塞排空）。
 /// `out` 槽会被复用：先把 len 顶到槽容量再收，收完 truncate 到实际长度。
-fn recvmmsg_udp(fd: RawFd, out: &mut Vec<Vec<u8>>, max: usize) -> io::Result<usize> {
-    let n = max.min(UDP_BATCH_MAX);
-    while out.len() < n {
-        out.push(Vec::new());
+/// O8：槽按需增长——上一批收满才扩一个（上限 `max`），空闲会话只占 1 个槽。
+fn recvmmsg_udp(
+    fd: RawFd,
+    out: &mut Vec<crate::bufpool::PoolBuf>,
+    max: usize,
+) -> io::Result<usize> {
+    let cap = max.min(UDP_BATCH_MAX);
+    if out.is_empty() {
+        out.push(crate::bufpool::PoolBuf::zeroed(UDP_SLOT));
     }
+    let n = out.len().min(cap);
     let mut iovecs: [libc::iovec; UDP_BATCH_MAX] = unsafe { std::mem::zeroed() };
     let mut names: [libc::sockaddr_storage; UDP_BATCH_MAX] = unsafe { std::mem::zeroed() };
     let mut msgs: [libc::mmsghdr; UDP_BATCH_MAX] = unsafe { std::mem::zeroed() };
     for i in 0..n {
         let slot = &mut out[i];
-        if slot.capacity() < UDP_SLOT {
-            slot.reserve(UDP_SLOT - slot.capacity());
+        let cap = slot.capacity();
+        if cap < UDP_SLOT {
+            slot.reserve(UDP_SLOT - cap);
         }
-        unsafe { slot.set_len(UDP_SLOT) };
+        // SAFETY：容量已确保；len 仅用于 recv 写入，随后按 msg_len truncate。
+        unsafe { slot.as_mut_vec().set_len(UDP_SLOT) };
         iovecs[i] = libc::iovec {
             iov_base: slot.as_mut_ptr() as *mut libc::c_void,
             iov_len: UDP_SLOT,
@@ -567,6 +575,10 @@ fn recvmmsg_udp(fd: RawFd, out: &mut Vec<Vec<u8>>, max: usize) -> io::Result<usi
         for i in 0..got {
             let len = msgs[i].msg_len as usize;
             out[i].truncate(len.min(UDP_SLOT));
+        }
+        // 本批收满 → 下一批扩容一档（队列持续深时逐步升到 max）。
+        if got == n && n < cap {
+            out.push(crate::bufpool::PoolBuf::zeroed(UDP_SLOT));
         }
         return Ok(got);
     }
@@ -717,7 +729,12 @@ impl UdpRelay {
     /// O7：批量下行。Plain/Ss 用 `recvmmsg`（首包阻塞，`MSG_WAITFORONE` 之后非阻塞排空）；
     /// Stream/Tuic/Hy2/Juicity 逐包（QUIC/TCP 帧内已聚合，不再粘连阻塞）。
     /// `out` 为可复用槽（调用方保留；本函数负责扩容量与写入明文）。返回收到的包数。
-    pub fn recv_batch(&self, out: &mut Vec<Vec<u8>>, max: usize) -> io::Result<usize> {
+    /// O8：槽按需增长（空会话只占 1 个 64KB 槽，队列深时才扩），且走缓冲池。
+    pub fn recv_batch(
+        &self,
+        out: &mut Vec<crate::bufpool::PoolBuf>,
+        max: usize,
+    ) -> io::Result<usize> {
         if max == 0 {
             return Ok(0);
         }
@@ -743,7 +760,7 @@ impl UdpRelay {
             _ => {
                 let payload = self.recv_payload(&mut [])?;
                 if out.is_empty() {
-                    out.push(Vec::new());
+                    out.push(crate::bufpool::PoolBuf::zeroed(UDP_SLOT));
                 }
                 out[0].clear();
                 out[0].extend_from_slice(&payload);
@@ -3140,13 +3157,13 @@ mod tests {
     }
 
     fn collect_batch(relay: &UdpRelay, want: usize) -> Vec<Vec<u8>> {
-        let mut out: Vec<Vec<u8>> = Vec::new();
+        let mut out: Vec<crate::bufpool::PoolBuf> = Vec::new();
         let mut got: Vec<Vec<u8>> = Vec::new();
         let mut spins = 0;
         while got.len() < want {
             match relay.recv_batch(&mut out, want) {
                 Ok(0) => {}
-                Ok(n) => got.extend(out.iter().take(n).map(|v| v.clone())),
+                Ok(n) => got.extend(out.iter().take(n).map(|v| v.to_vec())),
                 Err(e)
                     if matches!(
                         e.kind(),

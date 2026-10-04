@@ -307,6 +307,8 @@ pub struct SsReader {
     inoff: usize,
     /// 当前帧的长度块已解密、nonce 已推进，等载荷收齐（WO 重试不得重读长度块）。
     pending_len: Option<usize>,
+    /// O8：最近一次 `fill_inbuf` 在帧边界遇到对端正常关闭（干净 EOF）。
+    eof_now: bool,
 }
 
 /// 半关闭回调（写半持有；直接拨号时即底层 TcpStream 的 `shutdown(Write)`）。
@@ -374,6 +376,7 @@ pub fn connect_split_boxed(
             inbuf: Vec::new(),
             inoff: 0,
             pending_len: None,
+            eof_now: false,
         };
         let writer = SsWriter {
             inner: writer,
@@ -405,6 +408,7 @@ pub fn connect_split_boxed(
         inbuf: Vec::new(),
         inoff: 0,
         pending_len: None,
+        eof_now: false,
     };
     let writer = SsWriter {
         inner: writer,
@@ -541,15 +545,19 @@ impl Read for SsReader {
             return Ok(0);
         }
         while self.pos >= self.buf.len() {
-            let made = if self.method.is_2022() {
+            let chunk = if self.method.is_2022() {
                 self.read_chunk_2022()?
             } else {
                 self.read_chunk_classic()?
             };
-            if !made {
-                // 非阻塞：帧未收齐。进度已保留在 inbuf/pending_len；上抛 WO 让
-                // reactor 等 EPOLLIN 后从断点续读（绝不能返回 Ok(0) 误报 EOF）。
-                return Err(io::Error::new(io::ErrorKind::WouldBlock, "ss: 帧未收齐"));
+            match chunk {
+                Some(true) => {}
+                Some(false) => {
+                    // 非阻塞：帧未收齐。进度已保留在 inbuf/pending_len；上抛 WO 让
+                    // reactor 等 EPOLLIN 后从断点续读（绝不能返回 Ok(0) 误报 EOF）。
+                    return Err(io::Error::new(io::ErrorKind::WouldBlock, "ss: 帧未收齐"));
+                }
+                None => return Ok(0), // 对端在帧边界正常关闭
             }
         }
         let n = buf.len().min(self.buf.len() - self.pos);
@@ -561,8 +569,10 @@ impl Read for SsReader {
 
 impl SsReader {
     /// 确保 inbuf 中至少还有 `need` 个未消费字节。
-    /// 返回 Ok(false) = 非阻塞暂无数据（已读字节保留，进度不丢）。
+    /// 返回 Ok(false) = 非阻塞暂无数据（已读字节保留，进度不丢）；
+    /// 若对端在帧边界正常关闭，置 `eof_now` 并同样返回 Ok(false)（由调用方区分）。
     fn fill_inbuf(&mut self, need: usize) -> io::Result<bool> {
+        self.eof_now = false;
         while self.inbuf.len() - self.inoff < need {
             if self.inoff > 0 {
                 self.inbuf.drain(..self.inoff);
@@ -573,10 +583,15 @@ impl SsReader {
             let want = missing.min(tmp.len());
             match self.inner.read(&mut tmp[..want]) {
                 Ok(0) => {
+                    if self.inbuf.is_empty() {
+                        // 帧边界干净 EOF（对端正常关闭）：不是错误，read() 上抛 Ok(0)。
+                        self.eof_now = true;
+                        return Ok(false);
+                    }
                     return Err(io::Error::new(
                         io::ErrorKind::UnexpectedEof,
                         "ss: 流在帧中途被截断",
-                    ))
+                    ));
                 }
                 Ok(n) => self.inbuf.extend_from_slice(&tmp[..n]),
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
@@ -603,20 +618,21 @@ impl SsReader {
     }
 
     /// classic 分块：长度块已解密后把长度记入 `pending_len`，载荷跨 WO 可续。
-    /// 返回 Ok(true) = 已解出一段明文；Ok(false) = 非阻塞等数据。
-    fn read_chunk_classic(&mut self) -> io::Result<bool> {
+    /// 返回 Ok(Some(true)) = 已解出一段明文；Ok(Some(false)) = 非阻塞等数据；
+    /// Ok(None) = 在帧边界干净 EOF。
+    fn read_chunk_classic(&mut self) -> io::Result<Option<bool>> {
         // 读服务器 salt（每方向一次）
         if self.key.is_none() {
             let sl = self.method.salt_len();
             let Some(salt) = self.take_exact(sl)? else {
-                return Ok(false);
+                return Ok(if self.eof_now { None } else { Some(false) });
             };
             self.key = Some(derive_subkey(&self.master, &salt).to_vec());
         }
         if self.pending_len.is_none() {
             // 长度块：2 字节明文 + 16 字节 tag
             let Some(lb) = self.take_exact(2 + TAG_LEN)? else {
-                return Ok(false);
+                return Ok(if self.eof_now { None } else { Some(false) });
             };
             let key = self.key.as_ref().expect("recv key");
             let plain_len = open(self.method, key, &nonce_of(self.nonce), &lb)?;
@@ -632,7 +648,14 @@ impl SsReader {
         }
         let len = self.pending_len.expect("pending_len");
         let Some(payload) = self.take_exact(len + TAG_LEN)? else {
-            return Ok(false);
+            if self.eof_now {
+                // 长度块已消费、载荷未收齐 → 真截断。
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "ss: 流在帧中途被截断",
+                ));
+            }
+            return Ok(Some(false));
         };
         let key = self.key.as_ref().expect("recv key");
         let out = open(self.method, key, &nonce_of(self.nonce), &payload)?;
@@ -640,12 +663,12 @@ impl SsReader {
         self.pending_len = None;
         self.buf = out;
         self.pos = 0;
-        Ok(true)
+        Ok(Some(true))
     }
 
     /// SIP022 分块读取：首选固定头，然后按长度/载荷块循环（跳过 0 长块）。
-    /// 返回 Ok(true) = 已解出一段明文；Ok(false) = 非阻塞等数据。
-    fn read_chunk_2022(&mut self) -> io::Result<bool> {
+    /// 返回同 classic 三态：Some(true)=明文 / Some(false)=WO / None=帧边界 EOF。
+    fn read_chunk_2022(&mut self) -> io::Result<Option<bool>> {
         // 调用方在 pos >= buf.len() 时才进来；先丢弃已读完的旧块。
         self.buf.clear();
         self.pos = 0;
@@ -654,7 +677,7 @@ impl SsReader {
             let fixed_plain_len = 1 + 8 + sl + 2;
             // 一次读出 salt + 固定头（SIP022 §3.1.3 建议一次 read）。
             let Some(raw) = self.take_exact(sl + fixed_plain_len + TAG_LEN)? else {
-                return Ok(false);
+                return Ok(if self.eof_now { None } else { Some(false) });
             };
             let key = derive_subkey_2022(self.method, &self.master, &raw[..sl]);
             let fixed = open(self.method, &key, &nonce_of(0), &raw[sl..])?;
@@ -684,7 +707,14 @@ impl SsReader {
                 }
                 let Some(ct) = self.take_exact(len + TAG_LEN)? else {
                     self.pending_len = Some(len);
-                    return Ok(false);
+                    if self.eof_now {
+                        // 长度块已消费、载荷未收齐 → 真截断。
+                        return Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "ss2022: 流在帧中途被截断",
+                        ));
+                    }
+                    return Ok(Some(false));
                 };
                 let key = self.key.as_ref().expect("2022 recv key");
                 let out = open(self.method, key, &nonce_of(self.nonce), &ct)?;
@@ -692,13 +722,13 @@ impl SsReader {
                 if !out.is_empty() {
                     self.buf = out;
                     self.pos = 0;
-                    return Ok(true);
+                    return Ok(Some(true));
                 }
                 // 0 长块：继续下一帧（长度块）
                 continue;
             }
             let Some(lb) = self.take_exact(2 + TAG_LEN)? else {
-                return Ok(false);
+                return Ok(if self.eof_now { None } else { Some(false) });
             };
             let key = self.key.as_ref().expect("2022 recv key");
             let plain = open(self.method, key, &nonce_of(self.nonce), &lb)?;
@@ -1563,6 +1593,7 @@ mod tests {
             inbuf: Vec::new(),
             inoff: 0,
             pending_len: None,
+            eof_now: false,
         }
     }
 
@@ -1601,6 +1632,79 @@ mod tests {
             }
             spins += 1;
             assert!(spins < 100_000, "WO 重试不收敛");
+        }
+    }
+
+    #[test]
+    fn classic_clean_eof_at_frame_boundary() {
+        // 对端发完最后一个完整帧后正常关闭：再 read 应得 Ok(0)（不是截断错误）。
+        let method = SsMethod::Chacha20IetfPoly1305;
+        let master = evp_bytes_to_key(b"secret", KEY_LEN);
+        let plain = b"bye".to_vec();
+        let wire = Wire::default();
+        let (_r0, mut w) = connect_split_boxed(
+            Box::new(io::empty()),
+            Box::new(WobWrite {
+                wire: wire.clone(),
+                block_next: false,
+            }),
+            None,
+            method,
+            &master,
+        )
+        .unwrap();
+        drive_writer(&mut w, &plain);
+        let mut r = wob_reader(wire.bytes(), method, &master, Vec::new(), true);
+        let mut got = vec![0u8; plain.len()];
+        read_exact_wob(&mut r, &mut got);
+        assert_eq!(got, plain);
+        let mut spins = 0;
+        loop {
+            match r.read(&mut [0u8; 16]) {
+                Ok(0) => break,
+                Ok(n) => panic!("期望干净 EOF，却读到 {n} 字节"),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                Err(e) => panic!("干净 EOF 不应报错: {e}"),
+            }
+            spins += 1;
+            assert!(spins < 1000);
+        }
+    }
+
+    #[test]
+    fn classic_midframe_eof_is_error() {
+        // 最后一个帧被截断：必须报 UnexpectedEof（不能静默当作 EOF）。
+        let method = SsMethod::Chacha20IetfPoly1305;
+        let master = evp_bytes_to_key(b"secret", KEY_LEN);
+        let plain = b"hello-world".to_vec();
+        let wire = Wire::default();
+        let (_r0, mut w) = connect_split_boxed(
+            Box::new(io::empty()),
+            Box::new(WobWrite {
+                wire: wire.clone(),
+                block_next: false,
+            }),
+            None,
+            method,
+            &master,
+        )
+        .unwrap();
+        drive_writer(&mut w, &plain);
+        let mut bytes = wire.bytes();
+        bytes.truncate(bytes.len() - 1); // 截掉最后一个 tag 字节
+        let mut r = wob_reader(bytes, method, &master, Vec::new(), true);
+        let mut buf = [0u8; 64];
+        let mut spins = 0;
+        loop {
+            match r.read(&mut buf) {
+                Ok(0) => panic!("半帧 EOF 不得当作干净 EOF"),
+                Ok(_) => {}
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+                Err(e) => panic!("期望 UnexpectedEof，得到 {e}"),
+            }
+            spins += 1;
+            assert!(spins < 1000);
         }
     }
 

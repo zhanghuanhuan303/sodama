@@ -47,6 +47,7 @@ use serde_json::json;
 mod anytls;
 mod bootstrap;
 mod brutal;
+mod bufpool;
 mod config;
 mod dns;
 mod dnsroute;
@@ -576,6 +577,13 @@ static ECS_SCOPE_LAST: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(
 
 extern "C" fn on_sighup(_sig: libc::c_int) {
     RELOAD.store(true, Ordering::SeqCst);
+}
+
+/// O8：SIGTERM/SIGINT = 优雅退出（有界等待；见 `graceful_shutdown`）。
+static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn on_shutdown(_sig: libc::c_int) {
+    SHUTDOWN.store(true, Ordering::SeqCst);
 }
 
 /// P6：SIGUSR2 = suspend（对照 dae `dae suspend`），由主循环写 control_flags_map。
@@ -1547,10 +1555,11 @@ fn pump(
     offloaded: bool,
     stop: Option<&AtomicBool>,
 ) {
-    let mut buf = vec![0u8; 65536];
+    // O8：64KB 读缓冲走池（短连接 churn 下免 malloc/页抖动）。
+    let mut buf = bufpool::PoolBuf::zeroed(65536);
     let mut terminal_logged = false;
     loop {
-        let read_res = r.read(&mut buf);
+        let read_res = r.read(&mut buf[..]);
         match read_res {
             Ok(0) | Err(_) if offloaded => {
                 if !terminal_logged {
@@ -3657,6 +3666,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         libc::signal(libc::SIGHUP, handler as *const () as libc::sighandler_t);
         let handler2: extern "C" fn(libc::c_int) = on_sigusr2;
         libc::signal(libc::SIGUSR2, handler2 as *const () as libc::sighandler_t);
+        // O8：终止信号 → 主循环走有界收尾（不再直接默认杀死）。
+        let handler3: extern "C" fn(libc::c_int) = on_shutdown;
+        libc::signal(libc::SIGTERM, handler3 as *const () as libc::sighandler_t);
+        libc::signal(libc::SIGINT, handler3 as *const () as libc::sighandler_t);
     }
 
     log(&format!("loading {}", args.ebpf));
@@ -3946,10 +3959,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::thread::spawn(udp_nat_janitor_loop);
 
     // 主循环：状态查询 + 检查重载标志 + 定期清扫 conn_state
+    // O8：50ms tick 一并发控：SIGTERM 检测/热重载响应更快（20 次/s 空转可忽略）。
     let mut ticks: u64 = 0;
-    let tick = Duration::from_millis(200);
+    let tick = Duration::from_millis(50);
     let janitor_ticks = (JANITOR_INTERVAL.as_millis() / tick.as_millis()).max(1) as u64;
     loop {
+        if SHUTDOWN.load(Ordering::SeqCst) {
+            graceful_shutdown();
+        }
         match status_rx.recv_timeout(tick) {
             Ok(status::MainMsg::Query { cmd, reply }) => {
                 let resp = handle_status_query(&cmd, &mut ebpf, &args);
@@ -3982,8 +3999,44 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Ok(n) => log(&format!("conn_state janitor: 清理 {n} 条过期状态")),
                 Err(e) => log(&format!("conn_state janitor 失败: {e}")),
             }
+            // O8：每 30s 回收分配器空闲页（churn 后 RSS 回落；避免高频 trim 抖动）。
+            if (ticks / janitor_ticks) % 6 == 0 {
+                trim_allocator();
+            }
         }
     }
+}
+
+/// O8：周期性把 glibc arena 空闲内存归还内核（churn 后 RSS 平台回落；多线程安全）。
+#[cfg(target_env = "gnu")]
+fn trim_allocator() {
+    unsafe {
+        libc::malloc_trim(0);
+    }
+}
+#[cfg(not(target_env = "gnu"))]
+fn trim_allocator() {}
+
+/// O8：优雅退出——有界等待在途连接收尾（≤300ms），随后退出。
+/// 数据面钩子是 TCX bpf_link：fd 随进程关闭由内核原子摘除，不残留过滤器（不会黑洞）。
+fn graceful_shutdown() -> ! {
+    let t0 = std::time::Instant::now();
+    let active = RELAY_STATS.conns_active.load(Ordering::Relaxed);
+    log(&format!(
+        "收到终止信号，优雅退出（在途 relay {active} 条，等待 ≤300ms）…"
+    ));
+    let deadline = t0 + Duration::from_millis(300);
+    while std::time::Instant::now() < deadline
+        && RELAY_STATS.conns_active.load(Ordering::Relaxed) > 0
+    {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    log(&format!(
+        "退出完成：{} ms（在途 relay {} 条）",
+        t0.elapsed().as_millis(),
+        RELAY_STATS.conns_active.load(Ordering::Relaxed)
+    ));
+    std::process::exit(0);
 }
 
 // ---------------------------------------------------------------- P3a：DNS（UDP 接管）
@@ -5005,7 +5058,8 @@ fn clear_domain_slot(ebpf: &mut Ebpf, slot: u32) -> Result<(), Box<dyn std::erro
 
 /// 上游回包 → 客户端（每会话一个 reader 线程；O7：recvmmsg 批量收 + sendmmsg 批量回）。
 fn udp_session_reader(sess: Arc<UdpSession>) {
-    let mut slots: Vec<Vec<u8>> = Vec::new();
+    // O8：槽走缓冲池且按需增长（空闲会话 ≈1×64KB）。
+    let mut slots: Vec<bufpool::PoolBuf> = Vec::new();
     loop {
         if !sess.alive.load(Ordering::Relaxed) {
             break;

@@ -15,7 +15,7 @@
 | ~~O5~~ | ~~bpf_printk 门控~~ **（M1 已完成）** | direct 剖面 0.3–0.45% 纯开销 | ✅ 默认关：单次传输 trace 600+→**0 行**；`--ebpf-debug` 开 | — | 已交付 |
 | ~~O6~~ | ~~AES-GCM 方法优先~~ **（已完成：实测结论为保留 chacha）** | 本机 RustCrypto：AES-NI 块加密 ~6 GB/s，但 GCM 受 GHASH 2.3 GB/s 串行限制（16KB 块 1.57 vs chacha 1.73 GB/s） | ✅ 测：ss TCP chacha 5.8–9.7 vs aes 4.4–8.0 Gbps、CPU 更低 → 不做 AES 优先；vmess auto→chacha、组内同分优先 chacha；定向换 ring/aws-lc 后端列为后续 | — | 已交付（微基准 `cipher_microbench` 留档；M2 6.57 GB/s 为块加密口径已更正） |
 | ~~O7~~ | ~~UDP 批量（recvmmsg/sendmmsg）+ 会话表分片~~ **（已完成）** | UDP 路径未同口径压测（backlog G1 缺口） | ✅ 实现：批量收发（Plain/Ss，`SODAMA_UDP_BATCH=0` A/B）+ 16 分片会话表 + 4–8MB 转发缓冲；20k pps 0 丢包 CPU **630 ms/40k 包**（dae 2140 / sing-box 1580 / v2ray 1780），RSS 28.6MB 最小；四方对拍 `lab/perf/udp.sh` | — | 已交付；实测批量在限速下每批 ~1 包（非 syscall-bound），保留但不宣称大幅提升（详见 O7 节） |
-| O8 | 缓冲池/回收与 shutdown 收敛 | 每连接 64KB 缓冲 malloc；SIGTERM 收敛 1–3s | 内存更稳、退出更快 | 低 | 低 |
+| ~~O8~~ | ~~缓冲池/回收与 shutdown 收敛~~ **（已完成）** | 每连接 64KB 缓冲 malloc；SIGTERM 收敛 1–3s（实测回退为即杀） | ✅ `bufpool`（64/128KB、按字节封顶 8MB）+ UDP 槽按需增长 + 有界优雅退出（50 在途连接 462ms）+ 30s `malloc_trim`；churn 300 条 RSS 23.9→trim 23.3MB 无增长 | — | 已交付；附带修复 ss 帧边界 EOF 误报截断（+2 单测）；verify 的 orig_dst 夹具陈旧另记 backlog |
 | ~~O9~~ | ~~kTLS 内核 TLS + TLS 上 splice~~ **（M2 已完成，实验开关）** | TLS 剖面 memcpy 29.4% + 建页 | ✅ 实测：48MB×4 中位 11.67→**12.32 Gbps**、CPU 420→**400ms**、memcpy→**1.6%**；8 流受同机夹具/内核 AES 速度限制（详见提案 05/07 节） | 中 | 中（需 TLS1.3+modprobe tls；默认关） |
 | ~~O10~~ | ~~Vision-over-TLS（XTLS DIRECT 双向）~~ **（M3 已完成）** | flow=vision 仅限 reality；无内层嗅探/上行 raw | ✅ 实测：tls/reality 内层 TLS1.3 2MB 逐字节 + 双向 DIRECT；ws/wss 逐字节；真订阅 48 节点 5MB e2e（日志 6/6 DIRECT）；见 ADR-0057 | 中 | 低（限 TCP；vision 连接旁路 kTLS） |
 
@@ -132,14 +132,26 @@
 - **边界**：依赖对端 Xray 的 DIRECT 语义（非 Xray 服务端按 END 兼容）；
   内层 TLS1.2 不进 DIRECT（嗅探保守，与 Xray 一致）。
 
-### O8 · 缓冲池与回收
+### O8 · 缓冲池与回收——✅ 已完成（2026-10-05）
 
-- **现状**：每连接泵缓冲 `vec![0u8; 65536]` ×2 每次 malloc；峰值 64 并发连接
-  100 线程、+8.6MB（~135KB/conn）；SIGTERM 优雅退出需 1–3s。
-- **做法**：泵缓冲从连接级 `Vec` 改为线程本地池（一次分配，连接间复用）；
-  输出路径 shutdown 时主动唤醒阻塞在 read 的泵线程（`shutdown(2)` 已可），
-  收敛退出路径的有界等待（≤500ms）。
-- **预期收益**：连接风暴下分配抖动更低；退出可预期。
+- **交付：**
+  1. **`bufpool` 全局缓冲池**：64KB/128KB 两档、**按字节封顶 8MB**，`PoolBuf` Drop 自动归还；
+     接入 codec 会话每方向 `out`（最大 churn 点）、回退泵 64KB、UDP 会话槽；
+  2. **UDP 会话槽按需增长**：空闲会话只占 1×64KB（旧实现预扩 32 槽 ≈ 2.1MB/会话），
+     队列持续深时才逐档扩到上限；
+  3. **SIGTERM/SIGINT 优雅退出**：信号→主循环（tick 50ms）→有界等待在途 relay ≤300ms
+     →`exit(0)`；数据面钩子是 TCX bpf_link，fd 随进程关闭由内核原子摘除（不残留过滤器黑洞）；
+  4. **周期性 `malloc_trim`**（每 30s）：把 glibc arena 空闲页归还内核（churn 后 RSS 回落）。
+- **实测（vless-tls，300 条 64KB 短连接 churn）：** RSS 27.3 → 23.9 → trim 后 **23.3 MB**
+  （无单调增长；未池化前同口径到 ~40MB 平台）；50 条在途连接下 SIGTERM：整机 **462 ms**
+  （内部有界等待 302 ms）、`tc filter` 无残留。
+- **期间修复（真实回归）**：ss codec 读半在「帧边界对端正常关闭」时误报 `流在帧中途被截断`
+  （数据正确但每连接一条错误日志，并影响 verify 判定）；现干净 EOF 上抛 `Ok(0)`，
+  仅半帧 EOF 报错；新增 2 条单测（`classic_clean_eof_at_frame_boundary` / `..._midframe_eof_is_error`）。
+- **验证**：`cargo test --release` **257/257**；`test-ss`（无泵失败日志）/`test-vless`/
+  `test-ss-udp`/`test-relay-offload`/`test-offload-lifecycle` 均 PASS。
+- **已知遗留（与 O8 无关）**：`lab.sh verify` 的 `orig_dst=` 断言在仓库内无任何夹具产生
+  （test_proxy/reload/rebind/fault 系列夹具陈旧），已在 backlog G 组登记。
 
 ---
 
