@@ -11,7 +11,7 @@
 
 | # | 域 | dae（Go 原版） | sodama（全 Rust） | 覆盖度 | 关键差异 / 证据 |
 |---|---|---|---|---|---|
-| 1 | **eBPF 数据面（程序/hook）** | 23 程序（13×TC L2/L3 变体 + `sk_skb` offload + 5×cgroup + kprobe/fentry）、24 map、4,403 行 C（HTML §2.1） | 8 程序（7×TC 含单臂 dual-role + `sk_skb` offload）、14 map（BTF）、~1.1k 行 Rust | **≈65%** | 主路径语义逐一对齐；缺 L2/桥接变体、cgroup 钩子、ringbuf。优势：C 已退役（ADR-0025）、TCX 退出即摘钩 |
+| 1 | **eBPF 数据面（程序/hook）** | 23 程序（13×TC L2/L3 变体 + `sk_skb` offload + 5×cgroup + kprobe/fentry）、24 map、4,403 行 C（HTML §2.1） | 8 程序（7×TC 含单臂 dual-role + `sk_skb` offload）、14 map（BTF）、~1.1k 行 Rust；**cgroup2 钩子 6/6 已挂载（pname 采集，P17b）** | **≈65%** | 主路径语义逐一对齐；余：L2/桥接变体、kprobe/fentry、ringbuf。优势：C 已退役（ADR-0025）、TCX 退出即摘钩 |
 | 2 | **分流主链路** | tproxy/direct/block、控制面 DNS override、五钩子角色、conn_state、双 epoch 热重载、redirect_track 单写者 | 同上全有 | **≈95%** | K0–K3 九用例 ×2 拓扑全过；`verify` 9/9（ADR-0009/0010，NOTES §11.16） |
 | 3 | **规则引擎** | dip/sip/dport/sport/l4proto/ipversion/dscp/mac/pname/domain/geoip/geosite/fallback + not/and + mark/must + sub/subnode | dae 现有函数集全覆盖（geoip/geosite 自 `.dat` 编译期展开，含 attr/ext；pname 走 cgroup2 采集；domain 走 DNS 位图 + 预计算索引）；`sub/subnode` 本版 dae 无此函数 | **≈95%** | **编译产物与 dae 逐字节对拍 5/5**（ADR-0010/0033）；真实 `.dat` 计数与上游清点一致（geoip:cn 15,357 / geosite:cn 6,623）；余项：geosite 负载未纳入对拍、流式解析、pname 用 comm 非 argv basename（CO-RE）；geodata 搜索目录已含 XDG（P18e） |
 | 4 | **配置系统** | 全量 `.dae`（global/dns/routing/group/subscription/node/include）全部生效 | 全量解析 + schema 校验 + 行级诊断；生效 routing 子集 + dns.upstream + **config 的 subscription/node/group 运行时**（ADR-0031）；deferred 项显式列出 | **≈65%** | 解析面与 `config_merger/parser` 语义逐条对齐；执行面为子集，deferred 不静默丢（ADR-0011）；缺 include 展开/全局健康参数全量、多组分派 |
