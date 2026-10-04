@@ -14,6 +14,8 @@ regex = "1"
 # P5 G1：协议栈（ss/trojan）
 aes-gcm = "0.10"
 chacha20poly1305 = "0.10"
+# SS2022（SIP022）：BLAKE3 子密钥派生（context = "shadowsocks 2022 session subkey"）
+blake3 = "1"
 hkdf = "0.12"
 sha1 = "0.10"
 sha2 = "0.10"

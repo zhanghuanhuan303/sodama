@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0
-//! P5：outbound 协议栈——Dialer 抽象 + direct/socks5/shadowsocks/trojan/vless/vmess/tuic/hysteria2。
+//! P5：outbound 协议栈——Dialer 抽象 + direct/socks5/http/shadowsocks/trojan/vless/vmess/tuic/hysteria2。
 //!
 //! 梯度与边界见 ADR-0004/ADR-0016/ADR-0018/ADR-0019：
-//! - G1：direct、socks5（TCP）、shadowsocks（classic AEAD，TCP+UDP）、trojan（TCP over TLS）；
+//! - G1：direct、socks5（TCP）、http CONNECT（TCP）、shadowsocks（classic AEAD 与
+//!   SIP022 2022-blake3-*，均 TCP+UDP）、trojan（TCP over TLS）；
 //! - G2：vless（TCP+UDP，tls/none）、vmess（AEAD，alterId=0，tcp，TCP+UDP，tls 可选）；
 //! - G3a：tuic v5（QUIC，TCP+UDP datagram）；G3b：hysteria2（QUIC，TCP+UDP datagram）；
 //! - offload（内核拼接）只对「字节透明」的 direct/socks5 开启：其余协议需要在用户态
@@ -330,11 +331,13 @@ impl<R: Read + Send> UdpDatagramSource for vmess::VmessUdpReader<R> {
 enum UdpKind {
     /// 直连：send_to(target)/recv_from（不校验来源，保持 P4b 语义）。
     Plain(UdpSocket),
-    /// shadowsocks：每个包独立 salt 的 AEAD，socket 已 connect 到服务端。
+    /// shadowsocks：classic 每包独立 salt，SIP022 需要会话状态；socket 已 connect 到服务端。
     Ss {
         socket: UdpSocket,
         method: ss::SsMethod,
         master: Vec<u8>,
+        /// SIP022 会话（packet id/重放窗口有状态）；classic 方法为 None。
+        session: Option<Mutex<ss::Ss2022UdpSession>>,
     },
     /// vless/vmess 的 UDP over stream（TCP 或 TLS）：帧式封装，读写两半分开。
     Stream {
@@ -382,8 +385,9 @@ impl UdpRelay {
                 socket,
                 method,
                 master,
+                session,
             } => {
-                // classic ss UDP：载荷 = SOCKS5 风格目标地址头 + 数据（服务端据此路由）
+                // ss UDP：载荷 = SOCKS5 风格目标地址头 + 数据（服务端据此路由）
                 let mut frame = Vec::with_capacity(data.len() + 7);
                 match self.target {
                     SocketAddr::V4(v4) => {
@@ -399,7 +403,10 @@ impl UdpRelay {
                 }
                 frame.extend_from_slice(&self.target.port().to_be_bytes());
                 frame.extend_from_slice(data);
-                let dg = ss::udp_seal(*method, master, &frame);
+                let dg = match session {
+                    Some(sess) => sess.lock().map_err(lock_err)?.seal(&frame),
+                    None => ss::udp_seal(*method, master, &frame),
+                };
                 socket.send(&dg)
             }
             UdpKind::Stream { write, .. } => {
@@ -424,10 +431,14 @@ impl UdpRelay {
                 socket,
                 method,
                 master,
+                session,
             } => {
                 let mut b = vec![0u8; 65536];
                 let n = socket.recv(&mut b)?;
-                ss::udp_open(*method, master, &b[..n])
+                match session {
+                    Some(sess) => sess.lock().map_err(lock_err)?.open(&b[..n]),
+                    None => ss::udp_open(*method, master, &b[..n]),
+                }
             }
             UdpKind::Stream { read, .. } => {
                 let mut r = read.lock().map_err(lock_err)?;
@@ -457,6 +468,12 @@ pub enum Outbound {
     Direct,
     Socks5 {
         server: SocketAddr,
+    },
+    /// HTTP CONNECT 隧道（`http://[user:pass@]host:port`，可选 Basic 认证）。
+    Http {
+        server: SocketAddr,
+        /// `Proxy-Authorization: Basic base64(user:pass)`。
+        auth: Option<(String, String)>,
     },
     Shadowsocks {
         server: SocketAddr,
@@ -511,6 +528,7 @@ impl Outbound {
         match self {
             Self::Direct => "direct".into(),
             Self::Socks5 { server } => format!("socks5://{server}"),
+            Self::Http { server, .. } => format!("http://{server}"),
             Self::Shadowsocks { server, method, .. } => {
                 format!("ss://{method_name}@{server}", method_name = method.name())
             }
@@ -549,7 +567,7 @@ impl Outbound {
             Self::Tuic { dialer } => dialer.name(),
             Self::Hysteria2 { dialer } => dialer.name(),
             Self::AnyTls { server, sni, .. } => format!("anytls://{server}?sni={sni}"),
-            Self::Group(g) => format!("group:{}（{} 节点）", g.name, g.members.len()),
+            Self::Group(g) => format!("group:{}（{} 节点）", g.name, g.member_count()),
         }
     }
 
@@ -558,7 +576,8 @@ impl Outbound {
         matches!(self, Self::Direct | Self::Socks5 { .. })
     }
 
-    /// 当前支持 UDP 代理的协议：ss（G1）、vless/vmess（G2）、tuic（G3）、hysteria2（G3b）。
+    /// 当前支持 UDP 代理的协议：ss（classic + SIP022）、vless/vmess（G2）、tuic（G3）、
+    /// hysteria2（G3b）；http CONNECT 仅 TCP。
     pub fn supports_udp(&self) -> bool {
         if let Self::Group(g) = self {
             return g.supports_udp();
@@ -590,6 +609,17 @@ impl Outbound {
                 let sock = marked_tcp_connect(*server, timeout)?;
                 let kill = sock.try_clone()?;
                 let s = socks5::handshake(sock, target, timeout)?;
+                let read = s.try_clone()?;
+                Ok(DialedStream {
+                    from_remote: Box::new(read),
+                    to_remote: Box::new(s),
+                    socket: Some(kill),
+                })
+            }
+            Self::Http { server, auth } => {
+                let sock = marked_tcp_connect(*server, timeout)?;
+                let kill = sock.try_clone()?;
+                let s = http_connect(sock, target, auth.as_ref(), timeout)?;
                 let read = s.try_clone()?;
                 Ok(DialedStream {
                     from_remote: Box::new(read),
@@ -754,12 +784,19 @@ impl Outbound {
             } => {
                 let socket = new_marked_udp()?;
                 socket.connect(server)?;
+                // SIP022 UDP 需要客户会话 ID/packet id/重放窗口，建会话状态；classic 无状态。
+                let session = if method.is_2022() {
+                    Some(Mutex::new(ss::Ss2022UdpSession::new(*method, master)?))
+                } else {
+                    None
+                };
                 Ok(Some(UdpRelay {
                     target,
                     kind: UdpKind::Ss {
                         socket,
                         method: *method,
                         master: master.clone(),
+                        session,
                     },
                 }))
             }
@@ -868,6 +905,9 @@ pub fn parse(url: &str) -> Result<Outbound, String> {
     if let Some(rest) = url.strip_prefix("ss://") {
         return parse_ss(rest);
     }
+    if let Some(rest) = url.strip_prefix("http://") {
+        return parse_http(rest);
+    }
     if let Some(rest) = url.strip_prefix("trojan://") {
         return parse_trojan(rest);
     }
@@ -895,8 +935,8 @@ pub fn parse(url: &str) -> Result<Outbound, String> {
         });
     }
     Err(format!(
-        "--dialer 不支持 {url}（G3b：direct / socks5:// / ss:// / trojan:// / vless:// / vmess:// / \
-         tuic:// / hysteria2:// / hy2://）"
+        "--dialer 不支持 {url}（direct / socks5:// / http:// / ss:// / trojan:// / vless:// / \
+         vmess:// / tuic:// / hysteria2:// / hy2://）"
     ))
 }
 
@@ -1427,6 +1467,103 @@ fn percent_decode(s: &str) -> String {
     percent_decode_str(s).decode_utf8_lossy().into_owned()
 }
 
+/// HTTP CONNECT 握手（RFC 7231 §4.3.6）：`CONNECT host:port HTTP/1.1`。
+///
+/// 响应头逐字节读取，避免把 200 之后紧跟的隧道数据吞进头部缓冲；非 200 直接报错。
+fn http_connect(
+    mut sock: TcpStream,
+    target: &Target,
+    auth: Option<&(String, String)>,
+    timeout: Duration,
+) -> io::Result<TcpStream> {
+    sock.set_read_timeout(Some(timeout))?;
+    sock.set_write_timeout(Some(timeout))?;
+
+    let authority = target_authority(target);
+    let mut req = format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n");
+    if let Some((user, pass)) = auth {
+        let token = base64::engine::general_purpose::STANDARD.encode(format!("{user}:{pass}"));
+        req.push_str(&format!("Proxy-Authorization: Basic {token}\r\n"));
+    }
+    req.push_str("\r\n");
+    sock.write_all(req.as_bytes())?;
+    sock.flush()?;
+
+    let mut head = Vec::with_capacity(256);
+    let mut b = [0u8; 1];
+    loop {
+        sock.read_exact(&mut b)?;
+        head.push(b[0]);
+        if head.ends_with(b"\r\n\r\n") {
+            break;
+        }
+        if head.len() > 16 * 1024 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "http: 代理响应头过长",
+            ));
+        }
+    }
+    let text = String::from_utf8_lossy(&head);
+    let status = text.lines().next().unwrap_or("");
+    let code: Option<u16> = status
+        .split_whitespace()
+        .nth(1)
+        .and_then(|c| c.parse().ok());
+    match code {
+        Some(200) => {}
+        Some(c) => {
+            return Err(io::Error::other(format!(
+                "http: CONNECT {authority} 失败（代理返回 {c}）"
+            )))
+        }
+        None => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("http: 非法状态行 {status:?}"),
+            ))
+        }
+    }
+    sock.set_read_timeout(None)?;
+    sock.set_write_timeout(None)?;
+    Ok(sock)
+}
+
+/// CONNECT 请求行/Host 头里的 authority（IPv6 带方括号）。
+fn target_authority(target: &Target) -> String {
+    match target {
+        Target::Ip(std::net::IpAddr::V6(ip), port) => format!("[{ip}]:{port}"),
+        Target::Ip(ip, port) => format!("{ip}:{port}"),
+        Target::Domain(name, port) => format!("{name}:{port}"),
+    }
+}
+
+/// `http://[user:pass@]host:port`：CONNECT 隧道（可选 Basic 认证）；UDP 不支持。
+fn parse_http(rest: &str) -> Result<Outbound, String> {
+    let rest = rest.split('#').next().unwrap_or(rest);
+    let rest = rest.split('?').next().unwrap_or(rest);
+    let (userinfo, hostport) = match rest.rsplit_once('@') {
+        Some((u, h)) => (Some(u), h),
+        None => (None, rest),
+    };
+    let auth = match userinfo {
+        Some(u) => {
+            let u = percent_decode(u);
+            let (user, pass) = match u.split_once(':') {
+                Some((a, b)) => (a.to_string(), b.to_string()),
+                None => (u, String::new()),
+            };
+            if user.is_empty() {
+                return Err("http:// 用户名不能为空".into());
+            }
+            Some((user, pass))
+        }
+        None => None,
+    };
+    let server = resolve(&percent_decode(hostport))?;
+    Ok(Outbound::Http { server, auth })
+}
+
 /// `ss://`：支持 SIP002（base64url 或明文 userinfo）与旧式（整体 base64）。
 fn parse_ss(rest: &str) -> Result<Outbound, String> {
     let rest = rest.split('#').next().unwrap_or(rest);
@@ -1463,7 +1600,21 @@ fn parse_ss(rest: &str) -> Result<Outbound, String> {
         .ok_or_else(|| "ss:// userinfo 需要 method:password".to_string())?;
     let method =
         ss::SsMethod::parse(method_s).ok_or_else(|| format!("ss:// 不支持的方法 {method_s}"))?;
-    let master = ss::evp_bytes_to_key(password.as_bytes(), ss::KEY_LEN);
+    let master = if method.is_2022() {
+        // SIP022：password 是 PSK 的标准 base64（可带 padding），**不做** EVP_BytesToKey。
+        let psk = b64_decode_any(password)
+            .ok_or_else(|| format!("ss:// {method_s} 的 password 必须是 base64 PSK"))?;
+        if psk.len() != method.key_len() {
+            return Err(format!(
+                "ss:// {method_s} 需要 {} 字节 PSK（base64 解出 {} 字节）",
+                method.key_len(),
+                psk.len()
+            ));
+        }
+        psk
+    } else {
+        ss::evp_bytes_to_key(password.as_bytes(), ss::KEY_LEN)
+    };
     Ok(Outbound::Shadowsocks {
         server: resolve(&hostport)?,
         method,
@@ -1666,6 +1817,163 @@ mod tests {
         }
     }
 
+    #[test]
+    fn parse_http_url_and_auth() {
+        let ob = parse("http://alice:s3cret@127.0.0.1:8080").unwrap();
+        match ob {
+            Outbound::Http { server, auth } => {
+                assert_eq!(server, "127.0.0.1:8080".parse().unwrap());
+                assert_eq!(auth, Some(("alice".into(), "s3cret".into())));
+            }
+            other => panic!("{other:?}"),
+        }
+        // 无认证
+        let ob = parse("http://127.0.0.1:3128").unwrap();
+        match ob {
+            Outbound::Http { auth, .. } => assert!(auth.is_none()),
+            other => panic!("{other:?}"),
+        }
+        // 百分号编码的密码
+        let ob = parse("http://bob:p%40ss%3Aword@127.0.0.1:3128").unwrap();
+        match ob {
+            Outbound::Http { auth, .. } => {
+                assert_eq!(auth, Some(("bob".into(), "p@ss:word".into())))
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn http_connect_mock_roundtrip() {
+        use std::net::TcpListener;
+        use std::sync::mpsc;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let proxy_addr = listener.local_addr().unwrap();
+        let (tx, rx) = mpsc::channel::<String>();
+        let server = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut req = Vec::new();
+            let mut b = [0u8; 1];
+            loop {
+                sock.read_exact(&mut b).unwrap();
+                req.push(b[0]);
+                if req.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            tx.send(String::from_utf8_lossy(&req).into_owned()).unwrap();
+            sock.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                .unwrap();
+            // 200 之后直接回显，验证隧道透传
+            let mut buf = [0u8; 64];
+            loop {
+                match sock.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if sock.write_all(&buf[..n]).is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let ob = parse(&format!("http://user:pass@{proxy_addr}")).unwrap();
+        let target = Target::domain("example.com", 443);
+        let mut d = ob.dial_tcp(&target, Duration::from_secs(5)).unwrap();
+        let req = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(
+            req.starts_with("CONNECT example.com:443 HTTP/1.1\r\n"),
+            "{req}"
+        );
+        assert!(req.contains("\r\nHost: example.com:443\r\n"), "{req}");
+        let want = format!(
+            "Proxy-Authorization: Basic {}",
+            base64::engine::general_purpose::STANDARD.encode("user:pass")
+        );
+        assert!(req.contains(&want), "{req}");
+
+        d.to_remote.write_all(b"ping").unwrap();
+        d.to_remote.flush().unwrap();
+        let mut buf = [0u8; 4];
+        d.from_remote.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"ping");
+        drop(d);
+        let _ = server.join();
+    }
+
+    #[test]
+    fn http_connect_rejects_non_200() {
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let proxy_addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut req = Vec::new();
+            let mut b = [0u8; 1];
+            loop {
+                sock.read_exact(&mut b).unwrap();
+                req.push(b[0]);
+                if req.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            sock.write_all(
+                b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic\r\n\r\n",
+            )
+            .unwrap();
+        });
+
+        let ob = parse(&format!("http://{proxy_addr}")).unwrap();
+        let target = Target::domain("example.com", 443);
+        match ob.dial_tcp(&target, Duration::from_secs(5)) {
+            Ok(_) => panic!("407 不应视为成功"),
+            Err(e) => assert!(e.to_string().contains("407"), "{e}"),
+        }
+        server.join().unwrap();
+    }
+
+    /// SIP022：`ss://` password 是 PSK 的标准 base64；解出的长度必须等于方法密钥长度。
+    #[test]
+    fn parse_ss_2022_psk() {
+        use base64::engine::general_purpose::{STANDARD as B64, URL_SAFE_NO_PAD as B64URL};
+
+        // 0xfb 的 base64 含 `+`/`/`，验证内层用标准 base64 解码。
+        let psk = [0xfbu8; 32];
+        let creds = format!("2022-blake3-aes-256-gcm:{}", B64.encode(psk));
+        let url = format!("ss://{}@127.0.0.1:8388", B64URL.encode(creds.as_bytes()));
+        match parse(&url).unwrap() {
+            Outbound::Shadowsocks { method, master, .. } => {
+                assert_eq!(method, ss::SsMethod::Ss2022Aes256Gcm);
+                assert_eq!(master, psk.to_vec());
+            }
+            other => panic!("{other:?}"),
+        }
+
+        // aes-128：PSK 必须 16 字节
+        let creds = format!("2022-blake3-aes-128-gcm:{}", B64.encode([0x11u8; 16]));
+        let url = format!("ss://{}@127.0.0.1:8388", B64URL.encode(creds.as_bytes()));
+        match parse(&url).unwrap() {
+            Outbound::Shadowsocks { master, .. } => assert_eq!(master, vec![0x11u8; 16]),
+            other => panic!("{other:?}"),
+        }
+
+        // 长度不符（aes-128 给 32 字节 PSK）必须报错
+        let creds = format!("2022-blake3-aes-128-gcm:{}", B64.encode([0x22u8; 32]));
+        let url = format!("ss://{}@127.0.0.1:8388", B64URL.encode(creds.as_bytes()));
+        let e = parse(&url).unwrap_err();
+        assert!(e.contains("需要 16 字节"), "{e}");
+
+        // 非 base64 的 password 必须报错
+        let creds = "2022-blake3-aes-256-gcm:not-base64-!!!!";
+        let url = format!("ss://{}@127.0.0.1:8388", B64URL.encode(creds.as_bytes()));
+        let e = parse(&url).unwrap_err();
+        assert!(e.contains("base64"), "{e}");
+    }
+
     /// 真实订阅节点探针（默认忽略，需要网络与环境变量）：
     ///   REAL_VLESS_WS_URL='vless://...type=ws...' [REAL_VLESS_WS_TARGET=www.gstatic.com:80] \
     ///   cargo test --release real_vless_ws_probe -- --ignored --nocapture
@@ -1734,5 +2042,89 @@ mod tests {
         let head = String::from_utf8_lossy(&buf[..buf.len().min(200)]).to_string();
         eprintln!("status head: {}", head.lines().next().unwrap_or("(empty)"));
         assert!(head.starts_with("HTTP/1."), "未拿到 HTTP 响应: {head}");
+    }
+
+    /// 交叉对拍（默认忽略）：本机装有 shadowsocks-rust 的 `ss-server` 时，
+    /// 用真实服务端验证 SS2022 TCP 互通；没有则打印 skip 并返回。
+    ///
+    ///   cargo test --release ss2022_vs_ssserver -- --ignored --nocapture
+    #[test]
+    #[ignore = "需要本机安装 shadowsocks-rust 的 ss-server"]
+    fn ss2022_vs_ssserver() {
+        use base64::engine::general_purpose::{STANDARD as B64, URL_SAFE_NO_PAD as B64URL};
+        use std::net::{TcpListener, TcpStream};
+
+        if std::process::Command::new("ss-server")
+            .arg("--help")
+            .output()
+            .is_err()
+        {
+            eprintln!("skip: 未找到 ss-server（shadowsocks-rust）");
+            return;
+        }
+
+        // 本地 echo 服务
+        let echo = TcpListener::bind("127.0.0.1:0").unwrap();
+        let echo_addr = echo.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for s in echo.incoming() {
+                let Ok(mut s) = s else { continue };
+                std::thread::spawn(move || {
+                    let mut w = s.try_clone().unwrap();
+                    let _ = std::io::copy(&mut s, &mut w);
+                });
+            }
+        });
+
+        let port = 18998u16;
+        let psk = [0x5au8; 32];
+        let method = "2022-blake3-aes-256-gcm";
+        let child = std::process::Command::new("ss-server")
+            .args([
+                "-s",
+                "127.0.0.1",
+                "-p",
+                &port.to_string(),
+                "-m",
+                method,
+                "-k",
+                &B64.encode(psk),
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        let mut child = match child {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("skip: 无法启动 ss-server: {e}");
+                return;
+            }
+        };
+        std::thread::sleep(Duration::from_millis(800));
+        if let Ok(Some(st)) = child.try_wait() {
+            eprintln!("skip: ss-server 提前退出（{st}），参数可能与本机版本不符");
+            return;
+        }
+
+        struct Guard(std::process::Child);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let _guard = Guard(child);
+
+        let creds = format!("{method}:{}", B64.encode(psk));
+        let url = format!("ss://{}@127.0.0.1:{port}", B64URL.encode(creds.as_bytes()));
+        let ob = parse(&url).unwrap();
+        let target = Target::from_socket_addr(echo_addr).unwrap();
+        let mut d = ob.dial_tcp(&target, Duration::from_secs(5)).unwrap();
+        d.to_remote.write_all(b"ping-ss2022").unwrap();
+        d.to_remote.flush().unwrap();
+        let mut buf = [0u8; 11];
+        d.from_remote.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"ping-ss2022");
+        let _ = TcpStream::connect(echo_addr); // 保活，避免 lint
     }
 }
