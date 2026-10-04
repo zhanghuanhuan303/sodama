@@ -7,8 +7,10 @@
 //! cmd：0x00 继续填充、0x01 结束填充（之后裸 VLESS 载荷直通）、
 //!      0x02 直通（服务端把下行切成裸 TCP——Vision splice）。
 //!
-//! 本实现策略（可用优先）：
-//! - 上行只发 0x00/0x01（不做上行 splice；服务端仍兼容，仅少一项优化）；
+//! 本实现策略：
+//! - 上行：过滤窗口内发 0x00（首帧含 UUID）并按对称加密首包长填充；窗口结束或非 TLS
+//!   数据帧发 0x01（CMD_END），之后 `finished` —— 后续字节以裸 TLS 应用数据直写，
+//!   即 Xray 的上行 splice（对照 dae/outbound vision）；
 //! - 下行完整处理 0x01/0x02：遇到 0x02 后把 TLS 读半切换成裸 TCP 直通，
 //!   之后的字节是目标站真实 TLS 记录，原样交给上层（浏览器自己解密）。
 
@@ -290,6 +292,52 @@ mod tests {
         }
         assert_eq!(&out[..hello.len()], &hello);
         assert!(!raw.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn writer_splices_after_filter_window() {
+        // 过滤窗口（6 笔）结束后：END 帧随最后一笔发出，之后是裸字节（上行 splice）。
+        let (a, b) = std::os::unix::net::UnixStream::pair().unwrap();
+        let uuid = [9u8; 16];
+        let mut w = VisionWriter::new(a, uuid);
+        let chunk = [0x16u8, 0x03, 0x01, 0, 0]; // TLS 形状（长填充）
+        for _ in 0..6 {
+            w.write_all(&chunk).unwrap(); // 第 1 笔首帧，后续 0x00 继续
+        }
+        w.write_all(&chunk).unwrap(); // 第 7 笔：packets_to_filter 到 1 → CMD_END
+        w.write_all(b"RAW").unwrap(); // splice：不经帧头直写
+        w.write_all(b"XYZ").unwrap();
+        w.flush().unwrap();
+        drop(w);
+        let mut wire = Vec::new();
+        let mut r = b;
+        r.read_to_end(&mut wire).unwrap();
+        // 手工解帧直到 END，验证其后就是裸字节
+        let mut off = 0usize;
+        let mut frames = 0usize;
+        loop {
+            let hdr = if frames == 0 { 21 } else { 5 };
+            if wire.len() < off + hdr {
+                break;
+            }
+            let (cmd, clen_off, pad_off) = if frames == 0 {
+                (wire[off + 16], off + 17, off + 19)
+            } else {
+                (wire[off], off + 1, off + 3)
+            };
+            let clen = u16::from_be_bytes([wire[clen_off], wire[clen_off + 1]]) as usize;
+            let pad = u16::from_be_bytes([wire[pad_off], wire[pad_off + 1]]) as usize;
+            off += hdr + clen + pad;
+            if cmd == CMD_END {
+                break;
+            }
+            frames += 1;
+        }
+        assert_eq!(
+            &wire[off..],
+            b"RAWXYZ",
+            "CMD_END 之后必须是裸字节（上行 splice）"
+        );
     }
 
     #[test]

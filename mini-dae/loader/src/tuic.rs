@@ -163,26 +163,59 @@ impl TuicDialer {
             let connecting = endpoint
                 .connect(cfg.server, &cfg.sni)
                 .map_err(|e| map_err("connect", e))?;
-            let conn = tokio::time::timeout(Duration::from_secs(8), connecting)
-                .await
-                .map_err(|_| map_err("握手超时", "8s"))?
-                .map_err(|e| map_err("握手", e))?;
-            // token：TLS 1.3 exporter（label = uuid 裸字节，context = password）
-            let mut token = [0u8; 32];
-            conn.export_keying_material(&mut token, &cfg.uuid, cfg.password.as_bytes())
-                .map_err(|e| map_err("exporter", format!("{e:?}")))?;
-            let mut uni = conn.open_uni().await.map_err(|e| map_err("open_uni", e))?;
-            let mut head = Vec::with_capacity(50);
-            head.push(VER5);
-            head.push(CMD_AUTH);
-            head.extend_from_slice(&cfg.uuid);
-            head.extend_from_slice(&token);
-            uni.write_all(&head)
-                .await
-                .map_err(|e| map_err("auth 写", e))?;
-            uni.finish().map_err(|e| map_err("auth fin", e))?;
-            Ok::<_, io::Error>(conn)
+            // P24：优先尝试 0-RTT（有会话票据时）；服务端/票据不支持则无痛回退 1-RTT。
+            match connecting.into_0rtt() {
+                Ok((conn, accepted)) => {
+                    match Self::auth(&conn, cfg).await {
+                        Ok(()) => {
+                            crate::log("tuic: 0-RTT 早数据已发送（认证+首流）");
+                            // 等服务端接受早数据；超时也继续用该连接（后续流不受影响）
+                            let _ = tokio::time::timeout(Duration::from_secs(3), accepted).await;
+                            return Ok(conn);
+                        }
+                        Err(e) => {
+                            crate::log(&format!("tuic: 0-RTT 认证失败（{e}），回退 1-RTT"));
+                            // 不能复用被拒的连接，重连一次
+                            let connecting = endpoint
+                                .connect(cfg.server, &cfg.sni)
+                                .map_err(|e| map_err("connect", e))?;
+                            let conn = tokio::time::timeout(Duration::from_secs(8), connecting)
+                                .await
+                                .map_err(|_| map_err("握手超时", "8s"))?
+                                .map_err(|e| map_err("握手", e))?;
+                            Self::auth(&conn, cfg).await?;
+                            return Ok(conn);
+                        }
+                    }
+                }
+                Err(connecting) => {
+                    let conn = tokio::time::timeout(Duration::from_secs(8), connecting)
+                        .await
+                        .map_err(|_| map_err("握手超时", "8s"))?
+                        .map_err(|e| map_err("握手", e))?;
+                    Self::auth(&conn, cfg).await?;
+                    Ok(conn)
+                }
+            }
         })
+    }
+
+    /// 认证（token = TLS 1.3 exporter，label = uuid 裸字节，context = password）。
+    async fn auth(conn: &quinn::Connection, cfg: &TuicConfig) -> io::Result<()> {
+        let mut token = [0u8; 32];
+        conn.export_keying_material(&mut token, &cfg.uuid, cfg.password.as_bytes())
+            .map_err(|e| map_err("exporter", format!("{e:?}")))?;
+        let mut uni = conn.open_uni().await.map_err(|e| map_err("open_uni", e))?;
+        let mut head = Vec::with_capacity(50);
+        head.push(VER5);
+        head.push(CMD_AUTH);
+        head.extend_from_slice(&cfg.uuid);
+        head.extend_from_slice(&token);
+        uni.write_all(&head)
+            .await
+            .map_err(|e| map_err("auth 写", e))?;
+        uni.finish().map_err(|e| map_err("auth fin", e))?;
+        Ok(())
     }
 
     /// 每条 TCP relay 连接开一条 QUIC 双向流。

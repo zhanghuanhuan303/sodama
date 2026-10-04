@@ -489,7 +489,8 @@ fn build_full_hello(spec: &ClientHelloSpec, kx: &ClientKx) -> Vec<u8> {
     }); // status_request
 
     let sigalgs: Vec<u16> = vec![
-        0x0403, 0x0804, 0x0401, 0x0503, 0x0805, 0x0806, 0x0807, 0x0601, 0x0603,
+        // Chrome 120（uTLS HelloChrome_120）的签名算法顺序/集合，逐项对齐：
+        0x0403, 0x0804, 0x0401, 0x0503, 0x0805, 0x0501, 0x0806, 0x0601,
     ];
     let mut sa = Vec::new();
     push_u16(&mut sa, (sigalgs.len() * 2) as u16);
@@ -537,22 +538,77 @@ fn build_full_hello(spec: &ClientHelloSpec, kx: &ClientKx) -> Vec<u8> {
         t: 0x002d,
         body: vec![1, 1],
     }); // psk_key_exchange_modes
+
+    // supported_versions：GREASE + TLS1.3 + TLS1.2（uTLS HelloChrome_120）
+    let grease_ver = grease_pool()[(rand_u16() % 16) as usize];
+    let mut sv = Vec::new();
+    push_u16(&mut sv, 6);
+    push_u16(&mut sv, grease_ver);
+    push_u16(&mut sv, 0x0304);
+    push_u16(&mut sv, 0x0303);
     exts.push(Ext {
         t: 0x002b,
-        body: vec![2, 0x03, 0x04],
-    }); // supported_versions(TLS1.3)
+        body: sv,
+    });
     exts.push(Ext {
         t: 0x001b,
         body: vec![2, 0, 2],
     }); // compress_certificate（Chrome：仅 brotli=2）
+
+    // application_settings / ALPS（uTLS ApplicationSettingsExtension，Chrome 120）
+    exts.push(Ext {
+        t: 0x4469,
+        body: vec![0, 3, 2, b'h', b'2'],
+    });
+
+    // GREASE ECH（uTLS BoringGREASEECH 形状：outer=0 / HKDF-SHA256+AES-128-GCM /
+    // 随机 config_id / 随机 enc / 随机 payload（长度取 144/176/208/240））。
+    {
+        use rand::RngCore;
+        let mut rng = rand::thread_rng();
+        let mut e = Vec::with_capacity(16 + 256);
+        e.push(0); // outer ClientHello
+        push_u16(&mut e, 0x0001); // kdf = HKDF-SHA256
+        push_u16(&mut e, 0x0001); // aead = AES-128-GCM
+        e.push((rng.next_u32() & 0xff) as u8); // config_id
+        let enc_len = 32usize;
+        push_u16(&mut e, enc_len as u16);
+        let mut enc = vec![0u8; enc_len];
+        rng.fill_bytes(&mut enc);
+        e.extend_from_slice(&enc);
+        let payload_lens = [144usize, 176, 208, 240];
+        let plen = payload_lens[(rng.next_u32() as usize) % 4];
+        push_u16(&mut e, plen as u16);
+        let mut payload = vec![0u8; plen];
+        rng.fill_bytes(&mut payload);
+        e.extend_from_slice(&payload);
+        exts.push(Ext {
+            t: grease_pool()[(rand_u16() % 16) as usize],
+            body: e,
+        });
+    }
+
     exts.push(Ext {
         t: grease2,
         body: vec![0],
     });
-    exts.push(Ext {
-        t: 0x0015,
-        body: vec![0; 8],
-    }); // padding
+
+    // padding：BoringSSL 风格——仅当当前长度在 (0xff, 0x200) 时垫到 0x200
+    // （uTLS BoringPaddingStyle；否则不发送 padding 扩展）。
+    {
+        let base: usize = 4 + body.len() + 2 + exts.iter().map(|e| 4 + e.body.len()).sum::<usize>();
+        if base > 0xff && base < 0x200 {
+            // 目标：base + 4（padding 扩展头）+ body = 0x200
+            let mut pad = 0x200 - base - 4;
+            if pad < 5 {
+                pad = 1; // 逼近 0x200（Boring 同）
+            }
+            exts.push(Ext {
+                t: 0x0015,
+                body: vec![0; pad],
+            });
+        }
+    }
 
     build_extensions(&exts, &mut body);
 
