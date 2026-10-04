@@ -1514,3 +1514,36 @@ lab 夹具 `http_connect_server.py` + `sub_server.py` 每次重读。）
 - 边界：`auth_*`（auth_aes128_md5/sha1、auth_sha1_v4、auth_chain_a/b）与 `obfs_*`
   （http_simple/http_post/random_head/tls1.2_ticket_auth）及 UDP 未做——
   解析即显式报错；SSR 连接不可与 TCP offload 拼接。
+
+### 11.46 P31（shadow-tls v1/v2/v3 + ss 插件，ADR-0055）已验收的行为
+
+- `shadowtls.rs`：v1（rustls TLS1.2 握手后裸隧道）、v2（`HashIo` 哈希服务端握手字节
+  → 首帧前置 8B HMAC-SHA1；按 0x17 分帧；应用读密钥甄别并跳过伪装站票据）、
+  v3（CH session_id 末 4B = HMAC(pw, CH 零位)；`V3HandshakeIo` 握手期对
+  `[mac4][xor(payload)]` 记录反变换重帧；读方向 relay 帧跳过/链式 MAC 帧交付；
+  写方向 `"C"` 链式 MAC）；证书默认 WebPKI（`CertPolicy::WebPki`，rustls-webpki
+  链+主机名+CV），`allowInsecure=1` 跳过。
+- `outbound`：`parse_ss` 支持 SIP003 `plugin=shadow-tls;password=…;version=…;
+  host/sni=…;allowInsecure=1`（默认 v3）；`Shadowsocks.shadowtls` 字段；
+  ss classic 可组合，ss2022/UDP 显式报错（P31 边界）；`supports_udp` 相应返回 false。
+- `ss.rs`：读写半 boxed 化 + `ShutdownFn`（同一条 ss 数据路径可跑在
+  shadow-tls 帧层上；直接拨号路径语义不变）。
+- **附带修复（实质 bug）**：P24 的 Chrome 形状 CH 两处不合规——
+  `supported_versions` 长度误用 u16（应为 u8）+ GREASE 值各处独立随机导致
+  偶发重复扩展类型；Go/OpenSSL 直接 alert，`tls13_real_server_handshake`
+  此前因此失败（现转为通过）；REALITY 服务端解析宽松故此前未暴露。
+- `tls13.rs` 新增：`CertPolicy`、`all_certificates`、WebPKI 链/主机名/CV 验签、
+  `RecordKeys::open`（`pub(crate)`，v2 票据甄别）；`tls.rs` 新增
+  `build_rustls_config_tls12`。
+- `main.rs`：relay pump 读失败分类日得（UnexpectedEof/Reset/Aborted/BrokenPipe
+  静默为正常断开，其余记日志）。
+- lab：Go 夹具（sing-shadowtls `Service` + 自签 TLS1.2/1.3 伪装站 +
+  handler 转发到 python ss 后端）；`shadowtls-up`/`shadowtls-v2-up`/`shadowtls-v1-up`
+  与 `test-shadowtls{,-v2,-v1}`（交互 + 512KB + `STLS handler conn` +
+  `TCP target=` 三方交叉）。
+- 实测：`cargo test` **232/232**（shadowtls 7 例）；lab v3/v2/v1 全 PASS；
+  回归 `test-ss`/`test-ss2022`/`test-ssr`/`verify` 9/9；真机网关 down→up
+  自检 + 66 节点组 + 0 panic；`tls13_real_server_webpki`（真站 WebPKI）通过。
+- 边界：v1 需 TLS 1.2 伪装站（协议使然，参考实现同）；v2/v3 需 TLS 1.3
+  伪装站；仅 ss classic、仅 TCP；simple-obfs/v2ray-plugin 等其余 SIP003
+  未做（解析即报错）。

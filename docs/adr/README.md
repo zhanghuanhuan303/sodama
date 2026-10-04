@@ -79,6 +79,7 @@
 | [0052](./ADR-0052-p28-ecs-cache.md) | P28 ECS 回填 / ecs_cache：解析上游应答 ECS 回显（RFC 7871 scope）并按回填 scope 作用域化缓存；`ecs_scope_ladder` 阶梯查找（请求前缀 → 本机 /32 → 更宽规范前缀，只向宽复用）；`ecs=auto` 改传完整客户端地址（修 /32 回填键覆盖 /24 的语义瑕疵）；状态面 `dns.ecs.echo/scope`；lab scope=0//16 复用断言 | 已采纳 | —（P28 执行；对标表缺口 #5 收官） |
 | [0053](./ADR-0053-p29-optimistic-refresh.md) | P29 optimistic cache 后台刷新（RFC 8767）：`DnsCache.refreshing` 单飞集合 + `CacheHit{resp,stale,scope}` + `is_negative_response` 四态；stale 命中后异步重查（失败保留旧条目、负答取代过期正值、保留 ECS 语义）；状态面 `dns.refresh.*`；lab「上游恰好 1 次刷新」断言 | 已采纳 | —（P29 执行；对标表缺口 #5 DNS 域闭环） |
 | [0054](./ADR-0054-p30-ssr.md) | P30 SSR 出站（shadowsocksr-stream，origin+plain 首段）：流密码层（aes-*-cfb/ctr、chacha20-ietf、rc4-md5(-6)；EVP_BytesToKey(MD5) 派生；CFB/CTR 自实现保流状态）+ 连接层（IV/首段目标地址/URL-safe base64 链接解析；`auth_*`/`obfs_*` 与 UDP 显式报错、不静默）；Go/outbound 夹具跨实现（交互 + 512KB）——出站 12 家族全有 | 已采纳 | —（P30 执行；对标表缺口 #6 ssr 收官） |
+| [0055](./ADR-0055-p31-shadow-tls.md) | P31 shadow-tls 客户端（v1/v2/v3，ss 插件）：v1 rustls TLS1.2+裸隧道；v2 首帧 HMAC-SHA1 前缀 + 应用密钥甄别票据；v3 CH session_id HMAC + 握手期 relay 帧反变换 + 链式 MAC；`CertPolicy::WebPki`（rustls-webpki 链+主机名+CV）；`ss://…?plugin=shadow-tls;…`（ss classic；ss2022/UDP 显式报错）；**附带修复** P24 CH 的 supported_versions u16→u8 与 GREASE 碰撞（严格解析器兼容性） | 已采纳 | —（P31 执行；对标表缺口 #6 插件/shadowtls 收官） |
 
 ## 新增一条 ADR
 

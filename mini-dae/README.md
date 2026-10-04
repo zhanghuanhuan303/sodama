@@ -10,7 +10,8 @@ P19（多组分派 + 启动健壮性）、
 P20（QUIC Initial SNI 嗅探）、P21（sniff-punt）、P22（UDP over IPv6 全链）、
 P23（sticky IP / DoH h2 / bootstrap / DNS 选项）、P24（uTLS Chrome-120 / Vision splice / TUIC 0-RTT）、
 P25（naive / HTTP-2 CONNECT）、P26（HTTP/3：DoH h3 / naive+quic）、P27（juicity v0）、
-P28（ECS 回填 / ecs_cache）、P29（optimistic 后台刷新）、P30（SSR origin+plain）与
+P28（ECS 回填 / ecs_cache）、P29（optimistic 后台刷新）、P30（SSR origin+plain）、
+P31（shadow-tls v1/v2/v3，ss 插件）与
 P6（suspend/reload/metrics/sysdump/日志轮转/整配置热重载）已完成**；P9+ 已删除 C 数据面，
 `ebpf-rs` 的 Rust 对象是**唯一数据面**（ADR-0025）。
 
@@ -170,8 +171,8 @@ P6（suspend/reload/metrics/sysdump/日志轮转/整配置热重载）已完成*
   NOTES §11.38）
 - **P24 协议细项**：REALITY ClientHello 对齐 uTLS Chrome-120（签名算法/版本/
   ALPS/GREASE-ECH/Boring padding）；Vision 上行 splice（回归测试固化）；TUIC 0-RTT
-  （无票据/被拒无痛回退）；显式边界（当时）：ECH/shadow-tls、rustls
-  路径 uTLS（juicity/naive/ssr 已由 P25–P27、P30 依次补齐；ADR-0048、NOTES §11.39）
+  （无票据/被拒无痛回退）；显式边界（当时）：ECH、rustls
+  路径 uTLS（juicity/naive/ssr 已由 P25–P27、P30 补齐，shadow-tls 由 P31 补齐；ADR-0048、NOTES §11.39）
 - **P25 naive（HTTP/2 CONNECT 出站）**：复用 DoH 的 `h2client` 帧层新增 CONNECT 隧道
   （HPACK `:method`/`:authority` + `connect_tunnel` reader 线程 + 双向流控 +
   `END_STREAM` 半关闭 + 两半 drop 关底层）；`naive+https://`/`naive://`（Basic）,
@@ -199,6 +200,12 @@ P6（suspend/reload/metrics/sysdump/日志轮转/整配置热重载）已完成*
   rc4-md5(-6)；EVP_BytesToKey(MD5) 派生；CFB/CTR 自实现保流状态）+ `ssr.rs` 连接层
   （IV/首段目标地址/URL-safe base64 链接解析；`auth_*`/`obfs_*` 与 UDP 显式报错）；
   lab Go/outbound 夹具 `ssr-up`/`test-ssr`（交互 + 512KB 逐字节；ADR-0054、NOTES §11.45）
+- **P31 shadow-tls（v1/v2/v3，ss 插件）**：`shadowtls.rs`（v1 rustls TLS1.2 裸隧道 /
+  v2 首帧 HMAC-SHA1 前缀 + 应用密钥甄别票据 / v3 CH session_id HMAC + 握手期
+  relay 帧反变换 + 链式 MAC）；证书默认 WebPKI（`CertPolicy::WebPki`）；
+  `ss://…?plugin=shadow-tls;…`（ss classic；ss2022/UDP 显式报错）；lab Go/
+  sing-shadowtls 夹具 `shadowtls-up`/`test-shadowtls` 三版（交互 + 512KB；
+  ADR-0055、NOTES §11.46）；附带修复 TLS1.3 CH 严格解析兼容性
 - **P5-G3a QUIC（tuic v5）**：惰性 tokio 运行时 + quinn（阻塞 relay 用 block_on 桥接）；
   认证 token = TLS exporter（label=uuid 裸字节、context=password）；TCP 每条中继一条 QUIC
   双向流，UDP 走 QUIC DATAGRAM（含分片/重组）；上游 socket 用自建 `Endpoint` 打 `SO_MARK`；
@@ -446,6 +453,13 @@ sudo lab/lab.sh test-ecs-cache   # scope=0 全局与 /16 跨子网复用（上�
 lab/proto-check/build-ssr-server.sh  # P30：构建 SSR 参考服务端（Go；origin+plain）
 sudo lab/lab.sh ssr-up   # P30：SSR（shadowsocksr-stream；origin+plain）会话 + offload 互斥
 sudo lab/lab.sh test-ssr         # 交互 + 512KB 双向 + 服务端 target 日志
+lab/proto-check/build-shadowtls-server.sh  # P31：构建 shadow-tls 参考服务端（Go/sing-shadowtls）
+sudo lab/lab.sh shadowtls-up     # P31：shadow-tls v3（ss 插件）会话
+sudo lab/lab.sh test-shadowtls   # 交互 + 512KB + STLS handler 交接 + ss 后端 target
+sudo lab/lab.sh shadowtls-v2-up  # P31：shadow-tls v2（首帧 HMAC）
+sudo lab/lab.sh test-shadowtls-v2
+sudo lab/lab.sh shadowtls-v1-up  # P31：shadow-tls v1（TLS1.2 裸隧道）
+sudo lab/lab.sh test-shadowtls-v1
 # P12：本地 SOCKS5 入口（浏览器验收；不加载 eBPF、不需 root）：
 # target/release/mini-dae --listen-socks 127.0.0.1:11080 --dialer 'anytls://…' --dial-timeout 15
 # 浏览器：SOCKS5 127.0.0.1:11080（Firefox 勾“SOCKS v5 时代理 DNS”）；停止：pkill -f listen-socks
