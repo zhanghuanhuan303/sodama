@@ -69,6 +69,10 @@
 | [0042](./ADR-0042-p18e-batch.md) | P18e 批量收尾：SS2022（SIP022 三方法）+ HTTP CONNECT 出站；SIGHUP 订阅热更新（成员热替换 + 健康继承）；`--max-conns` 并发上限；`udp_check_dns` 组 UDP 检查；eBPF 分片处理；geodata XDG；嗅探 h2c（最小 HPACK）+ QUIC Initial 识别；CI/systemd/install.sh/deploy.md | 已采纳 | —（P18e 执行；缺口 #1/#3/#6/#7/#8/#9/#11/#13 批量） |
 | [0043](./ADR-0043-multi-group-dispatch.md) | P19 多组分派：规则按组名选组（组索引 direct=0/block=1/用户组 2 起，数据面 outbound 经 `conn_state` 回读，eBPF 零改动；未定义组名回退 proxy）；**启动期 DNS 自我阻塞修复**（initial reload 不再重拉订阅）+ 单上游失败不拖垮上游集 + DoQ 改 IP+sni + 健康并发 24 + `gateway.sh up` 启动自检/自动回滚 | 已采纳 | —（P19 执行；对标表缺口 #2 收官） |
 | [0044](./ADR-0044-quic-sni-sniff.md) | P20 QUIC Initial SNI 嗅探：用户态解 Initial（RFC 9001：固定盐 HKDF + 头部保护 AES-ECB + AES-128-GCM + CRYPTO→ClientHello 共用解析），UDP 新会话接入 `sniffing.quic_sni` + 日志；RFC A.1/A.2 黄金向量 + 真实 quinn 首包跨实现验证 + lab Python 造包 | 已采纳 | —（P20 执行；对标表缺口 #1 嗅探收尾，余 sniff-punt） |
+| [0045](./ADR-0045-sniff-punt.md) | P21 sniff-punt：`CompiledRules::punt_match` 用户态重放规则 VM（域集合/LPM/not/logical OR-AND/must，dport=53→控制面），relay 嗅探命中后重判：direct=直连原始 IP/block=关连接/用户组=换组；`--sniff-punt`（CLI > `auto_sniff_punt`）；lab 双组双 ss 三路径交叉验证 | 已采纳 | —（P21 执行；对标表缺口 #1 收官） |
+| [0046](./ADR-0046-udp-v6.md) | P22 UDP over IPv6：`SockMap<3>→<4>`（key 3 = v6 UDP）、`IPV6_TRANSPARENT`/`V6ONLY`/`IPV6_RECVORIGDSTADDR` 透明监听 + 第二个 dns_loop、回包按族绑定；ss UDP v6 目标（ATYP=0x04）；lab v6 UDP relay（ss 日志跨实现）+ v6 DNS（源地址=原始目的） | 已采纳 | —（P22 执行；对标表缺口 #3 收官） |
+| [0047](./ADR-0047-p23-sticky-h2-bootstrap-dnsopts.md) | P23：代理域名粘滞 IP（3 次失败作废 + reload 重置，对照 dae StickyIpDialer）；DoH over HTTP/2（自实现最小 h2 客户端 + ALPN 门控 + H1 无痛回退，Go 标准库参考服务端）；bootstrap_resolver（A+AAAA、上游/订阅域名自举）；DNS 选项（optimistic cache + fixed_domain_ttl + ipversion_prefer） | 已采纳 | —（P23 执行；对标表缺口 #2/#5 收官） |
+| [0048](./ADR-0048-p24-protocol-details.md) | P24：uTLS Chrome-120 对齐（签名算法集合/supported_versions/ALPS/GREASE-ECH/Boring padding，REALITY 自实现栈）；Vision 上行 splice 确认 + 回归；TUIC 0-RTT（into_0rtt 早数据，无票据/被拒无痛回退）；显式边界：ECH（rustls 无客户端 ECH）、shadow-tls（依赖 fork rustls randoms）、juicity/naive/ssr、rustls 路径 uTLS | 已采纳 | —（P24 第一批；余项列 parity/README） |
 
 ## 新增一条 ADR
 

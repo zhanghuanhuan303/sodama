@@ -841,8 +841,8 @@ P4 稳定性 → P3 内核矩阵）：
   日志 `sniff 203.0.113.34:443 → www.gstatic.com（域名交节点远端解析）`、**204**、
   relay `dial_errors=0`；真机网关（wlan0 + anytls 节点）：`sniffing: attempts=10 hits=10
   misses=0`、gstatic **204** / YouTube **200** / 出口 IP=节点侧。
-- **边界（如实）**：只做 TCP 嗅探；QUIC/UDP 与 HTTP/2 明文（h2c）不做；
-  ClientHello 只看首 record（超时回退 IP）；无 sniff-punt（不按嗅探域名重判路由）；
+- **边界（如实）**：只做 TCP 嗅探；HTTP/2 明文（h2c）已在 P18e 补上；
+  ClientHello 只看首 record（超时回退 IP）；**sniff-punt 已于 P21 补齐（ADR-0045，见 §11.36）**；
   `domain` 即「命中即用域名」（等价 dae `domain+` 的“总是使用”行为，dae 的
   `domain` 带 DNS 缓存/后台探测门槛，未实现）；UDP 目标仍为 IP。
 
@@ -914,8 +914,8 @@ P4 稳定性 → P3 内核矩阵）：
     精确放行（lab `forward_allow/forward_disallow` 在 up/cleanup 成对增删，不碰全局策略）。
   - `test-reload` 会用 reload 变体覆盖 `lab/rules.dae`，早期失败路径不恢复会造成后续 `up`
     加载错规则（症状：代理全挂）；已加 `trap ... EXIT` 恢复。
-- **边界（如实）**：UDP v6 未做（sockmap key 3 预留未注册，DNS over UDP6 不接管；
-  UDP relay 目标仍是 `SocketAddr`）；ICMPv6 与会话分片未处理（放行）；控制对用 veth
+- **边界（如实）**：**UDP v6 已于 P22 补齐（ADR-0046，§11.37：sockmap key 3 + v6 透明监听 + DNS over UDP6 接管）**；
+  余 ICMPv6/分片不处理；UDP relay 目标仍是 `SocketAddr`（UDP 域名拨号未做）；控制对用 veth
   （上游新版 netkit）但配方等价；解析不处理 fragment 头。
 
 ### 11.24 P17（geoip/geosite 展开 + pname）已验收的行为
@@ -1057,7 +1057,7 @@ Selected/应答重查循环；夹具 `lab/dnsroute.dae`、假 DNS 支持 bind �
   `asis` UDP+TCP 回 10.9.9.2:53（WAN ns 假 DNS）/热重载 fallback 切换 + status 计数；
   回归：`verify` 9/9、明文 DNS 三连、`test-config-reload`、`test-dot`、`parity 5/5`。
 - 边界：DoH h2/h3、ECS、optimistic cache、`fixed_domain_ttl`、`ipversion_prefer`、
-  `bootstrap_resolver`、嗅探 punt 未做；`upstream(...)` 按名字比较（不复刻 dae 的
+  `bootstrap_resolver`、嗅探 punt **已于 P21/P23 补齐（ADR-0045/0047，§11.36/§11.38）**；`upstream(...)` 按名字比较（不复刻 dae 的
   数值巧合）；`ip()` 线性匹配（dae 用 trie）。
 - **自定义名单与分流观测（ADR-0037，mini 扩展）**：`qname(file: 'x.txt')`——每行一条、
   空行/`#` 注释、默认 suffix、行首 `full:/keyword:/regex:` 覆盖、相对路径按规则文件
@@ -1319,3 +1319,60 @@ lab 夹具 `http_connect_server.py` + `sub_server.py` 每次重读。）
 - 判断：**数据面与控制面已全 Rust**（单一 aya-ebpf 对象 + aya 加载器）；此前"C 数据面 + Rust 控制面"
   的过渡拆分已于 P9+ 退场——把「cb 标记、MAC 改写、sk_assign、回程路由配方」一并搬迁后，
   行为对齐且回归同口径通过，mini-dae 已经把这条路径跑通并收尾。
+
+### 11.36 P21（sniff-punt：嗅探域名在 relay 侧重判，ADR-0045）已验收的行为
+
+- `--sniff-punt`（或 config `global.auto_sniff_punt: true`；CLI 优先）。生效前提：
+  `dial_mode domain/domain+`（不嗅探无域可判，启动日志明确提示）；默认关。
+- 重判 VM：`rules::punt_match(PuntCtx{domain,dip,sip,dport,sport,l4proto})` 逐条对照
+  `ebpf-rs/src/route.rs`：域位图→`dns::domain_set_matches`（suffix/full/keyword/regex）、
+  dip/sip→`lpm_tries`（v4-mapped）、`not`/logical OR(0xFE)/AND(0xFF)/must、dport=53→
+  `ControlPlane`；mac/dscp/pname 用户态不可得按不命中（LAN 转发 `is_wan=0`，pname 恒不中）。
+- relay 行为：`direct`=直连原始目的 IP（不经组、不本地解析 SNI）、`block`=关连接、
+  用户组=换组拨号；NoMatch/无组映射=保持数据面决策；日志 `punt <域>（<orig>）→ …`，
+  状态面 `sniffing.punt_enabled/attempts/direct/block/group/keep`。
+- 实测：单测 5 项（含 `!domain`+AND 传播与 sticky-OR）；lab `sniff-punt-up`+
+  `test-sniff-punt`：direct 不经 ss（仅健康检查目标）、full 域重判到 alt 组（ss-B 日志
+  `TCP target=1.1.1.1:8080`、ss-A 无）、block 关连接——三路径计数与日志双证。
+
+### 11.37 P22（UDP over IPv6 全链，ADR-0046）已验收的行为
+
+- eBPF：`listen_socket_map` 3→4 槽（key 3 = IPv6 UDP；progs.rs 的 `(tcp?0:1)+(v6?2:0)` 早已算好）。
+- loader：UDP socket 家族化（`sockaddr_any_of`/`sockaddr_to_std` v6）、
+  `make_transparent_udp6`（`IPV6_V6ONLY`+`IPV6_RECVORIGDSTADDR`+bind `[::]`）、
+  `recv_with_orig_dst` 解 `IPV6_ORIGDSTADDR` cmsg、回包 socket 按族绑定；
+  key 3 注册后起第二个 `dns_loop`（host ns）；失败降级仅 v4（日志）。
+- 协议：ss UDP v6 目标 ATYP=0x04；`new_marked_udp_for(peer)` 按族建 socket（direct UDP 回退同样吃 v6）。
+- 实测：lab `v6-up`+`test-v6`：v6 UDP 2/2 回显 + ss 日志 `UDP target=2001:db8:aa::1:9998`；
+  v6 DNS（`[2001:db8:aa::1]:53`）rcode=0/answer=10.9.10.35/回包源=原始目的/假上游恰 1 次；
+  TCP 两段回归全过；`udp-up` 用例（v4）回归 PASS。
+
+### 11.38 P23（sticky IP / DoH h2 / bootstrap / DNS 选项，ADR-0047）已验收的行为
+
+- sticky：`resolve` 粘滞 + `note_dial`（连续 3 败作废/成功清零）+ reload `reset`；
+  接入 `dial_tcp/dial_udp` 的 `server_addr()` 反馈（协议实现零改动）。
+- DoH h2：`h2client`（前言/SETTINGS/PING/HEADERS+HPACK/DATA 流控/CONTINUATION/GOAWAY/RST，
+  `:status` 解析含 Huffman 值）；`tls::connect_alpn` 暴露协商结果——ALPN=h2 才发前言，
+  H1-only 服务端同连接直走 HTTP/1.1（lab DOH-CONN=1 为证）；ALPN=h2 但握手失败→
+  标 `h2_broken` 回退 H1。
+- bootstrap：`global.bootstrap_resolver`（逗号分隔；未配置=不启用）；A+AAAA、TC=1 走 TCP、
+  SO_MARK；接入 DNS 上游主机名与订阅 URL；启动/reload 热更新。
+- DNS 选项：optimistic cache（stale 供应 + TTL 压到上限，`sweep_expired` 尊重窗口）、
+  `fixed_domain_ttl`（缓存寿命覆盖；校验放行子段）、`ipversion_prefer`（`has_fresh`→非首选族空 NOERROR）；
+  状态面新增 5 个字段。
+- 实测：单测 sticky 6/bootstrap 3/h2client 4/dns 3；lab `test-doh-h2`（Go 标准库仅收 h2）、
+  `test-doh`（H1 回退 1 连接）、`test-dns-options`（首查 TTL=30；2s 后 stale TTL=7 且不重查；
+  AAAA 过滤；仅 AAAA 域不受影响）。
+
+### 11.39 P24（uTLS Chrome-120 / Vision splice / TUIC 0-RTT，ADR-0048）已验收的行为
+
+- ClientHello（仅 REALITY 自实现 TLS 1.3 路径）对齐 uTLS `HelloChrome_120`：签名算法 8 项
+  集合与顺序、`supported_versions`=GREASE+1.3+1.2、ALPS(0x4469)、GREASE-ECH（随机
+  config_id/enc、payload 144/176/208/240）、Boring padding（(0xff,0x200) 垫到 0x200）。
+- Vision 上行 splice 确认：过滤窗口/非 TLS 帧发 CMD_END 后裸写 TLS 应用数据（新回归测试
+  `writer_splices_after_filter_window`）；注释已修正。
+- TUIC 0-RTT：`into_0rtt()` 早数据发认证+首流；无票据/被拒回退 1-RTT（lab Go 服务端
+  场景验证回退无回归）。
+- 真机：新二进制重启网关自检通过；订阅含 48 条 REALITY 的组 66/66 alive、代理 204、0 panic。
+- 显式边界（本轮不做）：ECH（rustls 无客户端 ECH）、shadow-tls 插件（依赖 fork rustls
+  暴露 TLS randoms）、juicity/naive/ssr、rustls 路径 uTLS 逐字节（rustls 不暴露 CH 构造）。

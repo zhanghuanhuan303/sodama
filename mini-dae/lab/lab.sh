@@ -503,6 +503,7 @@ up() {
   fi
   # P15：订阅测试的第二个 ss 后端（节点组 failover 用）
   if [ -n "${USE_SS_B:-}" ]; then
+    rm -f "${SS_LOG}.b"
     python3 -u "$HERE/ss_server.py" "${SS_LOG}.b" "${USE_SS_METHOD:?USE_SS_METHOD 未设置}" "${USE_SS_PASSWORD:?USE_SS_PASSWORD 未设置}" "$SS_PORT_B" \
       >/tmp/mini-dae-ssb.log 2>&1 &
     echo $! >"$SSB_PID_FILE"

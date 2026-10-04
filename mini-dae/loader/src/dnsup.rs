@@ -6,8 +6,9 @@
 //! - `udp://`：UDP（同一上游串行复用同一 marked socket，避免响应串包）；
 //! - `tcp://`：TCP（2 字节长度分帧，每查询一条连接）；
 //! - `tls://`（DoT，默认 853）：TLS + 2 字节分帧，**持久连接**（锁内串行）；
-//! - `https://`（DoH，默认 443 /path=/dns-query）：TLS + HTTP/1.1 POST
-//!   `application/dns-message`，**持久连接**（keep-alive + Content-Length/chunked）；
+//! - `https://`（DoH，默认 443 /path=/dns-query）：TLS + **HTTP/2（ALPN 协商；
+//!   自实现最小 h2 客户端）** POST `application/dns-message`，**持久连接**；协商不到 h2
+//!   或 h2 握手失败时同连接/重连回退 HTTP/1.1（keep-alive + Content-Length/chunked）；
 //! - `quic://`（DoQ，默认 853）：RFC 9250——线上 DNS ID 必须置 0（应答恢复客户端
 //!   ID）、每查询一条双向流、**查询写完 FIN 后才读应答**、连接复用（错流/过期重建）；
 //! - `h3://`（DoH over HTTP/3）未实现（显式报错）。
@@ -15,10 +16,9 @@
 //! URL 查询参数（mini 扩展，与其它协议一致）：`sni=` 覆盖 TLS SNI、
 //! `insecure=1|allowInsecure=1` 跳过证书校验（lab 自签用）。
 //!
-//! 与 dae 的差异（如实）：DoH 目前用 HTTP/1.1（RFC 8484 要求 h2/h3；主流
-//! 公共 DoH 均兼容 HTTP/1.1，实测 Google/AliDNS/DNSPod 可用）；h2 在上游
-//! 依赖 HPACK 实现，列为修订条件。上游主机名解析**优先 IPv4**（marked
-//! socket 为 AF_INET；解析在启动/重载时做一次）。
+//! 与 dae 的差异（如实）：DoH 已优先 h2（RFC 8484），H3 未做；h2 客户端为最小实现
+//! （无服务端推送/动态表解码）；上游主机名解析默认系统解析，配置 `global.bootstrap_resolver`
+//! 后改为直连自举（对照 dae：dae 未配置时也有 119.29/223.5 回退，mini 不回退、保持系统解析）。
 
 use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs, UdpSocket};

@@ -7,7 +7,8 @@ trojan）、P5-G2（vless + vmess AEAD）、P5-G3a（tuic v5 / QUIC）、P5-G3b�
 QUIC + 最小 HTTP/3 认证）、P5-G3b+（salamander 混淆 / Brutal 近似 / udphop）、
 P18a–e（DoT/DoH、DoQ、`dns.routing`、ECS/sip、pname、REALITY+Vision、SS2022/http、热更新、CI/systemd）、
 P19（多组分派 + 启动健壮性）、
-P20（QUIC Initial SNI 嗅探）与
+P20（QUIC Initial SNI 嗅探）、P21（sniff-punt）、P22（UDP over IPv6 全链）、
+P23（sticky IP / DoH h2 / bootstrap / DNS 选项）、P24（uTLS Chrome-120 / Vision splice / TUIC 0-RTT）与
 P6（suspend/reload/metrics/sysdump/日志轮转/整配置热重载）已完成**；P9+ 已删除 C 数据面，
 `ebpf-rs` 的 Rust 对象是**唯一数据面**（ADR-0025）。
 
@@ -91,7 +92,8 @@ P6（suspend/reload/metrics/sysdump/日志轮转/整配置热重载）已完成*
   （ADR-0033、NOTES §11.24）
 - **P18a DNS 安全上游（DoT/DoH）**：`dnsup` 上游抽象 + 五种 scheme（udp/tcp/tcp+udp/tls/https），
   默认端口/path 与 dae 对齐；`tcp+udp` 回正为 UDP 优先、TC/失败才 TCP（客户端协议不再
-  决定上游传输）；DoT/DoH 持久连接（HTTP/1.1 POST `application/dns-message`，含 chunked），
+  决定上游传输）；DoT/DoH 持久连接（**P23 起 DoH 按 ALPN 优先 HTTP/2**，自实现最小
+  h2 客户端；H1-only 服务端同连接走 HTTP/1.1，含 chunked），
   失败丢弃重连一次；`--dns-upstream` 接完整 URL，reload 按 URL 热切换；状态面
   `dns.upstream_url`/`upstream_scheme`；lab 自签 DoT/DoH 夹具 + 连接复用断言，
   真实公网 AliDNS DoT/DoH 实测（ADR-0034、NOTES §11.25）
@@ -149,6 +151,25 @@ P6（suspend/reload/metrics/sysdump/日志轮转/整配置热重载）已完成*
   验证：RFC 9001 A.1 密钥向量 + A.2 官方向量包（SNI=example.com）黄金用例 + 真实
   quinn 栈环回首包 + lab `quic_probe.py`（Python 独立实现）`test-quic-sniff`
   （ADR-0044、NOTES §11.35）
+- **P21 sniff-punt（嗅探域名在 relay 侧重判）**：`--sniff-punt`（CLI >
+  `global.auto_sniff_punt`）；`rules::punt_match` 用户态重放规则 VM（域集合/LPM/not/
+  logical OR-AND/must，dport=53→控制面）——`direct`=直连原始 IP、`block`=关连接、
+  用户组=换组拨号；状态面 `sniffing.punt_*`；lab `sniff-punt-up`/`test-sniff-punt`
+  （双组双 ss 三路径交叉；ADR-0045、NOTES §11.36）
+- **P22 UDP over IPv6 全链**：`SockMap<4>`（key 3 = v6 UDP）+ `IPV6_TRANSPARENT`/
+  `V6ONLY`/`IPV6_RECVORIGDSTADDR` 透明监听 + 第二个 dns_loop；v6 DNS 接管
+  （回包源=原始目的）；ss UDP v6 目标 ATYP=0x04；lab `test-v6` 四段（TCP/direct/
+  UDP 2/2 跨实现/v6 DNS；ADR-0046、NOTES §11.37）
+- **P23 sticky IP + DoH h2 + bootstrap + DNS 选项**：代理域名粘滞 IP（连续 3 败作废/
+  成功清零/reload 重置）；DoH 优先 HTTP/2（自实现最小 h2 客户端；ALPN 门控——
+  H1-only 服务端零额外连接，握手失败回退）；`global.bootstrap_resolver`（上游/订阅
+  域名自举，A+AAAA、TC→TCP）；DNS `optimistic_cache`（stale 供应 + TTL 上限）/
+  `fixed_domain_ttl`/`ipversion_prefer`；lab `doh-h2-up`/`dnsopts-up`（ADR-0047、
+  NOTES §11.38）
+- **P24 协议细项**：REALITY ClientHello 对齐 uTLS Chrome-120（签名算法/版本/
+  ALPS/GREASE-ECH/Boring padding）；Vision 上行 splice（回归测试固化）；TUIC 0-RTT
+  （无票据/被拒无痛回退）；显式边界：ECH/shadow-tls/juicity/naive/ssr、rustls
+  路径 uTLS（ADR-0048、NOTES §11.39）
 - **P5-G3a QUIC（tuic v5）**：惰性 tokio 运行时 + quinn（阻塞 relay 用 block_on 桥接）；
   认证 token = TLS exporter（label=uuid 裸字节、context=password）；TCP 每条中继一条 QUIC
   双向流，UDP 走 QUIC DATAGRAM（含分片/重组）；上游 socket 用自建 `Endpoint` 打 `SO_MARK`；
@@ -950,7 +971,7 @@ IPv6 剩余项（UDP v6/DNS over UDP6 接管、ICMPv6/分片）；P17 剩余：p
 geodata XDG 搜索目录/流式解析、geosite 负载入对拍。
 转发面：offload 的 backlog fuse / tcp_info 精确计费 / SK_PASS 用户态回退协调（ADR-0022 已补：
 （ADR-0022 已补：半关闭超时看门狗、fast_sock 键注销、注册前排空队列；已 offload 的连接可回收）；UDP 跨目标
-full-cone；嗅探的剩余形态（QUIC/UDP、h2c、sniff-punt；TLS/HTTP1 已做见 ADR-0030）；relay 并发上限。
+full-cone；嗅探的剩余形态（QUIC/UDP 域名拨号；TLS/HTTP1/h2c/QUIC-SNI + sniff-punt 已做，见 ADR-0030/0044/0045）；relay 并发上限。
 节点生态剩余（ADR-0031）：按规则分派不同组（数据面 outbound id）、订阅热更新（update_interval）、
 `add_latency`/`region`/`udp_check_dns`/多 check URL、gzip 压缩订阅。
 协议栈（P5-G3b+ 后的剩余）：hysteria2 的 gecko 混淆、pinSHA256/ECH/自定义 CA、QPACK 动态表
