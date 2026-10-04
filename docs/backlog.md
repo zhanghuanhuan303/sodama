@@ -4,9 +4,10 @@
 **如实**（不把未做写成已做）、**有验收条件**（每条给出可判定的完成标准）、
 **与 ADR/parity 互链**（决策理由见 ADR；覆盖度口径见 `parity-status.md`）。
 
-当前版本（v2.9 / HTML v2.40，main@93a2816）的范围：核心数据面复现（K0–K3）、
-分流主链路、DNS 子系统、出站 12 家族 + shadow-tls 插件、真网关可用、
-规则编译逐字节对拍。以下为余项。
+当前状态（main@a00d74a；ADR-0058；单测 257/257；架构档案 HTML v2.43 / VLESS 提案 v1.9）：
+核心数据面复现（K0–K3）、分流主链路、DNS 子系统、出站 12 家族 + shadow-tls 插件、
+真网关可用、规则编译逐字节对拍、M1–M4 性能项（O3/O4/O5/O9）与 O6/O7/O8、
+G1 同机 + 真实节点口径均已交付。以下为余项。
 
 ## 已具备的工程化资产（对照基线）
 
@@ -48,7 +49,7 @@
 | # | 事项 | 现状 | 验收标准 |
 |---|---|---|---|
 | C1 | L2/桥接程序族（TC L2 变体） | 8 程序（7×TC + sk_skb） | 桥接拓扑 lab 用例 |
-| C2 | cgroup 钩子（connect/bind/sendmsg…） | 未做 | 至少 connect/bind 两钩子的 sock_addr 重定向用例 |
+| C2 | cgroup 钩子（connect/bind/sendmsg…） | **6/6 已挂载**（sock_create/release、connect4/6、sendmsg4/6；P17b）——用于 pname 采集与 `pname()` 规则（WAN egress 新连接，见 `status` hooks）；bind 与 sock_addr 重定向用例未做 | 至少 connect/bind 两钩子的 sock_addr 重定向用例 |
 | C3 | ringbuf 事件通道 | 用 printk 调试 | 高频事件可采样上报，替代 printk |
 | C4 | XDP 可选路径调研 | 未做 | 调研报告（收益/兼容性）即可 |
 
@@ -67,7 +68,7 @@
 |---|---|---|---|
 | E1 | UDP endpoint pool / full-cone NAT（网关侧 UDP 代理） | 协议侧可用、网关默认 UDP 直连 | full-cone 行为测试（外部多映射） |
 | E2 | backlog fuse / 连接计费 | 未做 | 压测下 fuse 生效 + 计费可导出 |
-| E3 | offload 完整形态（fuse 失效路径与统计） | 最小实现 | 失效全路径与计数可观测 |
+| E3 | offload 完整形态（fuse 失效路径与统计） | 生命周期/回收已交付（O4/O8：每 offload 连接 0 线程、200 条 fds 回收全过、可观测计数）；余 fuse 失效路径（依赖 E2） | 失效全路径与计数可观测 |
 
 ## F. 嗅探 / IPv6
 
@@ -82,7 +83,7 @@
 | # | 事项 | 现状 | 验收标准 |
 |---|---|---|---|
 | G1 | 与 Go 版**同机对拍** + **异机/公网口径**（六路径基准） | **已完成**：P33.2 四方对比（direct/ss，ssserver 上游 + 全双工夹具 + 5 次中位数；并发扩展/内存/线程/perf 剖面齐备；`docs/perf-report.md`）——sodama 与 dae 同机同拓扑；UDP 四方对拍补齐（`lab/perf/udp.sh`：20k pps 0 丢包，sodama CPU 630 ms/40k 包 vs dae 2140 / sing-box 1580 / v2ray 1780；O7）；ss 方法 A/B（chacha vs aes-256-gcm）已做（O6）；**真实节点/公网口径（2026-10-05）**：`lab/perf/real.sh` 三方共用同一节点 + 固定后端 IP（VLESS-REALITY+Vision，v2ray skip）、8 MiB×17 轮：客户端 CPU_ms/GB sodama **6 233** vs dae 8 820（-29%）/ sing-box 8 557（-27%）；同后端轮 4 987 vs 8 613 / 10 290（见 roadmap P5） | 同机 + 异机口径均无回退；余：kTLS 目标异机重测（G2） |
-| G2 | 生产级优化（THP/连接池/看门狗内存上限） | **M1+M2+M4（stage 1+2 全部）已交付**：splice 零拷贝（Direct/VLESS 明文/kTLS 成功的 TLS，`--no-splice` 可关；vless 12.2→16.9 Gbps / CPU 380→60 ms；relay 8 流 15→21.6 Gbps） + eBPF printk 门控 + **kTLS 内核 TLS 实验（`--ktls`：TLS 48MB×4 11.67→12.32 Gbps、memcpy 29.4%→1.6%、TX+RX+splice 全链路，默认关）** + **M4 epoll worker 池：10k 连接 28 线程 / 32.1 MB、fail=0、风暴 25 606/s；stage 2 codec 全协议面（VLESS 全组合含 reality/vision/ws、Trojan、vmess、ss/ssr/anytls）vless-tls 2 000 连接 27 线程 / 61 MB（线程模型 4 011 / 222 MB）；offload 看门狗单线程化（每 offload 连接 0 线程）；io_uring A/B 结论不引入；`SODAMA_NO_REACTOR=1` / `SODAMA_REACTOR_CODEC=0` 可关（ADR-0058）**；方向与待办（服务端异机复测、UDP 批量化）在 `docs/optimization-roadmap.md`（O1–O9） | 各优化项有开关与压测数据；M2 对账：memcpy ✓；≥13 Gbps/≤1000 ms 受本机夹具（≈12.5 Gbps 封顶）与内核密码引擎速度限制，待异机口径重测；M4：✅ 10k 连接 28 线程 / 32.1 MB、fail=0；stage 2 验收：ss/ssr/ss2022/anytls 均逐连接确认 codec 投递、offload 200 条 0 线程回收全过 |
+| G2 | 生产级优化（THP/连接池/看门狗内存上限） | **M1+M2+M4+O8 已交付**：splice 零拷贝（Direct/VLESS 明文/kTLS 成功的 TLS，`--no-splice` 可关；vless 12.2→16.9 Gbps / CPU 380→60 ms；relay 8 流 15→21.6 Gbps） + eBPF printk 门控 + **kTLS 内核 TLS 实验（`--ktls`：TLS 48MB×4 11.67→12.32 Gbps、memcpy 29.4%→1.6%、TX+RX+splice 全链路，默认关）** + **M4 epoll worker 池：10k 连接 28 线程 / 32.1 MB、fail=0、风暴 25 606/s；stage 2 codec 全协议面（VLESS 全组合含 reality/vision/ws、Trojan、vmess、ss/ssr/anytls）vless-tls 2 000 连接 27 线程 / 61 MB（线程模型 4 011 / 222 MB）；offload 看门狗单线程化（每 offload 连接 0 线程）；io_uring A/B 结论不引入；`SODAMA_NO_REACTOR=1` / `SODAMA_REACTOR_CODEC=0` 可关（ADR-0058）**；**O8 缓冲池/回收：按字节封顶 8MB 池 + UDP 槽按需增长 + SIGTERM 有界优雅退出（50 在途整机 462ms、无 tc 残留）+ 30s malloc_trim（churn 300 条 RSS 无增长）**；方向与待办（ss 路径 O1/O2 按用户方向暂缓——以 VLESS 为基准；kTLS 异机复测）在 `docs/optimization-roadmap.md`（O1–O10） | 各优化项有开关与压测数据；M2 对账：memcpy ✓；≥13 Gbps/≤1000 ms 受本机夹具（≈12.5 Gbps 封顶）与内核密码引擎速度限制，待异机口径重测；M4：✅ 10k 连接 28 线程 / 32.1 MB、fail=0；stage 2 验收：ss/ssr/ss2022/anytls 均逐连接确认 codec 投递、offload 200 条 0 线程回收全过；O8：churn/退出均有界 |
 | G3 | fuzz（`.dae` 解析 / DNS 报文 / CH 解析） | 未做 | 至少 3 个 fuzz target 跑通 |
 | G6 | `lab.sh verify` 探针陈旧 | `test_proxy`/`test_host_proxy`/`test_reload`/`test_rebind`/`test_fault_*` 断言 回包含 `orig_dst=`，但仓库内无任何夹具产生该字段（历史遗留）；O8 期间实测 6 项因断言失败 | 修复夹具或断言（使 verify 回到 9/9）；在此之前专项用例（test-ss/vless/offload/udp）为准 |
 | G4 | 特权内核加载类 CI | CI 只编译+单测 | self-hosted runner 或 QEMU 中跑 verify 子集 |
@@ -92,7 +93,7 @@
 
 | # | 事项 | 现状 | 验收标准 |
 |---|---|---|---|
-| H1 | 顶层 `README.md` 状态区重写 | 数字停留在 P5 时期（121/121、ADR-0031 等），与当前（236 单测、ADR-0056）脱节 | 状态表与实际一致；仓库结构/快速开始重写 |
+| H1 | 顶层 `README.md` 状态区重写 | 数字停留在 P5 时期（121/121、ADR-0031 等），与当前（257 单测、ADR-0058、G1 真实节点数据）脱节 | 状态表与实际一致；仓库结构/快速开始重写 |
 | H2 | 用户手册（配置参考 + Go dae → sodama 迁移指南） | 散在 README/NOTES | 独立章节：逐项差异表（配置/CLI/部署） |
 | H3 | 基准报告 | bench.sh 有输出 | `docs/bench.md` 固化方法与结果 |
 
