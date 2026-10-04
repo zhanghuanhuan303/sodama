@@ -779,7 +779,7 @@ pub fn client_handshake<S: Read + Write>(
     let mut cert_pub: Option<Vec<u8>> = None;
     let mut server_finished: Option<Vec<u8>> = None;
     while server_finished.is_none() {
-        // 需要时补读 socket。
+        // 需要时补读 socket（一次可能仅得部分记录：读完必须回到循环顶重判）。
         if io_hs.pending.len() < 5
             || (io_hs.pending.len() >= 5
                 && io_hs.pending.len()
@@ -794,8 +794,14 @@ pub fn client_handshake<S: Read + Write>(
                 ));
             }
             io_hs.pending.extend_from_slice(&tmp[..n]);
+            continue;
         }
-        let (typ, body) = io_hs.take_record().expect("完整记录");
+        let Some((typ, body)) = io_hs.take_record() else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "tls13: 握手记录不完整（内部不变量被破坏）",
+            ));
+        };
         match typ {
             CT_CHANGE_CIPHER_SPEC => continue,
             CT_ALERT => {
@@ -1482,6 +1488,22 @@ mod tests {
     }
 
     #[test]
+    #[test]
+    fn hs_io_take_record_partial() {
+        // 回归：分片到达时 take_record 必须返回 None（调用方需继续读，不得 panic）。
+        let mut io = HsIo {
+            hs_buf: Vec::new(),
+            pending: Vec::new(),
+        };
+        io.pending
+            .extend_from_slice(&[0x17, 0x03, 0x03, 0x00, 0x05, 1, 2]);
+        assert!(io.take_record().is_none());
+        io.pending.extend_from_slice(&[3, 4, 5]);
+        let (t, b) = io.take_record().unwrap();
+        assert_eq!(t, 0x17);
+        assert_eq!(b, vec![1, 2, 3, 4, 5]);
+        assert!(io.pending.is_empty());
+    }
 
     /// 真站对拍：用本 TLS13 客户端握手 www.microsoft.com:443（验证 CH 被严格解析器接受）。
     /// `cargo test --release -- --ignored tls13_real_server`。

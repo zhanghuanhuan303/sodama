@@ -1174,6 +1174,10 @@ addons flow。）
 - **互操作踩坑**（对拍 OpenSSL/utls/真站所得）：key_share 的 GREASE 组
   必须同时在 supported_groups（否则 OpenSSL `illegal_parameter`）；GREASE
   share 数据不可为空（utls 拒）；compress_certificate 用 `[02 00 02]`。
+- **实测修复**：握手循环「读 socket 后必须 `continue` 回到顶部重判记录完整性」；
+  首版读半片后直接 `take_record().expect`，真机健康探测（真实网络分片）即
+  panic（group 探针线程传播）；已改为先 continue、缺记录时返回错误而非 panic，
+  并留 `hs_io_take_record_partial` 回归单测。
 - 实测：`cargo test` **154/154**；ignored e2e：本机 sing-box（REALITY+Vision）
   echo 128KB 往返逐字节一致；本 TLS13 直握 microsoft/openssl；真实订阅节点
   HTTP 200、HTTPS（内层 TLS1.3 触发下行 splice）成功；网关订阅#2
