@@ -1,0 +1,112 @@
+# mini-dae CI：构建 eBPF 数据面对象 + 编译/单测 loader。
+#
+# 只做「编译 + 单测」验证：eBPF 的挂载、透明代理与 lab 用例需要 root、netns 和真实内核，
+# GitHub Actions 的 ubuntu-latest 上不可复现，不在这里执行（真机验证见 mini-dae/lab/ 与
+# mini-dae/README.md）。
+#
+# 触发：push / pull_request 到 main（见 `on:`）。
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# 同一分支的新 push 取消仍在跑的旧任务。
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # 本机（mini-dae/NOTES.md §11.13、docs/adr/ADR-0023）验证过的组合：
+  #   rustc 1.101.0-nightly (5c543b0b8 2026-09-29) + bpf-linker 0.11.1（LLVM 23）。
+  # 固定 nightly 日期保证可复现；升级时同步修改这里与 BPF_LINKER_VERSION
+  # （并确认两者 LLVM 版本匹配，见 bpf-linker BUILDING.md）。
+  NIGHTLY: nightly-2026-09-29
+  BPF_LINKER_VERSION: "0.11.1"
+
+jobs:
+  build-and-test:
+    name: build & test
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust (stable + pinned nightly with rust-src)
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup toolchain install "${NIGHTLY}" --profile minimal --component rust-src
+          rustup default stable
+          rustc --version
+          rustc +"${NIGHTLY}" --version
+
+      - name: Cache cargo registry / git
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-${{ hashFiles('mini-dae/Cargo.lock', 'mini-dae/ebpf-rs/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Cache bpf-linker binary
+        id: cache-bpf-linker
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/bpf-linker
+          key: ${{ runner.os }}-bpf-linker-${{ env.BPF_LINKER_VERSION }}
+
+      - name: Install LLVM 23 + bpf-linker (cache miss)
+        if: steps.cache-bpf-linker.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          # bpf-linker 0.11.1 默认 feature 是 llvm-23，且要求 LLVM 与 Rust 工具链版本匹配
+          # （固定的 nightly 即 LLVM 23）。先试系统源，缺包再走 apt.llvm.org。
+          sudo apt-get update
+          if ! sudo apt-get install -y llvm-23-dev libclang-23-dev; then
+            sudo apt-get install -y wget software-properties-common
+            wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key |
+              sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc >/dev/null
+            . /etc/os-release
+            sudo add-apt-repository -y \
+              "deb https://apt.llvm.org/${VERSION_CODENAME}/ llvm-toolchain-${VERSION_CODENAME}-23 main"
+            sudo apt-get update
+            sudo apt-get install -y llvm-23-dev libclang-23-dev
+          fi
+          export LLVM_PREFIX=/usr/lib/llvm-23
+          export PATH="${LLVM_PREFIX}/bin:${PATH}"
+          cargo install bpf-linker --version "${BPF_LINKER_VERSION}" --locked
+
+      - name: bpf-linker version
+        run: bpf-linker --version
+
+      # mini-dae/lab/build-ebpf-rs.sh 的核心步骤是 `cargo +nightly build --release`
+      # （目标 bpfel-unknown-none + build-std=core，见 ebpf-rs/.cargo/config.toml）。
+      # CI 为可复现固定到具体 nightly 日期，因此执行等价命令而不是脚本本身。
+      - name: Build eBPF object (build-std=core)
+        working-directory: mini-dae/ebpf-rs
+        run: cargo +"${NIGHTLY}" build --release --locked
+
+      - name: Verify eBPF object
+        run: |
+          obj=mini-dae/ebpf-rs/target/bpfel-unknown-none/release/mini-dae-ebpf
+          test -f "$obj"
+          ls -l "$obj"
+          file "$obj" || true
+
+      - name: Build loader (release)
+        working-directory: mini-dae
+        run: cargo build --release --locked
+
+      # 只跑单测；`--ignored` 的 e2e 用例需要真实节点/root，不在此触发。
+      - name: Unit tests (release)
+        working-directory: mini-dae/loader
+        run: cargo test --release --locked
+
+      # 刻意不加 `cargo fmt --check`：仓库当前并非 rustfmt-clean（例如
+      # loader/src/huffman_table.rs），加进来会立刻失败。
