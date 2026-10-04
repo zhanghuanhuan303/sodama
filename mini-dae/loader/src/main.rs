@@ -54,6 +54,7 @@ mod huffman_table;
 mod hysteria2;
 mod outbound;
 mod quicsock;
+mod reality;
 mod rules;
 mod sniffer;
 mod socks5;
@@ -63,8 +64,10 @@ mod status;
 mod subscribe;
 mod target;
 mod tls;
+mod tls13;
 mod trojan;
 mod tuic;
+mod vision;
 mod vless;
 mod vmess;
 mod ws;
@@ -426,6 +429,192 @@ struct MiniPidPname {
     last_seen_ns: u64,
 }
 unsafe impl aya::Pod for MiniPidPname {}
+
+/// P18c+：与 ebpf-rs 的 `MiniDnsSenderKey`/`MiniDnsSenderPname` 同位。
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+struct MiniDnsSenderKey {
+    addr: [u8; 16],
+    port: u16,
+    pad: u16,
+}
+unsafe impl aya::Pod for MiniDnsSenderKey {}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+struct MiniDnsSenderPname {
+    pname: [u8; 16],
+    pad: u16,
+    _pad2: [u8; 6],
+    ts_ns: u64,
+}
+unsafe impl aya::Pod for MiniDnsSenderPname {}
+
+/// P18c+：dns_sender_pname_map 的 fd（dup 自加载的 map；DNS 线程用它做
+/// BPF_MAP_LOOKUP_ELEM syscall，不持有 Ebpf 借用）。-1 = 未就绪。
+static DNS_PNAME_MAP_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+/// BPF_MAP_LOOKUP_ELEM（raw syscall；attr 为 bpf_attr 的 map_fd/key/value 前 32B）。
+fn bpf_map_lookup_raw(fd: i32, key: &[u8], val: &mut [u8]) -> Result<(), i32> {
+    bpf_map_op_raw(1, fd, Some(key), Some(val.as_mut_ptr()))
+}
+
+/// bpf_attr 的 map 操作公共前缀（lookup/delete/get_next_key 同布局）。
+#[repr(C)]
+struct BpfMapOpAttr {
+    map_fd: u32,
+    _pad: u32,
+    key: u64,
+    value: u64,
+    flags: u64,
+}
+
+/// raw bpf() syscall 的 map 操作（cmd：1=lookup，3=delete，4=get_next_key）。
+fn bpf_map_op_raw(
+    cmd: i64,
+    fd: i32,
+    key: Option<&[u8]>,
+    value: Option<*mut u8>,
+) -> Result<(), i32> {
+    let attr = BpfMapOpAttr {
+        map_fd: fd as u32,
+        _pad: 0,
+        key: key.map(|k| k.as_ptr() as u64).unwrap_or(0),
+        value: value.map(|p| p as u64).unwrap_or(0),
+        flags: 0,
+    };
+    let ret = unsafe {
+        libc::syscall(
+            libc::SYS_bpf,
+            cmd,
+            &attr as *const BpfMapOpAttr as *const libc::c_void,
+            core::mem::size_of::<BpfMapOpAttr>() as u64,
+        )
+    };
+    if ret < 0 {
+        Err(unsafe { *libc::__errno_location() })
+    } else {
+        Ok(())
+    }
+}
+
+/// BPF_MAP_DELETE_ELEM。
+fn bpf_map_delete_raw(fd: i32, key: &[u8]) -> Result<(), i32> {
+    bpf_map_op_raw(3, fd, Some(key), None)
+}
+
+/// BPF_MAP_GET_NEXT_KEY；key=None 表示从第一个键开始。
+fn bpf_map_get_next_key_raw(fd: i32, key: Option<&[u8]>, next: &mut [u8]) -> Result<(), i32> {
+    bpf_map_op_raw(4, fd, key, Some(next.as_mut_ptr()))
+}
+
+/// 内核 ktime（ns，自启动），用于判断 dns_sender_pname_map 条目是否陈旧；
+/// 读 /proc/uptime，结果缓存 5s（DNS 每查询一次调用，开销可忽略）。
+fn ktime_ns_now() -> u64 {
+    use std::sync::Mutex;
+    static CACHE: Mutex<Option<(std::time::Instant, u64)>> = Mutex::new(None);
+    if let Ok(g) = CACHE.lock() {
+        if let Some((at, v)) = *g {
+            if at.elapsed() < std::time::Duration::from_secs(5) {
+                return v;
+            }
+        }
+    }
+    let v = std::fs::read_to_string("/proc/uptime")
+        .ok()
+        .and_then(|s| {
+            s.split_whitespace()
+                .next()
+                .and_then(|x| x.parse::<f64>().ok())
+        })
+        .map(|secs| (secs * 1e9) as u64)
+        .unwrap_or(0);
+    if let Ok(mut g) = CACHE.lock() {
+        *g = Some((std::time::Instant::now(), v));
+    }
+    v
+}
+
+/// P18c+：反查 DNS 查询发送方进程名（WAN egress 新 UDP DNS 流由 eBPF 写入）。
+/// 条目超 120s 视为陈旧（端口重用防误判）；pname 空 = 未命中。
+fn lookup_dns_pname(client: Option<std::net::IpAddr>, sport: u16) -> Option<String> {
+    let fd = DNS_PNAME_MAP_FD.load(Ordering::Relaxed);
+    if fd < 0 {
+        return None;
+    }
+    let ip = client?;
+    let addr = match ip {
+        std::net::IpAddr::V4(a) => dns::map_v4(a.octets()),
+        std::net::IpAddr::V6(a) => a.octets(),
+    };
+    let key = MiniDnsSenderKey {
+        addr,
+        port: sport,
+        pad: 0,
+    };
+    let mut val = MiniDnsSenderPname::default();
+    let keyb = unsafe {
+        core::slice::from_raw_parts(
+            &key as *const _ as *const u8,
+            core::mem::size_of::<MiniDnsSenderKey>(),
+        )
+    };
+    let valb = unsafe {
+        core::slice::from_raw_parts_mut(
+            &mut val as *mut _ as *mut u8,
+            core::mem::size_of::<MiniDnsSenderPname>(),
+        )
+    };
+    if bpf_map_lookup_raw(fd, keyb, valb).is_err() {
+        return None;
+    }
+    if val.pname.iter().all(|b| *b == 0) {
+        return None;
+    }
+    if val.ts_ns != 0 {
+        let now = ktime_ns_now();
+        if now != 0 && now.saturating_sub(val.ts_ns) > 120_000_000_000 {
+            return None;
+        }
+    }
+    let end = val.pname.iter().position(|b| *b == 0).unwrap_or(16);
+    Some(String::from_utf8_lossy(&val.pname[..end]).into_owned())
+}
+
+/// P18c+：dns_sender_pname_map 周期性回收。条目仅对「最近 120s 的查询」有意义；
+/// 不回收会因客户端源端口轮换耗尽 4096 槽位，新查询的 pname 反查静默失败。
+fn dns_pname_gc_loop(fd: i32) {
+    const KEY_LEN: usize = 20; // MiniDnsSenderKey
+    const VAL_LEN: usize = 32; // MiniDnsSenderPname
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(60));
+        let now = ktime_ns_now();
+        if now == 0 {
+            continue;
+        }
+        let mut prev: Option<[u8; KEY_LEN]> = None;
+        let mut scanned = 0u32;
+        loop {
+            let mut next = [0u8; KEY_LEN];
+            if bpf_map_get_next_key_raw(fd, prev.as_ref().map(|p| p.as_slice()), &mut next).is_err()
+            {
+                break;
+            }
+            scanned += 1;
+            if scanned > 1_000_000 {
+                break; // 防御异常（get_next_key 不会回退，正常到不了）
+            }
+            let mut val = [0u8; VAL_LEN];
+            if bpf_map_lookup_raw(fd, &next, &mut val).is_ok() {
+                let ts = u64::from_le_bytes(val[24..32].try_into().unwrap());
+                if ts != 0 && now.saturating_sub(ts) > 120_000_000_000 {
+                    let _ = bpf_map_delete_raw(fd, &next);
+                }
+            }
+            prev = Some(next);
+        }
+    }
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
@@ -2394,6 +2583,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::fs::read(&args.ebpf).map_err(|e| format!("read eBPF object {}: {e}", args.ebpf))?;
     let mut ebpf = Ebpf::load(&data).map_err(|e| format!("Ebpf::load: {e}"))?;
 
+    // P18c+：把 dns_sender_pname_map 的 fd dup 一份给 DNS 线程
+    // （raw BPF_MAP_LOOKUP_ELEM；避免 DNS 线程持有 Ebpf 借用）。
+    if let Some(map) = ebpf.map("dns_sender_pname_map") {
+        use std::os::fd::{AsFd, AsRawFd};
+        let raw = match map {
+            aya::maps::Map::HashMap(md) => Some(md.fd().as_fd().as_raw_fd()),
+            _ => None,
+        };
+        if let Some(raw) = raw {
+            let dup = unsafe { libc::dup(raw) };
+            if dup >= 0 {
+                DNS_PNAME_MAP_FD.store(dup, Ordering::Relaxed);
+                let _ = std::thread::Builder::new()
+                    .name("dns-pname-gc".into())
+                    .spawn(move || dns_pname_gc_loop(dup));
+            }
+        }
+    }
+
     let root_ns = OwnedFd::from(
         std::fs::File::open("/proc/self/ns/net")
             .map_err(|e| format!("open /proc/self/ns/net: {e}"))?,
@@ -2875,10 +3083,11 @@ enum Selected {
     Up(Arc<dnsup::Upstream>, String, dnsroute::ReqOut),
 }
 
-/// P18c：请求路由选择上游（asis / tag / legacy）；`client` 供 `sip()` 匹配。
+/// P18c：请求路由选择上游（asis / tag / legacy）；`client` 供 `sip()`，`pname` 供 `pname()`。
 fn select_request_upstream(
     q: &dns::Question,
     client: Option<std::net::IpAddr>,
+    pname: Option<&str>,
     orig_dst: Option<SocketAddr>,
 ) -> Result<Selected, String> {
     let set = upstreams().ok_or("DNS 上游未初始化")?;
@@ -2892,7 +3101,7 @@ fn select_request_upstream(
             dnsroute::ReqOut::Tag("default".into()),
         ));
     };
-    match router.request_select_for(q, client) {
+    match router.request_select_for(q, client, pname) {
         dnsroute::ReqOut::Reject => {
             note_tag_hit("reject");
             Ok(Selected::Reject)
@@ -2936,6 +3145,7 @@ fn resolve_dns(
     query: &[u8],
     proto: ClientProto,
     client: Option<std::net::IpAddr>,
+    pname: Option<&str>,
     orig_dst: Option<SocketAddr>,
     tx: &std::sync::mpsc::Sender<status::MainMsg>,
 ) -> Option<Vec<u8>> {
@@ -2943,7 +3153,7 @@ fn resolve_dns(
     let edns = dns::query_edns(query);
     // 1) 请求路由（reject 先于缓存；对照 dae「Route request first, then check cache」）
     let selected = match &parsed {
-        Some(q) => match select_request_upstream(q, client, orig_dst) {
+        Some(q) => match select_request_upstream(q, client, pname, orig_dst) {
             Ok(s) => s,
             Err(e) => {
                 DNS_STATS.upstream_errors.fetch_add(1, Ordering::Relaxed);
@@ -3014,7 +3224,7 @@ fn resolve_dns(
     loop {
         let verdict = router
             .as_ref()
-            .map(|r| r.response_select_for(&resp, &served, client))
+            .map(|r| r.response_select_for(&resp, &served, client, pname))
             .unwrap_or(dnsroute::RespOut::Accept);
         match verdict {
             dnsroute::RespOut::Accept => break,
@@ -3096,12 +3306,15 @@ fn dns_loop(listener: OwnedFd, tx: std::sync::mpsc::Sender<status::MainMsg>) {
             continue;
         }
         DNS_STATS.queries.fetch_add(1, Ordering::Relaxed);
+        // P18c+：发送方进程名（WAN egress 新 UDP DNS 流由 eBPF 写入）
+        let dns_pname = lookup_dns_pname(Some(client.ip()), client.port());
         // panic 隔离：单次查询（含第三方 QUIC 栈）出 panic 不应杀死整个 DNS 线程
         let resolved = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             resolve_dns(
                 &buf[..n],
                 ClientProto::Udp,
                 Some(client.ip()),
+                dns_pname.as_deref(),
                 Some(orig_dst),
                 &tx,
             )
@@ -3141,7 +3354,9 @@ fn handle_tcp_dns_conn(mut stream: TcpStream, tx: std::sync::mpsc::Sender<status
     let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
     // P18c：透明 socket 的 local_addr = 客户端原始目的地址（asis 用）；peer = 客户端地址（sip 用）
     let orig_dst = stream.local_addr().ok();
-    let peer_ip = stream.peer_addr().ok().map(|a| a.ip());
+    let peer = stream.peer_addr().ok();
+    let peer_ip = peer.map(|a| a.ip());
+    let peer_port = peer.map(|a| a.port()).unwrap_or(0);
     loop {
         let mut lb = [0u8; 2];
         if stream.read_exact(&mut lb).is_err() {
@@ -3156,8 +3371,16 @@ fn handle_tcp_dns_conn(mut stream: TcpStream, tx: std::sync::mpsc::Sender<status
             break;
         }
         DNS_STATS.tcp_queries.fetch_add(1, Ordering::Relaxed);
+        let dns_pname = lookup_dns_pname(peer_ip, peer_port);
         let resolved = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            resolve_dns(&query, ClientProto::Tcp, peer_ip, orig_dst, &tx)
+            resolve_dns(
+                &query,
+                ClientProto::Tcp,
+                peer_ip,
+                dns_pname.as_deref(),
+                orig_dst,
+                &tx,
+            )
         }));
         let resp = match resolved {
             Ok(Some(r)) => r,
@@ -3656,6 +3879,8 @@ fn run_dns_bench(argv: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut names: Vec<String> = Vec::new();
     let mut tags: Vec<String> = Vec::new();
     let mut runs = 5usize;
+    let mut rounds = 1usize;
+    let mut concurrency = 1usize;
     let mut client: Option<std::net::IpAddr> = None;
     let mut it = argv.iter().skip(2);
     while let Some(a) = it.next() {
@@ -3680,16 +3905,24 @@ fn run_dns_bench(argv: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     .collect()
             }
             "--runs" => runs = it.next().ok_or("--runs 需要值")?.parse()?,
+            "--rounds" => rounds = it.next().ok_or("--rounds 需要值")?.parse()?,
+            "--concurrency" => concurrency = it.next().ok_or("--concurrency 需要值")?.parse()?,
             "--client" => client = Some(it.next().ok_or("--client 需要值")?.parse()?),
             other => return Err(format!("未知参数 {other}").into()),
         }
     }
-    let cfg = cfg.ok_or("用法: mini-dae dns-bench --config <file.dae> --names a.com,b.com [--tags t1,t2] [--runs N] [--client <IP>]")?;
+    let cfg = cfg.ok_or("用法: mini-dae dns-bench --config <file.dae> --names a.com,b.com [--tags t1,t2] [--runs N] [--rounds R] [--concurrency C] [--client <IP>]")?;
     if names.is_empty() {
         return Err("--names 不能为空".into());
     }
     if runs == 0 || runs > 100 {
         return Err("--runs 取值 1..=100".into());
+    }
+    if rounds == 0 || rounds > 100 {
+        return Err("--rounds 取值 1..=100".into());
+    }
+    if concurrency == 0 || concurrency > 64 {
+        return Err("--concurrency 取值 1..=64".into());
     }
     let ups = build_upstream_set_core(None, Some(Path::new(&cfg)))?;
     let mut sel: Vec<String> = if tags.is_empty() {
@@ -3707,63 +3940,41 @@ fn run_dns_bench(argv: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             .into());
         }
     }
+    let total = runs * rounds;
     println!(
-        "dns-bench: runs={runs} client={} names={} tags={}",
+        "dns-bench: per-point total={total}（runs={runs}×rounds={rounds}, concurrency={concurrency}） client={} names={} tags={}",
         client.map(|c| c.to_string()).unwrap_or_else(|| "-".into()),
         names.join(","),
         sel.join(",")
     );
     println!(
-        "{:<10} {:<6} {:<24} {:>5} {:>9} {:>9} {:>9} {:>8} {:>6}",
-        "tag", "scheme", "name", "ok", "min_ms", "avg_ms", "p50_ms", "ancount", "ttl"
+        "{:<10} {:<6} {:<24} {:>5} {:>9} {:>9} {:>9} {:>9} {:>8} {:>6}",
+        "tag", "scheme", "name", "ok", "min_ms", "avg_ms", "p50_ms", "p95_ms", "ancount", "ttl"
     );
     for name in &names {
         for tag in &sel {
             let up = ups.by_tag.get(tag).unwrap();
-            let mut times: Vec<f64> = Vec::new();
-            let mut errs = 0usize;
-            let mut ancount_last = 0usize;
-            let mut ttl_last = 0u32;
-            for i in 0..runs {
-                let q = dns::build_query(name, 1, 0x100 + i as u16);
-                let q = match up.spec.ecs {
-                    Some(dnsup::EcsMode::Auto) => client
-                        .and_then(|c| dns::add_ecs(&q, dns::ecs_auto_prefix(c)))
-                        .unwrap_or(q),
-                    Some(dnsup::EcsMode::Prefix(ip, p)) => dns::add_ecs(&q, (ip, p)).unwrap_or(q),
-                    None => q,
-                };
-                let t0 = Instant::now();
-                match up.exchange(&q) {
-                    Ok(resp) => {
-                        times.push(t0.elapsed().as_secs_f64() * 1000.0);
-                        if let Some(ttl) = dns::first_answer_ttl(&resp) {
-                            ttl_last = ttl;
-                        }
-                        let (v4, v6) = dns::answer_a_and_aaaa_records(&resp);
-                        ancount_last = v4.len() + v6.len();
-                    }
-                    Err(_) => errs += 1,
-                }
-            }
-            let (min, avg, p50) = if times.is_empty() {
-                (f64::NAN, f64::NAN, f64::NAN)
+            let (times, errs, ancount_last, ttl_last) =
+                bench_one(up, name, client, total, concurrency);
+            let (min, avg, p50, p95) = if times.is_empty() {
+                (f64::NAN, f64::NAN, f64::NAN, f64::NAN)
             } else {
                 let min = times.iter().cloned().fold(f64::INFINITY, f64::min);
                 let avg = times.iter().sum::<f64>() / times.len() as f64;
                 let mut s = times.clone();
                 s.sort_by(|a, b| a.partial_cmp(b).unwrap());
-                (min, avg, s[s.len() / 2])
+                (min, avg, s[s.len() / 2], pct(&s, 0.95))
             };
             println!(
-                "{:<10} {:<6} {:<24} {:>5} {:>9.2} {:>9.2} {:>9.2} {:>8} {:>6}",
+                "{:<10} {:<6} {:<24} {:>5} {:>9.2} {:>9.2} {:>9.2} {:>9.2} {:>8} {:>6}",
                 tag,
                 up.spec.scheme.name(),
                 name,
-                format!("{}/{}", times.len(), runs),
+                format!("{}/{}", times.len(), total),
                 min,
                 avg,
                 p50,
+                p95,
                 ancount_last,
                 if ttl_last == 0 {
                     "-".to_string()
@@ -3777,6 +3988,83 @@ fn run_dns_bench(argv: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     Ok(())
+}
+
+/// 百分位（已排序；nearest-rank）。
+fn pct(sorted: &[f64], p: f64) -> f64 {
+    if sorted.is_empty() {
+        return f64::NAN;
+    }
+    let idx = ((p * sorted.len() as f64).ceil() as usize)
+        .saturating_sub(1)
+        .min(sorted.len() - 1);
+    sorted[idx]
+}
+
+/// 单点 bench：total 次交换，concurrency 个线程（scoped）并发；返回
+/// (样本毫秒, 失败次数, 末次 ancount, 末次 TTL)。
+fn bench_one(
+    up: &Arc<dnsup::Upstream>,
+    name: &str,
+    client: Option<std::net::IpAddr>,
+    total: usize,
+    concurrency: usize,
+) -> (Vec<f64>, usize, usize, u32) {
+    let workers = concurrency.min(total).max(1);
+    let mut all: Vec<f64> = Vec::with_capacity(total);
+    let mut errs = 0usize;
+    let mut ancount_last = 0usize;
+    let mut ttl_last = 0u32;
+    let per = total.div_ceil(workers);
+    std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for w in 0..workers {
+            handles.push(scope.spawn(move || {
+                let mut times = Vec::new();
+                let mut errs = 0usize;
+                let mut ancount = 0usize;
+                let mut ttl = 0u32;
+                for i in 0..per {
+                    let id = 0x100u16.wrapping_add((w * per + i) as u16);
+                    let q = dns::build_query(name, 1, id);
+                    let q = match up.spec.ecs {
+                        Some(dnsup::EcsMode::Auto) => client
+                            .and_then(|c| dns::add_ecs(&q, dns::ecs_auto_prefix(c)))
+                            .unwrap_or(q),
+                        Some(dnsup::EcsMode::Prefix(ip, p)) => {
+                            dns::add_ecs(&q, (ip, p)).unwrap_or(q)
+                        }
+                        None => q,
+                    };
+                    let t0 = Instant::now();
+                    match up.exchange(&q) {
+                        Ok(resp) => {
+                            times.push(t0.elapsed().as_secs_f64() * 1000.0);
+                            if let Some(t) = dns::first_answer_ttl(&resp) {
+                                ttl = t;
+                            }
+                            let (v4, v6) = dns::answer_a_and_aaaa_records(&resp);
+                            ancount = v4.len() + v6.len();
+                        }
+                        Err(_) => errs += 1,
+                    }
+                }
+                (times, errs, ancount, ttl)
+            }));
+        }
+        for h in handles {
+            let (t, e, a, ttl) = h.join().unwrap_or_default();
+            all.extend(t);
+            errs += e;
+            if a > 0 || ancount_last == 0 {
+                ancount_last = a;
+            }
+            if ttl > 0 {
+                ttl_last = ttl;
+            }
+        }
+    });
+    (all, errs, ancount_last, ttl_last)
 }
 
 /// P6：解析 `--socket <path>` / `--out <path>`（子命令公用）。

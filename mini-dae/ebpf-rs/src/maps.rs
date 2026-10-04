@@ -46,6 +46,16 @@ pub static domain_routing_map: HashMap<
 pub static cookie_pid_map: HashMap<u64, MiniPidPname, 65536, { BPF_F_NO_PREALLOC as usize }> =
     HashMap::new();
 
+/// P18c+：DNS 发送方（client addr+port）→ 进程名；WAN egress 新 UDP DNS 流写入，
+/// 控制面按 (client, sport) 反查供 `dns.routing` 的 `pname()` 匹配。
+#[btf_map]
+pub static dns_sender_pname_map: HashMap<
+    MiniDnsSenderKey,
+    MiniDnsSenderPname,
+    4096,
+    { BPF_F_NO_PREALLOC as usize },
+> = HashMap::new();
+
 #[btf_map]
 pub static mini_stats_map: PerCpuArray<u64, 5> = PerCpuArray::new();
 

@@ -46,10 +46,32 @@ pub fn parse_uuid(s: &str) -> Option<[u8; 16]> {
 
 /// 构造请求头（cmd 后的 port/ATYP/ADDR）。
 pub fn build_request_header(uuid: &[u8; 16], target: &Target, udp: bool) -> io::Result<Vec<u8>> {
-    let mut h = Vec::with_capacity(18 + 1 + 2 + 1 + 5);
+    build_request_header_flow(uuid, target, udp, None)
+}
+
+/// 构造请求头；`flow`（如 `xtls-rprx-vision`）编码进 addons（protobuf field 1）。
+pub fn build_request_header_flow(
+    uuid: &[u8; 16],
+    target: &Target,
+    udp: bool,
+    flow: Option<&str>,
+) -> io::Result<Vec<u8>> {
+    // Addons { string flow = 1; } ⇒ tag 0x0a, len, bytes
+    let addons: Vec<u8> = match flow {
+        Some(f) if !f.is_empty() => {
+            let mut a = Vec::with_capacity(2 + f.len());
+            a.push(0x0a);
+            a.push(f.len() as u8);
+            a.extend_from_slice(f.as_bytes());
+            a
+        }
+        _ => Vec::new(),
+    };
+    let mut h = Vec::with_capacity(18 + addons.len() + 1 + 2 + 1 + 5);
     h.push(0x00);
     h.extend_from_slice(uuid);
-    h.push(0x00); // addon 长度
+    h.push(addons.len() as u8);
+    h.extend_from_slice(&addons);
     h.push(if udp { 0x02 } else { 0x01 });
     h.extend_from_slice(&target.port().to_be_bytes());
     target.encode_v2ray_addr(&mut h)?;
@@ -120,7 +142,22 @@ where
     R: Read,
     W: Write,
 {
-    let head = build_request_header(uuid, target, false)?;
+    connect_split_flow(read, write, uuid, target, None)
+}
+
+/// 同 `connect_split`，但请求头可携带 flow（VLESS addons）。
+pub fn connect_split_flow<R, W>(
+    read: R,
+    mut write: W,
+    uuid: &[u8; 16],
+    target: &Target,
+    flow: Option<&str>,
+) -> io::Result<(VlessReader<R>, VlessWriter<W>)>
+where
+    R: Read,
+    W: Write,
+{
+    let head = build_request_header_flow(uuid, target, false, flow)?;
     write.write_all(&head)?;
     write.flush()?;
     Ok((

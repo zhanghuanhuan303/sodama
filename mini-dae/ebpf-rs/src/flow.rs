@@ -179,7 +179,8 @@ pub unsafe fn split_flow(ctx: &mut TcContext, pkt: &MiniParseResult, is_wan: u8)
             }
         }
 
-        let result = mini_route(pkt, is_wan, &lookup_pname(ctx));
+        let pname = lookup_pname(ctx);
+        let result = mini_route(pkt, is_wan, &pname);
         if result < 0 {
             bpf_printk!(c"mini-dae: shot routing %d\n", result as i32);
             return TC_ACT_SHOT as i32;
@@ -194,6 +195,28 @@ pub unsafe fn split_flow(ctx: &mut TcContext, pkt: &MiniParseResult, is_wan: u8)
             must as u32,
             pkt.h_dport as u32
         );
+
+        // P18c+：WAN egress 新 DNS 流（UDP 首包 / TCP SYN）：把发送方进程名记入
+        // dns_sender_pname_map，控制面（透明 DNS）按 (client, sport) 反查，供
+        // dns.routing 的 pname() 匹配。注意：tuples 端口是网络序原始值，map 键
+        // 统一用主机序（pkt.h_sport），否则控制面反查键不匹配。
+        if is_wan != 0
+            && pkt.h_dport == 53
+            && (pkt.l4proto == IPPROTO_UDP || (pkt.l4proto == IPPROTO_TCP && pkt.new_flow != 0))
+        {
+            let key = MiniDnsSenderKey {
+                addr: pkt.tuples.sip,
+                port: pkt.h_sport,
+                pad: 0,
+            };
+            let val = MiniDnsSenderPname {
+                pname,
+                pad: 0,
+                _pad2: [0; 6],
+                ts_ns: bpf_ktime_get_ns(),
+            };
+            let _ = dns_sender_pname_map.insert(&key, &val, BPF_ANY as u64);
+        }
 
         if !(pkt.l4proto == IPPROTO_UDP && pkt.h_dport == 53) {
             conn_save(&pkt.tuples, outbound, mark, must, pkt.l4proto);

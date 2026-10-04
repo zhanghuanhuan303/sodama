@@ -202,6 +202,26 @@ pub struct MiniPidPname {
     pub last_seen_ns: u64,
 }
 
+/// P18c+：DNS 发送方键（client 地址 16B + 源端口；TC WAN egress 新 UDP DNS 流写入，
+/// 控制面按 (client addr, sport) 反查，供 `dns.routing` 的 `pname()` 匹配）。
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct MiniDnsSenderKey {
+    pub addr: [u8; 16],
+    pub port: u16,
+    pub pad: u16,
+}
+
+/// P18c+：DNS 发送方进程名（与 MiniPidPname 同的 16B pname；`ts_ns` 供控制面判陈旧）。
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct MiniDnsSenderPname {
+    pub pname: [u8; 16],
+    pub pad: u16,
+    pub _pad2: [u8; 6],
+    pub ts_ns: u64,
+}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct MiniDomainRouting {

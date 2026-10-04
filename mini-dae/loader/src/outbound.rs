@@ -19,8 +19,8 @@ use percent_encoding::percent_decode_str;
 use sha2::{Digest as _, Sha256};
 
 use crate::{
-    anytls, group::GroupRuntime, hysteria2, quicsock, socks5, ss, target::Target, tls, trojan,
-    tuic, vless, vmess, ws, DAE_SOCKET_MARK,
+    anytls, group::GroupRuntime, hysteria2, quicsock, reality, socks5, ss, target::Target, tls,
+    tls13, trojan, tuic, vision, vless, vmess, ws, DAE_SOCKET_MARK,
 };
 
 const SO_MARK_OPT: libc::c_int = 36;
@@ -220,6 +220,18 @@ impl WriteHalf for hysteria2::Hy2WriteHalf {
 }
 
 impl<W: WriteHalf> WriteHalf for vless::VlessWriter<W> {
+    fn shutdown_write(&self) -> io::Result<()> {
+        self.inner().shutdown_write()
+    }
+}
+
+impl WriteHalf for tls13::Tls13Writer {
+    fn shutdown_write(&self) -> io::Result<()> {
+        tls13::Tls13Writer::shutdown_write(self)
+    }
+}
+
+impl<W: WriteHalf> WriteHalf for vision::VisionWriter<W> {
     fn shutdown_write(&self) -> io::Result<()> {
         self.inner().shutdown_write()
     }
@@ -464,6 +476,10 @@ pub enum Outbound {
         sni: String,
         insecure: bool,
         transport: VlessTransport,
+        /// P18c+：security=reality（pbk/sid/fp）；与 `tls` 互斥（reality 自带 TLS）。
+        reality: Option<reality::RealityConfig>,
+        /// P18c+：VLESS flow（仅支持 `xtls-rprx-vision`，且目前限 reality 传输）。
+        flow: Option<String>,
     },
     Vmess {
         server: SocketAddr,
@@ -503,16 +519,23 @@ impl Outbound {
                 server,
                 tls,
                 transport,
+                reality,
+                flow,
                 ..
             } => {
                 let xport = match transport {
                     VlessTransport::Tcp => String::new(),
                     VlessTransport::Ws { .. } => "&type=ws".to_string(),
                 };
-                format!(
-                    "vless://{server}?security={}{xport}",
-                    if *tls { "tls" } else { "none" }
-                )
+                let sec = if let Some(rc) = reality {
+                    format!("reality&sni={}", rc.server_name)
+                } else if *tls {
+                    "tls".to_string()
+                } else {
+                    "none".to_string()
+                };
+                let fl = flow.as_deref().unwrap_or("");
+                format!("vless://{server}?security={sec}{xport}&flow={fl}")
             }
             Self::Vmess {
                 server, security, ..
@@ -616,20 +639,41 @@ impl Outbound {
                 sni,
                 insecure,
                 transport,
+                reality: reality_cfg,
+                flow,
             } => {
                 let sock = marked_tcp_connect(*server, timeout)?;
                 let kill = sock.try_clone()?;
-                let (r, w) = if *use_tls {
-                    let (r, w) = tls::connect(sock, sni, *insecure, &[], timeout)?;
-                    apply_ws(r, w, transport)?
-                } else {
-                    let read = sock.try_clone()?;
-                    apply_ws(read, sock, transport)?
-                };
-                let (r, w) = vless::connect_split(r, w, uuid, target)?;
+                let vision = flow.as_deref() == Some("xtls-rprx-vision");
+                let (from_remote, to_remote): (Box<dyn ReadHalf>, Box<dyn WriteHalf>) =
+                    if let Some(rc) = reality_cfg {
+                        let (tls_r, tls_w, raw_flag) = reality::connect(sock, rc, Some(timeout))?;
+                        let (vr, vw) =
+                            vless::connect_split_flow(tls_r, tls_w, uuid, target, flow.as_deref())?;
+                        if vision {
+                            (
+                                Box::new(vision::VisionReader::new(vr, *uuid, raw_flag)),
+                                Box::new(vision::VisionWriter::new(vw, *uuid)),
+                            )
+                        } else {
+                            (Box::new(vr), Box::new(vw))
+                        }
+                    } else if *use_tls {
+                        let (r, w) = tls::connect(sock, sni, *insecure, &[], timeout)?;
+                        let (r, w) = apply_ws(r, w, transport)?;
+                        let (r, w) =
+                            vless::connect_split_flow(r, w, uuid, target, flow.as_deref())?;
+                        (Box::new(r), Box::new(w))
+                    } else {
+                        let read = sock.try_clone()?;
+                        let (r, w) = apply_ws(read, sock, transport)?;
+                        let (r, w) =
+                            vless::connect_split_flow(r, w, uuid, target, flow.as_deref())?;
+                        (Box::new(r), Box::new(w))
+                    };
                 Ok(DialedStream {
-                    from_remote: Box::new(r),
-                    to_remote: Box::new(w),
+                    from_remote,
+                    to_remote,
                     socket: Some(kill),
                 })
             }
@@ -726,7 +770,13 @@ impl Outbound {
                 sni,
                 insecure,
                 transport,
+                reality: reality_cfg,
+                ..
             } => {
+                if reality_cfg.is_some() {
+                    // P18c+：reality（含 vision）暂不支持 UDP over stream（vision 为 TCP 直通设计）。
+                    return Ok(None);
+                }
                 let sock = marked_tcp_connect(*server, timeout)?;
                 let timeout_sock = sock.try_clone()?;
                 let (read, write): (Box<dyn UdpDatagramSource>, Box<dyn UdpDatagramSink>) =
@@ -924,10 +974,11 @@ fn b64_decode_any(s: &str) -> Option<Vec<u8>> {
     None
 }
 
-/// `vless://uuid@host:port?type=tcp|ws&security=tls&sni=...&allowInsecure=1`
+/// `vless://uuid@host:port?type=tcp|ws&security=tls|reality&sni=...&flow=xtls-rprx-vision`
 ///
 /// 传输：tcp / ws（`host`/`path` 参数，缺省 host=sni、path=/）；headerType=none；
-/// flow 非空（vision/XUDP）与 security=reality 显式拒绝（ADR-0017，ws 为 P10 新增）。
+/// security=reality 需 `pbk`（base64url）/`sid`（hex）/`fp`（chrome）；
+/// flow 仅支持 `xtls-rprx-vision`（P18c+，且目前限 reality 传输）。
 fn parse_vless(rest: &str) -> Result<Outbound, String> {
     let rest = rest.split('#').next().unwrap_or(rest);
     let (main, query) = match rest.split_once('?') {
@@ -943,6 +994,11 @@ fn parse_vless(rest: &str) -> Result<Outbound, String> {
     let mut ws = false;
     let mut ws_host: Option<String> = None;
     let mut ws_path: Option<String> = None;
+    let mut flow: Option<String> = None;
+    let mut is_reality = false;
+    let mut pbk: Option<String> = None;
+    let mut sid: Option<String> = None;
+    let mut fp: Option<String> = None;
     for kv in query.split('&').filter(|s| !s.is_empty()) {
         let (k, v) = kv.split_once('=').unwrap_or((kv, ""));
         match k.to_ascii_lowercase().as_str() {
@@ -957,22 +1013,32 @@ fn parse_vless(rest: &str) -> Result<Outbound, String> {
             "security" => match v.to_ascii_lowercase().as_str() {
                 "" | "none" => use_tls = false,
                 "tls" => use_tls = true,
-                other => return Err(format!("vless:// security={other} 未实现（只做 tls/none）")),
+                "reality" => is_reality = true,
+                other => {
+                    return Err(format!(
+                        "vless:// security={other} 未实现（只做 tls/none/reality）"
+                    ))
+                }
             },
-            "sni" | "peer" => sni = Some(percent_decode(v)),
+            "sni" | "peer" | "servername" => sni = Some(percent_decode(v)),
             "host" => ws_host = Some(percent_decode(v)),
             "path" => ws_path = Some(percent_decode(v)),
             "allowinsecure" | "insecure" | "skip-cert-verify" => {
                 insecure = matches!(v, "1" | "true" | "TRUE" | "True")
             }
             "flow" if !v.is_empty() => {
-                return Err(format!(
-                    "vless:// flow={v} 未实现（vision/XUDP 属后续档位）"
-                ))
+                let f = percent_decode(v);
+                if f != "xtls-rprx-vision" {
+                    return Err(format!("vless:// flow={f} 未实现（只做 xtls-rprx-vision）"));
+                }
+                flow = Some(f);
             }
             "encryption" if !matches!(v.to_ascii_lowercase().as_str(), "" | "none") => {
                 return Err(format!("vless:// encryption={v} 未实现（只做 none）"))
             }
+            "pbk" | "publickey" => pbk = Some(percent_decode(v)),
+            "sid" | "shortid" => sid = Some(percent_decode(v)),
+            "fp" | "fingerprint" => fp = Some(percent_decode(v)),
             _ => {}
         }
     }
@@ -992,6 +1058,26 @@ fn parse_vless(rest: &str) -> Result<Outbound, String> {
     } else {
         VlessTransport::Tcp
     };
+    let reality = if is_reality {
+        if !matches!(transport, VlessTransport::Tcp) {
+            return Err("vless:// reality 只支持 tcp 传输".to_string());
+        }
+        let pbk = pbk.ok_or_else(|| "vless:// security=reality 缺 pbk".to_string())?;
+        let pk =
+            reality::RealityConfig::parse_public_key(&pbk).map_err(|e| format!("vless:// {e}"))?;
+        let short = reality::RealityConfig::parse_short_id(sid.as_deref().unwrap_or(""))
+            .map_err(|e| format!("vless:// {e}"))?;
+        let fp = fp.unwrap_or_else(|| "chrome".to_string());
+        Some(reality::RealityConfig::new(&sni, pk, short, &fp))
+    } else {
+        if flow.is_some() {
+            return Err(
+                "vless:// flow=xtls-rprx-vision 目前仅支持 security=reality（需裸 TCP 直通层）"
+                    .to_string(),
+            );
+        }
+        None
+    };
     Ok(Outbound::Vless {
         server: resolve(&hostport)?,
         uuid,
@@ -999,6 +1085,8 @@ fn parse_vless(rest: &str) -> Result<Outbound, String> {
         sni,
         insecure,
         transport,
+        reality,
+        flow,
     })
 }
 
@@ -1487,25 +1575,69 @@ mod tests {
         assert!(e.contains("未实现"), "{e}");
     }
 
-    // 真实订阅普查（ADR-0026 边界）：REALITY 与 Vision 仍显式拒绝。
+    // P18c+：REALITY 已实现（D+vision），URL 应能解析出配置；坏 pbk/sid 仍报错。
     #[test]
-    fn parse_vless_rejects_reality() {
+    fn parse_vless_reality_ok_and_bad_fields_rejected() {
+        let ob = parse(
+            "vless://b831381d-6324-4d53-ad4f-8cda48b30811@1.2.3.4:443\
+             ?type=tcp&security=reality&sni=www.microsoft.com\
+             &pbk=GD_dxMYmX6k5E3jcSitfWYY4QNMYof3Qig4tj0TrC3M&sid=41b9cb10b696&fp=chrome\
+             &flow=xtls-rprx-vision",
+        )
+        .unwrap();
+        match ob {
+            Outbound::Vless {
+                reality: Some(rc),
+                flow,
+                tls,
+                ..
+            } => {
+                assert_eq!(rc.server_name, "www.microsoft.com");
+                assert_eq!(&rc.short_id[..6], &[0x41, 0xb9, 0xcb, 0x10, 0xb6, 0x96]);
+                assert_eq!(flow.as_deref(), Some("xtls-rprx-vision"));
+                assert!(!tls);
+            }
+            other => panic!("应为 reality vless: {other:?}"),
+        }
+        // 坏 pbk
         let e = parse(
             "vless://b831381d-6324-4d53-ad4f-8cda48b30811@1.2.3.4:443\
-             ?type=tcp&security=reality&sni=www.microsoft.com&pbk=abc&sid=def",
+             ?type=tcp&security=reality&sni=a.com&pbk=short",
         )
         .unwrap_err();
-        assert!(e.contains("reality") && e.contains("未实现"), "{e}");
+        assert!(e.contains("pbk"), "{e}");
+        // 缺 pbk
+        let e = parse(
+            "vless://b831381d-6324-4d53-ad4f-8cda48b30811@1.2.3.4:443\
+             ?type=tcp&security=reality&sni=a.com&sid=00",
+        )
+        .unwrap_err();
+        assert!(e.contains("pbk"), "{e}");
+        // reality + ws 拒绝
+        let e = parse(
+            "vless://b831381d-6324-4d53-ad4f-8cda48b30811@1.2.3.4:443\
+             ?type=ws&security=reality&sni=a.com&pbk=GD_dxMYmX6k5E3jcSitfWYY4QNMYof3Qig4tj0TrC3M",
+        )
+        .unwrap_err();
+        assert!(e.contains("tcp"), "{e}");
     }
 
     #[test]
-    fn parse_vless_rejects_vision_flow() {
+    fn parse_vless_vision_flow_needs_reality() {
+        // 非 reality 的 vision 目前不支持（无裸 TCP 直通层）。
         let e = parse(
             "vless://b831381d-6324-4d53-ad4f-8cda48b30811@1.2.3.4:443\
              ?type=tcp&security=tls&flow=xtls-rprx-vision",
         )
         .unwrap_err();
-        assert!(e.contains("flow") && e.contains("未实现"), "{e}");
+        assert!(e.contains("reality"), "{e}");
+        // 其它 flow 值拒绝
+        let e = parse(
+            "vless://b831381d-6324-4d53-ad4f-8cda48b30811@1.2.3.4:443\
+             ?type=tcp&flow=xtls-rprx-direct",
+        )
+        .unwrap_err();
+        assert!(e.contains("flow"), "{e}");
     }
 
     #[test]
