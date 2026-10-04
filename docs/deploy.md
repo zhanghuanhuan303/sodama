@@ -12,6 +12,9 @@
 
 ## 0. 部署模型（先读，避免踩坑）
 
+> OpenWrt / 路由器（musl + ipk + procd）见 [`openwrt.md`](openwrt.md)：含 musl 交叉构建、
+> 内核 fragment（**官方镜像默认未开 NAMESPACES/NET_NS，需自编内核**）与 QEMU 冒烟。
+
 sodama 的 loader **只做三件事**：加载 eBPF 对象、挂 tc 钩子、跑 relay/DNS 控制面。
 它**不会自建** netns、veth、路由与 sysctl：
 

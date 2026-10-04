@@ -25,3 +25,6 @@ __pycache__/
 *.pyc
 .DS_Store
 nohup.out
+
+# OpenWrt 预编译产物（由 lab/build-openwrt.sh 生成，随 SDK 使用，不入库）
+/sodama/install/openwrt/prebuilt/

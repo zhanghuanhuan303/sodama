@@ -1,0 +1,105 @@
+#!/bin/sh /etc/rc.common
+# sodama OpenWrt init（procd）。
+#
+# 启动顺序：sodama-datapath setup（netns/veth/sysctl）→ loader（eBPF 透明代理）。
+# 停止：SIGTERM（loader 有界优雅退出）→ datapath teardown。
+# reload：`/etc/init.d/sodama reload` → `sodama reload`（SIGHUP 等价，热重载规则/订阅）。
+START=95
+STOP=10
+USE_PROCD=1
+
+DATAPATH=/usr/lib/sodama/sodama-datapath
+SODAMA=/usr/bin/sodama
+
+config_foreach_get() {
+	# config_foreach_get <section> <option> <default>
+	local val
+	config_get val "$1" "$2" "$3"
+	echo "$val"
+}
+
+start_service() {
+	config_load sodama
+	local enabled config lan wan dual daens dae0 dae0peer status_socket log_file
+	local offload dial_timeout dial_mode sniff_ms ipv6
+	enabled=$(config_foreach_get main enabled 0)
+	[ "$enabled" = "1" ] || {
+		echo "sodama: disabled（uci set sodama.main.enabled=1 后 /etc/init.d/sodama start）"
+		return 0
+	}
+	config=$(config_foreach_get main config /etc/sodama/config.dae)
+	lan=$(config_foreach_get main lan "")
+	wan=$(config_foreach_get main wan wan)
+	dual=$(config_foreach_get main dual "")
+	daens=$(config_foreach_get main daens daens)
+	dae0=$(config_foreach_get main dae0 dae0)
+	dae0peer=$(config_foreach_get main dae0peer dae0peer)
+	status_socket=$(config_foreach_get main status_socket /var/run/sodama.sock)
+	log_file=$(config_foreach_get main log_file /var/log/sodama.log)
+	offload=$(config_foreach_get main offload 0)
+	dial_timeout=$(config_foreach_get main dial_timeout 15)
+	dial_mode=$(config_foreach_get main dial_mode ip)
+	sniff_ms=$(config_foreach_get main sniffing_timeout_ms 100)
+	ipv6=$(config_foreach_get main ipv6 1)
+
+	[ -f "$config" ] || {
+		echo "sodama: 缺配置 $config（可从 /usr/share/sodama/config.example.dae 复制）"
+		return 1
+	}
+
+	# ---- 数据面对（netns + veth + sysctl；失败则不起 loader）----
+	SODAMA_DATAPATH_IPV6="$ipv6" DAE_NS="$daens" DAE0="$dae0" DAE0PEER="$dae0peer" \
+		"$DATAPATH" setup || return 1
+
+	# ---- 参数拼装 ----
+	local lan_args="--lan none"
+	[ -n "$lan" ] && lan_args="--lan $lan"
+	local extra=""
+	[ -n "$dual" ] && extra="--dual $dual"
+	[ "$offload" = "1" ] && extra="$extra --offload"
+
+	procd_open_instance
+	# shellcheck disable=SC2086
+	procd_set_param command "$SODAMA" \
+		--ebpf /usr/lib/sodama/sodama-ebpf \
+		$lan_args --wan "$wan" $extra \
+		--dae0 "$dae0" --dae0peer "$dae0peer" --daens "$daens" \
+		--config "$config" \
+		--dial-timeout "$dial_timeout" \
+		--dial-mode "$dial_mode" \
+		--sniffing-timeout-ms "$sniff_ms" \
+		--status-socket "$status_socket" \
+		--log-file "$log_file"
+	procd_set_param respawn 3600 5 5
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_close_instance
+
+	echo "sodama: 启动中（wan=$wan lan=${lan:-none} dual=${dual:-无} 配置=$config）"
+}
+
+stop_service() {
+	config_load sodama
+	local daens dae0 dae0peer ipv6
+	daens=$(config_foreach_get main daens daens)
+	dae0=$(config_foreach_get main dae0 dae0)
+	dae0peer=$(config_foreach_get main dae0peer dae0peer)
+	ipv6=$(config_foreach_get main ipv6 1)
+	# procd 已发送 TERM，loader 自身有界退出；这里仅回收数据面对
+	SODAMA_DATAPATH_IPV6="$ipv6" DAE_NS="$daens" DAE0="$dae0" DAE0PEER="$dae0peer" \
+		"$DATAPATH" teardown || true
+}
+
+reload_service() {
+	config_load sodama
+	local status_socket
+	status_socket=$(config_foreach_get main status_socket /var/run/sodama.sock)
+	"$SODAMA" reload --socket "$status_socket" || {
+		echo "sodama: reload 失败（实例未运行？）"
+		return 1
+	}
+}
+
+service_triggers() {
+	procd_add_reload_trigger sodama
+}

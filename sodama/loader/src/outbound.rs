@@ -560,7 +560,7 @@ fn recvmmsg_udp(
                 fd,
                 msgs.as_mut_ptr(),
                 n as libc::c_uint,
-                libc::MSG_WAITFORONE,
+                crate::MSG_WAITFORONE,
                 std::ptr::null_mut(),
             )
         };

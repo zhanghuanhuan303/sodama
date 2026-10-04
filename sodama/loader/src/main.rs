@@ -92,6 +92,13 @@ mod ws;
 /// （内核 net.ipv4.tcp_fwmark_accept=1 时的 inet_request_mark 行为）。
 const DAE_SOCKET_MARK: libc::c_int = 0x233;
 
+/// musl 的 `recvmmsg` flags 为 `c_uint`，gnu 为 `c_int`——按目标环境对齐类型，
+/// 保证同一源码在 glibc / musl（OpenWrt 等）都能编。
+#[cfg(target_env = "musl")]
+pub(crate) const MSG_WAITFORONE: libc::c_uint = libc::MSG_WAITFORONE as libc::c_uint;
+#[cfg(not(target_env = "musl"))]
+pub(crate) const MSG_WAITFORONE: libc::c_int = libc::MSG_WAITFORONE;
+
 /// 与 ebpf-rs/src/common.rs 的 SODAMA_MAX_MATCH_SET_LEN 保持一致。
 const MAX_MATCH_SET_LEN: u32 = rules::MAX_MATCH_SET_LEN;
 const EPOCH_SLOT_NUM: u32 = 2;
@@ -4401,7 +4408,7 @@ impl UdpRecvBatch {
                     fd,
                     self.msgs.as_mut_ptr(),
                     n as libc::c_uint,
-                    libc::MSG_WAITFORONE,
+                    crate::MSG_WAITFORONE,
                     std::ptr::null_mut(),
                 )
             };

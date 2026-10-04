@@ -1,0 +1,74 @@
+#!/bin/sh
+# sodama 数据面对：netns + veth + 地址/静态邻居/策略路由/sysctl。
+# 对照 lab/gateway.sh 的 setup_datapath（dae control/netns_utils.go：169.254.0.11/32
+# 生成正确 L3 头，静态邻居保证 tproxy 回包可发出；v6 静态 fe80 邻居同理）。
+#
+# 用法：DAE_NS=daens DAE0=dae0 DAE0PEER=dae0peer sodama-datapath setup|teardown
+# 需要 ip-full（busybox ip 不支持 netns）。
+set -e
+
+DAE_NS="${DAE_NS:-daens}"
+DAE0="${DAE0:-dae0}"
+DAE0PEER="${DAE0PEER:-dae0peer}"
+IPV6="${SODAMA_DATAPATH_IPV6:-1}"
+
+log() { echo "[sodama-datapath] $*"; }
+die() { echo "[sodama-datapath] ERROR: $*" >&2; exit 1; }
+
+setup() {
+  command -v ip >/dev/null || die "缺 ip 命令"
+  ip netns list >/dev/null 2>&1 || die "内核/ip 不支持 netns（需 ip-full 且 CONFIG_NET_NS=y）"
+  ip netns list | grep -qw "$DAE_NS" && die "netns $DAE_NS 已存在（先 teardown 或停旧实例）"
+  ip link show dev "$DAE0" >/dev/null 2>&1 && die "接口 $DAE0 已存在"
+
+  log "建立 netns=$DAE_NS veth=$DAE0/$DAE0PEER"
+  ip netns add "$DAE_NS"
+  ip link add "$DAE0" type veth peer name "$DAE0PEER"
+  ip link set "$DAE0PEER" netns "$DAE_NS"
+  ip link set "$DAE0" up
+  ip -n "$DAE_NS" link set lo up
+  ip -n "$DAE_NS" link set "$DAE0PEER" up
+
+  ip -n "$DAE_NS" addr add 169.254.0.11/32 dev "$DAE0PEER"
+  ip -n "$DAE_NS" route add 169.254.0.1/32 dev "$DAE0PEER" scope link
+  ip -n "$DAE_NS" route add default via 169.254.0.1 dev "$DAE0PEER"
+  mac="$(ip link show dev "$DAE0" | awk '/link\/ether/ {print $2; exit}')"
+  [ -n "$mac" ] || die "拿不到 $DAE0 的 MAC"
+  ip -n "$DAE_NS" neigh add 169.254.0.1 lladdr "$mac" dev "$DAE0PEER" nud permanent
+  ip netns exec "$DAE_NS" sysctl -qw "net.ipv4.conf.$DAE0PEER.accept_local=1"
+  ip netns exec "$DAE_NS" sysctl -qw net.ipv4.ip_nonlocal_bind=1
+  # 被 mark 的 tproxy 报文必须本地投递（对照 dae tproxy.c）
+  ip -n "$DAE_NS" rule add fwmark 0x8000000/0x8000000 table 2023
+  ip -n "$DAE_NS" route add local default dev lo table 2023
+
+  if [ "$IPV6" = "1" ] && ip -6 addr add fe80::ecee:eeff:feee:eeee/128 dev "$DAE0" \
+      scope link nodad 2>/dev/null; then
+    sysctl -qw "net.ipv6.conf.$DAE0.forwarding=1" || true
+    ip -n "$DAE_NS" -6 route add default via fe80::ecee:eeff:feee:eeee dev "$DAE0PEER" 2>/dev/null || true
+    ip -n "$DAE_NS" -6 neigh add fe80::ecee:eeff:feee:eeee lladdr "$mac" \
+      dev "$DAE0PEER" nud permanent 2>/dev/null || true
+    ip -n "$DAE_NS" -6 rule add fwmark 0x8000000/0x8000000 table 2023 2>/dev/null || true
+    ip -n "$DAE_NS" -6 route add local default dev lo table 2023 2>/dev/null || true
+    log "IPv6 数据面已启用"
+  else
+    log "IPv6 数据面跳过（地址配置失败或 SODAMA_DATAPATH_IPV6=0）"
+  fi
+
+  sysctl -qw net.ipv4.ip_forward=1
+  sysctl -qw net.ipv4.conf.all.rp_filter=0
+  sysctl -qw net.ipv4.conf.default.rp_filter=0 2>/dev/null || true
+  sysctl -qw "net.ipv4.conf.$DAE0.accept_local=1"
+  log "就绪（netns=$DAE_NS veth=$DAE0/$DAE0PEER）"
+}
+
+teardown() {
+  ip netns del "$DAE_NS" 2>/dev/null || true
+  ip link del "$DAE0" 2>/dev/null || true
+  log "已清理（netns=$DAE_NS veth=$DAE0）"
+}
+
+case "${1:-}" in
+setup) setup ;;
+teardown) teardown ;;
+*) echo "用法：$0 setup|teardown（环境：DAE_NS/DAE0/DAE0PEER/SODAMA_DATAPATH_IPV6）" >&2; exit 2 ;;
+esac
