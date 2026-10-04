@@ -4,7 +4,8 @@
 netns 实验环境。**K0–K3、P3a（DNS 接管/域位图）、P3b-1（缓存/TCP DNS）、P3b-2a
 （domain(regex:)/EDNS）、P4（TCP relay / UDP NAT / TCP offload）、P5-G1（shadowsocks +
 trojan）、P5-G2（vless + vmess AEAD）、P5-G3a（tuic v5 / QUIC）、P5-G3b（hysteria2 /
-QUIC + 最小 HTTP/3 认证）、P5-G3b+（salamander 混淆 / Brutal 近似 / udphop）与
+QUIC + 最小 HTTP/3 认证）、P5-G3b+（salamander 混淆 / Brutal 近似 / udphop）、
+P18a–d（DoT/DoH、DoQ、`dns.routing`、ECS/sip、pname、REALITY+Vision）与
 P6（suspend/reload/metrics/sysdump/日志轮转/整配置热重载）已完成**；P9+ 已删除 C 数据面，
 `ebpf-rs` 的 Rust 对象是**唯一数据面**（ADR-0025）。
 
@@ -112,6 +113,16 @@ P6（suspend/reload/metrics/sysdump/日志轮转/整配置热重载）已完成*
   来源过滤；`dns-bench` 子命令（用户态 + marked socket，同域名跨上游
   min/avg/p50/TTL 对比，`--client` 供 ECS）；真机 router↔DoH↔DoH+ECS A/B
   （ADR-0039、NOTES §11.30）
+- **P18c 实用化：DNS `pname()` + bench 并发/多轮**（mini 扩展）：WAN egress 按 DNS
+  流（UDP/TCP SYN）写 `dns_sender_pname_map`，控制面 raw 反查 + 120s 陈旧判定 +
+  60s GC；`dns.routing` 请求/应答双侧支持 `pname(...)`（无进程信息不命中）；
+  `dns-bench --rounds/--concurrency` + p95（ADR-0040、NOTES §11.31）
+- **P18d REALITY + Vision（自实现 TLS 1.3）**：零新运行时依赖新增
+  `tls13.rs`（Chrome 形状 ClientHello + X25519MLKEM768 hybrid + 记录层
+  AES-GCM/ChaCha + `raw_read` 直通）、`reality.rs`（authKey/session_id 密封/
+  证书 HMAC-SHA512+ed25519 绑定）、`vision.rs`（帧层 + 下行 splice）；
+  `vless://…security=reality…flow=xtls-rprx-vision` 直接解析入组；
+  订阅#2 66/66 节点入组，真机 HTTP/HTTPS 实测（ADR-0041、NOTES §11.32）
 - **P5-G3a QUIC（tuic v5）**：惰性 tokio 运行时 + quinn（阻塞 relay 用 block_on 桥接）；
   认证 token = TLS exporter（label=uuid 裸字节、context=password）；TCP 每条中继一条 QUIC
   双向流，UDP 走 QUIC DATAGRAM（含分片/重组）；上游 socket 用自建 `Endpoint` 打 `SO_MARK`；
@@ -172,7 +183,10 @@ loader/src/ss.rs    shadowsocks classic AEAD（SIP004：evp_bytes_to_key + HKDF-
                    TCP 分块 / UDP 包，读写两半）
 loader/src/tls.rs   共享 TLS 层（rustls：握手 + 读路径 pending/抽干不变量，ALPN）
 loader/src/trojan.rs trojan（TLS + CONNECT 头；仅 TCP；无 close_notify 半关闭）
-loader/src/vless.rs vless（TCP/UDP，tls/none，tcp/ws 传输，UUID 解析含 UUID5 回退，惰性响应头）
+loader/src/vless.rs vless（TCP/UDP，tls/none/reality，tcp/ws 传输，addons flow=xtls-rprx-vision，响应头惰性解析）
+loader/src/tls13.rs P18d：最小 TLS 1.3 客户端（Chrome 形状 CH + X25519MLKEM768 + 记录层 AES-GCM/ChaCha + raw_read 直通）
+loader/src/reality.rs P18d：REALITY 客户端（authKey HKDF、session_id AES-GCM 密封、证书 HMAC-SHA512/ed25519 绑定）
+loader/src/vision.rs P18d：xtls-rprx-vision 帧层（UUID/cmd/len/pad、长填充、下行 splice 裸读）
 loader/src/ws.rs    VLESS over WebSocket：RFC6455 客户端传输（Upgrade 握手 + 掩码帧，可拆半）
 loader/src/anytls.rs AnyTLS 客户端（anytls-go v2：sha256 认证 + 帧 + paddingScheme，单 Stream）
 loader/src/vmess.rs vmess AEAD（嵌套 HMAC KDF、auth id、SHAKE128 分块/填充、终止块）
@@ -367,6 +381,20 @@ sudo lab/lab.sh dnsroute-up && sudo lab/lab.sh test-dnsroute
 # P18c+：上游 A/B 对比（用户态；需 root 因为 marked socket；不加载 eBPF）
 sudo target/release/mini-dae dns-bench --config lab/gateway.dae \
   --names www.taobao.com,www.google.com --tags router,alidns_ecs,alidns --runs 5 --client 192.0.2.254
+# P18c++：并发/多轮 + p95；`--rounds R --concurrency C`（总样本 runs×R）
+sudo target/release/mini-dae dns-bench --config lab/gateway.dae \
+  --names www.taobao.com --tags alidns,alidns_ecs,router --runs 10 --rounds 2 --concurrency 4 --client 192.0.2.254
+# P18d：REALITY + Vision（自实现 TLS 1.3；ignored e2e，需本机 sing-box）
+#   本机参考服务端 128KB 往返：
+#   cargo test --release -- --ignored e2e_reality_vision
+#   真实节点（不接管系统网络；HTTP/HTTPS，HTTPS 会触发下行 splice）：
+#   NODE='vless://…security=reality…flow=xtls-rprx-vision' \
+#     MINI_DAE_E2E_URL="$NODE" MINI_DAE_E2E_TARGET=example.com:80 \
+#     cargo test --release -- --ignored e2e_reality_vision
+#   MINI_DAE_E2E_URL="$NODE" MINI_DAE_E2E_HTTPS=www.gstatic.com cargo test --release -- --ignored e2e_reality_vision
+#   loader 本地 SOCKS（root，SO_MARK 生效）定向验证节点：
+#   sudo target/release/mini-dae --listen-socks 127.0.0.1:1083 --dialer "$NODE"
+#   curl -x socks5h://127.0.0.1:1083 http://example.com/
 sudo lab/lab.sh ops-up      # P6：运维面会话（--log-file + 状态面控制命令）
 sudo lab/lab.sh test-ops         # suspend(fail-open)/reload/metrics/sysdump/日志轮转
 sudo lab/lab.sh ops-reload-up    # P6：整配置热重载会话（/tmp 配置副本 + 假 DNS）

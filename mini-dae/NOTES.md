@@ -1131,6 +1131,55 @@ Selected/应答重查循环；夹具 `lab/dnsroute.dae`、假 DNS 支持 bind �
   google 1.32 / 7.25 / 6.81ms（router / DoH / DoH+ECS，均 5/5）；
   ECS 与普通 DoH 的应答 TTL 不同（上游视角随子网变化）。
 
+### 11.31 DNS `pname()` + `dns-bench` 并发/多轮（ADR-0040）
+
+（实现：`ebpf-rs/src/flow.rs` 写 `dns_sender_pname_map`；`loader/src/main.rs`
+`lookup_dns_pname`/`dns_pname_gc_loop`/`bpf_map_op_raw`；`dnsroute.rs` 的
+`ReqKind::Pname`/`RespKind::Pname`；bench 的 `bench_one`/`pct`。）
+
+- 采集：WAN egress 对 DNS 流（UDP 任意包 / TCP SYN）写入
+  `{sip(16B v4-mapped), h_sport(主机序 u16)} → {pname[16], ts_ns}`；
+  **教训**：`MiniTuple.sport` 是网络序原始值（报文直接装入），首版按主机序
+  当键导致永不命中——写侧改用 `pkt.h_sport`。
+- 反查：DNS 线程 dup map fd，raw `BPF_MAP_LOOKUP_ELEM`；条目 >120s 视为陈旧；
+  另有 60s 周期 GC 线程（`BPF_MAP_GET_NEXT_KEY/DELETE_ELEM`）避免端口轮换
+  耗尽 4096 槽位。
+- 规则：请求/应答 `pname(...)`（等值、多值 OR、`!`；无进程信息不命中）。
+- bench：`--rounds R --concurrency C`（总样本 runs×R，scoped 线程并发）+ p95。
+- 实测：`cargo test` **154/154**；真网关临时规则
+  `qname(full: example.com) && pname(python3) -> reject`：python3 空应答、
+  getent 正常、TCP DNS 同样命中；移除后恢复。bench（runs=10×rounds=2×
+  concurrency=4，client=192.0.2.254）：taobao DoH p50 9.2/p95 124.8ms、
+  DoH+ECS 8.2/109.8ms、UDP 1.4/24.8ms；google 类似。
+
+### 11.32 REALITY + Vision（自实现 TLS 1.3，ADR-0041）
+
+（实现：`loader/src/tls13.rs`、`reality.rs`、`vision.rs`；接入
+`outbound.rs` 的 `parse_vless`/`Outbound::Vless{reality,flow}` 与 `vless.rs`
+addons flow。）
+
+- **tls13.rs**：最小 TLS 1.3 客户端（rustls 换不动的四个点：自定义
+  session_id/key_share、取 ECDHE 私钥、按记录粒度直通、证书钩子）。
+  Chrome 形状 CH（GREASE/16 套件/ALPN）；key share 含 X25519 与
+  X25519MLKEM768（`ml-kem`，REALITY 服务端现在强制要求）；套件
+  AES-128/256-GCM 与 ChaCha；Finished/KeyUpdate/alert；`raw_read` 开关。
+- **reality.rs**：authKey = HKDF-SHA256(X25519(clientEph, srvStaticPub),
+  salt=random[:20], info="REALITY")；session_id 明文前 16B（`[1,8,10,0]` +
+  unix + sid8）用 AES-256-GCM 密封（nonce=random[20:32]，AD=session_id
+  置零的完整 CH）回填 offset 39；叶证书签名域 == HMAC-SHA512(authKey,
+  SPKI ed25519 公钥) 才认可（否则判“被转发到真站”）；极简 DER 解析。
+- **vision.rs**：帧 `[UUID?][cmd][len u16BE][pad u16BE][content][padding]`；
+  首帧长填充（<900B 垫到 ~900B+）；非 TLS 发 0x01 后直通；下行收到 0x02
+  切裸读（记录层多读字节移交）；上行不 splice（只 0x00/0x01，服务端兼容）。
+- **互操作踩坑**（对拍 OpenSSL/utls/真站所得）：key_share 的 GREASE 组
+  必须同时在 supported_groups（否则 OpenSSL `illegal_parameter`）；GREASE
+  share 数据不可为空（utls 拒）；compress_certificate 用 `[02 00 02]`。
+- 实测：`cargo test` **154/154**；ignored e2e：本机 sing-box（REALITY+Vision）
+  echo 128KB 往返逐字节一致；本 TLS13 直握 microsoft/openssl；真实订阅节点
+  HTTP 200、HTTPS（内层 TLS1.3 触发下行 splice）成功；网关订阅#2
+  **66/66 入组** + `gateway.sh test` PASS + curl http/https 正常；lab verify
+  9/9 无回归。
+
 ## 12. 用 Rust 重写这套东西的可行性
 
 已验证（本仓库 mini-dae，实测跑通）：

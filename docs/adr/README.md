@@ -64,6 +64,8 @@
 | [0037](./ADR-0037-dns-file-blocklist.md) | `qname(file:)` 自定义域名名单（mini 扩展：文本名单、默认 suffix、full:/keyword:/regex: 前缀、相对路径按规则文件目录、缺失硬失败）+ `upstream_hits` 分流命中观测；真网关默认国内→本地明文/其余→DoH/名单拦截 | 已采纳 | —（P18c 实用化扩展） |
 | [0038](./ADR-0038-dns-ecs-sip.md) | DNS 精细策略（mini 扩展）：上游 URL `ecs=auto|<CIDR>` 注入 ECS（客户端子网，v4/24 v6/56，已带 OPT 透传，缓存按子网分域）+ 请求函数 `sip(...)` 客户端网段路由；真网关国内域 DoH+ECS | 已采纳 | —（P18c 实用化扩展二） |
 | [0039](./ADR-0039-dns-response-sip-bench.md) | 应答侧 `sip(...)`（按客户端来源过滤应答）+ `dns-bench` 子命令（用户态、marked socket、同域名跨上游 min/avg/p50/TTL 对比）；真机 router↔DoH↔DoH+ECS A/B | 已采纳 | —（P18c 实用化扩展三） |
+| [0040](./ADR-0040-dns-pname-bench-concurrency.md) | DNS `pname()`（mini 扩展：WAN egress 按 DNS 流写入 `dns_sender_pname_map`，控制面 raw lookup 反查；请求/应答双侧过滤；陈旧条目 GC）+ `dns-bench` 并发/多轮 p95；真机 python3/getent/TCP 三态验证 | 已采纳 | —（P18c 实用化扩展四） |
+| [0041](./ADR-0041-reality-vision.md) | REALITY + Vision（自实现 TLS 1.3 客户端）：Chrome 形状 CH + X25519MLKEM768（ml-kem）+ session_id AES-GCM 密封 + 证书 HMAC-SHA512/ed25519 绑定；Vision 帧层（UUID/cmd/len/pad、长填充、下行 splice 裸读）；订阅#2 48 条 REALITY 入组（对标表缺口 #6 首段） | 已采纳 | —（P18d 执行；缺口 #6 首段） |
 
 ## 新增一条 ADR
 

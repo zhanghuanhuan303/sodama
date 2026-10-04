@@ -205,7 +205,7 @@
     <span class="chip">代码量 <b>~65k 非测试 LOC / ~40k 测试</b></span>
     <span class="chip">数据面 <b>tproxy.c 4403 行 · 23 个程序 · 24 个 map</b></span>
     <span class="chip">许可 <b>AGPL-3.0</b></span>
-    <span class="chip">文档版本 <b>v2.24 · 2026-10-04</b></span>
+    <span class="chip">文档版本 <b>v2.26 · 2026-10-04</b></span>
   </div>
 </header>
 
@@ -1240,7 +1240,7 @@ wait signal → reload / suspend / shutdown</pre>
 </section>
 
 <p style="color:var(--dim);font-family:var(--mono);font-size:.78rem;margin-top:56px;border-top:1px solid var(--line);padding-top:14px">
-  dae → Rust 决策档案 · v2.24 · 生成于 2026-10-04 · 基于 dae main@e3fee8f（nightly）· 本文件自包含，可离线打开<br>
+  dae → Rust 决策档案 · v2.26 · 生成于 2026-10-04 · 基于 dae main@e3fee8f（nightly）· 本文件自包含，可离线打开<br>
   v1.1：新增 4.5 部署形态、4.6 常驻与故障语义、决策点 D8<br>
   v1.2：按 ADR-0009 改为 K 轨道路线图；D7 修订为内核切片先行；K0 第一步（规则 VM + LPM）已实测<br>
   v1.3：K0、K1 均已完成并实测（双 epoch 热重载、conn_state 缓存、五钩子角色、本机 WAN 流量与回程）<br>
@@ -1274,6 +1274,8 @@ wait signal → reload / suspend / shutdown</pre>
                                 v2.22：P18c 实用化扩展——`qname(file: '<名单>')`（mini 扩展）：文本名单（每行一条、空行/`#` 注释、默认 suffix、行首 `full:/keyword:/regex:` 覆盖、相对路径按规则所在文件目录、缺失/空域名硬失败、空名单合法）；`dns.routing.upstream_hits{tag|asis|legacy|reject}` 选路计数（状态面）；真网关默认配置 `lab/gateway.dae`：广告数据集 + 用户名单 → reject、`geosite:cn` → 本地路由器明文、其余 → DoH，`--dns <URL>`/`--geodata-dir` 新增到 gateway.sh。实测：`cargo test` 143/143；lab 名单矩阵（suffix/full/注释/不上行）；真机 105 查询 0 错误、`upstream_hits {alidns: 92, router: 13}`（分流生效）、名单热加载（加 `example.com` → reload → 拦截；移除 → reload → 恢复）（详情见 ADR-0037 与 `mini-dae/NOTES.md` §11.28）<br>
                                         v2.23：DNS 精细策略（mini 扩展，ADR-0038）——上游 URL `ecs=auto|<CIDR>`：发送前尾插 OPT+ECS option 8（v4 /24、v6 /56，地址按前缀截断，RDLEN/option-length 分列），客户端已带 OPT 时透传不注入，注入时缓存作用域加 `|ecs=<前缀>`（不同子网不串答），应答重查按新上游重新注入；请求函数 `sip(...)`（CIDR/geoip/ext，支持 `!`，与 qname/qtype 同链，UDP 取源地址/TCP 取 peer）；真网关 `alidns_ecs`（DoH+ECS）接 `geosite:cn`。实测：`cargo test` 145/145；lab 假上游收到 `ecs=1/24/10.0.0`、`qname && sip(10.0.0.0/24)` 命中 up2、7/3 规则矩阵全断言；真机 `upstream_hits {alidns: 78, alidns_ecs: 8}`、86 查询 0 错误（详情见 ADR-0038 与 `mini-dae/NOTES.md` §11.29）<br>
                                                 v2.24：应答侧 `sip()` + `dns-bench` 上游 A/B——应答路由可按客户端来源过滤（CIDR/geoip/ext、`!`、同链；UDP 源地址/TCP peer 透传）；`dns-bench` 子命令（用户态、marked socket 不被运行中网关接管，需 root）：复用生产 `UpstreamSet`，同域名跨上游 min/avg/p50/ancount/TTL，`--client` 供 `ecs=auto`。实测：`cargo test` 146/146；lab 7/5 规则矩阵（resp_rejects=2）；真机 A/B runs=5：taobao 1.31/7.43/7.45ms、baidu 1.32/7.37/7.24ms、google 1.32/7.25/6.81ms（router/DoH/DoH+ECS，均 5/5），ECS 与普通 DoH 应答 TTL 不同（上游视角随子网变化）（详情见 ADR-0039 与 `mini-dae/NOTES.md` §11.30）<br>
+                                                v2.25：DNS `pname()` + `dns-bench` 并发/多轮 p95（ADR-0040）——WAN egress 按 DNS 流（UDP/TCP SYN）把发起进程名写入 `dns_sender_pname_map`（键含主机序源端口，修正网络序错位），控制面 raw `BPF_MAP_LOOKUP_ELEM` 反查 + 120s 陈旧判定 + 60s GC 线程回收；`dns.routing.request/response` 支持 `pname(...)`（等值/多值 OR/`!`，无进程信息不命中）；`dns-bench --rounds/--concurrency` + p95。实测：`cargo test` **154/154**；真网关 python3 被 reject（空应答）、getent/TCP 正常，移除规则后恢复；bench runs=10×rounds=2×concurrency=4：taobao DoH p50 9.2/p95 124.8ms、UDP 1.4/24.8ms（详情见 ADR-0040 与 `mini-dae/NOTES.md` §11.31）<br>
+                                                v2.26：REALITY + Vision（自实现 TLS 1.3，ADR-0041）——零新运行时依赖新增 `tls13.rs`（Chrome 形状 ClientHello + X25519MLKEM768（`ml-kem`）+ 记录层 AES-GCM/ChaCha + HKDF + Finished/KeyUpdate + `raw_read` 直通开关）、`reality.rs`（authKey HKDF、“前 16B AES-GCM 密封” session_id、证书签名域 HMAC-SHA512/ed25519 绑定、极简 DER）、`vision.rs`（UUID/cmd/len/pad 帧、~900B 首帧长填充、下行 `command=0x02` 后裸 TCP splice）；`vless` addons flow + `parse_vless security=reality`。互操作踩坑：key_share 的 GREASE 组必须在 supported_groups、share 数据不可为空、compress_certificate `[02 00 02]`。实测：**154/154** + 3 个 ignored e2e（本机 sing-box 参考服务端 128KB 往返、真站/openssl ClientHello、真实节点 HTTP/HTTPS+内层 TLS 触发 splice）；网关订阅#2 **66/66 节点入组**、`gateway.sh test` PASS、curl http 200 / https 204，lab verify 9/9 无回归（详情见 ADR-0041 与 `mini-dae/NOTES.md` §11.32）<br>
 </p>
 </main>
 
