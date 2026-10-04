@@ -10,7 +10,7 @@
 //!   做 AEAD/TLS 编解码，内核拼接会绕过协议层（ADR-0016 第 3 条）。
 
 use std::io::{self, Read, Write};
-use std::net::{SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
+use std::net::{SocketAddr, TcpStream, UdpSocket};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -321,10 +321,13 @@ impl<W: WriteHalf> WriteHalf for vmess::VmessWriter<W> {
 }
 
 /// 拨号结果：读写两半（可并发）+ 底层 TCP（offload 注册/强制关闭）。
+/// `splice`：数据面是否可直接 splice 零拷贝（字节透明且前缀已一次性发出；
+/// 目前 Direct 与 VLESS 明文 TCP 置位）。
 pub struct DialedStream {
     pub from_remote: Box<dyn ReadHalf>,
     pub to_remote: Box<dyn WriteHalf>,
     pub socket: Option<TcpStream>,
+    pub splice: bool,
 }
 
 // ---------------------------------------------------------------- UDP relay
@@ -698,6 +701,7 @@ impl Outbound {
                     from_remote: Box::new(read),
                     to_remote: Box::new(sock),
                     socket: Some(kill),
+                    splice: true,
                 })
             }
             Self::Socks5 { server } => {
@@ -709,6 +713,7 @@ impl Outbound {
                     from_remote: Box::new(read),
                     to_remote: Box::new(s),
                     socket: Some(kill),
+                    splice: false,
                 })
             }
             Self::Http { server, auth } => {
@@ -720,6 +725,7 @@ impl Outbound {
                     from_remote: Box::new(read),
                     to_remote: Box::new(s),
                     socket: Some(kill),
+                    splice: false,
                 })
             }
             Self::Shadowsocks {
@@ -763,6 +769,7 @@ impl Outbound {
                     from_remote: reader,
                     to_remote: writer,
                     socket: Some(kill),
+                    splice: false,
                 })
             }
             Self::Trojan {
@@ -779,6 +786,7 @@ impl Outbound {
                     from_remote: Box::new(reader),
                     to_remote: Box::new(writer),
                     socket: Some(kill),
+                    splice: false,
                 })
             }
             Self::Vless {
@@ -794,6 +802,12 @@ impl Outbound {
                 let sock = marked_tcp_connect(*server, timeout)?;
                 let kill = sock.try_clone()?;
                 let vision = flow.as_deref() == Some("xtls-rprx-vision");
+                // splice 条件：明文 TCP 且无 vision（字节透明；请求头已在 connect 时一次性发出，
+                // 响应头由 relay 首读消费，之后可直接裸搏）。
+                let splice = !*use_tls
+                    && reality_cfg.is_none()
+                    && matches!(*transport, VlessTransport::Tcp)
+                    && !vision;
                 let (from_remote, to_remote): (Box<dyn ReadHalf>, Box<dyn WriteHalf>) =
                     if let Some(rc) = reality_cfg {
                         let (tls_r, tls_w, raw_flag) = reality::connect(sock, rc, Some(timeout))?;
@@ -824,6 +838,7 @@ impl Outbound {
                     from_remote,
                     to_remote,
                     socket: Some(kill),
+                    splice,
                 })
             }
             Self::Vmess {
@@ -844,6 +859,7 @@ impl Outbound {
                         from_remote: Box::new(r),
                         to_remote: Box::new(w),
                         socket: Some(kill),
+                        splice: false,
                     })
                 } else {
                     let read = sock.try_clone()?;
@@ -852,6 +868,7 @@ impl Outbound {
                         from_remote: Box::new(r),
                         to_remote: Box::new(w),
                         socket: Some(kill),
+                        splice: false,
                     })
                 }
             }
@@ -917,6 +934,7 @@ impl Outbound {
                         from_remote: Box::new(tr),
                         to_remote: Box::new(tw),
                         socket: None,
+                        splice: false,
                     });
                 }
                 let sock = marked_tcp_connect(*server, timeout)?;
@@ -944,6 +962,7 @@ impl Outbound {
                     from_remote: Box::new(tr),
                     to_remote: Box::new(tw),
                     socket: Some(kill),
+                    splice: false,
                 })
             }
             Self::Tuic { dialer } => {
@@ -953,6 +972,7 @@ impl Outbound {
                     from_remote: Box::new(r),
                     to_remote: Box::new(w),
                     socket: None,
+                    splice: false,
                 })
             }
             Self::Hysteria2 { dialer } => {
@@ -962,6 +982,7 @@ impl Outbound {
                     from_remote: Box::new(r),
                     to_remote: Box::new(w),
                     socket: None,
+                    splice: false,
                 })
             }
             Self::Juicity { dialer } => {
@@ -971,6 +992,7 @@ impl Outbound {
                     from_remote: Box::new(r),
                     to_remote: Box::new(w),
                     socket: None,
+                    splice: false,
                 })
             }
             Self::Ssr { dialer } => {
@@ -981,6 +1003,7 @@ impl Outbound {
                     from_remote: Box::new(r),
                     to_remote: Box::new(w),
                     socket: Some(kill),
+                    splice: false,
                 })
             }
             Self::AnyTls {
@@ -997,6 +1020,7 @@ impl Outbound {
                     from_remote: Box::new(r),
                     to_remote: Box::new(w),
                     socket: Some(kill),
+                    splice: false,
                 })
             }
             Self::Group(g) => g.dial_tcp(target, timeout),

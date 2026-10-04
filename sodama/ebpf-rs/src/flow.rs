@@ -19,6 +19,14 @@ pub fn suspended() -> bool {
     }
 }
 
+/// M1：热路径调试打印开关（默认关；避免 per-packet bpf_printk 的 trace 开销）。
+pub fn debug_log() -> bool {
+    match control_flags_map.get(0) {
+        Some(v) => *v & SODAMA_FLAG_DEBUG != 0,
+        None => false,
+    }
+}
+
 unsafe fn conn_lookup(key: &SodaTuple, l4proto: u8) -> Option<*mut SodaConnState> {
     let st = conn_state_map.get_ptr_mut(key)?;
     let now = bpf_ktime_get_ns();
@@ -157,18 +165,22 @@ pub unsafe fn split_flow(ctx: &mut TcContext, pkt: &SodaParseResult, is_wan: u8)
         outbound = (*s).outbound;
         mark = (*s).mark;
         let _ = (*s).must; /* C 同位置也读了 must 但缓存路径不消费 */
-        bpf_printk!(
-            c"sodama: cached outbound=0x%x dport=%u\n",
-            outbound as u32,
-            pkt.h_dport as u32
-        );
+        if debug_log() {
+            bpf_printk!(
+                c"sodama: cached outbound=0x%x dport=%u\n",
+                outbound as u32,
+                pkt.h_dport as u32
+            );
+        }
     } else {
         if pkt.l4proto == IPPROTO_TCP && pkt.new_flow == 0 {
             /* 无状态的非 SYN TCP：放行（对照 dae tproxy.c:2935）。 */
-            bpf_printk!(
-                c"sodama: stateless tcp passthrough dport=%u\n",
-                pkt.h_dport as u32
-            );
+            if debug_log() {
+                bpf_printk!(
+                    c"sodama: stateless tcp passthrough dport=%u\n",
+                    pkt.h_dport as u32
+                );
+            }
             return TC_ACT_OK as i32;
         }
         if pkt.l4proto == IPPROTO_TCP && pkt.new_flow == 0 {
@@ -188,13 +200,15 @@ pub unsafe fn split_flow(ctx: &mut TcContext, pkt: &SodaParseResult, is_wan: u8)
         outbound = (result & 0xff) as u8;
         mark = ((result as u64 >> SODAMA_RESULT_MARK_SHIFT) & 0xffff_ffff) as u32;
         let must = ((result as u64 >> SODAMA_RESULT_MUST_SHIFT) & 1) as u8;
-        bpf_printk!(
-            c"sodama: route outbound=0x%x mark=0x%x must=%u dport=%u\n",
-            outbound as u32,
-            mark,
-            must as u32,
-            pkt.h_dport as u32
-        );
+        if debug_log() {
+            bpf_printk!(
+                c"sodama: route outbound=0x%x mark=0x%x must=%u dport=%u\n",
+                outbound as u32,
+                mark,
+                must as u32,
+                pkt.h_dport as u32
+            );
+        }
 
         // P18c+：WAN egress 新 DNS 流（UDP 首包 / TCP SYN）：把发送方进程名记入
         // dns_sender_pname_map，控制面（透明 DNS）按 (client, sport) 反查，供

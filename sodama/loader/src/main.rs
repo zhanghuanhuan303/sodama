@@ -28,7 +28,7 @@
 #![recursion_limit = "512"]
 
 use std::ffi::CString;
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::Path;
@@ -166,6 +166,10 @@ fn group_index_map(cfg: Option<&config::Config>) -> std::collections::HashMap<St
 }
 /// relay 连接空闲回收阈值（秒）；janitor 每 5s 扫描一次。
 static RELAY_IDLE_SECS: AtomicU64 = AtomicU64::new(300);
+/// M1：relay splice 零拷贝开关（默认开；`--no-splice` 关闭）。
+static RELAY_SPLICE: AtomicBool = AtomicBool::new(true);
+/// M1：splice 不可用回退日志（只打一次，避免刷屏）。
+static SPLICE_FALLBACK_LOGGED: AtomicBool = AtomicBool::new(false);
 /// P11：relay 拨号超时（毫秒，默认 5000；真实节点首连可能较慢）
 static RELAY_DIAL_TIMEOUT_MS: AtomicU64 = AtomicU64::new(5000);
 /// P4b：UDP NAT 会话空闲阈值（秒）。
@@ -230,6 +234,9 @@ struct RelayStats {
     evicted: AtomicU64,
     offloaded_total: AtomicU64,
     offload_failures: AtomicU64,
+    /// M1：splice 零拷贝连接数 / 不可用回退次数。
+    splice_total: AtomicU64,
+    splice_fallbacks: AtomicU64,
     /// P18e：并发上限拒绝数（--max-conns）。
     limit_rejected: AtomicU64,
 }
@@ -242,6 +249,8 @@ static RELAY_STATS: RelayStats = RelayStats {
     evicted: AtomicU64::new(0),
     offloaded_total: AtomicU64::new(0),
     offload_failures: AtomicU64::new(0),
+    splice_total: AtomicU64::new(0),
+    splice_fallbacks: AtomicU64::new(0),
     limit_rejected: AtomicU64::new(0),
 };
 
@@ -853,6 +862,10 @@ struct Args {
     forward: Option<String>,
     /// P4c：启用 TCP relay offload（fast_sock + sk_skb）
     offload: bool,
+    /// M1：relay splice 零拷贝（Direct / VLESS 明文；默认开，`--no-splice` 关）
+    splice: bool,
+    /// M1：eBPF 热路径调试打印（默认关；`--ebpf-debug` 置 control_flags 位）
+    ebpf_debug: bool,
     /// P3a/P18a：DNS 上游 URL（无 scheme 或 udp://、tcp://、tcp+udp://、tls://(DoT)、
     /// https://(DoH)；缺省时用配置 dns.upstream 或 8.8.8.8:53）
     dns_upstream: Option<String>,
@@ -941,6 +954,8 @@ fn usage() -> ! {
            --udp-idle-timeout <s>   P4：UDP NAT 会话空闲秒数（默认 60）\n\
            --forward <url>       旧写法：等价于 --dialer socks5://host:port\n\
            --offload             P4c：启用 TCP relay offload（内核对拼，需 --dialer）\n\
+           --no-splice           M1：关闭 relay splice 零拷贝（默认开：Direct/VLESS 明文）\n\
+           --ebpf-debug          M1：eBPF 热路径调试打印（默认关）\n\
            --max-conns <N>       P18e：relay 并发上限（0=不限；超限直接关闭并计数）\n\
            --dns-upstream <url>  P3a：DNS 上游（host:port 或 udp://host:port）\n\
            --dump                打印编译出的 match_set / LPM 内容\n\
@@ -993,6 +1008,8 @@ fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
         udp_idle_timeout: None,
         forward: None,
         offload: false,
+        splice: true,
+        ebpf_debug: false,
         dns_upstream: None,
         dump: false,
         compile_dump: None,
@@ -1042,6 +1059,8 @@ fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
             "--udp-idle-timeout" => args.udp_idle_timeout = Some(next()?.parse()?),
             "--forward" => args.forward = Some(next()?),
             "--offload" => args.offload = true,
+            "--no-splice" => args.splice = false,
+            "--ebpf-debug" => args.ebpf_debug = true,
             "--max-conns" => args.max_conns = Some(next()?.parse()?),
             "--dns-upstream" => args.dns_upstream = Some(next()?),
             "--dump" => args.dump = true,
@@ -1311,7 +1330,10 @@ fn attach_pname_hooks(ebpf: &mut Ebpf) {
 
     // (程序名, 类型)：六个钩子，返回 1 放行（同 dae）。
     let sock_specs: [(&str, CgroupSockAttachType); 2] = [
-        ("sodama_cgroup_sock_create", CgroupSockAttachType::SockCreate),
+        (
+            "sodama_cgroup_sock_create",
+            CgroupSockAttachType::SockCreate,
+        ),
         (
             "sodama_cgroup_sock_release",
             CgroupSockAttachType::SockRelease,
@@ -1522,6 +1544,154 @@ fn pump(
         }
     }
     let _ = w.shutdown_write();
+}
+
+// ---------------------------------------------------------------- M1：splice 零拷贝泵
+
+/// splice 不可用（首调 EINVAL/ENOSYS）时回退用户态泵；Fatal 为传输中错误。
+enum SpliceErr {
+    Unsupported(io::Error),
+    Fatal(io::Error),
+}
+
+/// 单向 splice 泵：`src → pipe → dst`，大块零拷贝搬运（页级），EOF 时对 dst 半关闭。
+/// 与 `pump` 语义对齐：返回 Ok = 已收到 EOF 且已 shutdown(dst, SHUT_WR)。
+fn splice_pump(
+    src: RawFd,
+    dst: RawFd,
+    last_ns: &AtomicU64,
+    bytes: &AtomicU64,
+) -> Result<(), SpliceErr> {
+    const CHUNK: usize = 1 << 20;
+    let mut fds = [0i32; 2];
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        return Err(SpliceErr::Unsupported(io::Error::last_os_error()));
+    }
+    struct PipeGuard([i32; 2]);
+    impl Drop for PipeGuard {
+        fn drop(&mut self) {
+            unsafe {
+                libc::close(self.0[0]);
+                libc::close(self.0[1]);
+            }
+        }
+    }
+    let pipe = PipeGuard(fds);
+    let (pr, pw) = (pipe.0[0], pipe.0[1]);
+    // 扩大管道容量；失败忽略（默认 64KB，仅影响 syscall 频率）。
+    unsafe {
+        libc::fcntl(pw, libc::F_SETPIPE_SZ, CHUNK as libc::c_int);
+    }
+    let mut started = false;
+    loop {
+        let n = unsafe {
+            libc::splice(
+                src,
+                std::ptr::null_mut(),
+                pw,
+                std::ptr::null_mut(),
+                CHUNK,
+                0,
+            )
+        };
+        if n == 0 {
+            break; // EOF：与 pump 一致，向对端传播半关闭
+        }
+        if n < 0 {
+            let e = io::Error::last_os_error();
+            if e.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(if started {
+                SpliceErr::Fatal(e)
+            } else {
+                SpliceErr::Unsupported(e)
+            });
+        }
+        started = true;
+        let mut left = n as usize;
+        while left > 0 {
+            let m = unsafe {
+                libc::splice(pr, std::ptr::null_mut(), dst, std::ptr::null_mut(), left, 0)
+            };
+            if m <= 0 {
+                return Err(SpliceErr::Fatal(if m == 0 {
+                    io::Error::other("splice: 管道提前关闭")
+                } else {
+                    io::Error::last_os_error()
+                }));
+            }
+            left -= m as usize;
+        }
+        bytes.fetch_add(n as u64, Ordering::Relaxed);
+        last_ns.store(monotonic_now_ns(), Ordering::Relaxed);
+    }
+    unsafe {
+        libc::shutdown(dst, libc::SHUT_WR);
+    }
+    Ok(())
+}
+
+/// M1：一次 codec 首读（消费 VLESS 响应头等前缀）后切换到 splice；
+/// 不可 splice 时回退 `pump`。`upstream_fd` 为底层 socket（Direct/VLESS 明文）。
+fn pump_or_splice_down(
+    mut from_remote: Box<dyn outbound::ReadHalf>,
+    mut client: TcpStream,
+    upstream_fd: RawFd,
+    last_ns: &AtomicU64,
+    splice: bool,
+    stop: Option<&AtomicBool>,
+) {
+    const PRE: usize = 65536;
+    let mut buf = vec![0u8; PRE];
+    if splice {
+        match from_remote.read(&mut buf) {
+            Ok(0) => {
+                let _ = client.shutdown(std::net::Shutdown::Write);
+                return;
+            }
+            Ok(n) => {
+                if let Err(e) = client.write_all(&buf[..n]) {
+                    log(&format!("pump: 写失败（{e}）"));
+                    return;
+                }
+                RELAY_STATS
+                    .bytes_down
+                    .fetch_add(n as u64, Ordering::Relaxed);
+                last_ns.store(monotonic_now_ns(), Ordering::Relaxed);
+            }
+            Err(e) => {
+                log(&format!("pump: 读失败（{e}）"));
+                return;
+            }
+        }
+        match splice_pump(
+            upstream_fd,
+            client.as_raw_fd(),
+            last_ns,
+            &RELAY_STATS.bytes_down,
+        ) {
+            Ok(()) => return,
+            Err(SpliceErr::Unsupported(e)) => {
+                RELAY_STATS.splice_fallbacks.fetch_add(1, Ordering::Relaxed);
+                if !SPLICE_FALLBACK_LOGGED.swap(true, Ordering::Relaxed) {
+                    log(&format!("splice: 下游方向不可用（{e}），回退用户态泵"));
+                }
+            }
+            Err(SpliceErr::Fatal(e)) => {
+                log(&format!("splice: 下游传输错误（{e}）"));
+                return;
+            }
+        }
+    }
+    pump(
+        from_remote,
+        Box::new(client),
+        last_ns,
+        &RELAY_STATS.bytes_down,
+        false,
+        stop,
+    );
 }
 
 /// P7：offload 看门狗（被动观察 + 有界回收）。
@@ -1907,6 +2077,7 @@ fn handle_socks_conn(mut client: TcpStream) {
         from_remote,
         to_remote,
         socket: _,
+        splice: _,
     } = dialed;
     let last_ns = Arc::new(AtomicU64::new(monotonic_now_ns()));
     let up = Arc::new(AtomicU64::new(0));
@@ -2092,6 +2263,7 @@ fn handle_relay_conn(mut client: TcpStream) {
         from_remote,
         mut to_remote,
         socket,
+        splice: wire_splice,
     } = dialed;
     let mut offload_keys = None;
     if RELAY_OFFLOAD.get().is_some() && dialer.supports_offload() {
@@ -2114,6 +2286,12 @@ fn handle_relay_conn(mut client: TcpStream) {
         }
     }
     let offloaded = offload_keys.is_some();
+    // M1：splice 零拷贝（仅未 offload 时；直接拨号/VLESS 明文在拨号层置位）。
+    let splice = wire_splice && !offloaded && RELAY_SPLICE.load(Ordering::Relaxed);
+    let upstream_fd = socket.as_ref().map(|s| s.as_raw_fd());
+    if splice {
+        RELAY_STATS.splice_total.fetch_add(1, Ordering::Relaxed);
+    }
     let id = NEXT_RELAY_ID.fetch_add(1, Ordering::Relaxed);
     // QUIC（tuic）没有底层 TCP：upstream 用 Option（仅 janitor 强制关闭用）。
     let Ok(client_clone) = client.try_clone() else {
@@ -2150,7 +2328,25 @@ fn handle_relay_conn(mut client: TcpStream) {
     // 客户端 → 上游
     if let Ok(c_read) = client.try_clone() {
         let h2 = handle.clone();
+        let up_dst = upstream_fd;
         std::thread::spawn(move || {
+            if splice {
+                if let Some(dst) = up_dst {
+                    match splice_pump(c_read.as_raw_fd(), dst, &h2.last_ns, &RELAY_STATS.bytes_up) {
+                        Ok(()) => return,
+                        Err(SpliceErr::Unsupported(e)) => {
+                            RELAY_STATS.splice_fallbacks.fetch_add(1, Ordering::Relaxed);
+                            if !SPLICE_FALLBACK_LOGGED.swap(true, Ordering::Relaxed) {
+                                log(&format!("splice: 上游方向不可用（{e}），回退用户态泵"));
+                            }
+                        }
+                        Err(SpliceErr::Fatal(e)) => {
+                            log(&format!("splice: 上游传输错误（{e}）"));
+                            return;
+                        }
+                    }
+                }
+            }
             pump(
                 Box::new(c_read),
                 to_remote,
@@ -2162,14 +2358,24 @@ fn handle_relay_conn(mut client: TcpStream) {
         });
     }
     // 上游 → 客户端（本线程）
-    pump(
-        from_remote,
-        Box::new(client),
-        &handle.last_ns,
-        &RELAY_STATS.bytes_down,
-        offloaded,
-        Some(&handle.stop),
-    );
+    match upstream_fd {
+        Some(src) if splice => pump_or_splice_down(
+            from_remote,
+            client,
+            src,
+            &handle.last_ns,
+            true,
+            Some(&handle.stop),
+        ),
+        _ => pump(
+            from_remote,
+            Box::new(client),
+            &handle.last_ns,
+            &RELAY_STATS.bytes_down,
+            offloaded,
+            Some(&handle.stop),
+        ),
+    }
     // P7：注销 fast_sock 键（sockmap 条目持有 socket 引用，不删会泄漏）；
     // P8：guard 镜像先摘，再摘 fast_sock。
     if let Some((k_up, k_cl)) = offload_keys {
@@ -2510,14 +2716,30 @@ fn reload_rules(args: &Args, ebpf: &mut Ebpf) -> Result<usize, Box<dyn std::erro
     Ok(compiled.sets.len())
 }
 
-/// P6：写 control_flags_map 的 suspend 位（对照 dae suspend 的 no-load 状态）。
-fn set_suspend(ebpf: &mut Ebpf, on: bool) -> Result<(), Box<dyn std::error::Error>> {
+/// eBPF control_flags 位定义（与 ebpf-rs/src/common.rs 保持一致）。
+const FLAG_SUSPEND: u32 = 1;
+/// M1：热路径调试打印门控位。
+const FLAG_DEBUG: u32 = 2;
+
+/// 读改写 control_flags 的单个位（保留其它位；对照 dae suspend 的 no-load 状态）。
+fn update_control_flag(
+    ebpf: &mut Ebpf,
+    mask: u32,
+    on: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     let map = ebpf
         .map_mut("control_flags_map")
         .ok_or("map control_flags_map not found（对象未包含 P6 控制位？）")?;
     let mut flags: Array<_, u32> = Array::try_from(map)?;
-    flags.set(0, if on { 1u32 } else { 0u32 }, 0)?;
+    let cur = flags.get(&0, 0).unwrap_or(0);
+    let next = if on { cur | mask } else { cur & !mask };
+    flags.set(0, next, 0)?;
     Ok(())
+}
+
+/// P6：写 control_flags_map 的 suspend 位（对照 dae suspend 的 no-load 状态）。
+fn set_suspend(ebpf: &mut Ebpf, on: bool) -> Result<(), Box<dyn std::error::Error>> {
+    update_control_flag(ebpf, FLAG_SUSPEND, on)
 }
 
 /// P6：一次完整热重载（对照 dae `dae reload`）：清除 suspend → 重编译/切槽 →
@@ -3031,6 +3253,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(s) = args.udp_idle_timeout {
         UDP_IDLE_SECS.store(s, Ordering::SeqCst);
     }
+    RELAY_SPLICE.store(args.splice, Ordering::SeqCst);
 
     // P14：dial_mode（CLI > config global.dial_mode > ip）
     {
@@ -3222,11 +3445,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ---------- 1) host netns：LAN ingress / WAN egress+ingress / dae0 ingress ----------
     let dae0_ifindex = if_nametoindex(&args.dae0)?;
     for iface in &args.lan {
-        attach(&mut ebpf, "sodama_lan_ingress", iface, TcAttachType::Ingress)?;
+        attach(
+            &mut ebpf,
+            "sodama_lan_ingress",
+            iface,
+            TcAttachType::Ingress,
+        )?;
     }
     for iface in &args.wan {
         attach(&mut ebpf, "sodama_wan_egress", iface, TcAttachType::Egress)?;
-        attach(&mut ebpf, "sodama_wan_ingress", iface, TcAttachType::Ingress)?;
+        attach(
+            &mut ebpf,
+            "sodama_wan_ingress",
+            iface,
+            TcAttachType::Ingress,
+        )?;
     }
     for iface in &args.dual {
         attach(
@@ -3366,6 +3599,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let initial = do_reload(&args, &mut ebpf, true);
     if !initial.ok {
         return Err(format!("初始规则下发失败: {}", initial.error.unwrap_or_default()).into());
+    }
+    // M1：eBPF 热路径调试打印门控（control_flags bit 1；默认关，`--ebpf-debug` 开）
+    if let Err(e) = update_control_flag(&mut ebpf, FLAG_DEBUG, args.ebpf_debug) {
+        log(&format!("eBPF debug flag 设置失败：{e}"));
     }
     let n = initial.match_sets;
     log(&format!("路由规则已下发给数据面（{n} 条 match_set）"));
@@ -5195,6 +5432,9 @@ fn status_json(ebpf: &mut Ebpf) -> serde_json::Value {
             "offload_enabled": RELAY_OFFLOAD.get().is_some(),
             "offloaded_total": RELAY_STATS.offloaded_total.load(Ordering::Relaxed),
             "offload_failures": RELAY_STATS.offload_failures.load(Ordering::Relaxed),
+            "splice_enabled": RELAY_SPLICE.load(Ordering::Relaxed),
+            "splice_total": RELAY_STATS.splice_total.load(Ordering::Relaxed),
+            "splice_fallbacks": RELAY_STATS.splice_fallbacks.load(Ordering::Relaxed),
             "max_conns": RELAY_MAX_CONNS.load(Ordering::Relaxed),
             "limit_rejected": RELAY_STATS.limit_rejected.load(Ordering::Relaxed),
         },
@@ -5410,6 +5650,18 @@ fn metrics_text(v: &serde_json::Value) -> String {
         "counter",
         "sodama_offload_failures",
         get(v, &["relay", "offload_failures"]),
+    );
+    emit(
+        &mut s,
+        "counter",
+        "sodama_relay_splice_total",
+        get(v, &["relay", "splice_total"]),
+    );
+    emit(
+        &mut s,
+        "counter",
+        "sodama_relay_splice_fallbacks",
+        get(v, &["relay", "splice_fallbacks"]),
     );
     emit(
         &mut s,

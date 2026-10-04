@@ -50,6 +50,8 @@ pub const SODAMA_STATE_MUST: u8 = 1 << 2;
 pub const SODAMA_STATE_DNS_QUERY: u8 = 1 << 3;
 
 pub const SODAMA_FLAG_SUSPEND: u32 = 1;
+/// M1：热路径调试打印门控（默认关；loader `--ebpf-debug` 置位）。
+pub const SODAMA_FLAG_DEBUG: u32 = 2;
 
 pub const SODAMA_STAT_REBIND_REJECTED: u32 = 0;
 pub const SODAMA_STAT_REDIRECT_UPDATE_FAILED: u32 = 1;

@@ -87,13 +87,15 @@ pub fn sodama0peer_ingress(ctx: TcContext) -> i32 {
         (cb[0], cb[1], cb[2], cb[3])
     };
     unsafe {
-        bpf_printk!(
-            c"sodama: dae0peer_ingress cb0=%u cb1=%u cb2=%u cb3=%u\n",
-            cb0,
-            cb1,
-            cb2,
-            cb3
-        );
+        if crate::flow::debug_log() {
+            bpf_printk!(
+                c"sodama: dae0peer_ingress cb0=%u cb1=%u cb2=%u cb3=%u\n",
+                cb0,
+                cb1,
+                cb2,
+                cb3
+            );
+        }
     }
 
     if cb0 != TPROXY_MARK {
@@ -121,8 +123,10 @@ pub fn sodama0peer_ingress(ctx: TcContext) -> i32 {
     }
 
     let ret = unsafe { bpf_sk_assign(ctx.skb.skb as *mut c_void, sk, 0) };
-    unsafe {
-        bpf_printk!(c"sodama: sk_assign key=%u ret=%d\n", key, ret as i32);
+    if crate::flow::debug_log() {
+        unsafe {
+            bpf_printk!(c"sodama: sk_assign key=%u ret=%d\n", key, ret as i32);
+        }
     }
     unsafe {
         bpf_sk_release(sk);
@@ -188,12 +192,14 @@ pub fn sodama0_ingress(ctx: TcContext) -> i32 {
     } else {
         0
     };
-    unsafe {
-        bpf_printk!(
-            c"sodama: dae0_ingress reply -> ifindex=%u ingress=%u\n",
-            ifindex,
-            (flags != 0) as u32
-        );
+    if crate::flow::debug_log() {
+        unsafe {
+            bpf_printk!(
+                c"sodama: dae0_ingress reply -> ifindex=%u ingress=%u\n",
+                ifindex,
+                (flags != 0) as u32
+            );
+        }
     }
     unsafe { aya_ebpf_bindings::helpers::bpf_redirect(ifindex, flags) as i32 }
 }

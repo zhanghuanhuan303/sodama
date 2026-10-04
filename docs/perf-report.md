@@ -113,6 +113,23 @@ dae/sing-box 高 18–28%，是当前最大短板——根因见 §perf 剖面�
 `rep_movs` 46.8% + 建页 18.8%）；③ **TLS（AES-NI GCM）比 ss 的 chacha20-poly1305 更快
 更省**（11.6G/420ms vs 9.5G/590ms）；④ Vision-over-TLS 为待补的主流组合缺口。
 
+### M1 落地后（2026-10-04 晚，同口径复测）
+
+splice 零拷贝（Direct / VLESS 明文；见 `optimization-roadmap.md` O3）已上线：requests header 在
+拨号时发送、响应头由 relay 首读消费，之后双向 `splice(socket→pipe→socket)`，EOF→`SHUT_WR`
+半关闭与旧泵语义一致，EINVAL 自动回退，`--no-splice` 可关。
+
+| 场景 | M1 前 | M1 后 |
+|---|---:|---:|
+| vless 48MB×4（5 轮中位） | 12 225 Mbps / 380 ms / p50 40µs | **16 926 Mbps / 60 ms / p50 36µs** |
+| vless 8×64MB（scaling） | 11 678 Mbps / 1 100 ms | **16 177 Mbps / 190 ms** |
+| relay 8×64MB（scaling） | 14 864 Mbps / 1 100 ms | **21 580 Mbps / 150 ms**（4 流 23 147） |
+| vless-tls（回归） | 11 624 Mbps / 420 ms | 11 670 Mbps / 420 ms（加密路径自动跳过 splice） |
+| perf 热点（vless 明文） | `rep_movs` 46.8% + 建页 18.8% | 转为内核 splice 管线（`skb_splice_from_iter` 8.4% 居首） |
+
+证据：`splice_total=720 / fallbacks=0`（status/metrics，Prometheus 同源）；lab `verify` 9/9；
+`cargo test` 236/236；eBPF `bpf_printk` 已门控（默认关：单次传输 trace 行 600+ → 0，`--ebpf-debug` 开）。
+
 ## perf 热点剖面（8×64MB，`perf record -g`）
 
 **ss 路径（9.5 Gbps，sodama 进程 CPU 1690ms/512MB）**：

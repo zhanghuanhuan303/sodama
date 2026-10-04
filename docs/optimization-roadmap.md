@@ -10,9 +10,9 @@
 |---|---|---|---|---|---|
 | O1 | ss AEAD 零分配 + 原地加解密 | ss 剖面 AEAD ~38–41%、libc memcpy 3.4% | ss CPU -10~15% | 中 | 低 |
 | O2 | ss 读写 syscall 合并/预缓冲 | 每块 2×read_exact + 2×write；`rep_movs` 中 11.7% | ss CPU -5~10% | 中 | 低 |
-| O3 | relay splice 零拷贝 | relay 剖面 `rep_movs` 49.4% + 建页 18.5% | relay CPU -50% 或吞吐 ×1.5+ | 中高 | 中 |
-| O4 | 每连接线程 → epoll worker 池 | 64 并发 = 100 线程、~135KB/conn；ss 4→8 流 CPU 翻倍 | 线程 O(核数)；万级连接 | 高 | 中 |
-| O5 | bpf_printk 门控 | direct 剖面 0.3–0.45% 纯开销；高 PPS 放大 | 高 PPS 下显著 | 低 | 低 |
+| ~~O3~~ | ~~relay splice 零拷贝~~ **（M1 已完成）** | relay 剖面 `rep_movs` 49.4% + 建页 18.5% | ✅ 实测：relay 8 流 14.9→**21.6 Gbps**、CPU 1100→**150ms**；vless 明文 12.2→**16.9 Gbps**、CPU 380→**60ms** | — | 已交付（`--no-splice` 可关） |
+| O4 | 每连接线程 → epoll worker 池 | 64 并发 = 123 线程、~175KB/conn | 线程 O(核数)；万级连接 | 高 | 中 |
+| ~~O5~~ | ~~bpf_printk 门控~~ **（M1 已完成）** | direct 剖面 0.3–0.45% 纯开销 | ✅ 默认关：单次传输 trace 600+→**0 行**；`--ebpf-debug` 开 | — | 已交付 |
 | O6 | AES-GCM 方法优先（可选） | chacha20-poly1305 AVX2 ~1.5GB/s/core | ss CPU -30~50%（若节点支持） | 中 | 低 |
 | O7 | UDP 批量（recvmmsg/sendmmsg） | UDP 路径未同口径压测（backlog G1 缺口） | PPS 提升、CPU 降 | 中 | 低 |
 | O8 | 缓冲池/回收与 shutdown 收敛 | 每连接 64KB 缓冲 malloc；SIGTERM 收敛 1–3s | 内存更稳、退出更快 | 低 | 低 |
@@ -71,20 +71,17 @@
 
 ## P1 · relay / 直连用户态泵：零拷贝
 
-### O3 · splice（socket↔socket via pipe）
+### O3 · splice（socket↔socket via pipe）——✅ M1 已完成（2026-10-04）
 
-- **现状**：relay 路径 8 流 CPU 1.1s 换 15 Gbps；剖面 `rep_movs` 49.4% +
-  `clear_page` 18.5% ≈ 68% 是「拷贝 + 建页」。这是用户态泵的结构性成本。
-- **目标**：无加密直通路径几乎零用户态拷贝，CPU/Gbps 降 2× 以上。
-- **做法**：
-  - 每方向 `splice(client_sock → pipe)` + `splice(pipe → upstream_sock)`，
-    非阻塞 + epoll 驱动，pipe 大小 `F_SETPIPE_SZ` 调大；
-  - 不可 splice（非 TCP / QUIC / 需要嗅探改写）时回退现泵；保留 counters；
-  - 与 eBPF offload（fast_sock）互补：offload 优先，splice 兜底第二档，
-    用户态泵最后。
-- **预期收益**：relay 吞吐 15 → 25+ Gbps 或 CPU 减半；直接改善「relay 路径
-  24.7 Gbps（历史）→ 对齐 direct」的差距。
-- **验证**：`scaling.sh relay` 对照；`perf` 中 `rep_movs` 应显著下降。
+- **实测（同口径复测）**：relay 8×64MB 14 864 → **21 580 Mbps**（CPU 1 100 → 150 ms）；
+  vless 明文 48MB×4 中位 12 225 → **16 926 Mbps**（CPU 380 → 60 ms）；
+  perf 中 `rep_movs`+建页（≈65%）退出前十，转为内核 splice 管线（`skb_splice_from_iter` 8.4% 居首）。
+- **实现**：`DialedStream.splice` 能力位（Direct / VLESS 明文 TCP）；每方向
+  `splice(socket→pipe→socket)`（1MB 管道、页级，EOF→`SHUT_WR` 保持半关闭语义）；
+  VLESS 请求头拨号时发出、响应头由一次 codec 首读消费后切 splice；EINVAL 自动回退旧泵；
+  `--no-splice` 开关；`status`/Prometheus 暴露 `splice_total/fallbacks`（命中 720 / 回退 0）。
+- **验证**：`lab.sh verify` 9/9、`cargo test` 236/236、半关闭逐字节 verify=ok。
+- **遗留**：加密/成帧链路不适用（TLS 收益归 M2；vision/ws 不适用）。
 
 ### O8 · 缓冲池与回收
 
@@ -117,16 +114,13 @@
 
 ## P3 · eBPF 纯开销清理
 
-### O5 · bpf_printk 门控
+### O5 · bpf_printk 门控——✅ M1 已完成
 
-- **现状**：`sodama0peer_ingress`（每包）与 `sodama0_ingress`（每包）无条件
-  `bpf_printk!`；direct 系统级剖面 0.3–0.45%（ss 剖面 0.45%）。当前不致命，
-  但随 PPS 放大（trace ring buffer 写入 + `bpf_bprintf_prepare`），且污染
-  trace_pipe。
-- **做法**：改为 debug map 门控（查 1 次 map，仅 debug 打开时打印），或直接删除
-  非必要行；错误路径 printk 保留。
-- **预期收益**：高 PPS 直连场景 1–3% CPU；消除日志噪音。
-- **验证**：`perf report | grep bpf_bprintf` 归零；64×1MB direct 吞吐复测。
+- **实现**：`control_flags` 新增 debug 位（读改写保留 suspend 位）；门控
+  `flow.rs` 的 `cached`（每包）/`stateless`/`route` 与 `progs.rs` 的
+  `dae0peer_ingress`/`sk_assign`/`dae0_ingress`；`--ebpf-debug` 打开。
+- **实测**：默认关时单次传输 trace 行 600+ → **0**；打开时 600+（可调试）。
+- **验证**：`grep -c "sodama:" /sys/kernel/tracing/trace` 前后对照。
 
 ---
 
@@ -156,6 +150,7 @@ sudo lab/perf/run.sh down
 perf record -F 1499 -g -p <sodama> -- sleep 12           # 热点搬家（AEAD→? 拷贝→?）
 ```
 
-目标基线（2026-10-04）：ss 8 流 10.9 Gbps / 155 ms·Gbps⁻¹ → **≥12 Gbps / ≤110**；
-relay 8 流 15.0 Gbps / 1100 ms → **≥22 Gbps / ≤550 ms**；四方对比 ss 吞吐力争
-超 dae、逼近 sing-box，CPU 回到 dae 同级（≤460ms）。
+目标基线（2026-10-04，M1 后更新）：vless 明文 8 流 **16.2 Gbps / 190 ms**（已达 ≥16 G 目标）、
+48MB×4 中位 **16.9 Gbps / 60 ms**；relay 8 流 **21.6 Gbps / 150 ms**；
+下一步 M2：TLS 8 流 11.3 → **≥13 Gbps**、CPU 1 450 → **≤1 000 ms**；M4：ss 8 流 CPU ≤460 ms、
+四方对比 ss 吞吐超 dae、逼近 sing-box；线程数 O(核数)（10k 连接基准）。
