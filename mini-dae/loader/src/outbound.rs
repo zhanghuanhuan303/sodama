@@ -20,8 +20,8 @@ use percent_encoding::percent_decode_str;
 use sha2::{Digest as _, Sha256};
 
 use crate::{
-    anytls, group::GroupRuntime, hysteria2, juicity, quicsock, reality, socks5, ss, target::Target,
-    tls, tls13, trojan, tuic, vision, vless, vmess, ws, DAE_SOCKET_MARK,
+    anytls, group::GroupRuntime, hysteria2, juicity, quicsock, reality, socks5, ss, ssr,
+    target::Target, tls, tls13, trojan, tuic, vision, vless, vmess, ws, DAE_SOCKET_MARK,
 };
 
 const SO_MARK_OPT: libc::c_int = 36;
@@ -257,6 +257,12 @@ impl WriteHalf for crate::h2client::TunnelWriter {
 impl WriteHalf for crate::h3client::H3TunnelWriter {
     fn shutdown_write(&self) -> io::Result<()> {
         crate::h3client::H3TunnelWriter::end_stream(self)
+    }
+}
+
+impl WriteHalf for ssr::SsrWriteHalf {
+    fn shutdown_write(&self) -> io::Result<()> {
+        self.shutdown_write()
     }
 }
 
@@ -558,6 +564,10 @@ pub enum Outbound {
     Juicity {
         dialer: std::sync::Arc<juicity::JuicityDialer>,
     },
+    /// P30：SSR（shadowsocksr-stream；当前 origin+plain + 流密码，TCP）。
+    Ssr {
+        dialer: std::sync::Arc<ssr::SsrDialer>,
+    },
     /// P25/P26：naive（CONNECT + Basic）；`h3=false` 走 HTTP/2（`naive+https://`），
     /// `h3=true` 走 HTTP/3（`naive+quic://`，QUIC 无底层 TcpStream）。
     Naive {
@@ -616,6 +626,7 @@ impl Outbound {
             Self::Tuic { dialer } => dialer.name(),
             Self::Hysteria2 { dialer } => dialer.name(),
             Self::Juicity { dialer } => dialer.name(),
+            Self::Ssr { dialer } => dialer.name(),
             Self::AnyTls { server, sni, .. } => format!("anytls://{server}?sni={sni}"),
             Self::Naive {
                 server, h3: true, ..
@@ -658,6 +669,7 @@ impl Outbound {
             | Self::Vmess { server, .. }
             | Self::AnyTls { server, .. } => Some(*server),
             Self::Naive { server, .. } => Some(*server),
+            Self::Ssr { dialer } => Some(dialer.server()),
             _ => None,
         }
     }
@@ -932,6 +944,16 @@ impl Outbound {
                     socket: None,
                 })
             }
+            Self::Ssr { dialer } => {
+                let sock = marked_tcp_connect(dialer.server(), timeout)?;
+                let kill = sock.try_clone()?;
+                let (r, w) = ssr::connect(sock, dialer.config(), target)?;
+                Ok(DialedStream {
+                    from_remote: Box::new(r),
+                    to_remote: Box::new(w),
+                    socket: Some(kill),
+                })
+            }
             Self::AnyTls {
                 server,
                 password_sha256,
@@ -1128,6 +1150,9 @@ pub fn parse(url: &str) -> Result<Outbound, String> {
     if let Some(rest) = url.strip_prefix("juicity://") {
         return parse_juicity(rest);
     }
+    if url.starts_with("ssr://") {
+        return parse_ssr_link(url);
+    }
     // P25/P26：naive（h2 = naive+https/naive；h3 = naive+quic）
     if let Some(rest) = url.strip_prefix("naive+https://") {
         return parse_naive(rest, false);
@@ -1144,7 +1169,7 @@ pub fn parse(url: &str) -> Result<Outbound, String> {
         });
     }
     Err(format!(
-        "--dialer 不支持 {url}（direct / socks5:// / http:// / ss:// / trojan:// / vless:// / \
+        "--dialer 不支持 {url}（direct / socks5:// / http:// / ss:// / ssr:// / trojan:// / vless:// / \
          vmess:// / tuic:// / hysteria2:// / hy2:// / anytls:// / naive+https:// / naive+quic:// / \
          juicity://）"
     ))
@@ -1306,6 +1331,16 @@ fn parse_juicity(rest: &str) -> Result<Outbound, String> {
             sni: sni.unwrap_or(default_sni),
             insecure,
         })),
+    })
+}
+
+/// `ssr://...`（shadowsocksr-stream；当前 origin+plain + 流密码，见 ADR-0054）。
+fn parse_ssr_link(url: &str) -> Result<Outbound, String> {
+    // 先剥 fragment（生态里会有 #remarks 附加）
+    let url = url.split('#').next().unwrap_or(url);
+    let cfg = ssr::parse_link(url)?;
+    Ok(Outbound::Ssr {
+        dialer: Arc::new(ssr::SsrDialer::new(cfg)),
     })
 }
 

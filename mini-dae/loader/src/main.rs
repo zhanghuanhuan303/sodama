@@ -69,6 +69,8 @@ mod sniffer;
 mod socks5;
 mod socksin;
 mod ss;
+mod ssr;
+mod ssr_cipher;
 mod status;
 mod sticky;
 mod subscribe;

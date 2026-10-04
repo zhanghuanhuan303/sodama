@@ -195,6 +195,13 @@ JUICITY_LOG=/tmp/mini-dae-juicity.log
 JUICITY_PID_FILE=/tmp/mini-dae-juicity.pid
 JUICITY_UUID=b831381d-6324-4d53-ad4f-8cda48b30811
 JUICITY_PASSWORD=testpass
+# P30：SSR（shadowsocksr-stream；origin+plain）参考服务端
+SSR_PORT=8389
+SSR_METHOD=aes-256-cfb
+SSR_PASSWORD=testpass
+SSR_PASSWORD_B64=dGVzdHBhc3M
+SSR_LOG=/tmp/mini-dae-ssr-target.txt
+SSR_PID_FILE=/tmp/mini-dae-ssr.pid
 # P25：naive（HTTP/2 CONNECT）参考服务端
 NAIVE_PORT=8663
 NAIVE_LOG=/tmp/mini-dae-naive.log
@@ -336,6 +343,10 @@ cleanup() {
   if [ -f "$JUICITY_PID_FILE" ]; then
     kill "$(cat "$JUICITY_PID_FILE")" 2>/dev/null || true
     rm -f "$JUICITY_PID_FILE"
+  fi
+  if [ -f "$SSR_PID_FILE" ]; then
+    kill "$(cat "$SSR_PID_FILE")" 2>/dev/null || true
+    rm -f "$SSR_PID_FILE"
   fi
   if [ -f "$NAIVE_PID_FILE" ]; then
     kill "$(cat "$NAIVE_PID_FILE")" 2>/dev/null || true
@@ -764,6 +775,18 @@ up() {
     echo $! >"$JUICITY_PID_FILE"
     sleep 0.3
     kill -0 "$(cat "$JUICITY_PID_FILE")" 2>/dev/null || { cat /tmp/mini-dae-juicity.stdout; die "juicity 服务端启动失败"; }
+  fi
+
+  # P30：SSR 参考服务端（Go；origin+plain + 流密码，仅 TCP）
+  if [ -n "${USE_SSR:-}" ]; then
+    [ -x "$HERE/proto-check/bin/ssr-server" ] \
+      || die "缺 SSR 参考服务端：先运行 lab/proto-check/build-ssr-server.sh"
+    rm -f "$SSR_LOG"
+    "$HERE/proto-check/bin/ssr-server" -port "$SSR_PORT" -method "$SSR_METHOD" \
+      -password "$SSR_PASSWORD" -log "$SSR_LOG" >/tmp/mini-dae-ssr.stdout 2>&1 &
+    echo $! >"$SSR_PID_FILE"
+    sleep 0.3
+    kill -0 "$(cat "$SSR_PID_FILE")" 2>/dev/null || { cat /tmp/mini-dae-ssr.stdout; die "SSR 服务端启动失败"; }
   fi
 
   # P18b：DoQ 参考服务端（Go/quic-go，需先构建）
@@ -2905,6 +2928,39 @@ PY
   echo "PASS: juicity v0 UDP（流帧元数据 + len + 载荷）"
 }
 
+# P30：SSR（shadowsocksr-stream；origin+plain + aes-256-cfb 流密码）TCP 转发。
+test_ssr() {
+  require_root
+  echo "== P30：SSR（origin+plain + 流密码）TCP 转发 =="
+  : >"$SSR_LOG" 2>/dev/null || true
+  local out
+  out="$(ip netns exec "$CLIENT_NS" timeout 8 python3 "$HERE/client_probe.py" "$PROXY_DST" 8080 2>&1 || true)"
+  echo "$out"
+  echo "$out" | grep -q "wan-echo-ok data=ping" || { echo "FAIL: SSR 链路未把流量转发到真实目标"; exit 1; }
+  out="$(ip netns exec "$CLIENT_NS" timeout 30 python3 "$HERE/stream_probe.py" "$PROXY_DST" 8080 512 2>&1 || true)"
+  echo "$out"
+  echo "$out" | grep -q "^stream-ok bytes=524288" || { echo "FAIL: SSR 大流量（512KB）回显不一致（流密码状态/半关闭？）"; exit 1; }
+  grep -q "SSR connect target=$PROXY_DST:8080" "$SSR_LOG" \
+    || { echo "FAIL: Go 参考服务端未看到目标地址（跨实现失败）"; cat "$SSR_LOG"; exit 1; }
+  grep -q "SSR cipher error\|SSR read iv.*:" "$SSR_LOG" && { echo "FAIL: 出现解密/IV 错误（流密码状态不同步？）"; cat "$SSR_LOG"; exit 1; }
+  "$LOADER" status --socket "$STATUS_SOCK" --json >/tmp/mini-dae-status.json
+  python3 - /tmp/mini-dae-status.json <<'PY'
+import json, sys
+v = json.load(open(sys.argv[1]))
+assert v["dialer"].startswith("ssr://"), v["dialer"]
+r = v["relay"]
+assert r["conns_total"] >= 2, r
+assert r["dial_errors"] == 0, r
+assert r["offload_enabled"], r
+assert r["offloaded_total"] == 0, r   # 流密码不交内核拼接
+assert r["bytes_up"] >= 512 * 1024, r
+assert r["bytes_down"] >= 512 * 1024, r
+print("ssr tcp: conns=%d bytes_up=%d bytes_down=%d offloaded=%d" % (
+    r["conns_total"], r["bytes_up"], r["bytes_down"], r["offloaded_total"]))
+PY
+  echo "PASS: SSR（origin+plain + aes-256-cfb 流密码；跨实现 Go 参考服务端）"
+}
+
 # P28：ECS 回填 / ecs_cache（上游回显 scope → 按回填键缓存与阶梯复用）。
 test_ecs_cache() {
   require_root
@@ -3408,6 +3464,8 @@ test-dns-udp) test_dns_udp ;;  # 显式 udp:// 上游（仅 UDP）
     USE_DIALER="juicity://$JUICITY_UUID:$JUICITY_PASSWORD@127.0.0.1:$JUICITY_PORT?sni=localhost&allow_insecure=1" up ;;  # P27
   juicity-udp-up) USE_RULES="$HERE/rules.udp.dae" USE_JUICITY=1 \
     USE_DIALER="juicity://$JUICITY_UUID:$JUICITY_PASSWORD@127.0.0.1:$JUICITY_PORT?sni=localhost&allow_insecure=1" up ;;  # P27
+  ssr-up) USE_RULES="$HERE/rules.dae" USE_SSR=1 USE_OFFLOAD=1 USE_RELAY_IDLE=600 \
+    USE_DIALER="ssr://127.0.0.1:$SSR_PORT:origin:$SSR_METHOD:plain:$SSR_PASSWORD_B64" up ;;  # P30
   hy2-up) USE_RULES="$HERE/rules.dae" USE_HY2=1 USE_OFFLOAD=1 USE_RELAY_IDLE=600 \
     USE_DIALER="hysteria2://$HY2_AUTH@127.0.0.1:$HY2_PORT?sni=localhost&insecure=1&alpn=h3" up ;;
   hy2-udp-up) USE_RULES="$HERE/rules.udp.dae" USE_HY2=1 \
@@ -3463,6 +3521,7 @@ test-dns-udp) test_dns_udp ;;  # 显式 udp:// 上游（仅 UDP）
   test-tuic-udp) test_tuic_udp ;;
   test-juicity) test_juicity ;;  # P27
   test-juicity-udp) test_juicity_udp ;;  # P27
+  test-ssr) test_ssr ;;  # P30
   test-hy2) test_hy2 ;;
   test-hy2-udp) test_hy2_udp ;;
   test-hy2-obfs) test_hy2_obfs ;;
@@ -3478,5 +3537,5 @@ test-dns-udp) test_dns_udp ;;  # 显式 udp:// 上游（仅 UDP）
   status) status ;;
   trace) trace ;;
   down) down ;;
-  *) echo "usage: $0 {build|up|dual-up|config-up|forward-up|dns-up|dot-up|doh-up|doh-h2-up|doh-h3-up|doq-up|dnsroute-up|dnsopts-up|ecscache-up|dns-udp-up|dns-tcpup-up|geo-up|pname-up|regex-up|relay-up|offload-up|udp-up|ss-up|ss2022-up|http-up|groups-up|ss-udp-up|trojan-up|vless-up|vless-tls-up|vless-udp-up|vmess-up|vmess-tls-up|vmess-udp-up|tuic-up|tuic-udp-up|hy2-up|hy2-udp-up|hy2-obfs-up|hy2-obfs-udp-up|hy2-brutal-up|hy2-hop-up|juicity-up|juicity-udp-up|ops-up|naive-up|test-naive|naive-h3-up|test-naive-h3|ops-reload-up|bench-up|test-proxy|test-direct|test-block|test-host-proxy|test-reload|test-rebind|test-status|test-config|test-forward|test-domain|test-dns-cache|test-dns-tcp|test-dns-reload|test-domain-regex|test-dns-edns|test-dot|test-doh|test-doh-h2|test-doh-h3|test-doq|test-dnsroute|test-dns-options|test-ecs-cache|test-dns-udp|test-dns-tcpup|test-geo|test-pname|test-v6|test-relay|test-relay-idle|test-relay-offload|test-offload-lifecycle|test-udp-relay|test-quic-sniff|test-udp-idle|test-ss|test-ss2022|test-http|test-groups|test-trojan|test-ss-udp|test-vless|test-vless-udp|test-vmess|test-vmess-udp|test-tuic|test-tuic-udp|test-juicity|test-juicity-udp|test-hy2|test-hy2-udp|test-hy2-obfs|test-hy2-obfs-udp|test-hy2-brutal|test-hy2-hop|test-ops|test-config-reload|test-fault-reload|test-fault-kill|reload|verify|status|trace|down|sniff-punt-up|test-sniff-punt}"; exit 2 ;;
+  *) echo "usage: $0 {build|up|dual-up|config-up|forward-up|dns-up|dot-up|doh-up|doh-h2-up|doh-h3-up|doq-up|dnsroute-up|dnsopts-up|ecscache-up|dns-udp-up|dns-tcpup-up|geo-up|pname-up|regex-up|relay-up|offload-up|udp-up|ss-up|ss2022-up|http-up|groups-up|ss-udp-up|trojan-up|vless-up|vless-tls-up|vless-udp-up|vmess-up|vmess-tls-up|vmess-udp-up|tuic-up|tuic-udp-up|hy2-up|hy2-udp-up|hy2-obfs-up|hy2-obfs-udp-up|hy2-brutal-up|hy2-hop-up|juicity-up|juicity-udp-up|ssr-up|ops-up|naive-up|test-naive|naive-h3-up|test-naive-h3|ops-reload-up|bench-up|test-proxy|test-direct|test-block|test-host-proxy|test-reload|test-rebind|test-status|test-config|test-forward|test-domain|test-dns-cache|test-dns-tcp|test-dns-reload|test-domain-regex|test-dns-edns|test-dot|test-doh|test-doh-h2|test-doh-h3|test-doq|test-dnsroute|test-dns-options|test-ecs-cache|test-dns-udp|test-dns-tcpup|test-geo|test-pname|test-v6|test-relay|test-relay-idle|test-relay-offload|test-offload-lifecycle|test-udp-relay|test-quic-sniff|test-udp-idle|test-ss|test-ss2022|test-http|test-groups|test-trojan|test-ss-udp|test-vless|test-vless-udp|test-vmess|test-vmess-udp|test-tuic|test-tuic-udp|test-juicity|test-juicity-udp|test-ssr|test-hy2|test-hy2-udp|test-hy2-obfs|test-hy2-obfs-udp|test-hy2-brutal|test-hy2-hop|test-ops|test-config-reload|test-fault-reload|test-fault-kill|reload|verify|status|trace|down|sniff-punt-up|test-sniff-punt}"; exit 2 ;;
 esac
