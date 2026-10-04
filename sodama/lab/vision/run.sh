@@ -36,9 +36,21 @@ REALITY_SID=41b9cb10b696
 DIALER_TLS="vless://$UUID@10.9.9.2:$XRAY_PORT?type=tcp&security=tls&sni=localhost&allowinsecure=1&flow=xtls-rprx-vision"
 
 die() { echo "!! $*" >&2; exit 1; }
-require_root() { [ "$(id -u)" = 0 ] || die "需要 root：sudo $0 $*"; }
+require_root() { [ "$(id -u)" = 0 ] || die "需要 root：sudo $0 $*" ; }
 in_client() { ip netns exec "$CLIENT_NS" "$@"; }
 in_wan() { ip netns exec "$WAN_NS" "$@"; }
+
+# 按 cmdline 特征清理夹具进程（pidfile 记的是 netns 包装进程，杀不干净）。
+kill_fixture() {
+  local p cmd
+  for p in $(pgrep -x xray) $(pgrep -x python3); do
+    [ "$p" = "$$" ] && continue
+    cmd="$(tr '\0' ' ' </proc/$p/cmdline 2>/dev/null)"
+    case "$cmd" in
+      *vision-lab*|*https_target.py*) kill -9 "$p" 2>/dev/null || true ;;
+    esac
+  done
+}
 
 prepare() {
   require_root
@@ -129,8 +141,8 @@ PY
 }
 JSON
   "$LAB" down >/dev/null 2>&1 || true
+  kill_fixture
   TOPO_ONLY=1 "$LAB" up
-  for f in xray https13 https12 http8081; do [ -f "$DIR/$f.pid" ] && kill "$(cat "$DIR/$f.pid")" 2>/dev/null || true; done
   in_wan python3 "$HERE/https_target.py" "$TLS13_PORT" "$DIR/www" tls13 >"$DIR/https13.log" 2>&1 &
   echo $! >"$DIR/https13.pid"
   in_wan python3 "$HERE/https_target.py" "$TLS12_PORT" "$DIR/www" tls12 >"$DIR/https12.log" 2>&1 &
@@ -236,10 +248,7 @@ test() {
 down() {
   require_root
   for p in $(pgrep -x sodama); do kill -9 "$p"; done
-  for f in xray https13 https12 http8081; do
-    [ -f "$DIR/$f.pid" ] && kill "$(cat "$DIR/$f.pid")" 2>/dev/null || true
-    rm -f "$DIR/$f.pid"
-  done
+  kill_fixture
   "$LAB" down >/dev/null 2>&1 || true
   echo "== 已清理 =="
 }
