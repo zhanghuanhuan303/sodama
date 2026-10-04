@@ -1,22 +1,27 @@
 // SPDX-License-Identifier: GPL-2.0
-//! P18c+：VLESS `xtls-rprx-vision` 客户端帧层（对照 dae outbound `vision` 包）。
+//! P18c+ / M3：VLESS `xtls-rprx-vision` 客户端帧层（对照 dae outbound `vision` 包）。
 //!
 //! 线上布局（VLESS 载荷之内，外层仍是 TLS/REALITY 加密）：
 //!   首帧： [UUID 16B][cmd 1B][contentLen u16 BE][paddingLen u16 BE][content][padding]
 //!   后续： [cmd 1B][contentLen u16 BE][paddingLen u16 BE][content][padding]
-//! cmd：0x00 继续填充、0x01 结束填充（之后裸 VLESS 载荷直通）、
-//!      0x02 直通（服务端把下行切成裸 TCP——Vision splice）。
+//! cmd：0x00 继续填充、0x01 结束填充（之后视帧而不见，保持在内外层协议上）、
+//!      0x02 直通（双向 splice：切到裸 TCP，外层加解密全部停用——XTLS DIRECT）。
 //!
-//! 本实现策略：
-//! - 上行：过滤窗口内发 0x00（首帧含 UUID）并按对称加密首包长填充；窗口结束或非 TLS
-//!   数据帧发 0x01（CMD_END），之后 `finished` —— 后续字节以裸 TLS 应用数据直写，
-//!   即 Xray 的上行 splice（对照 dae/outbound vision）；
-//! - 下行完整处理 0x01/0x02：遇到 0x02 后把 TLS 读半切换成裸 TCP 直通，
-//!   之后的字节是目标站真实 TLS 记录，原样交给上层（浏览器自己解密）。
+//! M3 对齐 Xray/dae 的完整 DIRECT 状态机：
+//! - **内层 TLS 嗅探**（`TlsSniffer`，移植 dae `FilterTLS`）：过滤窗口内双向观察，
+//!   识别内层 ServerHello 的 TLS 1.3 supported_versions + 受支持 cipher；
+//! - **上行**：窗口结束/应用数据开始后，若内层确为 TLS 1.3 → 发 0x02 并置 `write_raw`，
+//!   后续字节裸写 TCP（不再经外层 TLS）；否则发 0x01 维持原协议；
+//! - **下行**：收到 0x02 后置 `read_raw`，后续从裸 TCP 直读（浏览器自己解密内层 TLS）；
+//! - 外层必须 TLS 1.3（REALITY 天然满足；rustls 由 `connect_vision` 校验）。
+//!
+//! 与 dae 的差异：dae 用 unsafe 反射取 Go TLS 内部读缓冲（input/rawInput）做交接；
+//! 我们的 rustls 读半用「逐记录有界喂入」保证切换前不多读一个字节（见 `tls.rs`），
+//! 因此无需反射，读半置位后直接裸读。
 
 use std::io::{self, Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 pub const CMD_CONTINUE: u8 = 0x00;
 pub const CMD_END: u8 = 0x01;
@@ -24,6 +29,12 @@ pub const CMD_DIRECT: u8 = 0x02;
 
 const HEADER_LEN_UUID: usize = 16 + 1 + 2 + 2;
 const HEADER_LEN: usize = 1 + 2 + 2;
+
+// 内层 TLS 嗅探用到的常量（对照 dae filter.go）。
+const TLS_SERVER_HELLO_START: [u8; 3] = [0x16, 0x03, 0x03];
+const TLS_CLIENT_HELLO_START: [u8; 2] = [0x16, 0x03];
+const TLS_APP_DATA_START: [u8; 3] = [0x17, 0x03, 0x03];
+const TLS13_SUPPORTED_VERSIONS: [u8; 6] = [0x00, 0x2b, 0x00, 0x02, 0x03, 0x04];
 
 fn rand_u32() -> u32 {
     use rand::RngCore;
@@ -39,7 +50,137 @@ fn padding_len(content_len: usize, long_padding: bool) -> usize {
     }
 }
 
-/// Vision 读半：解析下行帧；遇到 direct 后经 `raw` 让 TLS 层裸读。
+fn looks_tls(buf: &[u8]) -> bool {
+    buf.len() >= 3 && (buf[0] == 0x16 || buf[0] == 0x17) && buf[1] == 0x03
+}
+
+fn looks_tls_app_data(buf: &[u8]) -> bool {
+    buf.len() > 6 && buf[..3] == TLS_APP_DATA_START
+}
+
+fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+/// Xray TLS 1.3 cipher suite → XTLS DIRECT 是否可用（0x1305 CCM_8 除外）。
+fn xtls_cipher_ok(cipher: u16) -> bool {
+    matches!(cipher, 0x1301..=0x1304)
+}
+
+/// 双向共享的内层流量嗅探状态（dae `FilterTLS` 移植）。
+struct SniffState {
+    packets_to_filter: u32,
+    is_tls: bool,
+    enable_xtls: bool,
+    cipher: u16,
+    remaining_server_hello: usize,
+    outer_tls13: bool,
+}
+
+/// 读写两半共享：内层 TLS 是否是「可用 XTLS DIRECT 的 TLS 1.3」。
+pub struct TlsSniffer {
+    state: Mutex<SniffState>,
+}
+
+#[derive(Clone, Copy)]
+pub struct SniffSnapshot {
+    pub is_tls: bool,
+    pub enable_xtls: bool,
+    pub packets_to_filter: u32,
+}
+
+impl TlsSniffer {
+    /// `outer_tls13`：外层是否 TLS 1.3（XTLS DIRECT 的硬前提）。
+    pub fn new(outer_tls13: bool) -> Self {
+        TlsSniffer {
+            state: Mutex::new(SniffState {
+                packets_to_filter: 6,
+                is_tls: false,
+                enable_xtls: false,
+                cipher: 0,
+                remaining_server_hello: 0,
+                outer_tls13,
+            }),
+        }
+    }
+
+    /// 喂入一段（任一方向的）内层字节。
+    pub fn filter(&self, buf: &[u8]) {
+        let mut st = match self.state.lock() {
+            Ok(s) => s,
+            Err(p) => p.into_inner(),
+        };
+        if st.packets_to_filter == 0 || buf.is_empty() {
+            return;
+        }
+        st.packets_to_filter -= 1;
+        let len_p = buf.len();
+        let mut index: i64 = -1;
+        if let Some(i) = find(buf, &TLS_SERVER_HELLO_START) {
+            index = i as i64;
+            if len_p > i + 5 && buf[0] == 22 && buf[1] == 3 && buf[2] == 3 {
+                st.is_tls = true;
+                if buf[i + 5] == 0x02 {
+                    // ServerHello：记录总长 = len+5；从固定偏移取 cipher。
+                    st.remaining_server_hello =
+                        u16::from_be_bytes([buf[i + 3], buf[i + 4]]) as usize + 5;
+                    if len_p - i >= 79 && st.remaining_server_hello >= 79 {
+                        let sid_len = buf[i + 43] as usize;
+                        let cipher_off = i + 44 + sid_len;
+                        // RSV8446：session_id 长度必须 ≤32，否则跳过 cipher 识别（保守失败）。
+                        if sid_len <= 32 && cipher_off + 2 <= len_p {
+                            st.cipher = u16::from_be_bytes([buf[cipher_off], buf[cipher_off + 1]]);
+                        }
+                    } else {
+                        st.remaining_server_hello = 0;
+                    }
+                }
+            }
+        } else if let Some(i) = find(buf, &TLS_CLIENT_HELLO_START) {
+            index = i as i64;
+            if len_p > i + 5 && buf[i + 5] == 0x01 {
+                st.is_tls = true;
+            }
+        }
+        if st.remaining_server_hello > 0 {
+            let i = if index < 0 { 0usize } else { index as usize };
+            let want = st.remaining_server_hello;
+            let segment_end;
+            if i + want > len_p {
+                segment_end = len_p;
+                st.remaining_server_hello -= len_p - i;
+            } else {
+                st.remaining_server_hello -= want;
+                segment_end = i + want;
+            }
+            if find(&buf[i..segment_end], &TLS13_SUPPORTED_VERSIONS).is_some() {
+                if st.outer_tls13 && xtls_cipher_ok(st.cipher) {
+                    st.enable_xtls = true;
+                }
+                st.packets_to_filter = 0;
+            } else if st.remaining_server_hello == 0 {
+                st.packets_to_filter = 0;
+            }
+        }
+    }
+
+    pub fn snapshot(&self) -> SniffSnapshot {
+        let st = match self.state.lock() {
+            Ok(s) => s,
+            Err(p) => p.into_inner(),
+        };
+        SniffSnapshot {
+            is_tls: st.is_tls,
+            enable_xtls: st.enable_xtls,
+            packets_to_filter: st.packets_to_filter,
+        }
+    }
+}
+
+/// Vision 读半：解析下行帧；收到 0x02 后经 `read_raw` 让 TLS 层裸读。
 pub struct VisionReader<R> {
     inner: R,
     uuid: [u8; 16],
@@ -49,12 +190,19 @@ pub struct VisionReader<R> {
     /// 当前帧内容/填充耗尽后要进入的状态。
     after: Option<u8>,
     passthrough: bool,
-    raw: Arc<AtomicBool>,
+    read_raw: Arc<AtomicBool>,
+    sniffer: Arc<TlsSniffer>,
     hdr: [u8; HEADER_LEN_UUID],
+    logged_direct: bool,
 }
 
 impl<R: Read> VisionReader<R> {
-    pub fn new(inner: R, uuid: [u8; 16], raw: Arc<AtomicBool>) -> Self {
+    pub fn new(
+        inner: R,
+        uuid: [u8; 16],
+        read_raw: Arc<AtomicBool>,
+        sniffer: Arc<TlsSniffer>,
+    ) -> Self {
         VisionReader {
             inner,
             uuid,
@@ -63,8 +211,10 @@ impl<R: Read> VisionReader<R> {
             remaining_padding: 0,
             after: None,
             passthrough: false,
-            raw,
+            read_raw,
+            sniffer,
             hdr: [0u8; HEADER_LEN_UUID],
+            logged_direct: false,
         }
     }
 
@@ -129,6 +279,8 @@ impl<R: Read> Read for VisionReader<R> {
                     ));
                 }
                 self.remaining_content -= got;
+                // 内层流量嗅探：内容真正的载体（dae 在 readRemainingContent 分支喂 FilterTLS）。
+                self.sniffer.filter(&buf[..got]);
                 return Ok(got);
             }
             if self.remaining_padding > 0 {
@@ -147,8 +299,12 @@ impl<R: Read> Read for VisionReader<R> {
             if let Some(cmd) = self.after.take() {
                 match cmd {
                     CMD_DIRECT => {
-                        // 切换 TLS 读半为裸 TCP 直通。
-                        self.raw.store(true, Ordering::SeqCst);
+                        // XTLS DIRECT：TLS 读半切裸 TCP（tls.rs/tls13.rs 的 raw 开关）。
+                        if !self.logged_direct {
+                            self.logged_direct = true;
+                            eprintln!("[sodama] vision: 下行 DIRECT 切换（裸 TCP 直通）");
+                        }
+                        self.read_raw.store(true, Ordering::SeqCst);
                         self.passthrough = true;
                     }
                     CMD_END => {
@@ -174,33 +330,39 @@ impl<R: Read> Read for VisionReader<R> {
     }
 }
 
-/// Vision 写半：首帧带 UUID；TLS 流量按需长填充；非 TLS 或过滤窗口结束发 0x01 后直通。
+/// Vision 写半：首帧带 UUID；内层 TLS 1.3 确认后发 0x02 并切裸写（XTLS DIRECT），
+/// 否则窗口结束发 0x01（保持外层协议，仅少一项优化）。
 pub struct VisionWriter<W> {
     inner: W,
     uuid: [u8; 16],
     first: bool,
-    packets_to_filter: u32,
     finished: bool,
+    write_raw: Arc<AtomicBool>,
+    sniffer: Arc<TlsSniffer>,
+    logged_direct: bool,
 }
 
 impl<W: Write> VisionWriter<W> {
-    pub fn new(inner: W, uuid: [u8; 16]) -> Self {
+    pub fn new(
+        inner: W,
+        uuid: [u8; 16],
+        write_raw: Arc<AtomicBool>,
+        sniffer: Arc<TlsSniffer>,
+    ) -> Self {
         VisionWriter {
             inner,
             uuid,
             first: true,
-            packets_to_filter: 6,
             finished: false,
+            write_raw,
+            sniffer,
+            logged_direct: false,
         }
     }
 
     pub fn inner(&self) -> &W {
         &self.inner
     }
-}
-
-fn looks_tls(buf: &[u8]) -> bool {
-    buf.len() >= 3 && (buf[0] == 0x16 || buf[0] == 0x17) && buf[1] == 0x03
 }
 
 impl<W: Write> Write for VisionWriter<W> {
@@ -233,8 +395,12 @@ impl<W: Write> Write for VisionWriter<W> {
 impl<W: Write> VisionWriter<W> {
     fn write_frame(&mut self, buf: &[u8]) -> io::Result<()> {
         debug_assert!(buf.len() <= u16::MAX as usize);
-        let is_tls = looks_tls(buf);
+        // 先喂嗅探器（与 dae 相同：本块决定本条命令）。
+        self.sniffer.filter(buf);
+        let sn = self.sniffer.snapshot();
+        let is_tls = sn.is_tls || looks_tls(buf);
         let first = self.first;
+        let mut direct = false;
         let cmd;
         if first {
             // 首帧恒 0x00（UUID 在本帧里）。
@@ -243,11 +409,15 @@ impl<W: Write> VisionWriter<W> {
         } else if !is_tls {
             cmd = CMD_END;
             self.finished = true;
-        } else if self.packets_to_filter <= 1 {
-            cmd = CMD_END;
+        } else if looks_tls_app_data(buf) || sn.packets_to_filter == 0 {
+            if sn.enable_xtls {
+                cmd = CMD_DIRECT;
+                direct = true;
+            } else {
+                cmd = CMD_END;
+            }
             self.finished = true;
         } else {
-            self.packets_to_filter -= 1;
             cmd = CMD_CONTINUE;
         }
         let pad = padding_len(buf.len(), is_tls);
@@ -261,24 +431,93 @@ impl<W: Write> VisionWriter<W> {
         frame.extend_from_slice(buf);
         frame.resize(frame.len() + pad, 0);
         self.inner.write_all(&frame)?;
-        self.inner.flush()
+        self.inner.flush()?;
+        if direct {
+            // 帧（含填充）已经写出后才置位：之后的字节裸写 TCP（绕过外层 TLS）。
+            if !self.logged_direct {
+                self.logged_direct = true;
+                eprintln!("[sodama] vision: 上行 DIRECT 切换（裸 TCP 直写）");
+            }
+            self.write_raw.store(true, Ordering::SeqCst);
+        }
+        Ok(())
     }
 }
-
-impl<W: Write> VisionWriter<W> {}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicBool;
+
+    fn sniff_pair(outer_tls13: bool) -> Arc<TlsSniffer> {
+        Arc::new(TlsSniffer::new(outer_tls13))
+    }
+
+    /// 构造内层 TLS 1.3 ServerHello（含 32B compat session_id 与 supported_versions），
+    /// 喂给嗅探器。
+    fn inner_server_hello_tls13() -> Vec<u8> {
+        // 记录头 5B + handshake 头 4B + version 2 + random 32 + sid_len 1 + sid 32
+        // + cipher 2 + comp 1 + ext_len 2 + supported_versions ext 6
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0x03, 0x03]); // legacy version
+        body.extend_from_slice(&[0xAAu8; 32]); // random
+        body.push(32); // session_id len（TLS1.3 compat echo）
+        body.extend_from_slice(&[0x5Au8; 32]);
+        body.extend_from_slice(&[0x13, 0x01]); // TLS_AES_128_GCM_SHA256
+        body.push(0x00); // compression
+        body.extend_from_slice(&[0x00, 0x06]); // ext total len
+        body.extend_from_slice(&TLS13_SUPPORTED_VERSIONS);
+        let mut hs = Vec::new();
+        hs.push(0x02); // ServerHello
+        let hs_len = body.len();
+        hs.extend_from_slice(&[(hs_len >> 16) as u8, (hs_len >> 8) as u8, hs_len as u8]);
+        hs.extend_from_slice(&body);
+        let mut rec = Vec::new();
+        rec.extend_from_slice(&[0x16, 0x03, 0x03]);
+        rec.extend_from_slice(&(hs.len() as u16).to_be_bytes());
+        rec.extend_from_slice(&hs);
+        rec
+    }
+
+    #[test]
+    fn sniffer_detects_inner_tls13() {
+        let s = sniff_pair(true);
+        s.filter(&inner_server_hello_tls13());
+        let sn = s.snapshot();
+        assert!(sn.is_tls);
+        assert!(sn.enable_xtls, "内层 TLS1.3 + 支持 cipher 应启用 XTLS");
+        assert_eq!(sn.packets_to_filter, 0);
+    }
+
+    #[test]
+    fn sniffer_outer_tls12_never_enables_xtls() {
+        let s = sniff_pair(false);
+        s.filter(&inner_server_hello_tls13());
+        let sn = s.snapshot();
+        assert!(sn.is_tls);
+        assert!(!sn.enable_xtls, "外层非 TLS1.3 不允许 DIRECT");
+    }
+
+    #[test]
+    fn sniffer_detects_inner_client_hello_only_as_tls() {
+        let s = sniff_pair(true);
+        let mut ch = vec![0x16, 0x03, 0x01, 0x00, 0x40, 0x01];
+        ch.extend_from_slice(&[0u8; 64]);
+        s.filter(&ch);
+        let sn = s.snapshot();
+        assert!(sn.is_tls);
+        assert!(!sn.enable_xtls, "ClientHello 不足以启用 XTLS");
+    }
 
     #[test]
     fn writer_reader_roundtrip() {
         // 内存通道：writer 写 → reader 读（不含 direct）。
         let (a, b) = std::os::unix::net::UnixStream::pair().unwrap();
         let uuid = [7u8; 16];
-        let raw = Arc::new(AtomicBool::new(false));
-        let mut w = VisionWriter::new(a, uuid);
-        let mut r = VisionReader::new(b, uuid, raw.clone());
+        let read_raw = Arc::new(AtomicBool::new(false));
+        let write_raw = Arc::new(AtomicBool::new(false));
+        let mut w = VisionWriter::new(a, uuid, write_raw.clone(), sniff_pair(true));
+        let mut r = VisionReader::new(b, uuid, read_raw.clone(), sniff_pair(true));
         // 第一笔：TLS 形状（长填充）
         let hello = [0x16u8, 0x03, 0x01, 1, 2, 3, 4];
         w.write_all(&hello).unwrap();
@@ -291,28 +530,25 @@ mod tests {
             got += n;
         }
         assert_eq!(&out[..hello.len()], &hello);
-        assert!(!raw.load(Ordering::SeqCst));
+        assert!(!read_raw.load(Ordering::SeqCst));
+        assert!(!write_raw.load(Ordering::SeqCst));
     }
 
     #[test]
-    fn writer_splices_after_filter_window() {
-        // 过滤窗口（6 笔）结束后：END 帧随最后一笔发出，之后是裸字节（上行 splice）。
+    fn writer_sends_end_for_non_tls() {
+        // 过滤窗口内出现非 TLS 数据：发 0x01 后裸（保持外层）直写。
         let (a, b) = std::os::unix::net::UnixStream::pair().unwrap();
         let uuid = [9u8; 16];
-        let mut w = VisionWriter::new(a, uuid);
-        let chunk = [0x16u8, 0x03, 0x01, 0, 0]; // TLS 形状（长填充）
-        for _ in 0..6 {
-            w.write_all(&chunk).unwrap(); // 第 1 笔首帧，后续 0x00 继续
-        }
-        w.write_all(&chunk).unwrap(); // 第 7 笔：packets_to_filter 到 1 → CMD_END
-        w.write_all(b"RAW").unwrap(); // splice：不经帧头直写
-        w.write_all(b"XYZ").unwrap();
+        let write_raw = Arc::new(AtomicBool::new(false));
+        let mut w = VisionWriter::new(a, uuid, write_raw.clone(), sniff_pair(true));
+        w.write_all(b"GET / HTTP/1.1\r\n").unwrap(); // 首帧 0x00
+        w.write_all(b"more plain http").unwrap(); // 非 TLS → 0x01
+        w.write_all(b"RAW").unwrap();
         w.flush().unwrap();
         drop(w);
         let mut wire = Vec::new();
         let mut r = b;
         r.read_to_end(&mut wire).unwrap();
-        // 手工解帧直到 END，验证其后就是裸字节
         let mut off = 0usize;
         let mut frames = 0usize;
         loop {
@@ -333,18 +569,52 @@ mod tests {
             }
             frames += 1;
         }
-        assert_eq!(
-            &wire[off..],
-            b"RAWXYZ",
-            "CMD_END 之后必须是裸字节（上行 splice）"
+        assert_eq!(&wire[off..], b"RAW", "CMD_END 之后必须是裸字节");
+        assert!(!write_raw.load(Ordering::SeqCst), "非 XTLS 不得切裸写");
+    }
+
+    #[test]
+    fn writer_direct_after_inner_tls13() {
+        // 窗口内看到内层 TLS1.3 ServerHello + 应用数据 → 0x02 并置 write_raw。
+        let (a, b) = std::os::unix::net::UnixStream::pair().unwrap();
+        let uuid = [5u8; 16];
+        let write_raw = Arc::new(AtomicBool::new(false));
+        let sniffer = sniff_pair(true);
+        // 预置嗅探状态：模拟 ServerHello 已在下行被看到。
+        sniffer.filter(&inner_server_hello_tls13());
+        assert!(sniffer.snapshot().enable_xtls);
+        let mut w = VisionWriter::new(a, uuid, write_raw.clone(), sniffer);
+        w.write_all(&[0x16, 0x03, 0x01, 0, 0]).unwrap(); // 首帧 0x00
+                                                         // 下一笔 TLS 应用数据 + packets_to_filter 已为 0 → 0x02
+        w.write_all(&[0x17, 0x03, 0x03, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE])
+            .unwrap();
+        assert!(
+            write_raw.load(Ordering::SeqCst),
+            "TLS1.3 内层确认后应切裸写"
         );
+        w.write_all(b"RAWDATA").unwrap(); // finished，直写
+        w.flush().unwrap();
+        drop(w);
+        let mut wire = Vec::new();
+        let mut r = b;
+        r.read_to_end(&mut wire).unwrap();
+        // 解析首帧与次帧，确认次帧 cmd=0x02 且其后是裸字节。
+        let first_hdr = 21;
+        let clen0 = u16::from_be_bytes([wire[17], wire[18]]) as usize;
+        let pad0 = u16::from_be_bytes([wire[19], wire[20]]) as usize;
+        let off1 = first_hdr + clen0 + pad0;
+        assert_eq!(wire[off1], CMD_DIRECT);
+        let clen1 = u16::from_be_bytes([wire[off1 + 1], wire[off1 + 2]]) as usize;
+        let pad1 = u16::from_be_bytes([wire[off1 + 3], wire[off1 + 4]]) as usize;
+        let off2 = off1 + 5 + clen1 + pad1;
+        assert_eq!(&wire[off2..], b"RAWDATA");
     }
 
     #[test]
     fn reader_handles_direct_switch() {
         let (a, b) = std::os::unix::net::UnixStream::pair().unwrap();
         let uuid = [3u8; 16];
-        let raw = Arc::new(AtomicBool::new(false));
+        let read_raw = Arc::new(AtomicBool::new(false));
         // 手工构造：首帧(continue, content=2, pad=1) + 尾帧(direct, content=3, pad=0) + 裸数据
         let mut wire = Vec::new();
         wire.extend_from_slice(&uuid);
@@ -360,7 +630,7 @@ mod tests {
         wire.extend_from_slice(b"RAW");
         a.try_clone().unwrap().write_all(&wire).unwrap();
         drop(a);
-        let mut r = VisionReader::new(b, uuid, raw.clone());
+        let mut r = VisionReader::new(b, uuid, read_raw.clone(), sniff_pair(true));
         let mut out = Vec::new();
         let mut tmp = [0u8; 16];
         loop {
@@ -371,6 +641,6 @@ mod tests {
             }
         }
         assert_eq!(out, b"abxyzRAW");
-        assert!(raw.load(Ordering::SeqCst));
+        assert!(read_raw.load(Ordering::SeqCst));
     }
 }

@@ -81,6 +81,7 @@
 | [0054](./ADR-0054-p30-ssr.md) | P30 SSR 出站（shadowsocksr-stream，origin+plain 首段）：流密码层（aes-*-cfb/ctr、chacha20-ietf、rc4-md5(-6)；EVP_BytesToKey(MD5) 派生；CFB/CTR 自实现保流状态）+ 连接层（IV/首段目标地址/URL-safe base64 链接解析；`auth_*`/`obfs_*` 与 UDP 显式报错、不静默）；Go/outbound 夹具跨实现（交互 + 512KB）——出站 12 家族全有 | 已采纳 | —（P30 执行；对标表缺口 #6 ssr 收官） |
 | [0055](./ADR-0055-p31-shadow-tls.md) | P31 shadow-tls 客户端（v1/v2/v3，ss 插件）：v1 rustls TLS1.2+裸隧道；v2 首帧 HMAC-SHA1 前缀 + 应用密钥甄别票据；v3 CH session_id HMAC + 握手期 relay 帧反变换 + 链式 MAC；`CertPolicy::WebPki`（rustls-webpki 链+主机名+CV）；`ss://…?plugin=shadow-tls;…`（ss classic；ss2022/UDP 显式报错）；**附带修复** P24 CH 的 supported_versions u16→u8 与 GREASE 碰撞（严格解析器兼容性） | 已采纳 | —（P31 执行；对标表缺口 #6 插件/shadowtls 收官） |
 | [0056](./ADR-0056-p32-ech-boundary.md) | P32 ECH 边界（不实现）：dae 生态 ECH 仅 hy2 `?ech=` 经 ot/quic-go fork；rustls/quinn 无客户端 ECH 且无 CH 构造集成点 → 解析即显式报错（不静默降级）；剩余缺口的闭环记录 + 单测锁定 | 已采纳 | —（P32 执行；对标表缺口 #6 ECH 转边界） |
+| [0057](./ADR-0057-m3-vision-over-tls.md) | M3 Vision-over-TLS：内层 TLS 嗅探（dae FilterTLS 移植）+ 双向 XTLS DIRECT（0x02）裸 TCP；rustls 逐记录有界读替代 dae 的 unsafe 反射交接；tls13 补 raw 写；vision 旁路 kTLS、限 TCP；`lab/vision` Xray 夹具（tls/reality/ws/wss 四模式逐字节） | 已采纳 | —（M3 执行；对标表协议域 Vision 组合闭环） |
 
 ## 新增一条 ADR
 

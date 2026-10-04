@@ -34,6 +34,10 @@ pub struct TlsReader {
     feed_len: usize,
     /// M2：kTLS RX 已接管（内核解密）——read 直接读 socket 明文。
     ktls_rx: bool,
+    /// M3：Vision 模式——按 TLS 记录边界有界喂入（切换 DIRECT 前不多读一个字节）。
+    record_mode: bool,
+    /// M3：Vision 下行 DIRECT 开关；置位后先交付 rustls 残留明文，再裸读 TCP。
+    raw: Option<Arc<AtomicBool>>,
 }
 
 pub struct TlsWriter {
@@ -41,6 +45,8 @@ pub struct TlsWriter {
     sock: TcpStream,
     /// M2：kTLS TX 已接管（内核加密）——write 直接写 socket 明文。
     ktls_tx: bool,
+    /// M3：Vision 上行 DIRECT 开关；置位后写直接落到 socket（不经外层 TLS）。
+    raw: Option<Arc<AtomicBool>>,
 }
 
 impl TlsWriter {
@@ -59,6 +65,21 @@ impl Read for TlsReader {
         if self.ktls_rx {
             return ktls_read(&self.sock, buf);
         }
+        // M3：Vision 下行 DIRECT——先交付 rustls 已解出的残留明文（切换前一个字节都
+        // 没多读，正常为空），然后裸读 TCP（后续是目标站真实 TLS 记录）。
+        if let Some(raw) = self.raw.as_ref() {
+            if raw.load(Ordering::SeqCst) {
+                {
+                    let mut c = self.conn.lock().map_err(poisoned)?;
+                    if let Ok(n) = c.reader().read(buf) {
+                        if n > 0 {
+                            return Ok(n);
+                        }
+                    }
+                }
+                return self.sock.read(buf);
+            }
+        }
         loop {
             // 1) 先抽干已解密明文（有就立刻返回；没有才继续喂密文）
             {
@@ -73,14 +94,20 @@ impl Read for TlsReader {
                     return Ok(0);
                 }
             }
-            // 2) 缓冲耗尽则从 socket 补一批密文（阻塞读在锁外）
+            // 2) 缓冲耗尽则从 socket 补数据（阻塞读在锁外）
             if self.feed_off >= self.feed_len {
-                let cap = self.feed.len();
-                let n = self.sock.read(&mut self.feed[..cap])?;
-                self.feed_off = 0;
-                self.feed_len = n;
-                if n == 0 {
-                    self.eof = true;
+                if self.record_mode {
+                    if !self.fill_record()? {
+                        self.eof = true;
+                    }
+                } else {
+                    let cap = self.feed.len();
+                    let n = self.sock.read(&mut self.feed[..cap])?;
+                    self.feed_off = 0;
+                    self.feed_len = n;
+                    if n == 0 {
+                        self.eof = true;
+                    }
                 }
             }
             // 3) 只喂一次 read_tls，然后回到 1) 抽明文
@@ -111,6 +138,46 @@ impl Read for TlsReader {
 }
 
 impl TlsReader {
+    /// M3：Vision 模式专用的有界读取——保证缓冲内恰好一条完整 TLS 记录，
+    /// 绝不多读记录后的字节（socket 上剩下的就是 DIRECT 切换后的裸数据）。
+    fn fill_record(&mut self) -> io::Result<bool> {
+        // 紧凑到缓冲头部
+        if self.feed_off > 0 {
+            let len = self.feed_len - self.feed_off;
+            self.feed.copy_within(self.feed_off..self.feed_len, 0);
+            self.feed_off = 0;
+            self.feed_len = len;
+        }
+        loop {
+            let (want, complete) = if self.feed_len >= 5 {
+                let len = u16::from_be_bytes([self.feed[3], self.feed[4]]) as usize;
+                // 记录荷载上限 2^14（+2048 容忍），64KB 缓冲必然装得下。
+                if len > (1 << 14) + 2048 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("tls: 记录长度非法（{len}）"),
+                    ));
+                }
+                (5 + len - self.feed_len, self.feed_len >= 5 + len)
+            } else {
+                (5 - self.feed_len, false)
+            };
+            if complete {
+                return Ok(true);
+            }
+            if self.feed_len + want > self.feed.len() {
+                self.feed.resize(self.feed_len + want, 0);
+            }
+            let n = self
+                .sock
+                .read(&mut self.feed[self.feed_len..self.feed_len + want])?;
+            if n == 0 {
+                return Ok(false);
+            }
+            self.feed_len += n;
+        }
+    }
+
     /// P15：订阅拉取等短连接用——设置底层 socket 读超时。
     pub fn set_read_timeout(&self, d: Option<Duration>) -> io::Result<()> {
         self.sock.set_read_timeout(d)
@@ -128,6 +195,12 @@ impl Write for TlsWriter {
         if self.ktls_tx {
             return self.sock.write(buf);
         }
+        // M3：Vision 上行 DIRECT——裸写 TCP（不再经外层 TLS）。
+        if let Some(raw) = self.raw.as_ref() {
+            if raw.load(Ordering::SeqCst) {
+                return self.sock.write(buf);
+            }
+        }
         let mut c = self.conn.lock().map_err(poisoned)?;
         let n = c.writer().write(buf)?;
         while c.wants_write() {
@@ -139,6 +212,11 @@ impl Write for TlsWriter {
     fn flush(&mut self) -> io::Result<()> {
         if self.ktls_tx {
             return Ok(());
+        }
+        if let Some(raw) = self.raw.as_ref() {
+            if raw.load(Ordering::SeqCst) {
+                return Ok(()); // TCP 无用户态缓冲
+            }
         }
         let mut c = self.conn.lock().map_err(poisoned)?;
         while c.wants_write() {
@@ -716,6 +794,43 @@ pub fn connect_alpn(
     alpn: &[Vec<u8>],
     timeout: Duration,
 ) -> io::Result<((TlsReader, TlsWriter), Option<Vec<u8>>)> {
+    let ((r, w), negotiated, _) = connect_impl(tcp, sni, insecure, alpn, timeout, true, false)?;
+    Ok(((r, w), negotiated))
+}
+
+/// M3：Vision 专用连接——逐记录有界读 + 双向裸切换句柄；不使用 kTLS
+/// （DIRECT 需要中途停用外层加解密，内核 kTLS 无法动态撤销）。
+pub struct VisionRaw {
+    /// 置位后读半切裸 TCP（对端下行 DIRECT）。
+    pub read: Arc<AtomicBool>,
+    /// 置位后写半切裸 TCP（本端上行 DIRECT）。
+    pub write: Arc<AtomicBool>,
+    /// 外层是否 TLS 1.3（XTLS DIRECT 的硬前提；否则只能走 END 模式）。
+    pub outer_tls13: bool,
+}
+
+pub fn connect_vision(
+    tcp: TcpStream,
+    sni: &str,
+    insecure: bool,
+    alpn: &[Vec<u8>],
+    timeout: Duration,
+) -> io::Result<((TlsReader, TlsWriter), VisionRaw)> {
+    let ((r, w), _negotiated, raw) = connect_impl(tcp, sni, insecure, alpn, timeout, false, true)?;
+    let raw = raw.ok_or_else(|| io::Error::other("tls: vision 模式未生成 raw 句柄"))?;
+    Ok(((r, w), raw))
+}
+
+#[allow(clippy::type_complexity)]
+fn connect_impl(
+    tcp: TcpStream,
+    sni: &str,
+    insecure: bool,
+    alpn: &[Vec<u8>],
+    timeout: Duration,
+    ktls: bool,
+    vision: bool,
+) -> io::Result<((TlsReader, TlsWriter), Option<Vec<u8>>, Option<VisionRaw>)> {
     tcp.set_read_timeout(Some(timeout))?;
     tcp.set_write_timeout(Some(timeout))?;
     let name = ServerName::try_from(sni.to_string())
@@ -725,7 +840,7 @@ pub fn connect_alpn(
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("tls: {e}")))?;
 
     // 完整握手（阻塞至完成；超时保护来自上面的 socket 选项）
-    let want_ktls = KTLS_ENABLED.load(Ordering::Relaxed);
+    let want_ktls = ktls && KTLS_ENABLED.load(Ordering::Relaxed);
     // RX 可安装的前提：rustls 严格未消费服务端 Finished 之后的应用 epoch 记录。
     let mut rx_installable = false;
     if want_ktls {
@@ -770,6 +885,15 @@ pub fn connect_alpn(
     };
 
     let negotiated = conn.alpn_protocol().map(|p| p.to_vec());
+    let vision_raw = if vision {
+        Some(VisionRaw {
+            read: Arc::new(AtomicBool::new(false)),
+            write: Arc::new(AtomicBool::new(false)),
+            outer_tls13: conn.protocol_version() == Some(rustls::ProtocolVersion::TLSv1_3),
+        })
+    } else {
+        None
+    };
     let conn = Arc::new(Mutex::new(conn));
     Ok((
         (
@@ -781,13 +905,17 @@ pub fn connect_alpn(
                 feed_off: 0,
                 feed_len: 0,
                 ktls_rx,
+                record_mode: vision,
+                raw: vision_raw.as_ref().map(|v| v.read.clone()),
             },
             TlsWriter {
                 conn,
                 sock: tcp.try_clone()?,
                 ktls_tx,
+                raw: vision_raw.as_ref().map(|v| v.write.clone()),
             },
         ),
         negotiated,
+        vision_raw,
     ))
 }

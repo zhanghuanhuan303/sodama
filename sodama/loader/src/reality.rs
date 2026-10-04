@@ -115,7 +115,7 @@ impl RealityConfig {
     }
 }
 
-/// 与服务端 REALITY 握手（含 TLS 1.3），返回记录层读写半与裸读开关。
+/// 与服务端 REALITY 握手（含 TLS 1.3），返回记录层读写半与裸读/裸写开关。
 pub fn connect(
     sock: TcpStream,
     cfg: &RealityConfig,
@@ -123,6 +123,7 @@ pub fn connect(
 ) -> io::Result<(
     tls13::Tls13Reader,
     tls13::Tls13Writer,
+    Arc<std::sync::atomic::AtomicBool>,
     Arc<std::sync::atomic::AtomicBool>,
 )> {
     if cfg.fingerprint != "chrome" {

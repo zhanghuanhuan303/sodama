@@ -1,0 +1,4 @@
+# Vision 测试规则：1.1.1.1（假公网）全部经代理，WAN 段直连。
+dip(10.9.9.0/24) -> direct
+dip(1.1.1.1/32) -> proxy
+fallback -> block

@@ -802,6 +802,13 @@ impl Outbound {
                 let sock = marked_tcp_connect(*server, timeout)?;
                 let kill = sock.try_clone()?;
                 let vision = flow.as_deref() == Some("xtls-rprx-vision");
+                // M3：vision 是 TCP+外层 TLS1.3 的会话级协议，不能与 ws 组合（Xray 同义）。
+                if vision && !matches!(*transport, VlessTransport::Tcp) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "vless: flow=xtls-rprx-vision 仅支持 tcp 传输",
+                    ));
+                }
                 // splice 条件：字节透明且无 vision（请求头已在 connect 时一次性发出，
                 // 响应头由 relay 首读消费，之后可直接裸搬）；kTLS 成功时 TLS 路径同样透明。
                 let mut splice = !*use_tls
@@ -810,29 +817,60 @@ impl Outbound {
                     && !vision;
                 let (from_remote, to_remote): (Box<dyn ReadHalf>, Box<dyn WriteHalf>) =
                     if let Some(rc) = reality_cfg {
-                        let (tls_r, tls_w, raw_flag) = reality::connect(sock, rc, Some(timeout))?;
+                        let (tls_r, tls_w, raw_read, raw_write) =
+                            reality::connect(sock, rc, Some(timeout))?;
+                        // 外层 REALITY = TLS 1.3，满足 XTLS DIRECT 前提。
+                        let sniffer = Arc::new(vision::TlsSniffer::new(true));
                         let (vr, vw) =
                             vless::connect_split_flow(tls_r, tls_w, uuid, target, flow.as_deref())?;
                         if vision {
                             (
-                                Box::new(vision::VisionReader::new(vr, *uuid, raw_flag)),
-                                Box::new(vision::VisionWriter::new(vw, *uuid)),
+                                Box::new(vision::VisionReader::new(
+                                    vr,
+                                    *uuid,
+                                    raw_read,
+                                    sniffer.clone(),
+                                )),
+                                Box::new(vision::VisionWriter::new(vw, *uuid, raw_write, sniffer)),
                             )
                         } else {
                             (Box::new(vr), Box::new(vw))
                         }
                     } else if *use_tls {
-                        let (r, w) = tls::connect(sock, sni, *insecure, &[], timeout)?;
-                        if r.is_ktls() && w.is_ktls() {
-                            // kTLS：加解密已下沉内核，数据面回到字节透明（同明文）。
-                            splice = reality_cfg.is_none()
-                                && matches!(*transport, VlessTransport::Tcp)
-                                && !vision;
+                        if vision {
+                            // M3：Vision-over-TLS——不使用 kTLS（DIRECT 需中途停用外层加解密），
+                            // 读半逐记录有界喂入，置位 raw 后双向裸 TCP 直通。
+                            let ((r, w), raw) =
+                                tls::connect_vision(sock, sni, *insecure, &[], timeout)?;
+                            if !raw.outer_tls13 {
+                                return Err(io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    "vless: flow=xtls-rprx-vision 需要外层 TLS 1.3",
+                                ));
+                            }
+                            let sniffer = Arc::new(vision::TlsSniffer::new(true));
+                            let (vr, vw) =
+                                vless::connect_split_flow(r, w, uuid, target, flow.as_deref())?;
+                            (
+                                Box::new(vision::VisionReader::new(
+                                    vr,
+                                    *uuid,
+                                    raw.read,
+                                    sniffer.clone(),
+                                )),
+                                Box::new(vision::VisionWriter::new(vw, *uuid, raw.write, sniffer)),
+                            )
+                        } else {
+                            let (r, w) = tls::connect(sock, sni, *insecure, &[], timeout)?;
+                            if r.is_ktls() && w.is_ktls() {
+                                // kTLS：加解密已下沉内核，数据面回到字节透明（同明文）。
+                                splice = matches!(*transport, VlessTransport::Tcp);
+                            }
+                            let (r, w) = apply_ws(r, w, transport)?;
+                            let (r, w) =
+                                vless::connect_split_flow(r, w, uuid, target, flow.as_deref())?;
+                            (Box::new(r), Box::new(w))
                         }
-                        let (r, w) = apply_ws(r, w, transport)?;
-                        let (r, w) =
-                            vless::connect_split_flow(r, w, uuid, target, flow.as_deref())?;
-                        (Box::new(r), Box::new(w))
                     } else {
                         let read = sock.try_clone()?;
                         let (r, w) = apply_ws(read, sock, transport)?;
@@ -1521,14 +1559,19 @@ fn parse_vless(rest: &str) -> Result<Outbound, String> {
         let fp = fp.unwrap_or_else(|| "chrome".to_string());
         Some(reality::RealityConfig::new(&sni, pk, short, &fp))
     } else {
-        if flow.is_some() {
-            return Err(
-                "vless:// flow=xtls-rprx-vision 目前仅支持 security=reality（需裸 TCP 直通层）"
-                    .to_string(),
-            );
-        }
         None
     };
+    // M3：vision 需外层 TLS1.3（tls 或 reality）且限 TCP（Xray 同义）。
+    if flow.is_some() {
+        if !use_tls && reality.is_none() {
+            return Err(
+                "vless:// flow=xtls-rprx-vision 需要 security=tls 或 security=reality".to_string(),
+            );
+        }
+        if ws {
+            return Err("vless:// flow=xtls-rprx-vision 仅支持 tcp 传输".to_string());
+        }
+    }
     Ok(Outbound::Vless {
         server: resolve(&hostport)?,
         uuid,
@@ -2302,14 +2345,37 @@ mod tests {
     }
 
     #[test]
-    fn parse_vless_vision_flow_needs_reality() {
-        // 非 reality 的 vision 目前不支持（无裸 TCP 直通层）。
-        let e = parse(
+    fn parse_vless_vision_flow_constraints() {
+        // M3：vision 支持 tls/reality 外层（tcp），非 TLS 与 ws 拒绝。
+        let ob = parse(
             "vless://b831381d-6324-4d53-ad4f-8cda48b30811@1.2.3.4:443\
              ?type=tcp&security=tls&flow=xtls-rprx-vision",
         )
+        .unwrap();
+        match ob {
+            Outbound::Vless {
+                flow, reality, tls, ..
+            } => {
+                assert_eq!(flow.as_deref(), Some("xtls-rprx-vision"));
+                assert!(reality.is_none());
+                assert!(tls);
+            }
+            _ => panic!("应为 Vless"),
+        }
+        // 无外层 TLS：拒绝
+        let e = parse(
+            "vless://b831381d-6324-4d53-ad4f-8cda48b30811@1.2.3.4:443\
+             ?type=tcp&security=none&flow=xtls-rprx-vision",
+        )
         .unwrap_err();
-        assert!(e.contains("reality"), "{e}");
+        assert!(e.contains("tls") || e.contains("reality"), "{e}");
+        // ws + vision：拒绝（Xray 同义，仅 tcp）
+        let e = parse(
+            "vless://b831381d-6324-4d53-ad4f-8cda48b30811@1.2.3.4:443\
+             ?type=ws&security=tls&flow=xtls-rprx-vision",
+        )
+        .unwrap_err();
+        assert!(e.contains("tcp"), "{e}");
         // 其它 flow 值拒绝
         let e = parse(
             "vless://b831381d-6324-4d53-ad4f-8cda48b30811@1.2.3.4:443\

@@ -17,6 +17,7 @@
 | O7 | UDP 批量（recvmmsg/sendmmsg） | UDP 路径未同口径压测（backlog G1 缺口） | PPS 提升、CPU 降 | 中 | 低 |
 | O8 | 缓冲池/回收与 shutdown 收敛 | 每连接 64KB 缓冲 malloc；SIGTERM 收敛 1–3s | 内存更稳、退出更快 | 低 | 低 |
 | ~~O9~~ | ~~kTLS 内核 TLS + TLS 上 splice~~ **（M2 已完成，实验开关）** | TLS 剖面 memcpy 29.4% + 建页 | ✅ 实测：48MB×4 中位 11.67→**12.32 Gbps**、CPU 420→**400ms**、memcpy→**1.6%**；8 流受同机夹具/内核 AES 速度限制（详见提案 05/07 节） | 中 | 中（需 TLS1.3+modprobe tls；默认关） |
+| ~~O10~~ | ~~Vision-over-TLS（XTLS DIRECT 双向）~~ **（M3 已完成）** | flow=vision 仅限 reality；无内层嗅探/上行 raw | ✅ 实测：tls/reality 内层 TLS1.3 2MB 逐字节 + 双向 DIRECT；ws/wss 逐字节；真订阅 48 节点 5MB e2e（日志 6/6 DIRECT）；见 ADR-0057 | 中 | 低（限 TCP；vision 连接旁路 kTLS） |
 
 ---
 
@@ -101,6 +102,19 @@
   **内核 AES-GCM 速度决定收益**：本机 `generic-gcm-aesni-avx` 2.89 GB/s（用户态 6.57 GB/s）故默认仍用 rustls；
   VAES/AVX-512 平台或 NIC TLS 卸载时开启 `--ktls`（详见 `vless-proposal.html` 05/07 节）。
 
+### O10 · Vision-over-TLS：XTLS DIRECT 双向（M3，ADR-0057）
+
+- **实测**：`lab/vision/run.sh`（Xray 25.9.11 服务端 + 内层 TLS 靶站）
+  `security=tls|reality`：内层 TLS1.3 **2MB 逐字节一致** + 上行/下行 DIRECT 各触发；
+  内层 TLS1.2/明文 HTTP 走 END 互通；`security=ws|wss` 逐字节通过；
+  真订阅 48 节点（reality+vision）5MB 下载完整、日志 6/6 双向 DIRECT；`verify` 9/9、`cargo test` 240/240。
+- **实现**：① `vision::TlsSniffer`（dae `FilterTLS` 移植：窗口内嗅探内层 ServerHello TLS1.3+cipher）→
+  发 `0x02` 双向切裸 TCP（上行 `tls13`/rustls 写半新增 raw 开关）；
+  ② rustls 侧不用 unsafe 反射：**逐记录有界读**（恰好整条记录，切换前不多读一字节）；
+  ③ vision 连接旁路 kTLS（DIRECT 需中途停用外层加解密）、仅限 TCP；外层非 TLS1.3 显式报错。
+- **边界**：依赖对端 Xray 的 DIRECT 语义（非 Xray 服务端按 END 兼容）；
+  内层 TLS1.2 不进 DIRECT（嗅探保守，与 Xray 一致）。
+
 ### O8 · 缓冲池与回收
 
 - **现状**：每连接泵缓冲 `vec![0u8; 65536]` ×2 每次 malloc；峰值 64 并发连接
@@ -114,7 +128,14 @@
 
 ## P2 · 线程与规模模型
 
-### O4 · epoll/io_uring worker 池替代「每连接线程」
+### O4 · epoll/io_uring worker 池替代「每连接线程」——M4 首项
+
+> 2026-10-04 评估结论（用户问询 worker 化/async 的收益）：**worker 化买的是规模与效率，不是峰值吞吐**。
+> 依据：relay+splice 已 21.6 Gbps / CPU 仅 150ms（瓶颈是 syscall/内存带宽）；vless 明文 16.2 Gbps / 190ms；
+> TLS 受密码引擎限制（内核 2.89 GB/s、用户态 6.57 GB/s）；perf 剖面无单一大锁，线程模型零跨连接共享状态。
+> **async（tokio）不加数据面**：沿用 ADR-0003（relay 专用 OS 线程；tokio 仅 QUIC 桥接），
+> 唯一值得 A/B 的异步方向是 io_uring（IORING_OP_SPLICE + 注册缓冲），放在本项骨架落地后进行。
+> **M4 第一步**：新增连接规模/风暴基准（新建/s、10k 并发 RSS/线程曲线），作为本项验收口径。
 
 - **现状**：每个 relay 连接 1 个 accept 转交线程 + 1–2 个泵线程 + 条件性看门狗；
   64 并发已到 100 线程；连接建立/拆除的 spawn/join 成本也计入 ss RTT（p50 46µs）。
@@ -168,9 +189,10 @@ sudo lab/perf/run.sh down
 perf record -F 1499 -g -p <sodama> -- sleep 12           # 热点搬家（AEAD→? 拷贝→?）
 ```
 
-目标基线（2026-10-04，M2 后更新）：vless 明文 8 流 **16.2 Gbps / 190 ms**（已达 ≥16 G 目标）、
+目标基线（2026-10-05，M3 后更新）：vless 明文 8 流 **16.2 Gbps / 190 ms**（已达 ≥16 G 目标）、
 48MB×4 中位 **16.9 Gbps / 60 ms**；relay 8 流 **21.6 Gbps / 150 ms**；
 TLS：kTLS 全链路可用，48MB×4 中位 **12.3 Gbps / 400 ms**，memcpy 1.6%（达标）；
 8 流吞吐/CPU 目标（≥13 Gbps/≤1000 ms）因本机夹具（同机 sing-box TLS 服务端 ≈12.5 Gbps 封顶）
-与内核密码引擎速度（2.89 GB/s）均不可达——需要“服务端异机”口径后再评（M3 重测项）；
-M4：ss 8 流 CPU ≤460 ms、四方对比 ss 吞吐超 dae、逼近 sing-box；线程数 O(核数)（10k 连接基准）。
+与内核密码引擎速度（2.89 GB/s）均不可达——需要“服务端异机”口径后再评（重测项）；
+Vision-over-TLS 已交付（双向 DIRECT，ADR-0057）；
+M4：ss 8 流 CPU ≤460 ms、四方对比 ss 吞吐超 dae、逼近 sing-box；线程数 O(核数)（10k 连接基准，第一步先做连接规模/风暴基准）。

@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>sodama · VLESS 性能实测与优化提案（M1+M2 落地版）</title>
+<title>sodama · VLESS 性能实测与优化提案（M1+M2+M3 落地版）</title>
 <style>
   :root{
     --bg:#0f1115; --card:#171a21; --card2:#1d212b; --fg:#e6e9ef; --muted:#9aa3b2;
@@ -69,16 +69,16 @@
 <div class="wrap">
 
 <header class="top">
-  <h1>sodama · VLESS 性能实测与优化提案 <span class="tag ok">M1+M2 已落地</span></h1>
-  <div class="sub">同机四方对拍（sodama / dae v2.1.1 / sing-box 1.14.2 / v2ray 5.52.0）· VLESS 明文与 TLS · 5 轮中位数 · 2026-10-04 · v1.2（M2：kTLS 内核 TLS + TLS 上 splice，含逐记录握手驱动与控制记录处理）</div>
+  <h1>sodama · VLESS 性能实测与优化提案 <span class="tag ok">M1–M3 已落地</span></h1>
+  <div class="sub">同机四方对拍（sodama / dae v2.1.1 / sing-box 1.14.2 / v2ray 5.52.0）· VLESS 明文/TLS/Vision · 5 轮中位数 · 2026-10-05 · v1.3（M3：Vision-over-TLS——XTLS DIRECT 双向裸 TCP、tls/reality/ws/wss 四模式逐字节 + 真订阅 e2e）</div>
   <div class="chips">
     <span class="chip">数据口径 <b>5 轮中位</b></span>
     <span class="chip">夹具 <b>全双工 echo · 环回上限 ≈25 Gbps</b></span>
     <span class="chip">上游 <b>sing-box VLESS server（四方共用）</b></span>
     <span class="chip">M1 验收 <b class="ok">全部达标</b></span>
     <span class="chip">M2 验收 <b class="ok">memcpy 达标</b> · 吞吐/CPU <b class="warnc">夹具受限</b></span>
-    <span class="chip">kTLS <b>TX+RX true · 解密错误 0 · splice 4/4</b></span>
-    <span class="chip">回归 <b>verify 9/9（含 USE_KTLS=1）· cargo test 236/236</b></span>
+    <span class="chip">M3 验收 <b class="ok">Vision-over-TLS 全组合通过</b></span>
+    <span class="chip">回归 <b>verify 9/9 · cargo test 240/240</b></span>
   </div>
 </header>
 
@@ -127,6 +127,14 @@ splice EINVAL 均有正确处理；<b class="ok">libc memcpy 从 29.4% 降到 1.
 因此「搬到内核」在本硬件上是 CPU 平移而非下降：8×64MB 下 sodama CPU 1 510 vs rustls 1 370 ms、
 两类路径的系统总 CPU 相同（≈2.87 s），吞吐同被夹具压在 ≈11 Gbps。<span class="warnc">kTLS 在本机不作为默认</span>；
 VAES/AVX-512 或带 TLS 卸载的 NIC 上预期完全不同（内核变体更快、且可避免用户态拷贝）。
+</div>
+
+<div class="note ok">
+<b>M3 结论（Vision-over-TLS，ADR-0057）：</b>flow=vision 从「仅 REALITY、仅下行 raw」补齐为
+<b>tls/reality 双外层 + 双向 XTLS DIRECT（0x02 裸 TCP）</b>：内层嗅探（dae FilterTLS 移植）识别内层 TLS1.3 后，
+上行裸写、下行裸读（外层加解密停用，内层 TLS 端到端保障）；rustls 侧用<b>逐记录有界读</b>替代 dae 的 unsafe 反射。
+验收：`lab/vision`（Xray 25.9.11 夹具）tls/reality 内层 TLS1.3 2MB <b>逐字节一致</b> + 双向 DIRECT 各触发、
+TLS1.2/明文 END 互通、ws/wss 逐字节；真实订阅 48 节点 5MB 下载完整，日志 <b>6/6 双向 DIRECT</b>。
 </div>
 </section>
 
@@ -381,12 +389,13 @@ ChaCha20-Poly1305 分别为 1.76 / 2.87 GB/s（因此本机也不存在“换 ch
   <li><b>夹具是当前最大变量</b>：TLS 吞吐被同机 sing-box 服务端封顶 ≈12.5 Gbps（四方客户端一致），
   CPU 目标也需在服务端不同机的口径下重测；下一步优化（worker 池/缓冲池）应换到可拉开差距的口径验证。</li>
   <li><b>规模模型仍未解</b>：123 线程/64 连接、~175 KB/连接；splice 与 kTLS 不改变线程模型，M4 以 worker 池解决。</li>
-  <li><b>生态缺口仍在</b>：Vision-over-TLS 未实现（sodama 的 vision 仅随 REALITY 生效）；以 VLESS 为主链路时应补齐（M3）。</li>
+  <li><b>主流节点组合已齐（M3）</b>：Vision-over-TLS 交付——外层 tls/reality × 双向 XTLS DIRECT（裸 TCP）＋ws/wss；
+  内层嗅探保守（TLS1.2/明文走 END），rustls 无 unsafe 反射（逐记录有界读）；待 M4 解决规模模型后，主链路对齐完成。</li>
 </ol>
 </section>
 
 <section>
-<h2>09 · 提案进度与后续（M3–M4）</h2>
+<h2>09 · 提案进度与后续（M4）</h2>
 <table>
   <thead><tr><th>阶段</th><th>内容</th><th>验收目标</th><th>状态</th></tr></thead>
   <tbody>
@@ -400,17 +409,18 @@ ChaCha20-Poly1305 分别为 1.76 / 2.87 GB/s（因此本机也不存在“换 ch
         <span class="sub">kTLS 全链路可用（TX+RX、0 解密错误、splice 4/4），<code>--ktls</code> 保留按硬件开启</span></td></tr>
     <tr><td><b>M3</b></td><td>Vision-over-TLS + ws/wss 变体（对齐主流节点组合）</td>
         <td>lab 四方逐字节 + 真实订阅 e2e</td>
-        <td><span class="tag">计划</span></td></tr>
+        <td><span class="tag ok">完成</span> tls/reality 内层 TLS1.3 2MB 逐字节 + 双向 DIRECT；
+        TLS1.2/明文 END 互通；ws/wss 逐字节；真订阅 48 节点 5MB e2e（6/6 DIRECT）<br>
+        <span class="sub">ADR-0057；`lab/vision/run.sh {tls|reality|ws|wss}`；vision 连接旁路 kTLS（DIRECT 需停用外层加解密）</span></td></tr>
     <tr><td><b>M4</b></td><td>epoll worker 池替代每连接线程；ss 路径零分配；UDP 批量</td>
         <td>10k 连接基准；ss CPU ≤460 ms；UDP 四方对拍</td>
         <td><span class="tag">计划</span></td></tr>
   </tbody>
 </table>
 <div class="note">
-<b>M2 结论与后续（M3+）：</b>① kTLS 已交付为实验特性（<code>--ktls</code>，TX+RX+控制记录+splice 全链路，
-默认关：本机硬件下 rustls 更省 CPU）；② 吞吐/CPU 目标的下一轮验证需换口径——把 sing-box 服务端放到第二台机器
-（或升级到 VAES 平台复测 kTLS）；③ 缓冲池化/零分配与 <code>sendmsg(MSG_ZEROCOPY)</code> 试点并入 M3 与 worker 池一起做，
-在 rustls 路径上直接攻击剩余 30% 的 rep_movs/建页；④ Vision-over-TLS 补齐后，VLESS+TLS+Vision 组合才能与现代节点对齐。
+<b>M3 结论与后续（M4）：</b>① M3 已交付（双向 DIRECT、四模式逐字节、真订阅 e2e，见 01/09 节与 ADR-0057）；
+② 缓冲池化/零分配与 <code>sendmsg(MSG_ZEROCOPY)</code> 试点并入 M4（连同 worker 池），
+在 rustls 路径上直接攻击剩余 30% 的 rep_movs/建页；③ M4 第一步先做连接规模/风暴基准（10k 连接验收口径）。
 </div>
 </section>
 
@@ -446,10 +456,17 @@ sudo cat /proc/net/tls_stat | grep -E 'TlsTxSw|TlsRxSw|TlsDecryptError'   # 解�
 # 回归（kTLS 开关同场景验证）
 sudo lab/lab.sh up && sudo lab/lab.sh verify               # 9/9 PASS
 sudo USE_KTLS=1 ./lab/lab.sh vless-tls-up && sudo ./lab/lab.sh test-proxy   # vless-tls / vmess-tls / trojan 均见 kTLS 启用
-cd loader && cargo test --release                          # 236/236
+cd loader && cargo test --release                          # 240/240（M3 后）
+
+# M3 验收（Vision-over-TLS：Xray 夹具 + 真订阅）
+curl -L -o /tmp/xray.zip https://github.com/XTLS/Xray-core/releases/download/v25.9.11/Xray-linux-64.zip
+mkdir -p /tmp/xray && unzip -o /tmp/xray.zip -d /tmp/xray
+sudo VISION_SECURITY=tls     lab/vision/run.sh all   # 内层 TLS1.3 2MB 逐字节 + 双向 DIRECT（另 reality/ws/wss）
+sudo VISION_SECURITY=reality lab/vision/run.sh all
+cd loader && cargo test --release ## 240/240（vision 嗅探/DIRECT 状态机等 5 项新增）
 
 # 运行开关
---ktls            尝试 kTLS（TLS1.3；默认关，需 modprobe tls）
+--ktls            尝试 kTLS（TLS1.3；默认关，需 modprobe tls；vision 连接自动旁路）
 SODAMA_KTLS_DEBUG=1 / SODAMA_KTLS_TXONLY=1                 # 安装调试 / TX-only 实验
 --no-splice       关闭 splice（默认开：Direct/VLESS 明文/kTLS 成功后的 TLS）
 --ebpf-debug      打开 eBPF 热路径 printk（默认关）
@@ -458,12 +475,13 @@ status --cmd status --json | jq .relay.splice_total        # 命中/回退计数
 实现落点（M2）：<code>loader/src/tls.rs</code>（<code>handshake_record_by_record</code> / <code>ktls_read</code> / <code>try_install_ktls</code> / <code>install_one</code> / KeyLog+HKDF）、
 <code>loader/src/main.rs</code>（<code>ktls_take_control_record</code>、<code>splice_pump</code> EINVAL 回退、下游重试循环、<code>--ktls</code>）、
 <code>loader/src/outbound.rs</code>（kTLS → splice 能力位）；lab：<code>lab/lab.sh</code>（<code>USE_KTLS</code>）、<code>lab/perf/run.sh</code>/<code>scaling.sh</code>（<code>SODAMA_ARGS</code>）、<code>lab/perf/m2ab.sh</code>。
-M1 落点见上一版说明。
+实现落点（M3）：<code>loader/src/vision.rs</code>（<code>TlsSniffer</code>/DIRECT 状态机）、<code>loader/src/tls.rs</code>（<code>connect_vision</code>/<code>record_mode</code>/raw 开关）、
+<code>loader/src/tls13.rs</code>（raw 写）、<code>loader/src/outbound.rs</code>（tls/reality 装配与 URL 约束）、<code>lab/vision/</code>（Xray 夹具）、ADR-0057。M1 落点见上一版说明。
 </p>
 </section>
 
 <div class="foot">
-  sodama · VLESS 性能实测与优化提案 · v1.2（M1+M2 落地版）· 2026-10-04 · Arch / 6.18.54-lts / i9-9900KF ·
+  sodama · VLESS 性能实测与优化提案 · v1.3（M1+M2+M3 落地版）· 2026-10-05 · Arch / 6.18.54-lts / i9-9900KF ·
   数据为同机 lab 口径，5 轮中位数与 perf 剖面如实呈现；M2 验收对账（内存达标、吞吐/CPU 受夹具与硬件限制）见 05 节。
 </div>
 

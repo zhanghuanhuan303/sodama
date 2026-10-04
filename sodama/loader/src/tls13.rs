@@ -1361,6 +1361,8 @@ pub struct Tls13Writer {
     core: Arc<Mutex<Shared>>,
     sock: TcpStream,
     suite: Suite,
+    /// M3：Vision 上行 DIRECT——置位后裸写 TCP（不再封外层 TLS 记录）。
+    raw: Arc<AtomicBool>,
 }
 
 impl Tls13Reader {
@@ -1556,6 +1558,12 @@ impl Tls13Reader {
 
 impl Write for Tls13Writer {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        // M3：Vision 上行 DIRECT——裸写 TCP。
+        if self.raw.load(Ordering::SeqCst) {
+            let mut sock = &self.sock;
+            sock.write_all(buf)?;
+            return Ok(buf.len());
+        }
         let mut c = self.core.lock().map_err(poisoned)?;
         if c.want_key_update {
             let ku = [HS_KEY_UPDATE, 0, 0, 1, 0];
@@ -1587,14 +1595,14 @@ fn poisoned<T>(_: std::sync::PoisonError<T>) -> io::Error {
     io::Error::new(io::ErrorKind::Other, "tls13: 锁中毒")
 }
 
-/// 用 TcpStream 跑握手并拆出读写半。返回（读半, 写半, 裸读开关）。
+/// 用 TcpStream 跑握手并拆出读写半。返回（读半, 写半, 裸读开关, 裸写开关）。
 pub fn connect(
     sock: TcpStream,
     client_hello: &[u8],
     kx: &ClientKx,
     cert_hook: CertHook,
     timeout: Option<Duration>,
-) -> io::Result<(Tls13Reader, Tls13Writer, Arc<AtomicBool>)> {
+) -> io::Result<(Tls13Reader, Tls13Writer, Arc<AtomicBool>, Arc<AtomicBool>)> {
     let _ = timeout; // 超时由调用方在 socket 上设置
     let mut s = sock.try_clone()?;
     let out = client_handshake(&mut s, client_hello, kx, CertPolicy::Custom(cert_hook))?;
@@ -1607,6 +1615,7 @@ pub fn connect(
         closed_read: false,
     }));
     let raw = Arc::new(AtomicBool::new(false));
+    let raw_write = Arc::new(AtomicBool::new(false));
     let reader = Tls13Reader {
         core: core.clone(),
         sock,
@@ -1620,8 +1629,9 @@ pub fn connect(
         core,
         sock: s,
         suite,
+        raw: raw_write.clone(),
     };
-    Ok((reader, writer, raw))
+    Ok((reader, writer, raw, raw_write))
 }
 
 // ---------------------------------------------------------------- 单元测试
