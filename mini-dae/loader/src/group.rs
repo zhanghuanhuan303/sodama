@@ -446,18 +446,19 @@ impl GroupRuntime {
     }
 
     /// 启动健康探测线程：周期性经每个成员连接 check 目标，成功即更新延迟/存活。
+    /// P19：成员为空也启动（订阅热更新可能后续替换进成员）。
     pub fn spawn_health_loop(self: &Arc<Self>) {
-        if (self.check_targets.is_empty() && self.udp_check_dns.is_none())
-            || self.member_count() == 0
-        {
+        if self.check_targets.is_empty() && self.udp_check_dns.is_none() {
             return;
         }
         let g = self.clone();
         std::thread::spawn(move || loop {
             let n = g.member_count();
             let mut i = 0;
+            // P19：并发 24（原 8）——大订阅（66+ 节点）首轮收敛从 ~70s 降到 ~20s，
+            // 缩短网关启动后「健康数据空窗期」的浏览卡顿。
             while i < n {
-                let end = (i + 8).min(n);
+                let end = (i + 24).min(n);
                 std::thread::scope(|s| {
                     for j in i..end {
                         let g = &g;

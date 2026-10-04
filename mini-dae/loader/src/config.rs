@@ -1601,7 +1601,7 @@ pub struct RoutingExtract {
     pub supported: Vec<String>,
     /// 解析成功但数据面尚未实现、未纳入编译的规则（绝不静默丢弃）
     pub deferred: Vec<DeferredRule>,
-    /// 组名 → 数据面 outbound 的映射（K3：全部用户组都落到 proxy=0x02）
+    /// 组名 → 数据面 outbound 的映射（P19：已定义组直通组名；未定义回退 proxy）
     pub outbound_map: Vec<(String, String)>,
     /// 路由段的 fallback（已映射的数据面 outbound）
     pub fallback: Option<String>,
@@ -1611,11 +1611,25 @@ fn first_val(p: &Param) -> Option<String> {
     p.val.clone()
 }
 
-fn map_outbound(cfg_name: &str, extract: &mut RoutingExtract) -> String {
+/// 组名 → 数据面 outbound 文本。P19 起已定义的组**直通组名**（编译期再解析为索引）；
+/// 未定义的组名保持 K3 兼容行为回退 proxy（并在映射表中标明）。
+fn map_outbound(
+    cfg_name: &str,
+    defined: &std::collections::HashSet<String>,
+    extract: &mut RoutingExtract,
+) -> String {
     match cfg_name {
         "direct" => "direct".into(),
         "block" => "block".into(),
         "must_direct" => "direct(must)".into(),
+        other if defined.contains(other) => {
+            if !extract.outbound_map.iter().any(|(k, _)| k == other) {
+                extract
+                    .outbound_map
+                    .push((other.to_string(), other.to_string()));
+            }
+            other.to_string()
+        }
         other => {
             if !extract.outbound_map.iter().any(|(k, _)| k == other) {
                 extract
@@ -1631,6 +1645,9 @@ fn map_outbound(cfg_name: &str, extract: &mut RoutingExtract) -> String {
 /// 规则级原子：任何一项能力缺失 → 整条规则进 deferred（保持语义不被部分执行）。
 pub fn extract_routing(cfg: &Config) -> Result<RoutingExtract, Vec<Diag>> {
     let mut extract = RoutingExtract::default();
+    // P19：已定义的组名集合（config `group` 段）；规则 outbound 引用直通
+    let defined: std::collections::HashSet<String> =
+        groups(cfg).into_iter().map(|g| g.name).collect();
     let Some(sec) = cfg.sections.iter().find(|s| s.name == "routing") else {
         return Err(vec![diag(None, 0, "缺少 routing 段")]);
     };
@@ -1656,7 +1673,7 @@ pub fn extract_routing(cfg: &Config) -> Result<RoutingExtract, Vec<Diag>> {
                     });
                     continue;
                 }
-                let outbound = map_outbound(&rule.outbound.name, &mut extract);
+                let outbound = map_outbound(&rule.outbound.name, &defined, &mut extract);
                 extract
                     .supported
                     .push(format!("{} -> {}", parts.join(" && "), outbound));
@@ -1669,7 +1686,7 @@ pub fn extract_routing(cfg: &Config) -> Result<RoutingExtract, Vec<Diag>> {
                 }) else {
                     return Err(vec![p_loc(cfg, p)]);
                 };
-                extract.fallback = Some(map_outbound(&name, &mut extract));
+                extract.fallback = Some(map_outbound(&name, &defined, &mut extract));
             }
             _ => {}
         }

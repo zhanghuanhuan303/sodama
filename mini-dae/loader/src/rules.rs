@@ -29,7 +29,7 @@
 //! `domain(ext:…)` 在编译期展开（`geodata.rs`，对照 dae `DatReaderOptimizer`）。
 
 use regex::Regex;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::net::Ipv4Addr;
 
@@ -62,8 +62,10 @@ pub const MATCH_FALLBACK: u8 = 10;
 // ---- outbound 编码（= dae common/consts/ebpf_generated.go） ----
 pub const OUTBOUND_DIRECT: u8 = 0x00;
 pub const OUTBOUND_BLOCK: u8 = 0x01;
-/// mini-dae 只有一个用户组；其它组名都映射到它。
-pub const OUTBOUND_PROXY: u8 = 0x02;
+/// P19：用户组 outbound 索引基址（direct=0 / block=1，用户组 2、3、… 至 0xFB）。
+pub const GROUP_INDEX_BASE: u8 = 2;
+/// 兼容旧名：无组映射时的隐式 proxy 组索引。
+pub const OUTBOUND_PROXY: u8 = GROUP_INDEX_BASE;
 pub const OUTBOUND_MUST_RULES: u8 = 0xFC;
 pub const OUTBOUND_LOGICAL_OR: u8 = 0xFE;
 pub const OUTBOUND_LOGICAL_AND: u8 = 0xFF;
@@ -327,8 +329,7 @@ struct Outbound {
     id: u8,
     mark: u32,
     must: bool,
-    /// 原始组名，仅用于后续日志/报告（当前未消费）
-    #[allow(dead_code)]
+    /// P19：原始组名（built-in 外由 `resolve_outbound_id` 查组索引）。
     name: String,
 }
 
@@ -455,7 +456,7 @@ impl Parser {
             "direct" => OUTBOUND_DIRECT,
             "block" => OUTBOUND_BLOCK,
             "must_rules" => OUTBOUND_MUST_RULES,
-            // 其余组名都映射到 mini-dae 唯一的用户组
+            // P19：其余是用户组名；真实索引由 compile 阶段的 groups 映射解析。
             _ => OUTBOUND_PROXY,
         };
         Ok(Outbound {
@@ -904,10 +905,27 @@ fn expand_func(
     }
 }
 
+/// P19：组名 → outbound 索引。built-in：direct=0 / block=1 / must_rules=0xFC；
+/// 用户组：`groups` 映射（config `group` 顺序，从 `GROUP_INDEX_BASE` 起）。
+/// 未知名回退：同名不存在时用 "proxy"（若也未定义则最小索引/隐式 2）——与 K3 时代
+/// “其余组名都映射到唯一用户组”的行为兼容。
+fn resolve_outbound_id(name: &str, builtin: u8, groups: &HashMap<String, u8>) -> u8 {
+    match name {
+        "direct" | "block" | "must_rules" => builtin,
+        _ => groups
+            .get(name)
+            .or_else(|| groups.get("proxy"))
+            .or_else(|| groups.values().min())
+            .copied()
+            .unwrap_or(OUTBOUND_PROXY),
+    }
+}
+
 fn compile_rule(
     rule: &Rule,
     geo: Option<&Geodata>,
     notes: &mut Vec<String>,
+    groups: &HashMap<String, u8>,
 ) -> Result<CompiledRules, String> {
     // 第一遍：展开成扁平的 match_set 列表（记录所属函数与函数内位置）
     let mut flat: Vec<(Partial, usize, usize)> = Vec::new();
@@ -927,13 +945,14 @@ fn compile_rule(
     }
 
     // 第二遍：分配 outbound（= dae matcher_builder.go:60-73 的编码）
+    let outbound_id = resolve_outbound_id(&rule.outbound.name, rule.outbound.id, groups);
     let mut sets = Vec::with_capacity(flat.len());
     let mut lpm_tries = BTreeMap::new();
     let mut domain_sets = Vec::new();
     let last = flat.len() - 1;
     for (i, (p, fi, pi)) in flat.iter().enumerate() {
         let outbound = if i == last {
-            rule.outbound.id
+            outbound_id
         } else if *pi == func_lens[*fi] - 1 {
             OUTBOUND_LOGICAL_AND
         } else {
@@ -983,13 +1002,26 @@ fn compile_rule(
 /// 解析整个规则文件（每条规则一行，# 注释）。无 geodata 的入口（单测用）。
 #[cfg(test)]
 pub fn parse_and_compile(text: &str) -> Result<CompiledRules, String> {
-    parse_and_compile_with_geo(text, None)
+    parse_and_compile_with_groups(text, None, &HashMap::new())
 }
 
 /// P17a：带 geodata 的编译入口（`dip(geoip:…)`/`domain(geosite:…)` 展开）。
+/// 组名按空映射解析（全部回退隐式 proxy）——单测入口；生产路径用
+/// `parse_and_compile_with_groups`。
+#[cfg(test)]
 pub fn parse_and_compile_with_geo(
     text: &str,
     geo: Option<&Geodata>,
+) -> Result<CompiledRules, String> {
+    parse_and_compile_with_groups(text, geo, &HashMap::new())
+}
+
+/// P19：带组名映射的编译入口。`groups` = 组名 → outbound 索引
+/// （config `group` 段顺序，从 `GROUP_INDEX_BASE` 起）。
+pub fn parse_and_compile_with_groups(
+    text: &str,
+    geo: Option<&Geodata>,
+    groups: &HashMap<String, u8>,
 ) -> Result<CompiledRules, String> {
     let mut all = CompiledRules::default();
     for (lineno, raw) in text.lines().enumerate() {
@@ -1003,7 +1035,7 @@ pub fn parse_and_compile_with_geo(
             .parse_rule()
             .map_err(|e| format!("第 {} 行: {e}", lineno + 1))?;
         let mut rule_notes = Vec::new();
-        let compiled = compile_rule(&rule, geo, &mut rule_notes)
+        let compiled = compile_rule(&rule, geo, &mut rule_notes, groups)
             .map_err(|e| format!("第 {} 行: {e}", lineno + 1))?;
         all.notes.extend(rule_notes);
 
@@ -1231,6 +1263,26 @@ mod tests {
         assert_eq!(c.sets[0].outbound, OUTBOUND_LOGICAL_AND);
         assert_eq!(c.sets[1].type_, MATCH_FALLBACK);
         assert_eq!(c.sets[1].outbound, OUTBOUND_DIRECT);
+    }
+
+    #[test]
+    fn named_groups_resolve_to_indices() {
+        // P19：组名 → outbound 索引（config 顺序，从 GROUP_INDEX_BASE 起）
+        let mut groups = HashMap::new();
+        groups.insert("proxy".to_string(), GROUP_INDEX_BASE);
+        groups.insert("alt".to_string(), GROUP_INDEX_BASE + 1);
+        let c = parse_and_compile_with_groups(
+            "dport(8080) -> proxy\ndport(8082) -> alt\nfallback -> direct",
+            None,
+            &groups,
+        )
+        .unwrap();
+        assert_eq!(c.sets[0].outbound, GROUP_INDEX_BASE);
+        assert_eq!(c.sets[1].outbound, GROUP_INDEX_BASE + 1);
+        assert_eq!(c.sets[2].outbound, OUTBOUND_DIRECT);
+        // 未知名回退 proxy 组（不静默直连）
+        let c = parse_and_compile_with_groups("dport(1) -> typo", None, &groups).unwrap();
+        assert_eq!(c.sets[0].outbound, GROUP_INDEX_BASE);
     }
 
     #[test]

@@ -113,8 +113,44 @@ static CONFIG_STATE: Mutex<Option<(config::Config, config::RoutingExtract)>> = M
 static OUTBOUND: OnceLock<outbound::Outbound> = OnceLock::new();
 /// P4a：accept 线程（daens）→ relay 线程池（host ns）的连接转交通道
 static TCP_RELAY_TX: OnceLock<std::sync::mpsc::Sender<TcpStream>> = OnceLock::new();
-/// P15：活动节点组（状态面输出用）。
-static ACTIVE_GROUP: OnceLock<std::sync::Arc<group::GroupRuntime>> = OnceLock::new();
+/// P19：全部用户组（顺序 = config `group` 段顺序；outbound 索引 = GROUP_INDEX_BASE + i）。
+static GROUP_SET: OnceLock<std::sync::RwLock<GroupSet>> = OnceLock::new();
+/// P19：conn_state_map 的 fd（dup；relay/UDP 线程按 5 元组回读该连接选中的组）。
+static CONN_STATE_MAP_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+/// P19：组集合与默认组（`--group` 指定 > proxy > 第一个）。
+#[derive(Default)]
+struct GroupSet {
+    groups: Vec<std::sync::Arc<group::GroupRuntime>>,
+    default_idx: usize,
+}
+
+impl GroupSet {
+    fn by_outbound(&self, outbound: u8) -> Option<&std::sync::Arc<group::GroupRuntime>> {
+        if !(rules::GROUP_INDEX_BASE..rules::OUTBOUND_MUST_RULES).contains(&outbound) {
+            return None; // direct/block/must_rules/control_plane/逻辑编码 → 不是用户组
+        }
+        self.groups
+            .get((outbound - rules::GROUP_INDEX_BASE) as usize)
+    }
+
+    fn default_group(&self) -> Option<&std::sync::Arc<group::GroupRuntime>> {
+        self.groups.get(self.default_idx)
+    }
+}
+
+/// P19：组名 → outbound 索引（与 build_groups 的构建顺序严格一致）。
+fn group_index_map(cfg: Option<&config::Config>) -> std::collections::HashMap<String, u8> {
+    let specs = cfg.map(config::groups).unwrap_or_default();
+    let mut m = std::collections::HashMap::new();
+    if specs.is_empty() {
+        m.insert("proxy".to_string(), rules::GROUP_INDEX_BASE);
+    }
+    for (i, s) in specs.iter().enumerate() {
+        m.insert(s.name.clone(), rules::GROUP_INDEX_BASE + i as u8);
+    }
+    m
+}
 /// relay 连接空闲回收阈值（秒）；janitor 每 5s 扫描一次。
 static RELAY_IDLE_SECS: AtomicU64 = AtomicU64::new(300);
 /// P11：relay 拨号超时（毫秒，默认 5000；真实节点首连可能较慢）
@@ -1432,6 +1468,11 @@ fn addr16(ip: std::net::IpAddr) -> ([u8; 16], u8) {
 }
 
 fn mini_tuple_of(remote: SocketAddr, local: SocketAddr) -> Option<MiniTuple> {
+    mini_tuple_of_proto(remote, local, 6) // IPPROTO_TCP
+}
+
+/// P19：带协议的 5 元组键（TCP=6 / UDP=17）——conn_state 回读与 offload 共用。
+fn mini_tuple_of_proto(remote: SocketAddr, local: SocketAddr, l4proto: u8) -> Option<MiniTuple> {
     if remote.is_ipv4() != local.is_ipv4() {
         return None;
     }
@@ -1442,10 +1483,52 @@ fn mini_tuple_of(remote: SocketAddr, local: SocketAddr) -> Option<MiniTuple> {
         dip,
         sport: remote.port().to_be(),
         dport: local.port().to_be(),
-        l4proto: 6, // IPPROTO_TCP
+        l4proto,
         is_v6: v6,
         pad: [0; 2],
     })
+}
+
+/// P19：按连接 5 元组从 conn_state_map 回读数据面选中的 outbound（raw lookup）。
+fn lookup_conn_outbound(remote: SocketAddr, local: SocketAddr, l4proto: u8) -> Option<u8> {
+    let fd = CONN_STATE_MAP_FD.load(Ordering::Relaxed);
+    if fd < 0 {
+        return None;
+    }
+    let key = mini_tuple_of_proto(remote, local, l4proto)?;
+    let mut st = MiniConnState::default();
+    let keyb = unsafe {
+        std::slice::from_raw_parts(
+            &key as *const MiniTuple as *const u8,
+            std::mem::size_of::<MiniTuple>(),
+        )
+    };
+    let valb = unsafe {
+        std::slice::from_raw_parts_mut(
+            &mut st as *mut MiniConnState as *mut u8,
+            std::mem::size_of::<MiniConnState>(),
+        )
+    };
+    if bpf_map_lookup_raw(fd, keyb, valb).is_err() {
+        return None;
+    }
+    Some(st.outbound)
+}
+
+/// P19：为一条连接选组——数据面选中的用户组优先；查不到/非用户组返回 None（调用方回退默认组）。
+fn resolve_group_dialer(
+    remote: SocketAddr,
+    local: SocketAddr,
+    l4proto: u8,
+) -> Option<outbound::Outbound> {
+    let lock = GROUP_SET.get()?;
+    let outbound = lookup_conn_outbound(remote, local, l4proto)?;
+    let gs = match lock.read() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    let rt = gs.by_outbound(outbound)?.clone();
+    Some(outbound::Outbound::Group(rt))
 }
 
 fn tuple_hex(t: &MiniTuple) -> String {
@@ -1716,9 +1799,15 @@ fn handle_relay_conn(mut client: TcpStream) {
     let Ok(orig) = client.local_addr() else {
         return;
     };
-    let Some(dialer) = OUTBOUND.get() else {
+    let Some(default_dialer) = OUTBOUND.get() else {
         return;
     };
+    // P19：按规则选中的组分派（conn_state 回读；查不到/非用户组 → 默认组）。
+    let resolved = client
+        .peer_addr()
+        .ok()
+        .and_then(|peer| resolve_group_dialer(peer, orig, 6));
+    let dialer = resolved.as_ref().unwrap_or(default_dialer);
     // P14：dial_mode != ip 时先做用户态嗅探（MSG_PEEK 只读，不消费字节流）
     let mode = DIAL_MODE.load(Ordering::Relaxed);
     let target = if mode != 0 {
@@ -2065,6 +2154,8 @@ fn build_upstream_set(args: &Args) -> Result<Arc<UpstreamSet>, Box<dyn std::erro
 }
 
 /// 上游集合构建核心（启动/reload/`dns-bench` 共用；错误为字符串）。
+/// P19：**单个上游失败不再拖垮整个集合**——域名解析失败/参数错的条目跳过并告警，
+/// 其余（典型是 IP 字面量 DoH）照常生效；CLI `--dns-upstream` 显式给定时仍为硬错误。
 fn build_upstream_set_core(
     cli: Option<String>,
     config_path: Option<&Path>,
@@ -2073,18 +2164,40 @@ fn build_upstream_set_core(
         .and_then(|p| config::load(p).ok())
         .map(|c| config::dns_upstream_map(&c))
         .unwrap_or_default();
-    let legacy_url = cli
-        .clone()
-        .or_else(|| cfg_map.first().map(|(_, v)| v.clone()))
-        .unwrap_or_else(|| "8.8.8.8:53".into());
-    let legacy = dnsup::Upstream::new(&legacy_url)?;
+    let cli_ups = match &cli {
+        Some(url) => {
+            Some(dnsup::Upstream::new(url).map_err(|e| format!("--dns-upstream {url}: {e}"))?)
+        }
+        None => None,
+    };
     let mut by_tag: std::collections::HashMap<String, Arc<dnsup::Upstream>> =
         std::collections::HashMap::new();
+    let mut first_ok: Option<Arc<dnsup::Upstream>> = None;
+    let mut skipped: Vec<String> = Vec::new();
     for (tag, url) in &cfg_map {
-        let u =
-            dnsup::Upstream::new(url).map_err(|e| format!("dns.upstream {tag}（{url}）: {e}"))?;
-        by_tag.insert(tag.clone(), u);
+        match dnsup::Upstream::new(url) {
+            Ok(u) => {
+                if first_ok.is_none() {
+                    first_ok = Some(u.clone());
+                }
+                by_tag.insert(tag.clone(), u);
+            }
+            Err(e) => {
+                skipped.push(tag.clone());
+                log(&format!("dns.upstream {tag} 跳过（{e}）"));
+            }
+        }
     }
+    if !skipped.is_empty() {
+        log(&format!(
+            "dns.upstream：{} 个上游不可用已跳过 {skipped:?}（其余照常生效）",
+            skipped.len()
+        ));
+    }
+    let legacy = cli_ups
+        .or(first_ok)
+        .or_else(|| dnsup::Upstream::new("8.8.8.8:53").ok())
+        .ok_or("没有任何可用的 DNS 上游（含内置回退）")?;
     if cli.is_some() {
         by_tag.insert("default".to_string(), legacy.clone());
     } else if by_tag.is_empty() {
@@ -2130,7 +2243,13 @@ fn reload_rules(args: &Args, ebpf: &mut Ebpf) -> Result<usize, Box<dyn std::erro
     let text = rules_text(args)?;
     let geo = geodata_for(args);
     let geo = geo.lock().unwrap();
-    let compiled = rules::parse_and_compile_with_geo(&text, Some(&geo))
+    // P19：组名 → outbound 索引（与 build_groups 的构建顺序一致；config 失败时回退隐式 proxy）
+    let cfg = args
+        .config
+        .as_ref()
+        .and_then(|p| config::load(std::path::Path::new(p)).ok());
+    let groups = group_index_map(cfg.as_ref());
+    let compiled = rules::parse_and_compile_with_groups(&text, Some(&geo), &groups)
         .map_err(|e| format!("compile rules: {e}"))?;
     for n in &compiled.notes {
         log(&format!("geoexp: {n}"));
@@ -2172,7 +2291,8 @@ fn set_suspend(ebpf: &mut Ebpf, on: bool) -> Result<(), Box<dyn std::error::Erro
 
 /// P6：一次完整热重载（对照 dae `dae reload`）：清除 suspend → 重编译/切槽 →
 /// 重建域位图 → 记录结果；失败时保留旧规则（回滚等价于不切槽，reload_rules 内部先写非活跃槽）。
-fn do_reload(args: &Args, ebpf: &mut Ebpf) -> ReloadOutcome {
+/// `startup=true` = 启动期初始下发（P19：跳过订阅重拉，见下）。
+fn do_reload(args: &Args, ebpf: &mut Ebpf, startup: bool) -> ReloadOutcome {
     if SUSPENDED.load(Ordering::SeqCst) {
         match set_suspend(ebpf, false) {
             Ok(()) => {
@@ -2226,7 +2346,12 @@ fn do_reload(args: &Args, ebpf: &mut Ebpf) -> ReloadOutcome {
             // 对照 dae reconcileCurrentBpfProjections：新槽需要重建域位图。
             reconcile_domain_bits(ebpf);
             // P18e：订阅热更新（重拉订阅 → 整体替换活动组成员）。
-            reload_group_members(args);
+            // P19：启动期跳过——build_groups 刚拉过订阅；且此刻 eBPF 钩子已挂而 DNS
+            // 监听线程尚未启动，重拉时解析节点域名会被自己的数据面拦截并自我阻塞
+            // （getaddrinfo 超时卡死启动，钩子空挂 → 断网；重启后 DNS 缓存为空必现）。
+            if !startup {
+                reload_group_members(args);
+            }
             log(&format!("热重载完成（{n} 条 match_set）"));
             ReloadOutcome {
                 ok: true,
@@ -2301,9 +2426,9 @@ fn sweep_conn_state(ebpf: &mut Ebpf) -> Result<usize, Box<dyn std::error::Error>
     Ok(n)
 }
 
-/// P15：构建节点组（config subscription/node/group + `--subscribe`/`--group`）。
+/// P15/P19：构建全部节点组（config `group` 段顺序即索引顺序；无配置时为隐式 proxy 组）。
 /// 订阅拉取失败/节点全部不支持时返回 None（回落为无 dialer，保持实验回显语义）。
-fn build_group_outbound(args: &Args) -> Option<outbound::Outbound> {
+fn build_groups(args: &Args) -> Option<outbound::Outbound> {
     let cfg = args.config.as_ref().and_then(|p| {
         config::load(std::path::Path::new(p))
             .map_err(|d| {
@@ -2333,31 +2458,77 @@ fn build_group_outbound(args: &Args) -> Option<outbound::Outbound> {
         return None;
     }
 
-    let pick = |name: &str| group_specs.iter().find(|g| g.name == name);
-    let chosen = if group_specs.is_empty() {
-        Some(("proxy".to_string(), None::<&config::GroupSpec>))
+    // P19：全部组按 config 顺序注册；无 config 组时隐式单组 "proxy"（兼容旧行为）。
+    let specs: Vec<(String, Option<config::GroupSpec>)> = if group_specs.is_empty() {
+        vec![("proxy".to_string(), None)]
     } else {
-        args.group
-            .as_deref()
-            .and_then(pick)
-            .or_else(|| pick("proxy"))
-            .or_else(|| group_specs.first())
+        group_specs
+            .into_iter()
             .map(|g| (g.name.clone(), Some(g)))
+            .collect()
     };
-    let Some((gname, spec)) = chosen else {
-        return None;
-    };
-    let policy = group::parse_policy(spec.and_then(|g| g.policy.as_deref()));
-    let filters = spec.map(|g| g.filters.clone()).unwrap_or_default();
-    let members = group::build_members(&nodes, &filters);
-    if members.is_empty() {
-        log(&format!(
-            "组 {gname} 没有命中的节点（filter 过严？），组不启用"
+    let mut groups = Vec::with_capacity(specs.len());
+    let mut by_name = std::collections::HashMap::new();
+    for (i, (name, spec)) in specs.iter().enumerate() {
+        by_name.insert(name.clone(), i);
+        groups.push(make_group_runtime(
+            name,
+            spec.as_ref(),
+            &nodes,
+            cfg.as_ref(),
         ));
-        return None;
+    }
+    let default_idx = select_default_group(&by_name, args);
+    let default_rt = groups[default_idx].clone();
+    if groups.len() > 1 {
+        let names: Vec<&str> = specs.iter().map(|(n, _)| n.as_str()).collect();
+        log(&format!(
+            "P19 多组分派：{} 个组 {names:?}（outbound 索引 {} 起），默认组 {}",
+            groups.len(),
+            rules::GROUP_INDEX_BASE,
+            specs[default_idx].0
+        ));
     }
 
-    let global_str = |key: &str| cfg.as_ref().and_then(|c| config::global_value(c, key));
+    let set = GroupSet {
+        groups,
+        default_idx,
+    };
+    let lock = GROUP_SET.get_or_init(|| std::sync::RwLock::new(GroupSet::default()));
+    match lock.write() {
+        Ok(mut g) => *g = set,
+        Err(p) => *p.into_inner() = set,
+    }
+    Some(outbound::Outbound::Group(default_rt))
+}
+
+/// P19：默认组选择（`--group` 指定 > proxy > 第一个）。
+fn select_default_group(by_name: &std::collections::HashMap<String, usize>, args: &Args) -> usize {
+    args.group
+        .as_deref()
+        .and_then(|n| by_name.get(n).copied())
+        .or_else(|| by_name.get("proxy").copied())
+        .unwrap_or(0)
+}
+
+/// P15/P19：构建单个组（成员/策略/探测参数/udp_check）；成员为空也注册
+/// （保索引稳定，订阅热更新可后续替换进成员）。
+fn make_group_runtime(
+    gname: &str,
+    spec: Option<&config::GroupSpec>,
+    nodes: &[subscribe::ParsedNode],
+    cfg: Option<&config::Config>,
+) -> std::sync::Arc<group::GroupRuntime> {
+    let policy = group::parse_policy(spec.and_then(|g| g.policy.as_deref()));
+    let filters = spec.map(|g| g.filters.clone()).unwrap_or_default();
+    let members = group::build_members(nodes, &filters);
+    if members.is_empty() {
+        log(&format!(
+            "组 {gname} 没有命中的节点（filter 过严？），暂为空组"
+        ));
+    }
+
+    let global_str = |key: &str| cfg.and_then(|c| config::global_value(c, key));
     let check_urls: Vec<String> = match spec.and_then(|g| {
         if g.tcp_check_urls.is_empty() {
             None
@@ -2406,7 +2577,7 @@ fn build_group_outbound(args: &Args) -> Option<outbound::Outbound> {
         });
 
     let rt = group::GroupRuntime::new(
-        gname.clone(),
+        gname.to_string(),
         policy,
         members,
         targets.clone(),
@@ -2419,8 +2590,7 @@ fn build_group_outbound(args: &Args) -> Option<outbound::Outbound> {
         rt.member_count()
     ));
     rt.spawn_health_loop();
-    let _ = ACTIVE_GROUP.set(rt.clone());
-    Some(outbound::Outbound::Group(rt))
+    rt
 }
 
 /// 拉取内联节点 + 全部订阅（config subscription 与 CLI `--subscribe`）——
@@ -2469,10 +2639,10 @@ fn fetch_nodes(cfg: Option<&config::Config>, args: &Args) -> Vec<subscribe::Pars
     nodes
 }
 
-/// P18e：SIGHUP 订阅热更新——重拉订阅并整体替换活动组成员
-/// （同 name+tag 成员继承健康/延迟）；失败（无节点/filter 后为空）保留旧成员。
+/// P18e/P19：SIGHUP 订阅热更新——重拉订阅，按组 filter 替换成员（同名继承健康）。
+/// 组名集合变化（config 编辑）时整体重建（不做健康继承，日志明示）。
 fn reload_group_members(args: &Args) {
-    let Some(g) = ACTIVE_GROUP.get() else {
+    let Some(lock) = GROUP_SET.get() else {
         return;
     };
     let cfg = args.config.as_ref().and_then(|p| {
@@ -2487,25 +2657,57 @@ fn reload_group_members(args: &Args) {
         log("订阅热更新：未获得任何节点，保留旧成员");
         return;
     }
-    // 按当前活动组名回查 filter（非 config 组时为空 = 全收，与初次构建一致）。
-    let filters = cfg
-        .as_ref()
-        .map(config::groups)
-        .unwrap_or_default()
-        .into_iter()
-        .find(|s| s.name == g.name)
-        .map(|s| s.filters)
-        .unwrap_or_default();
-    let members = group::build_members(&nodes, &filters);
-    if members.is_empty() {
-        log("订阅热更新：filter 后无成员，保留旧成员");
-        return;
+    let group_specs = cfg.as_ref().map(config::groups).unwrap_or_default();
+    let specs: Vec<(String, Option<config::GroupSpec>)> = if group_specs.is_empty() {
+        vec![("proxy".to_string(), None)]
+    } else {
+        group_specs
+            .into_iter()
+            .map(|g| (g.name.clone(), Some(g)))
+            .collect()
+    };
+    let mut g = match lock.write() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    let old_names: Vec<String> = g.groups.iter().map(|r| r.name.clone()).collect();
+    let new_names: Vec<String> = specs.iter().map(|(n, _)| n.clone()).collect();
+    if old_names == new_names {
+        for (i, (name, spec)) in specs.iter().enumerate() {
+            let filters = spec.as_ref().map(|s| s.filters.clone()).unwrap_or_default();
+            let members = group::build_members(&nodes, &filters);
+            if members.is_empty() {
+                log(&format!(
+                    "订阅热更新：组 {name} filter 后无成员，保留旧成员"
+                ));
+                continue;
+            }
+            let (n, inherited) = g.groups[i].replace_members(members);
+            log(&format!(
+                "订阅热更新：组 {name} {n} 成员（继承 {inherited} 健康）"
+            ));
+        }
+    } else {
+        log(&format!(
+            "订阅热更新：组集合变更 {old_names:?} -> {new_names:?}，重建全部组（不继承健康）"
+        ));
+        let mut groups = Vec::with_capacity(specs.len());
+        let mut by_name = std::collections::HashMap::new();
+        for (i, (name, spec)) in specs.iter().enumerate() {
+            by_name.insert(name.clone(), i);
+            groups.push(make_group_runtime(
+                name,
+                spec.as_ref(),
+                &nodes,
+                cfg.as_ref(),
+            ));
+        }
+        let default_idx = select_default_group(&by_name, args);
+        *g = GroupSet {
+            groups,
+            default_idx,
+        };
     }
-    let (n, inherited) = g.replace_members(members);
-    log(&format!(
-        "订阅热更新：{n} 成员（继承 {inherited} 健康），组 {}",
-        g.name
-    ));
 }
 
 fn parse_check_target(u: &str) -> Option<(String, u16)> {
@@ -2616,9 +2818,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // P15：无 --dialer/--forward 时，用订阅/节点/组构建拨号出口（单个节点即单成员组）。
+    // P15/P19：无 --dialer/--forward 时，用订阅/节点/组构建全部组（规则按组名分派）。
     if OUTBOUND.get().is_none() {
-        if let Some(dialer) = build_group_outbound(&args) {
+        if let Some(dialer) = build_groups(&args) {
             let name = dialer.name();
             log(&format!("relay dialer: {name}"));
             let _ = OUTBOUND.set(dialer);
@@ -2631,7 +2833,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let text = std::fs::read_to_string(path).map_err(|e| format!("read rules {path}: {e}"))?;
         let geo = geodata_for(&args);
         let geo = geo.lock().unwrap();
-        let compiled = rules::parse_and_compile_with_geo(&text, Some(&geo))
+        // P19：带 --config 时按真实组名映射编译（对拍不带组的夹具时行为不变）
+        let cfg = args
+            .config
+            .as_ref()
+            .and_then(|p| config::load(std::path::Path::new(p)).ok());
+        let groups = group_index_map(cfg.as_ref());
+        let compiled = rules::parse_and_compile_with_groups(&text, Some(&geo), &groups)
             .map_err(|e| format!("compile rules: {e}"))?;
         print!("{}", compiled.dump_parity());
         let _ = std::io::stdout().flush();
@@ -2700,6 +2908,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let _ = std::thread::Builder::new()
                     .name("dns-pname-gc".into())
                     .spawn(move || dns_pname_gc_loop(dup));
+            }
+        }
+    }
+
+    // P19：把 conn_state_map 的 fd dup 一份给 relay/UDP 线程
+    // （按 5 元组回读该连接选中的用户组；组索引由规则编译写入）。
+    if let Some(map) = ebpf.map("conn_state_map") {
+        use std::os::fd::{AsFd, AsRawFd};
+        if let aya::maps::Map::HashMap(md) = map {
+            let raw = md.fd().as_fd().as_raw_fd();
+            let dup = unsafe { libc::dup(raw) };
+            if dup >= 0 {
+                CONN_STATE_MAP_FD.store(dup, Ordering::Relaxed);
             }
         }
     }
@@ -2835,7 +3056,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         dae0peer_mac
     ));
 
-    let initial = do_reload(&args, &mut ebpf);
+    let initial = do_reload(&args, &mut ebpf, true);
     if !initial.ok {
         return Err(format!("初始规则下发失败: {}", initial.error.unwrap_or_default()).into());
     }
@@ -2935,7 +3156,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         if RELOAD.swap(false, Ordering::SeqCst) {
             reopen_log();
-            do_reload(&args, &mut ebpf);
+            do_reload(&args, &mut ebpf, false);
         }
         ticks += 1;
         if ticks % janitor_ticks == 0 {
@@ -3655,8 +3876,9 @@ fn udp_nat_handle(
                 UDP_NAT_STATS.errors.fetch_add(1, Ordering::Relaxed);
                 return;
             };
-            // P5：有 dialer 且协议支持 UDP → 走代理；否则直连回退
-            let relay = match OUTBOUND.get() {
+            // P5/P19：按规则选中的组分派（conn_state 回读；回退默认组）
+            let resolved = resolve_group_dialer(client, orig_dst, 17);
+            let relay = match resolved.as_ref().or(OUTBOUND.get()) {
                 Some(o) if o.supports_udp() => match o.dial_udp(
                     orig_dst,
                     Duration::from_millis(RELAY_DIAL_TIMEOUT_MS.load(Ordering::Relaxed)),
@@ -4329,6 +4551,26 @@ fn read_stats(ebpf: &mut Ebpf) -> (u64, u64, u64, u64) {
     (get(0), get(1), get(2), get(3))
 }
 
+/// P19：单个组的 JSON（status 的 `group` 与 `groups[]` 共用）。
+fn group_json(g: &group::GroupRuntime, index: usize, default: bool) -> serde_json::Value {
+    let snap = g.snapshot();
+    json!({
+        "name": g.name,
+        "index": index,
+        "default": default,
+        "policy": format!("{:?}", g.policy),
+        "members": g.member_count(),
+        "alive": snap.iter().filter(|x| x.2).count(),
+        "dials": g.stats.dials.load(Ordering::Relaxed),
+        "failovers": g.stats.failovers.load(Ordering::Relaxed),
+        "probes_ok": g.stats.probes_ok.load(Ordering::Relaxed),
+        "probes_fail": g.stats.probes_fail.load(Ordering::Relaxed),
+        "nodes": snap.iter().map(|(n, tag, alive, last, ema)| json!({
+            "name": n, "tag": tag, "alive": alive, "last_ms": last, "ema_ms": ema
+        })).collect::<Vec<_>>(),
+    })
+}
+
 /// P6：状态面主查询体（status / metrics 共用数据源）。
 fn status_json(ebpf: &mut Ebpf) -> serde_json::Value {
     let rules_state = LAST_RULES.lock().ok().and_then(|g| g.clone());
@@ -4359,6 +4601,30 @@ fn status_json(ebpf: &mut Ebpf) -> serde_json::Value {
             "fallback": ex.fallback,
         })
     });
+    // P19：默认组（兼容旧口径）+ 全部组
+    let (default_group_json, groups_json) = match GROUP_SET.get() {
+        Some(l) => {
+            let gs = match l.read() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            let all: Vec<serde_json::Value> = gs
+                .groups
+                .iter()
+                .enumerate()
+                .map(|(i, g)| group_json(g, i, i == gs.default_idx))
+                .collect();
+            let def = gs
+                .default_group()
+                .map(|g| group_json(g, gs.default_idx, true))
+                .unwrap_or(serde_json::Value::Null);
+            (def, serde_json::Value::Array(all))
+        }
+        None => (
+            serde_json::Value::Null,
+            serde_json::Value::Array(Vec::new()),
+        ),
+    };
     json!({
         "version": env!("CARGO_PKG_VERSION"),
         "pid": std::process::id(),
@@ -4405,25 +4671,8 @@ fn status_json(ebpf: &mut Ebpf) -> serde_json::Value {
             "map_entries": cookie_pid,
             "hits": pname_hits,
         },
-        "group": match ACTIVE_GROUP.get() {
-            Some(g) => {
-                let snap = g.snapshot();
-                json!({
-                    "name": g.name,
-                    "policy": format!("{:?}", g.policy),
-                    "members": g.member_count(),
-                    "alive": snap.iter().filter(|x| x.2).count(),
-                    "dials": g.stats.dials.load(Ordering::Relaxed),
-                    "failovers": g.stats.failovers.load(Ordering::Relaxed),
-                    "probes_ok": g.stats.probes_ok.load(Ordering::Relaxed),
-                    "probes_fail": g.stats.probes_fail.load(Ordering::Relaxed),
-                    "nodes": snap.iter().map(|(n, tag, alive, last, ema)| json!({
-                        "name": n, "tag": tag, "alive": alive, "last_ms": last, "ema_ms": ema
-                    })).collect::<Vec<_>>(),
-                })
-            }
-            None => serde_json::Value::Null,
-        },
+        "group": default_group_json,
+        "groups": groups_json,
         "udp_nat": {
             "sessions_active": UDP_NAT.lock().map(|t| t.len()).unwrap_or(0),
             "sessions_total": UDP_NAT_STATS.sessions_total.load(Ordering::Relaxed),
@@ -4755,7 +5004,7 @@ fn handle_status_query(cmd: &str, ebpf: &mut Ebpf, args: &Args) -> String {
     match cmd {
         "status" => status_json(ebpf).to_string(),
         "reload" => {
-            let out = do_reload(args, ebpf);
+            let out = do_reload(args, ebpf, false);
             json!({
                 "ok": out.ok,
                 "match_sets": out.match_sets,
@@ -4845,5 +5094,43 @@ fn handle_status_query(cmd: &str, ebpf: &mut Ebpf, args: &Args) -> String {
             )
         })
         .to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// P19：单个上游构造失败（如非法 URL）应被跳过，其余照常生效——
+    /// 不再让一个坏条目把整个上游集（进而全机 DNS）拖垮。
+    #[test]
+    fn upstream_set_skips_broken_entries() {
+        let dir = std::env::temp_dir().join(format!("mini-dae-uptest-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = dir.join("t.dae");
+        std::fs::write(
+            &cfg,
+            concat!(
+                "global { }\n",
+                "dns {\n",
+                "    upstream {\n",
+                "        bad: 'https://'\n",
+                "        good: 'udp://127.0.0.1:53'\n",
+                "    }\n",
+                "}\n",
+                "routing { fallback: proxy }\n"
+            ),
+        )
+        .unwrap();
+        // config::load 默认校验权限（≤0640），测试文件收紧到 0600。
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&cfg, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let set = build_upstream_set_core(None, Some(&cfg)).expect("至少 good 可用");
+        assert!(set.by_tag.contains_key("good"), "{:?}", set.by_tag.keys());
+        assert!(!set.by_tag.contains_key("bad"));
+        assert_eq!(set.legacy.url, "udp://127.0.0.1:53");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
 # mini-dae 真网关模式：在宿主 netns 用 eBPF 透明接管本机流量（浏览器零配置）。
 #
-#   sudo lab/gateway.sh up [--iface wlan0] [--node <文件|URL> | --subscribe <文件|URL>] [--group <名>] [--rules <文件> | --config <配置文件>] [--dns <上游URL>] [--geodata-dir <目录>] [--no-ipv6] [--dial-mode ip|domain]
+#   sudo lab/gateway.sh up [--iface wlan0] [--node <文件|URL> | --subscribe <文件|URL>] [--group <名>] [--rules <文件> | --config <配置文件>] [--dns <上游URL>] [--geodata-dir <目录>] [--no-ipv6] [--dial-mode ip|domain] [--wait <秒>|--no-wait]
 #   sudo lab/gateway.sh down          # 停止并恢复（幂等）
 #   sudo lab/gateway.sh status        # 查看进程/钩子/日志
 #   lab/gateway.sh test               # 连通性快检（可直接用当前用户跑）
 #   sudo lab/gateway.sh up --dry-run  # 只打印将要执行的命令
+#
+# up 的启动自检（P19）：loader 起来后，等「节点组就绪 + 代理路径 204」才返回（默认最长
+# 75s，--wait <秒> 或 --no-wait 可调）；超时自动 down 回滚直连，不会把机器晾在断网态。
 #
 # 原理（复用 lab.sh test-host-proxy 已验证的宿主流量路径，网卡不移动、不断网）：
 #   - 物理网卡（默认路由网卡）留在宿主 netns，只挂 tc 钩子：
@@ -56,6 +59,8 @@ DIAL_MODE="domain"
 SNIFF_TIMEOUT_MS=100
 NO_IPV6=0
 DRY_RUN=0
+# P19：up 启动自检的最长等待（秒）；0 = 不等（旧行为）
+WAIT_SECS="${GATEWAY_WAIT_SECS:-75}"
 
 die() { echo "错误：$*" >&2; exit 1; }
 info() { echo "== $* =="; }
@@ -306,6 +311,17 @@ up() {
   fi
   echo "   loader pid=$(cat "$PID_FILE")"
 
+  # P19：启动自检 + 失败自动回滚（组健康 + 轻量代理探针；见文件头注释）。
+  if ! wait_ready; then
+    info "启动自检未通过 → 自动回滚到直连"
+    cleanup
+    restore_sysctls
+    echo "--- loader 日志尾部 ---" >&2
+    tail -n 25 "$LOG" >&2 || true
+    die "网关启动后自检失败（${WAIT_SECS}s），已自动回滚；本机网络保持直连"
+  fi
+  echo "   代理路径自检通过（节点组已就绪）"
+
   if [ "$NO_IPV6" -eq 1 ]; then
     echo "   已按 --no-ipv6 关闭 $IFACE 的 IPv6；数据面仅 IPv4。"
   elif ip -6 route show default 2>/dev/null | grep -q .; then
@@ -324,6 +340,56 @@ down() {
   ip route show default || true
   ip -6 route show default 2>/dev/null || true
   echo "完成：本机网络已恢复为直连。"
+}
+
+# P19：启动自检：等节点组至少一个成员探测成功（last_ms 非空），且（有 wget 时）
+# 轻量代理探针 204。返回 0 = 就绪；1 = 超时/loader 退出。
+wait_ready() {
+  local wait="${WAIT_SECS:-75}"
+  if [ "$wait" -le 0 ]; then
+    return 0
+  fi
+  local deadline=$((SECONDS + wait))
+  local ready=0
+  info "启动自检：等待节点组与代理路径就绪（最长 ${wait}s）"
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    sleep 4
+    local pid=""
+    [ -f "$PID_FILE" ] && pid="$(cat "$PID_FILE" 2>/dev/null || true)"
+    if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then
+      echo "   loader 已退出" >&2
+      return 1
+    fi
+    # 1) 组健康：任一成员探测成功（last_ms 非空；未探测前的乐观 alive 不算）
+    if ! "$LOADER" status --socket "$STATUS_SOCK" --json 2>/dev/null | python3 -c '
+import json, sys
+try:
+    v = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+gs = v.get("groups") or ([v["group"]] if v.get("group") else [])
+ok = any(
+    n.get("last_ms") is not None
+    for g in gs
+    for n in (g.get("nodes") or [])
+)
+sys.exit(0 if ok else 1)
+'; then
+      continue
+    fi
+    # 2) 轻量代理路径探针（wget 走 fallback->proxy；缺 wget 时仅以组健康为准）
+    if command -v wget >/dev/null 2>&1; then
+      local code=""
+      code="$(wget -S -O /dev/null --timeout=10 https://www.gstatic.com/generate_204 2>&1 \
+        | awk '/HTTP\//{c=$2} END{print c}' || true)"
+      if [ "$code" != "204" ]; then
+        continue
+      fi
+    fi
+    ready=1
+    break
+  done
+  [ "$ready" = 1 ]
 }
 
 status() {
@@ -395,6 +461,8 @@ while [ $# -gt 0 ]; do
   --dns) DNS="$2"; shift 2 ;;
   --geodata-dir) GEODATA_DIR="$2"; shift 2 ;;
   --dial-mode) DIAL_MODE="$2"; shift 2 ;;
+  --wait) WAIT_SECS="$2"; shift 2 ;;
+  --no-wait) WAIT_SECS=0; shift ;;
   --no-ipv6) NO_IPV6=1; shift ;;
   --dry-run) DRY_RUN=1; shift ;;
   -h | --help) usage; exit 0 ;;

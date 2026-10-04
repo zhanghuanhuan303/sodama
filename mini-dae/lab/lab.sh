@@ -150,6 +150,8 @@ SUB_PORT=18530
 SUB_PID_FILE=/tmp/mini-dae-sub.pid
 SUB_BODY=/tmp/mini-dae-sub-body.txt
 SUB_CONFIG=/tmp/mini-dae-subscribe.dae
+# P19：多组分派夹具配置（groups-up 生成）
+SUB_GROUPS_CONFIG=/tmp/mini-dae-groups.dae
 # P18e：SS2022（shadowsocks-rust ssserver 参考对端；PSK 为 16 字节 "0123456789abcdef" 的 base64）
 SS2022_PSK=MDEyMzQ1Njc4OWFiY2RlZg==
 SS2022_METHOD=2022-blake3-aes-128-gcm
@@ -2038,7 +2040,7 @@ test_sub_reload() {
   echo >>"$SUB_BODY"
   kill -HUP "$(cat "$PID_FILE")"
   sleep 3
-  grep -q "订阅热更新：1 成员（继承 1 健康），组 proxy" "$LOG" \
+  grep -q "订阅热更新：组 proxy 1 成员（继承 1 健康）" "$LOG" \
     || { echo "FAIL: 日志无订阅热更新或健康继承计数"; tail -8 "$LOG"; exit 1; }
   "$LOADER" status --socket "$STATUS_SOCK" --json >/tmp/mini-dae-status.json
   python3 - /tmp/mini-dae-status.json <<'PY'
@@ -2053,6 +2055,91 @@ PY
   out="$(ip netns exec "$CLIENT_NS" timeout 8 python3 "$HERE/client_probe.py" "$PROXY_DST" 8080 2>&1 || true)"
   echo "$out" | grep -q "wan-echo-ok" || { echo "FAIL: 热更新后拨号失败"; echo "$out"; exit 1; }
   echo "PASS: 订阅热更新（成员 2→1，node-a 继承健康，拨号正常）"
+}
+
+# P19：多组分派——规则按组名选组（proxy→A / alt→B），数据面 outbound 索引
+# 经 conn_state 回读，relay/UDP 按连接选组。
+groups_up() {
+  require_root
+  [ -f "$OBJ" ] && [ -x "$LOADER" ] || die "先运行 $0 build"
+  cleanup
+  local meth="chacha20-ietf-poly1305" pass="testpass"
+  {
+    echo "ss://$meth:$pass@127.0.0.1:$SS_PORT#node-a"
+    echo "ss://$meth:$pass@127.0.0.1:$SS_PORT_B#node-b"
+  } | base64 -w0 >"$SUB_BODY"
+  echo >>"$SUB_BODY"
+  cat >"$SUB_GROUPS_CONFIG" <<EOF
+# P19：多组分派（proxy→node-a / alt→node-b；routing 按目标端口选组）
+global {
+    tcp_check_url: 'http://10.9.9.2:9999'
+    check_interval: '1s'
+    check_tolerance: '1'
+}
+subscription {
+    lab: 'http://127.0.0.1:$SUB_PORT/sub'
+}
+group {
+    proxy {
+        filter: name(node-a)
+        policy: min_moving_avg
+    }
+    alt {
+        filter: name(node-b)
+        policy: min_moving_avg
+    }
+}
+routing {
+    dip(1.1.1.1/32) && dport(8080) -> proxy
+    dip(1.1.1.1/32) && dport(8082) -> alt
+    fallback: direct
+}
+EOF
+  chmod 640 "$SUB_GROUPS_CONFIG"
+  USE_CONFIG="$SUB_GROUPS_CONFIG" USE_SS=1 USE_SS_METHOD="$meth" USE_SS_PASSWORD="$pass" \
+    USE_SS_B=1 USE_SUB_SERVER=1 USE_RELAY_IDLE=600 up
+}
+
+test_groups() {
+  require_root
+  echo "== P19：多组分派（8080→proxy/node-a，8082→alt/node-b）=="
+  grep -q "P19 多组分派：2 个组" "$LOG" \
+    || { echo "FAIL: 日志无多组构建（先 groups-up）"; tail -5 "$LOG"; exit 1; }
+  local out
+  "$LOADER" status --socket "$STATUS_SOCK" --json >/tmp/mini-dae-status.json
+  python3 - /tmp/mini-dae-status.json <<'PY'
+import json, sys
+v = json.load(open(sys.argv[1]))
+gs = v.get("groups") or []
+assert len(gs) == 2, gs
+by = {g["name"]: g for g in gs}
+assert by["proxy"]["members"] == 1 and by["alt"]["members"] == 1, gs
+assert by["proxy"]["default"] and not by["alt"]["default"], gs
+assert v["group"]["name"] == "proxy", v.get("group")
+print("groups: " + ", ".join("%s(idx=%d members=%d default=%s)" % (g["name"], g["index"], g["members"], g["default"]) for g in gs))
+PY
+  # 8080 → proxy 组（node-a / SS_PORT，首包应答带 wan-echo-ok）
+  out="$(ip netns exec "$CLIENT_NS" timeout 8 python3 "$HERE/client_probe.py" "$PROXY_DST" 8080 2>&1 || true)"
+  echo "$out" | grep -q "wan-echo-ok" || { echo "FAIL: 8080 经 proxy 组未通"; echo "$out"; exit 1; }
+  # 8082 → alt 组（node-b / SS_PORT_B，纯回显：应答就是 ping）
+  out="$(ip netns exec "$CLIENT_NS" timeout 8 python3 "$HERE/client_probe.py" "$PROXY_DST" 8082 2>&1 || true)"
+  echo "$out" | grep -q "^ping" || { echo "FAIL: 8082 经 alt 组未通"; echo "$out"; exit 1; }
+  # 交叉验证：谁看到谁的 target（分派必须精确，不能串）
+  grep -q "TCP target=$PROXY_DST:8080" "$SS_LOG" || { echo "FAIL: ss-A 未看到 8080"; exit 1; }
+  grep -q "TCP target=$PROXY_DST:8082" "${SS_LOG}.b" || { echo "FAIL: ss-B 未看到 8082"; exit 1; }
+  if grep -q "TCP target=$PROXY_DST:8082" "$SS_LOG"; then echo "FAIL: 8082 错走到 ss-A（分派失效）"; exit 1; fi
+  if grep -q "TCP target=$PROXY_DST:8080" "${SS_LOG}.b"; then echo "FAIL: 8080 错走到 ss-B（分派失效）"; exit 1; fi
+  echo "PASS: 8080→node-a / 8082→node-b（双 ss 日志交叉为证）"
+  # SIGHUP 后分派保持（每组各自替换成员）
+  kill -HUP "$(cat "$PID_FILE")"
+  sleep 3
+  grep -q "订阅热更新：组 proxy 1 成员" "$LOG" \
+    || { echo "FAIL: 热更新日志缺 proxy 组"; tail -8 "$LOG"; exit 1; }
+  grep -q "订阅热更新：组 alt 1 成员" "$LOG" \
+    || { echo "FAIL: 热更新日志缺 alt 组"; tail -8 "$LOG"; exit 1; }
+  out="$(ip netns exec "$CLIENT_NS" timeout 8 python3 "$HERE/client_probe.py" "$PROXY_DST" 8082 2>&1 || true)"
+  echo "$out" | grep -q "^ping" || { echo "FAIL: 热更新后 alt 组拨号失败"; echo "$out"; exit 1; }
+  echo "PASS: 多组分派（含 SIGHUP 热更新后复测）"
 }
 
 # P4c：TCP offload——同一 512KB 流量下，用户态字节数远小于总传输（内核拼接证据）。
@@ -2762,6 +2849,8 @@ case "${1:-}" in
   subscribe-up) subscribe_up ;;
   sub-reload-up) subscribe_up ;;  # P18e：热更新测试的前置（与 subscribe-up 相同）
   test-sub-reload) test_sub_reload ;;
+  groups-up) groups_up ;;  # P19：多组分派（proxy→A / alt→B）
+  test-groups) test_groups ;;
   test-subscribe) test_subscribe ;;
   v6-up) USE_RULES="$HERE/rules.v6.dae" USE_SS=1 USE_SS_METHOD=chacha20-ietf-poly1305 \
     USE_SS_PASSWORD=testpass USE_DIALER="ss://chacha20-ietf-poly1305:testpass@127.0.0.1:$SS_PORT" \
@@ -2884,5 +2973,5 @@ case "${1:-}" in
   status) status ;;
   trace) trace ;;
   down) down ;;
-  *) echo "usage: $0 {build|up|dual-up|config-up|forward-up|dns-up|dot-up|doh-up|doq-up|dnsroute-up|dns-udp-up|dns-tcpup-up|geo-up|pname-up|regex-up|relay-up|offload-up|udp-up|ss-up|ss2022-up|http-up|ss-udp-up|trojan-up|vless-up|vless-tls-up|vless-udp-up|vmess-up|vmess-tls-up|vmess-udp-up|tuic-up|tuic-udp-up|hy2-up|hy2-udp-up|hy2-obfs-up|hy2-obfs-udp-up|hy2-brutal-up|hy2-hop-up|ops-up|ops-reload-up|bench-up|test-proxy|test-direct|test-block|test-host-proxy|test-reload|test-rebind|test-status|test-config|test-forward|test-domain|test-dns-cache|test-dns-tcp|test-dns-reload|test-domain-regex|test-dns-edns|test-dot|test-doh|test-doq|test-dnsroute|test-dns-udp|test-dns-tcpup|test-geo|test-pname|test-v6|test-relay|test-relay-idle|test-relay-offload|test-offload-lifecycle|test-udp-relay|test-udp-idle|test-ss|test-ss2022|test-http|test-trojan|test-ss-udp|test-vless|test-vless-udp|test-vmess|test-vmess-udp|test-tuic|test-tuic-udp|test-hy2|test-hy2-udp|test-hy2-obfs|test-hy2-obfs-udp|test-hy2-brutal|test-hy2-hop|test-ops|test-config-reload|test-fault-reload|test-fault-kill|reload|verify|status|trace|down}"; exit 2 ;;
+  *) echo "usage: $0 {build|up|dual-up|config-up|forward-up|dns-up|dot-up|doh-up|doq-up|dnsroute-up|dns-udp-up|dns-tcpup-up|geo-up|pname-up|regex-up|relay-up|offload-up|udp-up|ss-up|ss2022-up|http-up|groups-up|ss-udp-up|trojan-up|vless-up|vless-tls-up|vless-udp-up|vmess-up|vmess-tls-up|vmess-udp-up|tuic-up|tuic-udp-up|hy2-up|hy2-udp-up|hy2-obfs-up|hy2-obfs-udp-up|hy2-brutal-up|hy2-hop-up|ops-up|ops-reload-up|bench-up|test-proxy|test-direct|test-block|test-host-proxy|test-reload|test-rebind|test-status|test-config|test-forward|test-domain|test-dns-cache|test-dns-tcp|test-dns-reload|test-domain-regex|test-dns-edns|test-dot|test-doh|test-doq|test-dnsroute|test-dns-udp|test-dns-tcpup|test-geo|test-pname|test-v6|test-relay|test-relay-idle|test-relay-offload|test-offload-lifecycle|test-udp-relay|test-udp-idle|test-ss|test-ss2022|test-http|test-groups|test-trojan|test-ss-udp|test-vless|test-vless-udp|test-vmess|test-vmess-udp|test-tuic|test-tuic-udp|test-hy2|test-hy2-udp|test-hy2-obfs|test-hy2-obfs-udp|test-hy2-brutal|test-hy2-hop|test-ops|test-config-reload|test-fault-reload|test-fault-kill|reload|verify|status|trace|down}"; exit 2 ;;
 esac

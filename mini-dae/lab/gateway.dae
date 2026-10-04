@@ -27,8 +27,9 @@ dns {
         # 同上 + ECS（mini 扩展：auto = 按查询发起方地址归整 v4 /24、v6 /56）——
         # 国内域用它，让 CDN 解析落到本地视角（不再依赖路由器明文）
         alidns_ecs: 'https://223.5.5.5/dns-query?sni=dns.alidns.com&ecs=auto'
-        # 备选其一：DoQ（RFC 9250，UDP 853，本网络实测可用）
-        ali_quic: 'quic://dns.alidns.com'
+        # 备选其一：DoQ（RFC 9250，UDP 853，本网络实测可用；IP 字面量 + SNI，
+        # 同 DoH：不依赖自身 DNS 解析）
+        ali_quic: 'quic://223.5.5.5?sni=dns.alidns.com'
         # 备选：本地路由器明文（调试对照；也可作为 geosite:cn 的出口）
         router: 'udp://192.0.2.1:53'
     }
