@@ -1401,3 +1401,31 @@ lab 夹具 `http_connect_server.py` + `sub_server.py` 每次重读。）
 - 边界：仅 h2（无 H3/QUIC 形态）、不做跨目标连接池（每客户端连接一条底层 h2 连接）、
   Basic 凭据仅 base64（安全性依赖外层 TLS；`insecure=1` 时有 MITM 风险）、服务端兼容性
   未做矩阵穷举（按 RFC 9113 CONNECT 语义实现，已过 Go 标准库 `net/http` h2）。
+
+### 11.41 P26（HTTP/3：DoH h3 + naive+quic，ADR-0050）已验收的行为
+
+- `h3client.rs`（最小 HTTP/3，与 h2client 对称）：控制流 type 0x00 + 空 SETTINGS（保持
+  打开）；`request()`：HEADERS + QPACK + DATA + FIN，读 HEADERS（`:status`）/DATA 直到
+  流 FIN；`connect_tunnel()`：CONNECT（`:method`/`:authority`，无 `:scheme`/`:path`）→
+  2xx 后返回读写半；隧道数据走 **DATA 帧**（RFC 9114 §4.4），写侧 ≤16KB/帧，
+  `end_stream()` 幂等发 FIN；`H3Shared` 同时持有控制流与 endpoint 句柄（两半存活期间
+  连接不被驱动回收）。
+- `quicvarint.rs`：hysteria2 的 varint 四函数抽成公共模块（RFC 9000 §A.1 五组官方向量
+  测试），hy2 与 h3 共用。
+- DNS 上游实装 `h3://`（/`http3://`，默认 443、path=/dns-query）：ALPN=h3、5s
+  keep-alive/60s 空闲重建、一次失败重建重试、POST application/dns-message。
+- `naive+quic://`：`Outbound::Naive { h3: bool }`；QUIC endpoint 带 SO_MARK、ALPN=h3；
+  CONNECT 携 Basic；`socket=None`（QUIC 不与 offload 搭配）。
+- 踩坑（已修）：tokio **嵌套运行时**——`h3_conn()` 在 `block_on` 内又调 `H3Conn::new`
+  的 `block_on` → “Cannot start a runtime from within a runtime” panic；拆成两段调用。
+- lab：quic-go fork 离线夹具 `naive-h3-server`/`doh-h3-server`（dae-work 模块图，
+  GOPROXY=off）+ `naive-h3-up`/`test-naive-h3`（交互零延迟 + 512KB 双向 + 服务端
+  `proto=HTTP/3.0` + `offloaded_total=0`）与 `doh-h3-up`/`test-doh-h3`（两查询各答对、
+  `H3 request proto=HTTP/3.0` 恰 2 次、**新建连接恰 1 条**）；`fake_dns` 增
+  doh3.test→10.9.10.39 / doh4.test→10.9.10.40。
+- 实测：`cargo test --release` **208/208**；lab 两项 PASS；回归 `verify` 9/9 +
+  `test-doh-h2`/`test-doh`/`test-doq`/`test-naive`/`test-tuic`/`test-hy2` 全 PASS；
+  真机网关 66/66、generate_204→204、0 panic。
+- 边界：QPACK 只解静态表/字面量（引用动态表报错；不广告动态表容量、不开 QPACK
+  encoder/decoder 流）；无 0-RTT/服务端推送/GOAWAY 重试；`https://` 仍优先 h2，
+  H3 需显式 `h3://`。

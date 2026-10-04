@@ -73,7 +73,8 @@
 | [0046](./ADR-0046-udp-v6.md) | P22 UDP over IPv6：`SockMap<3>→<4>`（key 3 = v6 UDP）、`IPV6_TRANSPARENT`/`V6ONLY`/`IPV6_RECVORIGDSTADDR` 透明监听 + 第二个 dns_loop、回包按族绑定；ss UDP v6 目标（ATYP=0x04）；lab v6 UDP relay（ss 日志跨实现）+ v6 DNS（源地址=原始目的） | 已采纳 | —（P22 执行；对标表缺口 #3 收官） |
 | [0047](./ADR-0047-p23-sticky-h2-bootstrap-dnsopts.md) | P23：代理域名粘滞 IP（3 次失败作废 + reload 重置，对照 dae StickyIpDialer）；DoH over HTTP/2（自实现最小 h2 客户端 + ALPN 门控 + H1 无痛回退，Go 标准库参考服务端）；bootstrap_resolver（A+AAAA、上游/订阅域名自举）；DNS 选项（optimistic cache + fixed_domain_ttl + ipversion_prefer） | 已采纳 | —（P23 执行；对标表缺口 #2/#5 收官） |
 | [0048](./ADR-0048-p24-protocol-details.md) | P24：uTLS Chrome-120 对齐（签名算法集合/supported_versions/ALPS/GREASE-ECH/Boring padding，REALITY 自实现栈）；Vision 上行 splice 确认 + 回归；TUIC 0-RTT（into_0rtt 早数据，无票据/被拒无痛回退）；显式边界：ECH（rustls 无客户端 ECH）、shadow-tls（依赖 fork rustls randoms）、juicity/naive/ssr、rustls 路径 uTLS | 已采纳 | —（P24 第一批；余项列 parity/README） |
-| [0049](./ADR-0049-p25-naive.md) | P25 naive 出站：复用 DoH h2 帧层实现 HTTP/2 CONNECT 隧道 + Basic 认证（`encode_connect_headers`/`connect_tunnel` 双向流控/END_STREAM 半关闭/两半 drop 关底层）；`naive+https://`/`naive://`，`naive+quic://` 显式未实现；Go 标准库服务端跨实现（交互零延迟 + 512KB 逐字节）；边界：仅 h2、无连接池、Basic 依赖外层 TLS | 已采纳 | —（P25 执行；对标表缺口 #6 naive 收官） |
+| [0049](./ADR-0049-p25-naive.md) | P25 naive 出站：复用 DoH h2 帧层实现 HTTP/2 CONNECT 隧道 + Basic 认证（`encode_connect_headers`/`connect_tunnel` 双向流控/END_STREAM 半关闭/两半 drop 关底层）；`naive+https://`/`naive://`（当时 `naive+quic://` 显式未实现）；Go 标准库服务端跨实现（交互零延迟 + 512KB 逐字节）；边界：仅 h2、无连接池、Basic 依赖外层 TLS（H3 形态由 0050 补上） | 已采纳 | —（P25 执行；对标表缺口 #6 naive 收官） |
+| [0050](./ADR-0050-p26-http3.md) | P26 HTTP/3 双项：`h3client` 最小 HTTP/3（控制流/SETTINGS/QPACK/`request()`/CONNECT 隧道读写半，DATA 帧承载隧道）；DoH 上游 `h3://`（ALPN=h3、连接复用 + 重建重试）；`naive+quic://`（QUIC，socket=None）；varint 抽 `quicvarint`（RFC 9000 §A.1 向量）；quic-go 离线夹具跨实现（h3 512KB 双向 + 连接复用断言） | 已采纳 | —（P26 执行；对标表缺口 #5 h3、#6 naive H3 收官） |
 
 ## 新增一条 ADR
 
