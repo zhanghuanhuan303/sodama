@@ -81,7 +81,7 @@
 
 | # | 事项 | 现状 | 验收标准 |
 |---|---|---|---|
-| G1 | 与 Go 版**同机对拍**（六路径基准） | 有 Rust 数据、无同机对照（ADR-0022 如实） | 同机同场景表格 + 误差说明 |
+| G1 | 与 Go 版**同机对拍**（六路径基准） | **部分完成**：P33 四方对比（direct/ss；`docs/perf-report.md`）——sodama 与 dae 同机同拓扑 | 扩到 relay/offload/UDP 全路径 + 误差说明 |
 | G2 | 生产级优化（THP/连接池/看门狗内存上限） | 未做 | 各有开关与压测数据 |
 | G3 | fuzz（`.dae` 解析 / DNS 报文 / CH 解析） | 未做 | 至少 3 个 fuzz target 跑通 |
 | G4 | 特权内核加载类 CI | CI 只编译+单测 | self-hosted runner 或 QEMU 中跑 verify 子集 |

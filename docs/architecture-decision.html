@@ -205,7 +205,7 @@
     <span class="chip">代码量 <b>~65k 非测试 LOC / ~40k 测试</b></span>
     <span class="chip">数据面 <b>tproxy.c 4403 行 · 23 个程序 · 24 个 map</b></span>
     <span class="chip">许可 <b>AGPL-3.0</b></span>
-    <span class="chip">文档版本 <b>v2.41 · 2026-10-04</b></span>
+    <span class="chip">文档版本 <b>v2.42 · 2026-10-04</b></span>
   </div>
 </header>
 
@@ -1196,7 +1196,7 @@ wait signal → reload / suspend / shutdown</pre>
       <tr><td><b>11 · 部署自动化</b></td><td>netns 自动搭建（移网卡/sysctl/tproxy 规则）、systemd（<code>install/dae.service</code>）、Docker、发行包、shell 补全</td><td><code>lab.sh</code> / <code>gateway.sh</code> 脚本级一键；<b>systemd unit + install.sh（--dry-run/--uninstall）+ deploy.md（P18e）</b>；无 Docker/发行包</td><td><span class="b b-warn">≈65%</span></td><td>真网关一键脚本体验接近（ADR-0029）；ADR-0042；脚本代劳、安全性更高但自动化深度不同</td></tr>
       <tr><td><b>12 · 运维面</b></td><td>主线较弱（daed 独立项目提供 GraphQL/Web UI）</td><td>SIGHUP/USR2、状态 socket（status/rules/config/maps/metrics/reload/suspend/resume）、Prometheus、sysdump/trace、日志轮转</td><td><span class="b b-ok">≈90%</span></td><td>相对 dae 主线领先；daed 的 UI/鉴权不在范围（ADR-0021）</td></tr>
       <tr><td><b>13 · 质量工程</b></td><td>Go 单测 244 文件/3.9 万行 + CI（bpf-test/build/docker/go-test…）+ fuzz</td><td><b>236 单测</b> + verify 9×2 拓扑 + 专项（punt/UDP v6/DoH-h2/DNS 选项/ECS 回填+刷新/QUIC 嗅探/分组/订阅/naive h2+h3/juicity/ssr/shadow-tls v1-v3…）+ 对拍 5 逐字节 + QEMU 双内核矩阵 + soak + 六路径基准 + REALITY e2e + RFC 9001/9000 黄金向量 + <b>GitHub Actions CI</b></td><td><span class="b b-warn">≈83%</span></td><td>方法学密度高、绝对规模小（ADR-0010/0022/0025/0042–0056）；CI 缺特权内核加载类测试</td></tr>
-      <tr><td><b>14 · 性能</b></td><td>生产级优化（THP/内存上限/连接池/看门狗）</td><td>六路径基准：direct 31Gbps / relay 24.7Gbps / offload 14.6Gbps / ss 2.5Gbps</td><td><span class="b b-warn">≈55%</span></td><td>有数据、<b>缺与 Go 版同机对拍</b>（如实，ADR-0022）</td></tr>
+      <tr><td><b>14 · 性能</b></td><td>生产级优化（THP/内存上限/连接池/看门狗）</td><td>六路径基准（direct 31Gbps / relay 24.7Gbps / offload 14.6Gbps / ss 2.5Gbps）+ <b>同机四方对比（P33）：direct 路径 sodama 30.0 / dae v2.1.1 29.7 / sing-box 28.0 / v2ray 18.1 Gbps；ss 路径 2.20/1.93/2.76/0.54 Gbps（`docs/perf-report.md`）</b></td><td><span class="b b-ok">≈70%</span></td><td>同机同拓扑同上游同负载（lab/perf/run.sh）；余：relay/offload/UDP 全路径同机对拍、真实公网口径、生产级优化（如实，ADR-0022）</td></tr>
       <tr><td><b>15 · 真实订阅生态</b></td><td>全原生</td><td>订阅#1（50×vless-ws）✅；订阅#2：anytls ✅、<b>REALITY+Vision ✅</b>（自实现 TLS 1.3，ADR-0041；66/66 入组）</td><td><span class="b b-ok">≈85%</span></td><td>ADR-0026/0027/0028/0041；边界外协议可桥接过渡</td></tr>
     </tbody>
   </table>
@@ -1258,7 +1258,7 @@ wait signal → reload / suspend / shutdown</pre>
 </section>
 
 <p style="color:var(--dim);font-family:var(--mono);font-size:.78rem;margin-top:56px;border-top:1px solid var(--line);padding-top:14px">
-  dae → Rust 决策档案 · v2.41 · 生成于 2026-10-04 · 基于 dae main@e3fee8f（nightly）· 本文件自包含，可离线打开<br>
+  dae → Rust 决策档案 · v2.42 · 生成于 2026-10-04 · 基于 dae main@e3fee8f（nightly）· 本文件自包含，可离线打开<br>
   v1.1：新增 4.5 部署形态、4.6 常驻与故障语义、决策点 D8<br>
   v1.2：按 ADR-0009 改为 K 轨道路线图；D7 修订为内核切片先行；K0 第一步（规则 VM + LPM）已实测<br>
   v1.3：K0、K1 均已完成并实测（双 epoch 热重载、conn_state 缓存、五钩子角色、本机 WAN 流量与回程）<br>
@@ -1309,6 +1309,7 @@ wait signal → reload / suspend / shutdown</pre>
                                                                                                                                                                                                 v2.39：P31 shadow-tls 客户端（ADR-0055，对标表缺口 #6 插件/shadowtls 收官）+ **TLS1.3 ClientHello 严格解析修复**——新模块 `shadowtls.rs`：v1（rustls TLS1.2 握手后裸隧道）/ v2（`HashIo` 哈希服务端握手字节 → 首帧前置 8B HMAC-SHA1；按 0x17 分帧；**应用读密钥甄别并跳过伪装站票据**）/ v3（CH `session_id` 末 4B = HMAC(pw, CH 零位)；`V3HandshakeIo` 握手期对 `[mac4][xor(payload)]` 记录反变换重帧；读方向 relay 帧跳过/链式 MAC 帧交付；写方向 `"C"` 链式 MAC）；证书默认 **WebPKI**（`tls13::CertPolicy::WebPki`：rustls-webpki 链+主机名+CV 验签），`allowInsecure=1` 跳过。**ss 插件接入**：`ss://…?plugin=shadow-tls;password=…;version=3;sni=…`（SIP003；默认 v3；ss classic 可组合，ss2022/UDP 显式报错）；`ss.rs` 读写半 boxed 化 + `ShutdownFn`（同一数据路径可跑在帧层上）。**附带修复**：P24 Chrome 形状 CH 的 `supported_versions` 列表长度误用 u16（应 u8）+ GREASE 值各处独立随机偶发重复扩展类型 → Go/OpenSSL 等严格解析器直接拒收（`tls13_real_server_handshake` 由失败转通过；REALITY 服务端解析宽松此前未暴露）。lab：`lab/proto-check/shadowtls-server`（复用 sing-shadowtls `Service`：v1/v2/v3 + 自签 TLS1.2/1.3 伪装站 + handler 转发到 python ss 后端）+ `shadowtls-up`/`shadowtls-v2-up`/`shadowtls-v1-up` 与 `test-shadowtls{,-v2,-v1}`（交互 + 512KB + `STLS handler conn` + `TCP target=` 三方交叉）。实测：`cargo test` **232/232**（shadowtls 7 例）；lab v3/v2/v1 全 PASS；回归 `test-ss`/`test-ss2022`/`test-ssr` + `verify` 9/9；真机网关 down→up 自检 + 66 节点组 + `gateway.sh test`（出口 IP + DNS）+ 0 panic；真站 WebPKI 握手通过（详情见 ADR-0055 与 `sodama/NOTES.md` §11.46）<br>
                                                                                                                                                                                                 v2.40：P32 ECH 边界（ADR-0056，对标表缺口 #6 ECH 转边界闭环）——核实 dae 生态 ECH 仅存在于 hysteria2 链接参数 `?ech=<base64 ECHConfigList>`（`olicesx/outbound` 透传给 `olicesx/quic-go` fork 的 `EncryptedClientHelloConfigList`，**真实 ECH 密码学在 fork 里**；dae 主体无 ECH）；我方 hysteria2 为 `quinn + rustls`：rustls 无客户端 ECH 且不暴露 ClientHello 构造，quinn 无法替换 TLS 后端，自实现 `tls13` 只做 TLS-over-TCP 不能作 QUIC 的 TLS。决策：**不实现**；`ech=` 解析即显式报错（含 ADR 指引，**不静默降级**为明文 SNI）+ 单测锁定（`hy2_ech_rejected_loudly`，ech/pinSHA256）；ADR-0056 记录未来解的前置条件（rustls/quinn 提供 ECH 或可插拔 TLS + HPKE 依赖 + ot/quic-go ECH 服务端夹具）。实测：`cargo test` **236/236**（详情见 ADR-0056 与 `sodama/NOTES.md` §11.47）<br>
                                                                                                                                                                                                 v2.41：**后续版本 Backlog 固化**（新增 `docs/backlog.md`：A 工程化与发布 / B 协议余项 / C eBPF / D 配置 / E 转发面 / F 嗅探与 IPv6 / G 性能质量 / H 文档，逐条附验收标准）——明确本版不做：Docker 镜像、发行包、发行 CI、版本与 CHANGELOG、shell 补全、Makefile、PKGBUILD、许可证一致性审计（`LICENSE`=AGPL-3.0 与部分源码头 GPL-2.0 不一致）、install.sh 升级回滚；协议余项（其余 SIP003 插件、SSR auth_*/obfs_* 与 UDP、ECH 前置、rustls 路径 uTLS、ML-DSA/gecko）；eBPF（L2/cgroup/ringbuf）；配置（include/健康参数/组级 override）；转发面（UDP endpoint pool/fuse 计费）；嗅探/IPv6（QUIC 域名拨号、ICMPv6、分片）；性能质量（同机对拍/生产优化/fuzz/特权 CI/夜间 soak）；文档（顶层 README 重写等）。parity 新增 Backlog 小节互链<br>
+                                                                                                                                                                                                v2.42：**项目正式命名 sodama**（目录/crate/二进制/eBPF 符号/指标/systemd 全量重命名；lab verify 9/9）与 **P33 同机四方性能对比**——新增 `lab/perf/run.sh` + 四份对齐配置（sodama/dae v2.1.1/sing-box 1.14.2/v2ray 5.52）：同一 lab 拓扑（client ns—网关—WAN ns）、同一 python ss 上游、同一 C 负载（bench_io 48MB×4 流×3 轮 + 500 RTT，`BENCH_NOSHUT=1` 排除半关闭语义差异）；结果（3 轮中位）：direct 路径 sodama **30.0 Gbps**/dae 29.7/sing-box 28.0/v2ray 18.1（sodama 与 dae CPU≈0，eBPF 内核旁路），ss 路径 sing-box 2.76/sodama 2.20/dae 1.93/v2ray 0.54 Gbps；p50：direct 13-37µs、ss 54-67µs；全文与口径边界见 `docs/perf-report.md`（本地 veth、无公网、python ss 可能成上限等如实标注）<br>
 </p>
 </main>
 

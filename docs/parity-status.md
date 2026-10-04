@@ -24,7 +24,7 @@
 | 11 | **部署自动化** | netns 自动搭建（移网卡/sysctl/tproxy 规则，`netns_utils.go`）、systemd（`install/dae.service`）、Docker、发行包、shell 补全 | `lab.sh` / `gateway.sh` 脚本级一键；**systemd unit（`install/sodama.service`，capability 最小集 + SIGHUP ExecReload）+ `install/install.sh`（--dry-run/--uninstall）+ `docs/deploy.md`（P18e）**；无打包/发行包 | **≈65%** | 真网关一键脚本体验接近（ADR-0029）；ADR-0042；缺 Docker/发行包/shell 补全 |
 | 12 | **运维面** | 主线较弱（daed 独立项目提供 GraphQL/Web UI） | SIGHUP/USR2、状态 socket（status/rules/config/maps/metrics/reload/suspend/resume）、Prometheus、sysdump/trace、日志轮转 | **≈90%** | 相对 dae 主线领先；daed 的 UI/鉴权不在范围（ADR-0021） |
 | 13 | **质量工程** | Go 单测 244 文件/3.9 万行 + CI（bpf-test/build/docker/go-test…）+ fuzz | **236 单测** + verify 9×2 拓扑 + 专项用例（嗅探 punt/UDP v6/DoH-h2/DNS 选项/ECS 回填+刷新/QUIC 嗅探/分组/订阅/naive h2+h3/juicity/ssr/shadow-tls v1-v3…）+ 对拍 5 逐字节 + QEMU 双内核矩阵 + soak + 六路径基准 + `dns-bench` + REALITY e2e + RFC 9001/9000 黄金向量 + CI | **≈83%** | ADR-0010/0022/0025/0042–0056；CI 缺特权内核加载类测试 |
-| 14 | **性能** | 生产级优化（THP/内存上限/连接池/看门狗） | 六路径基准：direct 31Gbps / relay 24.7Gbps / offload 14.6Gbps / ss 2.5Gbps | **≈55%** | 有数据、缺与 Go 版同机对拍（如实，ADR-0022） |
+| 14 | **性能** | 生产级优化（THP/内存上限/连接池/看门狗） | 六路径基准（direct 31Gbps / relay 24.7Gbps / offload 14.6Gbps / ss 2.5Gbps）+ **同机四方对比：sodama 30.0 / dae v2.1.1 29.7 / sing-box 28.0 / v2ray 18.1 Gbps（direct）、ss 路径 2.20/1.93/2.76/0.54 Gbps（P33，`docs/perf-report.md`）** | **≈70%** | 同机同拓扑同上游同负载（lab/perf/run.sh）；余：relay/offload/UDP 全路径同机对拍、真实公网口径、生产级优化（如实，ADR-0022） |
 | 15 | **真实订阅生态** | 全原生 | 订阅#1（50×vless-ws）✅；订阅#2：anytls ✅、**REALITY+Vision ✅（自实现 TLS 1.3，ADR-0041）** | **≈85%** | ADR-0026/0027/0028/0041；边界外协议可桥接过渡 |
 
 ## 表 B · 汇总

@@ -39,6 +39,9 @@ byte-exact parity tests against dae's Go rule compiler and a netns test lab.*
 > 协议/数据面余项（其余 SIP003 插件、SSR auth_*/obfs_*、ECH 前置条件、eBPF L2/cgroup/ringbuf、
 > include 展开、UDP endpoint pool、fuzz、同机对拍、README 状态区重写等）已固化为全量清单
 > （含验收标准）：[`docs/backlog.md`](docs/backlog.md)。
+>
+> **性能对比**：sodama vs dae v2.1.1 vs sing-box 1.14.2 vs v2ray 5.52 的同机同拓扑结果与方法见
+> [`docs/perf-report.md`](docs/perf-report.md)（direct 30.0/29.7/28.0/18.1 Gbps；ss 2.20/1.93/2.76/0.54 Gbps；复现：`sudo lab/perf/run.sh all`）。
 
 ## 仓库结构
 
