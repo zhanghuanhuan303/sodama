@@ -627,22 +627,67 @@ impl<R: Read> Read for VmessReader<R> {
 pub struct VmessWriter<W> {
     inner: Mutex<W>,
     sealer: Mutex<ChunkSealer>,
+    /// stage 2：已密封待写出的帧（WO 后从断点续写，不重复密封）。
+    /// 第三项 = 终止帧已入队（重试时不得重复入队，否则 pending 无界增长）。
+    pending: Mutex<(Vec<u8>, usize, bool)>,
 }
 
 impl<W: Write> VmessWriter<W> {
     /// 终止块（空 payload）：协议层的半关闭信号。
+    /// 幂等：终止帧只入队一次，WO 重试不会重复追加（否则 pending 无界增长）。
     pub fn send_terminator(&self) -> io::Result<()> {
-        let frame = {
-            let mut s = self
-                .sealer
+        {
+            let mut g = self
+                .pending
                 .lock()
                 .map_err(|_| io::Error::other("vmess: 锁中毒"))?;
-            s.seal(&[])?
-        };
-        self.inner
+            if !g.2 {
+                let frame = {
+                    let mut s = self
+                        .sealer
+                        .lock()
+                        .map_err(|_| io::Error::other("vmess: 锁中毒"))?;
+                    s.seal(&[])?
+                };
+                g.0.extend_from_slice(&frame);
+                g.2 = true;
+            }
+        }
+        self.drain_pending()
+    }
+
+    /// 把 pending 中未写出的帧写到内层；WO/EINTR 保留偏移（可重入）。
+    fn drain_pending(&self) -> io::Result<()> {
+        let mut g = self
+            .pending
             .lock()
-            .map_err(|_| io::Error::other("vmess: 锁中毒"))?
-            .write_all(&frame)
+            .map_err(|_| io::Error::other("vmess: 锁中毒"))?;
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| io::Error::other("vmess: 锁中毒"))?;
+        while g.1 < g.0.len() {
+            match inner.write(&g.0[g.1..]) {
+                Ok(0) => {
+                    return Err(io::Error::new(ErrorKind::WriteZero, "vmess: 写 0"));
+                }
+                Ok(n) => g.1 += n,
+                Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        g.0.clear();
+        g.1 = 0;
+        Ok(())
+    }
+
+    fn queue_frame(&self, frame: &[u8]) -> io::Result<()> {
+        let mut g = self
+            .pending
+            .lock()
+            .map_err(|_| io::Error::other("vmess: 锁中毒"))?;
+        g.0.extend_from_slice(frame);
+        Ok(())
     }
 
     /// 暴露底层写半（outbound 的 `WriteHalf::shutdown_write` 需要）。
@@ -653,6 +698,11 @@ impl<W: Write> VmessWriter<W> {
 
 impl<W: Write> Write for VmessWriter<W> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        // 先冲刷上次未写完的帧；非阻塞下 WO 在消费新明文前上抛（重试幂等）。
+        self.drain_pending()?;
         let n = buf.len().min(MAX_PAYLOAD_PER_CHUNK);
         let frame = {
             let mut s = self
@@ -661,14 +711,18 @@ impl<W: Write> Write for VmessWriter<W> {
                 .map_err(|_| io::Error::other("vmess: 锁中毒"))?;
             s.seal(&buf[..n])?
         };
-        self.inner
-            .lock()
-            .map_err(|_| io::Error::other("vmess: 锁中毒"))?
-            .write_all(&frame)?;
+        self.queue_frame(&frame)?;
+        // 尽力写出；WO 时帧留在 pending，由 flush()/下次 write 续写（明文已接受）。
+        match self.drain_pending() {
+            Ok(()) => {}
+            Err(e) if e.kind() == ErrorKind::WouldBlock => {}
+            Err(e) => return Err(e),
+        }
         Ok(n)
     }
 
     fn flush(&mut self) -> io::Result<()> {
+        self.drain_pending()?;
         self.inner
             .lock()
             .map_err(|_| io::Error::other("vmess: 锁中毒"))?
@@ -707,6 +761,7 @@ where
         VmessWriter {
             inner: Mutex::new(write),
             sealer: Mutex::new(sealer),
+            pending: Mutex::new((Vec::new(), 0, false)),
         },
     ))
 }
@@ -886,6 +941,86 @@ mod tests {
             crc32fast::hash(&plain[..12]),
             u32::from_be_bytes([plain[12], plain[13], plain[14], plain[15]])
         );
+    }
+
+    #[test]
+    fn writer_survives_would_block() {
+        struct WobWrite {
+            out: Vec<u8>,
+            block_next: bool,
+            cap: usize,
+        }
+        impl Write for WobWrite {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                if buf.is_empty() {
+                    return Ok(0);
+                }
+                if self.block_next {
+                    self.block_next = false;
+                    return Err(ErrorKind::WouldBlock.into());
+                }
+                let n = buf.len().min(self.cap);
+                self.out.extend_from_slice(&buf[..n]);
+                self.block_next = true;
+                Ok(n)
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let sec = VmessSecurity::Aes128Gcm;
+        let iv = [9u8; 16];
+        let key = [11u8; 16];
+        let mut w = VmessWriter {
+            inner: Mutex::new(WobWrite {
+                out: Vec::new(),
+                block_next: false,
+                cap: 5,
+            }),
+            sealer: Mutex::new(ChunkSealer::new(sec, &iv, &key).unwrap()),
+            pending: Mutex::new((Vec::new(), 0, false)),
+        };
+        let payload: Vec<u8> = (0..40000u32).map(|i| (i % 251) as u8).collect();
+        let mut off = 0usize;
+        let mut guard = 0u32;
+        while off < payload.len() && guard < 1_000_000 {
+            guard += 1;
+            match w.write(&payload[off..]) {
+                Ok(n) => off += n,
+                Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                    let _ = w.flush();
+                }
+                Err(e) => panic!("write: {e}"),
+            }
+        }
+        loop {
+            match w.flush() {
+                Ok(()) => break,
+                Err(e) if e.kind() == ErrorKind::WouldBlock => continue,
+                Err(e) => panic!("flush: {e}"),
+            }
+        }
+        loop {
+            match w.send_terminator() {
+                Ok(()) => break,
+                Err(e) if e.kind() == ErrorKind::WouldBlock => continue,
+                Err(e) => panic!("terminator: {e}"),
+            }
+        }
+        assert_eq!(off, payload.len());
+        // 用接收端（同一密钥）逐块还原，验证 WO 下无重复/丢失
+        let wire = &w.inner.lock().unwrap().out;
+        let mut recv = ChunkReceiver::new(sec, &iv, &key).unwrap();
+        let mut pos = 0usize;
+        let mut got = Vec::new();
+        loop {
+            match recv.try_take(wire, &mut pos).unwrap() {
+                Some(ChunkStep::Data(d)) => got.extend_from_slice(&d),
+                Some(ChunkStep::Terminator) => break,
+                None => panic!("wire 不完整：pos={pos} len={}", wire.len()),
+            }
+        }
+        assert_eq!(got, payload);
     }
 
     #[test]

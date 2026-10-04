@@ -612,15 +612,19 @@ impl CodecDir {
                         ));
                     }
                     match &mut self.side {
-                        // 写半协议终止（vmess 终止块/裸 FIN 等）；失败按尽力而为。
-                        CodecSide::Sink(w) => {
-                            let _ = w.shutdown_write();
-                        }
-                        CodecSide::Source(_) => unsafe {
-                            libc::shutdown(self.dst, libc::SHUT_WR);
+                        // 写半协议终止（vmess 终止块/裸 FIN 等）；WO 时待 EPOLLOUT 重试。
+                        CodecSide::Sink(w) => match w.shutdown_write() {
+                            Ok(()) => self.done = true,
+                            Err(e) if retryable(&e) => self.flush_pending = true,
+                            Err(_) => self.done = true,
                         },
+                        CodecSide::Source(_) => {
+                            unsafe {
+                                libc::shutdown(self.dst, libc::SHUT_WR);
+                            }
+                            self.done = true;
+                        }
                     }
-                    self.done = true;
                 }
                 break;
             }

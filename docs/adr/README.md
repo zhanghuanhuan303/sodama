@@ -82,7 +82,7 @@
 | [0055](./ADR-0055-p31-shadow-tls.md) | P31 shadow-tls 客户端（v1/v2/v3，ss 插件）：v1 rustls TLS1.2+裸隧道；v2 首帧 HMAC-SHA1 前缀 + 应用密钥甄别票据；v3 CH session_id HMAC + 握手期 relay 帧反变换 + 链式 MAC；`CertPolicy::WebPki`（rustls-webpki 链+主机名+CV）；`ss://…?plugin=shadow-tls;…`（ss classic；ss2022/UDP 显式报错）；**附带修复** P24 CH 的 supported_versions u16→u8 与 GREASE 碰撞（严格解析器兼容性） | 已采纳 | —（P31 执行；对标表缺口 #6 插件/shadowtls 收官） |
 | [0056](./ADR-0056-p32-ech-boundary.md) | P32 ECH 边界（不实现）：dae 生态 ECH 仅 hy2 `?ech=` 经 ot/quic-go fork；rustls/quinn 无客户端 ECH 且无 CH 构造集成点 → 解析即显式报错（不静默降级）；剩余缺口的闭环记录 + 单测锁定 | 已采纳 | —（P32 执行；对标表缺口 #6 ECH 转边界） |
 | [0057](./ADR-0057-m3-vision-over-tls.md) | M3 Vision-over-TLS：内层 TLS 嗅探（dae FilterTLS 移植）+ 双向 XTLS DIRECT（0x02）裸 TCP；rustls 逐记录有界读替代 dae 的 unsafe 反射交接；tls13 补 raw 写；vision 旁路 kTLS、限 TCP；`lab/vision` Xray 夹具（tls/reality/ws/wss 四模式逐字节） | 已采纳 | —（M3 执行；对标表协议域 Vision 组合闭环） |
-| [0058](./ADR-0058-m4-reactor.md) | M4 reactor：epoll worker 池——stage 1 splice 链路 + stage 2 首段 codec（rustls VLESS-TCP/Trojan）每连接 0 线程（核并行度 worker、会话状态机、prelude；可重入前提：TlsWriter 待刷语义、VlessReader 响应头状态机、预算耗尽自驱补泵）；10k 连接 28 线程/32.1 MB、风暴 25 606/s；vless-tls 2 000 连接 27 线程/61 MB（线程模型 4 011/222 MB）；`SODAMA_NO_REACTOR=1`/`SODAMA_REACTOR_CODEC=0` 可关；余段：reality/ss/vmess + io_uring | 已采纳 | —（M4 执行；对标表性能域） |
+| [0058](./ADR-0058-m4-reactor.md) | M4 reactor：epoll worker 池——stage 1 splice + stage 2 codec（VLESS 全组合含 reality/vision/ws、Trojan、vmess）每连接 0 线程（核并行度 worker、会话状态机、prelude；可重入：TlsWriter 待刷、读半状态机（Vless/Vision/Ws）、写半待刷队列、预算耗尽自驱补泵、vmess 终止帧幂等）；10k 连接 28 线程/32.1 MB、风暴 25 606/s；vless-tls 2 000 连接 27 线程/61 MB；`SODAMA_NO_REACTOR=1`/`SODAMA_REACTOR_CODEC=0` 可关；余段：ss/ssr/anytls + io_uring | 已采纳 | —（M4 执行；对标表性能域） |
 
 ## 新增一条 ADR
 

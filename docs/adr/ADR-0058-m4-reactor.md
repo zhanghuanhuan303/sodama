@@ -66,31 +66,41 @@
   vs `SODAMA_NO_REACTOR=1` 8 657 / 14 890 / 16 428 / 15 706——大流不回退（1 流 −1.4% 为噪声），
   64×1 MB **15 783 vs 13 221 Mbps（+19%）**；relay 64×1 MB **37 969 vs 13 647 Mbps**；
 - kTLS + reactor：8×64 MB vless-tls **10 928 Mbps 逐字节一致**、splice 错误 0；
-- 回归：`cargo test --release` 241/241（含新增响应头 WouldBlock 可重入用例）；lab `verify` 9/9；
+- **回归**：`cargo test --release` **246/246**（新增响应头/帧头/写半 WO 可重入用例）；lab `verify` 9/9；
   `test-relay` / `test-relay-idle` / `test-offload-lifecycle` / `test-relay-offload` 全 PASS；
-  半关闭逐字节 verify=ok；
-- stage 2 余段（未含）：reality/vision/ws/ss/vmess 会话接入同一状态机、offload 看门狗/定时器统一、
-  io_uring（IORING_OP_SPLICE + 注册缓冲）A/B；UDP 批量化属 O7。
+  半关闭逐字节 verify=ok；vision 夹具 tls/reality/ws/wss 全过；
+- stage 2 余段（未含）：ss/ssr/anytls 会话接入（读半/写半需同模式改造）、
+  offload 看门狗/定时器统一、io_uring（IORING_OP_SPLICE + 注册缓冲）A/B；UDP 批量化属 O7。
 
-## stage 2（首段）：codec 会话接入（rustls VLESS-TCP / Trojan）
+## stage 2：codec 会话接入（VLESS 全组合 + Trojan + vmess）
 
 - **机制**：非 splice 且已审计的链路交 `submit_codec`——每方向 `CodecSide`（Sink=写半加密 /
   Source=读半解密）在 worker 内非阻塞驱动；`out` 缓冲 128 KB 水位 / 64 KB 块；
   EPOLLIN/EPOLLOUT 由「读侧可读 / 写侧可写」计算；EOF 后经写半 `shutdown_write` / 对端 `SHUT_WR` 半关闭；
-  协议面由 `Outbound::codec_reactor_capable()` 判定（排除 vision/ws/reality/ss/vmess）。
+  协议面由 `Outbound::codec_reactor_capable()` 判定：**Trojan、VLESS 全组合（Tcp/Ws ×
+  明文/rustls/REALITY/±vision）与 vmess**；ss/ssr/anytls 等仍走线程模型。
 - **可重入前提（本项核心修复）**：
   1. `TlsWriter::write`：rustls `writer().write` 只入缓冲（0.23 语义，永不 WouldBlock），
      `write_tls` 遇 WouldBlock 必须在已消费后降级为「待刷」（否则重试会重复加密/发送）；
      `flush()` 上抛 WouldBlock，由状态机等 EPOLLOUT 重试；
-  2. `VlessReader` 响应头改**可重入状态机**（原 `read_exact` 在 WouldBlock 时丢进度）；
-  3. **预算耗尽自驱补泵**：pump 每事件限 8 轮，可能在「rustls 内部已有明文、内核无事件」时退出
+  2. 读半可重入：`VlessReader` 响应头缓冲累积、`VisionReader` 帧头游标 `hdr_got`、
+     `WsReader` 改「ensure_buffered + 缓冲解析」（含控制帧 `pending_control` 续读）；
+     `Tls13Reader` 原 `pending` 续读、`VmessReader` 原缓冲+游标均满足；
+  3. 写半待刷队列：`Tls13Writer`/`VisionWriter`/`WsWriter`/`VmessWriter` 均改为
+     「组帧/密封入队 + 部分写 + WO 断点续写」，重试不重复组帧；
+  4. **预算耗尽自驱补泵**：pump 每事件限 8 轮，可能在「rustls 内部已有明文、内核无事件」时退出
      （卡住时两侧 pending=0、interest 挂着 EPOLLIN）；修复：会话入 worker `pending` 队列，
-     事件循环空转时继续泵，直到无内部余量。stress 45 轮（4/8/64 流）0 失败，补泵触发 1.7 万次。
+     事件循环空转时继续泵，直到无内部余量。stress 45 轮（4/8/64 流）0 失败，补泵触发 1.7 万次；
+  5. **终止帧幂等**（vmess）：非阻塞下 `send_terminator` 会被反复重试，若每次重试都重新入队
+     终止帧，`pending` 会无界增长（实测把测试进程撑到 20GB 被 OOM）；改为「终止帧只入队一次 +
+     续写断点」，并把 reactor 的 `shutdown_write` WO 处理改为「不置 done、等 EPOLLOUT 重试」。
 - **开关**：`SODAMA_REACTOR_CODEC=0` 关闭 codec 入池（回退线程模型）；
   `SODAMA_REACTOR_DEBUG=1` 含会话状态周期转储（诊断卡尾用）。
 - **实测（vless-tls，同二进制 A/B）**：1/2/4/8×64MB 吞吐 6.1 / 9.1–10.4 / 11.7–12.5 / 10.5–10.9 Gbps
   vs 线程模型 5.4 / 8.1 / 10.9 / 9.9（+5~25%）；64×1MB 在轮间噪声内（两模式 8.3–15.3 Gbps）；
-  长连接持有 2 000 条 = **27 线程 / 61 MB**（线程模型 4 011 线程 / 222 MB）、fail=0、建立 1 010/s。
+  长连接持有 2 000 条 = **27 线程 / 61 MB**（线程模型 4 011 线程 / 222 MB）、fail=0、建立 1 010/s；
+  **vision 夹具 tls/reality/ws/wss 四模式逐字节全过（ws/wss 亦走 codec，0 错误）**；
+  **reality+vision 60 个并发 HTTPS 下载下 reactor 恒定 27 线程**；vmess/ws/vision 写半均有 WO 注入单测。
 
 ## 相关
 

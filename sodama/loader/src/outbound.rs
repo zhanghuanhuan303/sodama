@@ -652,22 +652,19 @@ impl Outbound {
     /// M4 stage 2：该出站链路的读/写半是否已对 WouldBlock 可重入
     /// （可交 reactor codec 会话，每连接 0 线程）。
     ///
-    /// 覆盖：Trojan（rustls）与 VLESS TCP（rustls/明文，响应头已改成可重入状态机）；
-    /// 排除：vision（中途切裸 TCP）、ws（成帧解析）、reality/ss/vmess/anytls 等
-    /// （读半/写半未做非阻塞审计）；kTLS 成功的链路走 splice 分支。
+    /// 覆盖：Trojan（rustls）与 VLESS-TCP 全组合（明文/rustls/REALITY/±vision）——
+    /// 读半（VlessReader/TlsReader/Tls13Reader/VisionReader）与写半（TlsWriter/
+    /// Tls13Writer/VisionWriter）均已做 WouldBlock 可重入；
+    /// 排除：ws（成帧解析未审计）、ss/vmess/anytls 等；kTLS 成功的链路走 splice 分支。
     pub fn codec_reactor_capable(&self) -> bool {
         match self {
             Self::Trojan { .. } => true,
-            Self::Vless {
-                reality,
-                transport,
-                flow,
-                ..
-            } => {
-                reality.is_none()
-                    && matches!(transport, VlessTransport::Tcp)
-                    && flow.as_deref() != Some("xtls-rprx-vision")
-            }
+            // VLESS 全组合（Tcp/Ws × 明文/rustls/REALITY/±vision）：读半/写半均已做
+            // WouldBlock 可重入（VisionReader 帧头游标、WsReader 缓冲解析、VlessReader 状态机、
+            // TlsReader/Tls13Reader 可续读；TlsWriter/Tls13Writer/VisionWriter/WsWriter 待刷队列）。
+            Self::Vless { .. } => true,
+            // vmess：读半为「缓冲+游标」可重入；写半已改待刷队列（stage 2）。
+            Self::Vmess { .. } => true,
             _ => false,
         }
     }

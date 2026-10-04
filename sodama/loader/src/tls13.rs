@@ -1357,12 +1357,16 @@ pub struct Tls13Reader {
 }
 
 /// TLS 1.3 写半。
+/// stage 2：记录先密封入 `out` 再部分写出——非阻塞 WO 不丢进度、不重复加密。
 pub struct Tls13Writer {
     core: Arc<Mutex<Shared>>,
     sock: TcpStream,
     suite: Suite,
     /// M3：Vision 上行 DIRECT——置位后裸写 TCP（不再封外层 TLS 记录）。
     raw: Arc<AtomicBool>,
+    /// 已密封待写出的记录（含偏移，WO 后从断点续写）。
+    out: Vec<u8>,
+    out_off: usize,
 }
 
 impl Tls13Reader {
@@ -1558,17 +1562,20 @@ impl Tls13Reader {
 
 impl Write for Tls13Writer {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        // M3：Vision 上行 DIRECT——裸写 TCP。
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        // 先冲刷上次未写完的记录；非阻塞下 WO 在消费新明文前上抛（重试幂等）。
+        self.drain_out()?;
+        // M3：Vision 上行 DIRECT——裸写 TCP（允许部分写，返回实写字节）。
         if self.raw.load(Ordering::SeqCst) {
-            let mut sock = &self.sock;
-            sock.write_all(buf)?;
-            return Ok(buf.len());
+            return self.sock.write(buf);
         }
         let mut c = self.core.lock().map_err(poisoned)?;
         if c.want_key_update {
             let ku = [HS_KEY_UPDATE, 0, 0, 1, 0];
             let rec = c.write.seal(CT_HANDSHAKE, &ku)?;
-            write_all_sock(&self.sock, &rec)?;
+            self.out.extend_from_slice(&rec);
             c.write.update()?;
             c.want_key_update = false;
         }
@@ -1576,19 +1583,44 @@ impl Write for Tls13Writer {
         while off < buf.len() {
             let n = (buf.len() - off).min(16000);
             let rec = c.write.seal(CT_APPLICATION_DATA, &buf[off..off + n])?;
-            write_all_sock(&self.sock, &rec)?;
+            self.out.extend_from_slice(&rec);
             off += n;
+        }
+        drop(c);
+        // 尽力写出；WO 时密文留在 out，由 flush()/下次 write 续写（明文已“接受”）。
+        match self.drain_out() {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+            Err(e) => return Err(e),
         }
         Ok(buf.len())
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        Ok(())
+        self.drain_out()
     }
 }
 
-fn write_all_sock(mut sock: &TcpStream, data: &[u8]) -> io::Result<()> {
-    sock.write_all(data)
+impl Tls13Writer {
+    /// 把 `out` 中未写出的密文写到 socket；WO/EINTR 时保留偏移（可重入）。
+    fn drain_out(&mut self) -> io::Result<()> {
+        while self.out_off < self.out.len() {
+            match self.sock.write(&self.out[self.out_off..]) {
+                Ok(0) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "tls13: socket 写 0",
+                    ))
+                }
+                Ok(n) => self.out_off += n,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        self.out.clear();
+        self.out_off = 0;
+        Ok(())
+    }
 }
 
 fn poisoned<T>(_: std::sync::PoisonError<T>) -> io::Error {
@@ -1630,6 +1662,8 @@ pub fn connect(
         sock: s,
         suite,
         raw: raw_write.clone(),
+        out: Vec::new(),
+        out_off: 0,
     };
     Ok((reader, writer, raw, raw_write))
 }

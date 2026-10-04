@@ -31,11 +31,16 @@ pub struct WsReader<R> {
     remaining: u64,
     eof: bool,
     pongs: Pongs,
+    /// stage 2：头已读、载荷待消费的控制帧（opcode, 长度）——跨 WO 可重入。
+    pending_control: Option<(u8, u64)>,
 }
 
 pub struct WsWriter<W> {
     inner: W,
     pongs: Pongs,
+    /// stage 2：已组帧待写出的字节（WO 后从断点续写，不重复组帧/掩码）。
+    out: Vec<u8>,
+    out_off: usize,
 }
 
 impl<W: Write> WsWriter<W> {
@@ -44,7 +49,7 @@ impl<W: Write> WsWriter<W> {
         &self.inner
     }
 
-    fn write_frame(&mut self, opcode: u8, payload: &[u8]) -> io::Result<()> {
+    fn queue_frame(&mut self, opcode: u8, payload: &[u8]) {
         let n = payload.len();
         let mut hdr = [0u8; 14];
         hdr[0] = 0x80 | opcode; // FIN=1
@@ -67,21 +72,34 @@ impl<W: Write> WsWriter<W> {
         let mut mask = [0u8; 4];
         rand::thread_rng().fill_bytes(&mut mask);
         hdr[hlen..hlen + 4].copy_from_slice(&mask);
-        self.inner.write_all(&hdr[..hlen + 4])?;
-        let mut masked = Vec::with_capacity(n);
-        masked.extend(payload.iter().enumerate().map(|(i, b)| b ^ mask[i & 3]));
-        self.inner.write_all(&masked)
+        self.out.extend_from_slice(&hdr[..hlen + 4]);
+        self.out
+            .extend(payload.iter().enumerate().map(|(i, b)| b ^ mask[i & 3]));
     }
 
-    /// 把读半排队的 pong 发出去（写数据/显式 flush 时顺手带出）。
-    fn flush_pongs(&mut self) -> io::Result<()> {
+    /// 把读半排队的 pong 组帧进 out（发送顺序在后续数据帧之前）。
+    fn queue_pongs(&mut self) {
         let pongs = match self.pongs.lock() {
             Ok(mut g) => std::mem::take(&mut *g),
             Err(p) => std::mem::take(&mut *p.into_inner()),
         };
         for p in pongs {
-            self.write_frame(0xA, &p)?;
+            self.queue_frame(0xA, &p);
         }
+    }
+
+    /// 尽力把 out 写出；WO 时保留偏移（可重入），由 flush()/后续事件续写。
+    fn drain_out(&mut self) -> io::Result<()> {
+        while self.out_off < self.out.len() {
+            match self.inner.write(&self.out[self.out_off..]) {
+                Ok(0) => return Err(io::Error::new(ErrorKind::WriteZero, "ws: inner 写 0")),
+                Ok(n) => self.out_off += n,
+                Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        self.out.clear();
+        self.out_off = 0;
         Ok(())
     }
 }
@@ -91,76 +109,95 @@ impl<W: Write> Write for WsWriter<W> {
         if buf.is_empty() {
             return Ok(0);
         }
-        self.flush_pongs()?;
-        self.write_frame(0x2, buf)?;
+        // 先冲刷上次组帧；未清空前不消费新明文（非阻塞 WO 重试幂等）。
+        self.drain_out()?;
+        self.queue_pongs();
+        self.queue_frame(0x2, buf);
+        // 尽力写出；WO 时留在 out，由 flush() 续写（明文已接受并组帧）。
+        match self.drain_out() {
+            Ok(()) => {}
+            Err(e) if e.kind() == ErrorKind::WouldBlock => {}
+            Err(e) => return Err(e),
+        }
         Ok(buf.len())
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        self.flush_pongs()?;
+        self.queue_pongs();
+        self.drain_out()?;
         self.inner.flush()
     }
 }
 
 impl<R: Read> WsReader<R> {
-    fn read_exact_n(&mut self, out: &mut [u8]) -> io::Result<()> {
-        let mut off = 0;
-        while off < out.len() {
-            if self.pending_pos < self.pending.len() {
-                let n = (out.len() - off).min(self.pending.len() - self.pending_pos);
-                out[off..off + n]
-                    .copy_from_slice(&self.pending[self.pending_pos..self.pending_pos + n]);
-                self.pending_pos += n;
-                off += n;
-                continue;
+    /// 确保缓冲内至少有 `n` 个未消费字节；不足则补读。
+    /// 返回 false = 对端关闭且缓冲不足（EOF）；WouldBlock 上抛且缓冲保留（可重入）。
+    fn ensure_buffered(&mut self, n: usize) -> io::Result<bool> {
+        while self.pending.len() - self.pending_pos < n {
+            if self.pending_pos > 0 {
+                let len = self.pending.len() - self.pending_pos;
+                self.pending.copy_within(self.pending_pos.., 0);
+                self.pending.truncate(len);
+                self.pending_pos = 0;
             }
-            let n = self.inner.read(&mut out[off..])?;
-            if n == 0 {
-                return Err(io::Error::new(ErrorKind::UnexpectedEof, "ws: 帧被截断"));
+            let mut tmp = [0u8; 8192];
+            let got = self.inner.read(&mut tmp)?;
+            if got == 0 {
+                return Ok(false);
             }
-            off += n;
+            self.pending.extend_from_slice(&tmp[..got]);
         }
-        Ok(())
+        Ok(true)
     }
 
-    fn read_byte(&mut self) -> io::Result<u8> {
-        let mut b = [0u8; 1];
-        self.read_exact_n(&mut b)?;
-        Ok(b[0])
-    }
-
-    /// 读一个帧头：返回 (opcode, payload 长度, 是否掩码)。
+    /// 读帧头（缓冲解析，跨 WO 可重入）；返回 (opcode, payload 长度, 是否掩码)。
     fn read_frame_header(&mut self) -> io::Result<(u8, u64, bool)> {
-        let b0 = self.read_byte()?;
-        let b1 = self.read_byte()?;
+        if !self.ensure_buffered(2)? {
+            return Err(io::Error::new(ErrorKind::UnexpectedEof, "ws: 帧被截断"));
+        }
+        let b0 = self.pending[self.pending_pos];
+        let b1 = self.pending[self.pending_pos + 1];
         let opcode = b0 & 0x0f;
         let masked = b1 & 0x80 != 0;
         let mut len = (b1 & 0x7f) as u64;
-        match b1 & 0x7f {
-            126 => {
-                let mut b = [0u8; 2];
-                self.read_exact_n(&mut b)?;
-                len = u16::from_be_bytes(b) as u64;
+        let extra = match b1 & 0x7f {
+            126 => 2usize,
+            127 => 8,
+            _ => 0,
+        };
+        if extra > 0 {
+            if !self.ensure_buffered(2 + extra)? {
+                return Err(io::Error::new(ErrorKind::UnexpectedEof, "ws: 帧被截断"));
             }
-            127 => {
+            let p = self.pending_pos + 2;
+            if extra == 2 {
+                len = u16::from_be_bytes([self.pending[p], self.pending[p + 1]]) as u64;
+            } else {
                 let mut b = [0u8; 8];
-                self.read_exact_n(&mut b)?;
+                b.copy_from_slice(&self.pending[p..p + 8]);
                 len = u64::from_be_bytes(b);
             }
-            _ => {}
         }
+        self.pending_pos += 2 + extra;
         Ok((opcode, len, masked))
     }
 
-    fn skip_control(&mut self, len: u64) -> io::Result<()> {
+    /// 取一个控制帧载荷（≤125B）；跨 WO 可重入（头已消费、载荷未取完时重调即可）。
+    fn take_control(&mut self, len: u64) -> io::Result<Vec<u8>> {
         if len > 125 {
             return Err(io::Error::new(
                 ErrorKind::InvalidData,
                 format!("ws: 控制帧长度 {len} 非法"),
             ));
         }
-        let mut skip = vec![0u8; len as usize];
-        self.read_exact_n(&mut skip)
+        if !self.ensure_buffered(len as usize)? {
+            return Err(io::Error::new(ErrorKind::UnexpectedEof, "ws: 控制帧被截断"));
+        }
+        let s = self.pending_pos;
+        let e = s + len as usize;
+        let v = self.pending[s..e].to_vec();
+        self.pending_pos = e;
+        Ok(v)
     }
 }
 
@@ -170,6 +207,24 @@ impl<R: Read> Read for WsReader<R> {
             return Ok(0);
         }
         loop {
+            // stage 2：控制帧头已消费、载荷未取完时从这里续（WO 可重入）。
+            if let Some((op, len)) = self.pending_control {
+                let payload = self.take_control(len)?;
+                self.pending_control = None;
+                match op {
+                    0x8 => {
+                        // close：读掉载荷，之后一律 EOF
+                        self.eof = true;
+                        return Ok(0);
+                    }
+                    0x9 => match self.pongs.lock() {
+                        Ok(mut g) => g.push(payload),
+                        Err(poison) => poison.into_inner().push(payload),
+                    },
+                    _ => {} // pong 丢弃
+                }
+                continue;
+            }
             if self.remaining > 0 {
                 let n = buf.len().min(self.remaining as usize);
                 if self.pending_pos < self.pending.len() {
@@ -196,27 +251,7 @@ impl<R: Read> Read for WsReader<R> {
             }
             match opcode {
                 0x0 | 0x1 | 0x2 => self.remaining = len,
-                0x8 => {
-                    // close：读掉载荷，之后一律 EOF
-                    self.skip_control(len)?;
-                    self.eof = true;
-                    return Ok(0);
-                }
-                0x9 => {
-                    if len > 125 {
-                        return Err(io::Error::new(
-                            ErrorKind::InvalidData,
-                            format!("ws: ping 长度 {len} 非法"),
-                        ));
-                    }
-                    let mut p = vec![0u8; len as usize];
-                    self.read_exact_n(&mut p)?;
-                    match self.pongs.lock() {
-                        Ok(mut g) => g.push(p),
-                        Err(poison) => poison.into_inner().push(p),
-                    }
-                }
-                0xA => self.skip_control(len)?,
+                0x8 | 0x9 | 0xA => self.pending_control = Some((opcode, len)),
                 other => {
                     return Err(io::Error::new(
                         ErrorKind::InvalidData,
@@ -331,10 +366,13 @@ pub fn connect<R: Read, W: Write>(
             remaining: 0,
             eof: false,
             pongs: pongs.clone(),
+            pending_control: None,
         },
         WsWriter {
             inner: write,
             pongs,
+            out: Vec::new(),
+            out_off: 0,
         },
     ))
 }
@@ -354,6 +392,7 @@ mod tests {
             remaining: 0,
             eof: false,
             pongs: Arc::new(Mutex::new(Vec::new())),
+            pending_control: None,
         }
     }
 
@@ -413,6 +452,8 @@ mod tests {
         let mut w = WsWriter {
             inner: Vec::new(),
             pongs,
+            out: Vec::new(),
+            out_off: 0,
         };
         w.write_all(b"abc").unwrap();
         w.flush().unwrap();
@@ -496,5 +537,157 @@ mod tests {
         w.write_all(b"ping-data").unwrap();
         w.flush().unwrap();
         server.join().unwrap();
+    }
+
+    /// stage 2：读半跨 WO 不丢进度（帧头/控制帧/数据帧）。
+    #[test]
+    fn reader_survives_would_block() {
+        struct WobRead<'a> {
+            data: &'a [u8],
+            pos: usize,
+            block_next: bool,
+        }
+        impl Read for WobRead<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                if buf.is_empty() {
+                    return Ok(0);
+                }
+                if self.block_next {
+                    self.block_next = false;
+                    return Err(ErrorKind::WouldBlock.into());
+                }
+                if self.pos >= self.data.len() {
+                    return Ok(0);
+                }
+                buf[0] = self.data[self.pos];
+                self.pos += 1;
+                self.block_next = true;
+                Ok(1)
+            }
+        }
+        let mut script = Vec::new();
+        script.extend(frame(0x2, b"hello "));
+        script.extend(frame(0x9, b"pi")); // ping 排队 pong
+        script.extend(frame(0x2, b"world!!"));
+        script.extend(frame(0x8, b"")); // close
+        let mut r = WsReader {
+            inner: WobRead {
+                data: &script,
+                pos: 0,
+                block_next: false,
+            },
+            pending: Vec::new(),
+            pending_pos: 0,
+            remaining: 0,
+            eof: false,
+            pongs: Arc::new(Mutex::new(Vec::new())),
+            pending_control: None,
+        };
+        let mut out = Vec::new();
+        let mut guard = 0u32;
+        loop {
+            guard += 1;
+            assert!(guard < 1_000_000, "读循环未收敛");
+            let mut b = [0u8; 3];
+            match r.read(&mut b) {
+                Ok(0) => break,
+                Ok(n) => out.extend_from_slice(&b[..n]),
+                Err(e) if e.kind() == ErrorKind::WouldBlock => continue,
+                Err(e) => panic!("read: {e}"),
+            }
+        }
+        assert_eq!(out, b"hello world!!");
+        assert_eq!(r.pongs.lock().unwrap().clone(), vec![b"pi".to_vec()]);
+    }
+
+    /// stage 2：写半跨 WO 不重复组帧/掩码。
+    #[test]
+    fn writer_survives_would_block() {
+        struct WobWrite {
+            out: Vec<u8>,
+            block_next: bool,
+            cap: usize,
+        }
+        impl Write for WobWrite {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                if self.block_next {
+                    self.block_next = false;
+                    return Err(ErrorKind::WouldBlock.into());
+                }
+                let n = buf.len().min(self.cap);
+                if n == 0 {
+                    return Ok(0);
+                }
+                self.out.extend_from_slice(&buf[..n]);
+                self.block_next = true;
+                Ok(n)
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut w = WsWriter {
+            inner: WobWrite {
+                out: Vec::new(),
+                block_next: false,
+                cap: 3,
+            },
+            pongs: Arc::new(Mutex::new(Vec::new())),
+            out: Vec::new(),
+            out_off: 0,
+        };
+        let payload: Vec<u8> = (0..1000u32).map(|i| (i % 251) as u8).collect();
+        let mut off = 0usize;
+        let mut guard = 0u32;
+        while off < payload.len() && guard < 1_000_000 {
+            guard += 1;
+            match w.write(&payload[off..]) {
+                Ok(n) => off += n,
+                Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                    let _ = w.flush();
+                }
+                Err(e) => panic!("write: {e}"),
+            }
+        }
+        loop {
+            match w.flush() {
+                Ok(()) => break,
+                Err(e) if e.kind() == ErrorKind::WouldBlock => continue,
+                Err(e) => panic!("flush: {e}"),
+            }
+        }
+        assert_eq!(off, payload.len());
+        // 解析客户端掩码帧（含 126 扩展长度），还原载荷
+        let wire = &w.inner.out;
+        let mut pos = 0usize;
+        let mut decoded = Vec::new();
+        while pos < wire.len() {
+            assert_eq!(wire[pos] & 0x80, 0x80, "FIN=1");
+            let op = wire[pos] & 0x0f;
+            pos += 1;
+            let b1 = wire[pos];
+            pos += 1;
+            assert_eq!(b1 & 0x80, 0x80, "MASK=1");
+            let mut n = (b1 & 0x7f) as usize;
+            if n == 126 {
+                n = u16::from_be_bytes([wire[pos], wire[pos + 1]]) as usize;
+                pos += 2;
+            } else if n == 127 {
+                let mut b = [0u8; 8];
+                b.copy_from_slice(&wire[pos..pos + 8]);
+                n = u64::from_be_bytes(b) as usize;
+                pos += 8;
+            }
+            let mask = [wire[pos], wire[pos + 1], wire[pos + 2], wire[pos + 3]];
+            pos += 4;
+            let mut pl = wire[pos..pos + n].to_vec();
+            pos += n;
+            for (i, b) in pl.iter_mut().enumerate() {
+                *b ^= mask[i & 3];
+            }
+            assert_eq!(op, 0x2, "数据帧");
+            decoded.extend_from_slice(&pl);
+        }
+        assert_eq!(decoded, payload);
     }
 }

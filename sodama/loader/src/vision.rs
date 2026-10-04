@@ -193,6 +193,8 @@ pub struct VisionReader<R> {
     read_raw: Arc<AtomicBool>,
     sniffer: Arc<TlsSniffer>,
     hdr: [u8; HEADER_LEN_UUID],
+    /// stage 2：帧头已读字节数（非阻塞 WO 后从断点续读，不丢进度）。
+    hdr_got: usize,
     logged_direct: bool,
 }
 
@@ -214,6 +216,7 @@ impl<R: Read> VisionReader<R> {
             read_raw,
             sniffer,
             hdr: [0u8; HEADER_LEN_UUID],
+            hdr_got: 0,
             logged_direct: false,
         }
     }
@@ -224,12 +227,10 @@ impl<R: Read> VisionReader<R> {
         } else {
             HEADER_LEN
         };
-        let buf = &mut self.hdr[..need];
-        let mut got = 0usize;
-        while got < need {
-            let n = self.inner.read(&mut buf[got..])?;
+        while self.hdr_got < need {
+            let n = self.inner.read(&mut self.hdr[self.hdr_got..need])?;
             if n == 0 {
-                if got == 0 {
+                if self.hdr_got == 0 {
                     return Ok(None);
                 }
                 return Err(io::Error::new(
@@ -237,11 +238,12 @@ impl<R: Read> VisionReader<R> {
                     "vision: 帧头读取中断",
                 ));
             }
-            got += n;
+            self.hdr_got += n;
         }
+        self.hdr_got = 0;
         let mut off = 0usize;
         if self.first {
-            if buf[..16] != self.uuid {
+            if self.hdr[..16] != self.uuid {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "vision: 服务端回显 UUID 不匹配",
@@ -250,9 +252,9 @@ impl<R: Read> VisionReader<R> {
             self.first = false;
             off = 16;
         }
-        let cmd = buf[off];
-        let content = u16::from_be_bytes([buf[off + 1], buf[off + 2]]) as usize;
-        let padding = u16::from_be_bytes([buf[off + 3], buf[off + 4]]) as usize;
+        let cmd = self.hdr[off];
+        let content = u16::from_be_bytes([self.hdr[off + 1], self.hdr[off + 2]]) as usize;
+        let padding = u16::from_be_bytes([self.hdr[off + 3], self.hdr[off + 4]]) as usize;
         if cmd > CMD_DIRECT {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -340,6 +342,11 @@ pub struct VisionWriter<W> {
     write_raw: Arc<AtomicBool>,
     sniffer: Arc<TlsSniffer>,
     logged_direct: bool,
+    /// stage 2：已组帧待写出的字节（非阻塞下部分写；组帧状态已在入队时推进）。
+    out: Vec<u8>,
+    out_off: usize,
+    /// DIRECT 帧已入队：待 out 清空后再置 write_raw（0x02 不越位）。
+    pending_direct: bool,
 }
 
 impl<W: Write> VisionWriter<W> {
@@ -357,6 +364,9 @@ impl<W: Write> VisionWriter<W> {
             write_raw,
             sniffer,
             logged_direct: false,
+            out: Vec::new(),
+            out_off: 0,
+            pending_direct: false,
         }
     }
 
@@ -370,6 +380,8 @@ impl<W: Write> Write for VisionWriter<W> {
         if buf.is_empty() {
             return Ok(0);
         }
+        // 先冲刷上次组帧；未清空前不消费新明文（非阻塞 WO 重试幂等）。
+        self.drain_out()?;
         if self.finished {
             return self.inner.write(buf);
         }
@@ -378,22 +390,65 @@ impl<W: Write> Write for VisionWriter<W> {
         let mut off = 0usize;
         while off < buf.len() {
             let end = (off + 16384).min(buf.len());
-            self.write_frame(&buf[off..end])?;
+            self.queue_frame(&buf[off..end]);
             off = end;
             if self.finished && off < buf.len() {
-                return self.inner.write(&buf[off..]).map(|n| off + n);
+                match self.drain_out() {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(off),
+                    Err(e) => return Err(e),
+                }
+                let n = self.inner.write(&buf[off..])?;
+                return Ok(off + n);
             }
+        }
+        // 尽力写出；WO 时留在 out，由 flush() 续写（明文已接受并组帧）。
+        match self.drain_out() {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+            Err(e) => return Err(e),
         }
         Ok(buf.len())
     }
 
     fn flush(&mut self) -> io::Result<()> {
+        self.drain_out()?;
         self.inner.flush()
     }
 }
 
 impl<W: Write> VisionWriter<W> {
-    fn write_frame(&mut self, buf: &[u8]) -> io::Result<()> {
+    /// 写出 `out` 中未发出的帧；写空后应用 DIRECT 置位（保证 0x02 帧先出）。
+    fn drain_out(&mut self) -> io::Result<()> {
+        while self.out_off < self.out.len() {
+            match self.inner.write(&self.out[self.out_off..]) {
+                Ok(0) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "vision: inner 写 0",
+                    ))
+                }
+                Ok(n) => self.out_off += n,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        self.out.clear();
+        self.out_off = 0;
+        if self.pending_direct {
+            self.pending_direct = false;
+            if !self.logged_direct {
+                self.logged_direct = true;
+                eprintln!("[sodama] vision: 上行 DIRECT 切换（裸 TCP 直写）");
+            }
+            self.write_raw.store(true, Ordering::SeqCst);
+        }
+        Ok(())
+    }
+}
+
+impl<W: Write> VisionWriter<W> {
+    fn queue_frame(&mut self, buf: &[u8]) {
         debug_assert!(buf.len() <= u16::MAX as usize);
         // 先喂嗅探器（与 dae 相同：本块决定本条命令）。
         self.sniffer.filter(buf);
@@ -430,17 +485,11 @@ impl<W: Write> VisionWriter<W> {
         frame.extend_from_slice(&(pad as u16).to_be_bytes());
         frame.extend_from_slice(buf);
         frame.resize(frame.len() + pad, 0);
-        self.inner.write_all(&frame)?;
-        self.inner.flush()?;
+        self.out.extend_from_slice(&frame);
         if direct {
-            // 帧（含填充）已经写出后才置位：之后的字节裸写 TCP（绕过外层 TLS）。
-            if !self.logged_direct {
-                self.logged_direct = true;
-                eprintln!("[sodama] vision: 上行 DIRECT 切换（裸 TCP 直写）");
-            }
-            self.write_raw.store(true, Ordering::SeqCst);
+            // 帧（含填充）全部写出后才置位裸写（下一笔起生效）。
+            self.pending_direct = true;
         }
-        Ok(())
     }
 }
 
@@ -642,5 +691,156 @@ mod tests {
         }
         assert_eq!(out, b"abxyzRAW");
         assert!(read_raw.load(Ordering::SeqCst));
+    }
+
+    /// stage 2：注入 WouldBlock 的写半——wire 输出应与干净写逐字节一致。
+    #[test]
+    fn writer_survives_would_block() {
+        struct WobWrite {
+            out: Vec<u8>,
+            block_next: bool,
+            cap: usize,
+        }
+        impl Write for WobWrite {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                if self.block_next {
+                    self.block_next = false;
+                    return Err(io::ErrorKind::WouldBlock.into());
+                }
+                let n = buf.len().min(self.cap);
+                if n == 0 {
+                    return Ok(0);
+                }
+                self.out.extend_from_slice(&buf[..n]);
+                self.block_next = true;
+                Ok(n)
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let uuid = [5u8; 16];
+        let payload: Vec<u8> = (0..30000u32).map(|i| (i % 253) as u8).collect();
+        // WO 注入写：模拟 reactor codec 引擎（WO → flush 重试）
+        let mut w = VisionWriter::new(
+            WobWrite {
+                out: Vec::new(),
+                block_next: false,
+                cap: 7,
+            },
+            uuid,
+            Arc::new(AtomicBool::new(false)),
+            sniff_pair(true),
+        );
+        let mut off = 0usize;
+        let mut guard = 0u32;
+        while off < payload.len() && guard < 2_000_000 {
+            guard += 1;
+            match w.write(&payload[off..]) {
+                Ok(n) => off += n,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    let _ = w.flush();
+                }
+                Err(e) => panic!("非预期错误: {e}"),
+            }
+        }
+        loop {
+            match w.flush() {
+                Ok(()) => break,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+                Err(e) => panic!("非预期错误: {e}"),
+            }
+        }
+        assert_eq!(off, payload.len());
+        // 填充长度随机（防指纹），不能按 wire 字节比对：用读半把 WO 注入下的
+        // wire 还原为原 payload（帧头跨多次 read 不丢进度）。
+        let wire = w.inner().out.clone();
+        let mut r = VisionReader::new(
+            wire.as_slice(),
+            uuid,
+            Arc::new(AtomicBool::new(false)),
+            sniff_pair(true),
+        );
+        let mut round = Vec::new();
+        let mut guard = 0u32;
+        loop {
+            guard += 1;
+            assert!(guard < 2_000_000, "读循环未收敛");
+            let mut b = [0u8; 4096];
+            match r.read(&mut b) {
+                Ok(0) => break,
+                Ok(n) => round.extend_from_slice(&b[..n]),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+                Err(e) => panic!("非预期错误: {e}"),
+            }
+        }
+        assert_eq!(round, payload, "WO 注入下 payload 应逐字节还原");
+    }
+
+    /// stage 2：注入 WouldBlock 的读半——帧头跨多次 read 不丢进度。
+    #[test]
+    fn reader_survives_would_block() {
+        struct WobRead<'a> {
+            data: &'a [u8],
+            pos: usize,
+            block_next: bool,
+        }
+        impl Read for WobRead<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                if buf.is_empty() {
+                    return Ok(0);
+                }
+                if self.block_next {
+                    self.block_next = false;
+                    return Err(io::ErrorKind::WouldBlock.into());
+                }
+                if self.pos >= self.data.len() {
+                    return Ok(0);
+                }
+                buf[0] = self.data[self.pos];
+                self.pos += 1;
+                self.block_next = true;
+                Ok(1)
+            }
+        }
+        let uuid = [6u8; 16];
+        let payload: Vec<u8> = (0..8000u32).map(|i| (i % 241) as u8).collect();
+        // 干净写生成 wire
+        let mut wire = Vec::new();
+        {
+            let mut w = VisionWriter::new(
+                &mut wire,
+                uuid,
+                Arc::new(AtomicBool::new(false)),
+                sniff_pair(true),
+            );
+            w.write_all(&payload).unwrap();
+            w.flush().unwrap();
+        }
+        // WO 注入读还原
+        let mut r = VisionReader::new(
+            WobRead {
+                data: &wire,
+                pos: 0,
+                block_next: false,
+            },
+            uuid,
+            Arc::new(AtomicBool::new(false)),
+            sniff_pair(true),
+        );
+        let mut out = Vec::new();
+        let mut guard = 0u32;
+        loop {
+            guard += 1;
+            assert!(guard < 2_000_000, "读循环未收敛");
+            let mut buf = [0u8; 512];
+            match r.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => out.extend_from_slice(&buf[..n]),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+                Err(e) => panic!("非预期错误: {e}"),
+            }
+        }
+        assert_eq!(out, payload);
     }
 }
