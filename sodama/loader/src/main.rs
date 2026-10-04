@@ -63,6 +63,7 @@ mod outbound;
 mod quicsniff;
 mod quicsock;
 mod quicvarint;
+mod reactor;
 mod reality;
 mod rules;
 mod shadowtls;
@@ -2175,6 +2176,7 @@ fn handle_socks_conn(mut client: TcpStream) {
         to_remote,
         socket: _,
         splice: _,
+        splice_prelude: _,
     } = dialed;
     let last_ns = Arc::new(AtomicU64::new(monotonic_now_ns()));
     let up = Arc::new(AtomicU64::new(0));
@@ -2359,8 +2361,9 @@ fn handle_relay_conn(mut client: TcpStream) {
     let outbound::DialedStream {
         from_remote,
         mut to_remote,
-        socket,
+        mut socket,
         splice: wire_splice,
+        splice_prelude: wire_prelude,
     } = dialed;
     let mut offload_keys = None;
     if RELAY_OFFLOAD.get().is_some() && dialer.supports_offload() {
@@ -2420,6 +2423,22 @@ fn handle_relay_conn(mut client: TcpStream) {
             let cf = handle.client.as_raw_fd();
             let uf = up.as_raw_fd();
             std::thread::spawn(move || offload_monitor(cf, uf, h));
+        }
+    }
+    // M4：splice 连接的 epoll worker 池（每连接 0 线程）。需要响应头前缀的链路
+    // （VLESS）由 prelude 线程用 codec 读半消费后恢复；Direct 直接接管。
+    if splice && !offloaded && reactor::enabled() {
+        if let Some(up) = socket.take() {
+            let prelude: Option<Box<dyn outbound::ReadHalf>> = if wire_prelude {
+                Some(from_remote)
+            } else {
+                None
+            };
+            if reactor::submit(client, up, handle.clone(), id, prelude) {
+                return; // 注册表/统计由 reactor 收尾
+            }
+            relay_finish(id);
+            return;
         }
     }
     // 客户端 → 上游
@@ -2486,6 +2505,11 @@ fn handle_relay_conn(mut client: TcpStream) {
         }
         log(&format!("offload: {target} 已注销 fast_sock 键"));
     }
+    relay_finish(id);
+}
+
+/// relay 会话收尾：摘注册表 + 活跃计数递减（线程泵路径与 reactor 共用）。
+fn relay_finish(id: u64) {
     if let Ok(mut m) = RELAY_CONNS.lock() {
         m.remove(&id);
     }
@@ -3770,6 +3794,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
         std::thread::spawn(relay_janitor_loop);
         log("relay 线程池已启动（host ns）");
+        // M4：splice 数据面的 epoll worker 池（每连接 0 线程；仅字节透明链路）
+        if RELAY_SPLICE.load(Ordering::Relaxed) {
+            reactor::init();
+        }
     }
 
     // P4b：UDP NAT janitor（无论是否启用 dialer 都在跑；只清扫非 DNS 的代理 UDP 会话）

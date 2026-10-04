@@ -327,7 +327,10 @@ pub struct DialedStream {
     pub from_remote: Box<dyn ReadHalf>,
     pub to_remote: Box<dyn WriteHalf>,
     pub socket: Option<TcpStream>,
+    /// 数据面可 splice（字节透明且前缀已一次性发出）。
     pub splice: bool,
+    /// splice 前需由 codec 读半消费协议响应头（VLESS 等；Direct 为 false）。
+    pub splice_prelude: bool,
 }
 
 // ---------------------------------------------------------------- UDP relay
@@ -702,6 +705,7 @@ impl Outbound {
                     to_remote: Box::new(sock),
                     socket: Some(kill),
                     splice: true,
+                    splice_prelude: false,
                 })
             }
             Self::Socks5 { server } => {
@@ -714,6 +718,7 @@ impl Outbound {
                     to_remote: Box::new(s),
                     socket: Some(kill),
                     splice: false,
+                    splice_prelude: false,
                 })
             }
             Self::Http { server, auth } => {
@@ -726,6 +731,7 @@ impl Outbound {
                     to_remote: Box::new(s),
                     socket: Some(kill),
                     splice: false,
+                    splice_prelude: false,
                 })
             }
             Self::Shadowsocks {
@@ -770,6 +776,7 @@ impl Outbound {
                     to_remote: writer,
                     socket: Some(kill),
                     splice: false,
+                    splice_prelude: false,
                 })
             }
             Self::Trojan {
@@ -787,6 +794,7 @@ impl Outbound {
                     to_remote: Box::new(writer),
                     socket: Some(kill),
                     splice: false,
+                    splice_prelude: false,
                 })
             }
             Self::Vless {
@@ -883,6 +891,7 @@ impl Outbound {
                     to_remote,
                     socket: Some(kill),
                     splice,
+                    splice_prelude: splice,
                 })
             }
             Self::Vmess {
@@ -904,6 +913,7 @@ impl Outbound {
                         to_remote: Box::new(w),
                         socket: Some(kill),
                         splice: false,
+                        splice_prelude: false,
                     })
                 } else {
                     let read = sock.try_clone()?;
@@ -913,6 +923,7 @@ impl Outbound {
                         to_remote: Box::new(w),
                         socket: Some(kill),
                         splice: false,
+                        splice_prelude: false,
                     })
                 }
             }
@@ -979,6 +990,7 @@ impl Outbound {
                         to_remote: Box::new(tw),
                         socket: None,
                         splice: false,
+                        splice_prelude: false,
                     });
                 }
                 let sock = marked_tcp_connect(*server, timeout)?;
@@ -1007,6 +1019,7 @@ impl Outbound {
                     to_remote: Box::new(tw),
                     socket: Some(kill),
                     splice: false,
+                    splice_prelude: false,
                 })
             }
             Self::Tuic { dialer } => {
@@ -1017,6 +1030,7 @@ impl Outbound {
                     to_remote: Box::new(w),
                     socket: None,
                     splice: false,
+                    splice_prelude: false,
                 })
             }
             Self::Hysteria2 { dialer } => {
@@ -1027,6 +1041,7 @@ impl Outbound {
                     to_remote: Box::new(w),
                     socket: None,
                     splice: false,
+                    splice_prelude: false,
                 })
             }
             Self::Juicity { dialer } => {
@@ -1037,6 +1052,7 @@ impl Outbound {
                     to_remote: Box::new(w),
                     socket: None,
                     splice: false,
+                    splice_prelude: false,
                 })
             }
             Self::Ssr { dialer } => {
@@ -1048,6 +1064,7 @@ impl Outbound {
                     to_remote: Box::new(w),
                     socket: Some(kill),
                     splice: false,
+                    splice_prelude: false,
                 })
             }
             Self::AnyTls {
@@ -1065,6 +1082,7 @@ impl Outbound {
                     to_remote: Box::new(w),
                     socket: Some(kill),
                     splice: false,
+                    splice_prelude: false,
                 })
             }
             Self::Group(g) => g.dial_tcp(target, timeout),

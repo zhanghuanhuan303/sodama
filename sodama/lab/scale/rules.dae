@@ -1,0 +1,4 @@
+# 规模测试规则：1.1.1.1（假公网）→ relay（direct/splice），WAN 段直连。
+dip(10.9.9.0/24) -> direct
+dip(1.1.1.1/32) -> proxy
+fallback -> block
