@@ -205,7 +205,7 @@
     <span class="chip">代码量 <b>~65k 非测试 LOC / ~40k 测试</b></span>
     <span class="chip">数据面 <b>tproxy.c 4403 行 · 23 个程序 · 24 个 map</b></span>
     <span class="chip">许可 <b>AGPL-3.0</b></span>
-    <span class="chip">文档版本 <b>v2.27 · 2026-10-04</b></span>
+    <span class="chip">文档版本 <b>v2.28 · 2026-10-04</b></span>
   </div>
 </header>
 
@@ -1190,12 +1190,12 @@ wait signal → reload / suspend / shutdown</pre>
       <tr><td><b>5 · DNS 子系统</b></td><td>透明 UDP/TCP、缓存、EDNS、regex、<b>DoT/DoH/DoQ/H3 上游</b>、<b>dns.routing 请求/应答分流</b>、ECS、嗅探 punt</td><td>透明 UDP/TCP、正负缓存 TTL、域位图、regex、EDNS/截断、reload 重投影、TCP keep-alive、<b>DoT/DoH/DoQ 上游</b>、<b>多上游 + dns.routing（reject/asis/tag、应答重查≤3、路由先于缓存、作用域化缓存键）</b>、URL/路由热切换、<b>qname(file:) 名单 + upstream_hits + ECS 注入 + sip()/pname() 请求应答双侧 + dns-bench</b></td><td><span class="b b-ok">≈88%</span></td><td>ADR-0012–0014 + P18a/b/c 系列（ADR-0034–0040）：真实公网 DoT/DoH/DoQ、lab 全矩阵、真机网关国内→DoH+ECS/其余→DoH（upstream_hits 为证）；余 DoH h2/h3、上游 ECS 回填/ecs_cache、optimistic cache、<code>ipversion_prefer</code>、bootstrap_resolver、嗅探 punt</td></tr>
       <tr><td><b>6 · 出站协议栈</b></td><td>ss（含 2022/插件/shadowtls）、ssr、trojan、vmess、vless、tuic、hysteria2、<b>juicity</b>、<b>naive</b>、http、socks5、anytls</td><td>ss classic + <b>ss2022（SIP022 三方法）</b>、trojan(TCP)、vmess(AEAD)、vless(tcp/ws/<b>reality+vision</b>)、tuic v5、hy2(+obfs/Brutal/udphop)、anytls、socks5、<b>http（CONNECT）</b>、direct（TCP 目标已支持域名，逐协议 ATYP 对齐）</td><td><span class="b b-warn">≈70% 家族</span> <span class="b b-ok">≈95% 主流</span></td><td>主流 9 协议全覆盖且纯 Rust 跨实现验收（ADR-0016–0020/0026/0027/0042）；域名目标见 ADR-0030；缺 ssr/juicity/naive、插件/shadowtls、逐字节 uTLS、gecko</td></tr>
       <tr><td><b>7 · 转发面</b></td><td>relay（并发上限/backlog fuse/计费）、UDP endpoint pool（full-cone）、offload 完整</td><td>relay（SO_MARK/半关闭/janitor/<b>--max-conns 并发上限 + limit_rejected 指标</b>）、UDP NAT、offload 最小实现</td><td><span class="b b-warn">≈78%</span></td><td>512KB 逐字节、UDP 会话复用、offload 用户态零字节均实测（ADR-0015/0022）；并发上限已补（P18e/ADR-0042）；缺 fuse/计费</td></tr>
-      <tr><td><b>8 · 多节点·订阅·健康检查</b></td><td>subscription + node + group（min/max/random/fixed）+ alive set + 间隔/容忍度 + sticky IP</td><td><code>--subscribe</code>/config 订阅（HTTP(S)/file、base64/明文、逐行容错）+ group filter/policy + 经节点健康探测（TCP，<b>可选 udp_check_dns</b>）+ 拨号失败切换 + <b>SIGHUP 订阅热更新（成员替换 + 健康继承）</b>；<b>按规则分派不同组未做</b>（数据面单代理槽）</td><td><span class="b b-warn">≈65%</span></td><td>ADR-0031/0042、NOTES §11.22/§11.33；真机订阅#2：66/66 入组、204/YouTube 200；缺多组分派/sticky</td></tr>
+      <tr><td><b>8 · 多节点·订阅·健康检查</b></td><td>subscription + node + group（min/max/random/fixed）+ alive set + 间隔/容忍度 + sticky IP</td><td><code>--subscribe</code>/config 订阅（HTTP(S)/file、base64/明文、逐行容错）+ group filter/policy + 经节点健康探测（TCP + 可选 udp_check_dns，并发 24）+ 拨号失败切换 + <b>SIGHUP 订阅热更新（成员替换 + 健康继承）</b> + <b>按规则分派不同组（组索引 config 顺序，数据面 outbound 经 conn_state 回读）</b></td><td><span class="b b-warn">≈80%</span></td><td>ADR-0031/0042/0043、NOTES §11.22/§11.34；lab 双组交叉 + 真机 66/66 alive；缺 sticky IP</td></tr>
       <tr><td><b>9 · 嗅探与域名策略（dial_mode）</b></td><td>内核侧 TLS/HTTP/QUIC 嗅探 → <code>domain/domain+</code> 拨号（<b>远端解析，绕 DNS 污染</b>）、sniff-punt</td><td>用户态嗅探（TLS SNI / HTTP Host / <b>h2c：preface + 最小 HPACK :authority</b>，MSG_PEEK 不消费）+ <code>dial_mode ip/domain/domain+</code>；QUIC 仅 Initial 识别统计（无 SNI）；<b>无</b> sniff-punt</td><td><span class="b b-warn">≈60%</span></td><td>ADR-0030/0042、NOTES §11.21/§11.33；<code>domain</code> 等价 dae <code>domain+</code> 的“总是使用”行为（无 DNS 缓存门槛）</td></tr>
       <tr><td><b>10 · IPv6</b></td><td>数据面 + 规则 + 协议全支持</td><td>TCP 全链：v6 解析 + tproxy（sockmap key 2）+ 全部协议 v6 目标编码（ss 0x04/v2ray 0x03/tuic 0x02/hy2 字符串）+ v6 direct + v6 嗅探远端解析；<b>UDP v6 / ICMPv6 未做</b></td><td><span class="b b-ok">≈80%</span> <span class="b b-warn">（TCP）</span></td><td>ADR-0032、NOTES §11.23；lab <code>test-v6</code> 3 断言（tproxy→ss(ATYP=4)→v6 echo、direct、listener 注册）；真机网关 v6：嗅探 <code>[2001::1] → RELAY 远端解析</code> 204、字面量 <code>[2606:4700:4700::1111]</code> 200；静态 fe80 邻居不可省（NA 会被 dae0peer_ingress 丢弃）</td></tr>
       <tr><td><b>11 · 部署自动化</b></td><td>netns 自动搭建（移网卡/sysctl/tproxy 规则）、systemd（<code>install/dae.service</code>）、Docker、发行包、shell 补全</td><td><code>lab.sh</code> / <code>gateway.sh</code> 脚本级一键；<b>systemd unit + install.sh（--dry-run/--uninstall）+ deploy.md（P18e）</b>；无 Docker/发行包</td><td><span class="b b-warn">≈65%</span></td><td>真网关一键脚本体验接近（ADR-0029）；ADR-0042；脚本代劳、安全性更高但自动化深度不同</td></tr>
       <tr><td><b>12 · 运维面</b></td><td>主线较弱（daed 独立项目提供 GraphQL/Web UI）</td><td>SIGHUP/USR2、状态 socket（status/rules/config/maps/metrics/reload/suspend/resume）、Prometheus、sysdump/trace、日志轮转</td><td><span class="b b-ok">≈90%</span></td><td>相对 dae 主线领先；daed 的 UI/鉴权不在范围（ADR-0021）</td></tr>
-      <tr><td><b>13 · 质量工程</b></td><td>Go 单测 244 文件/3.9 万行 + CI（bpf-test/build/docker/go-test…）+ fuzz</td><td><b>174 单测</b> + verify 9×2 拓扑 + 6 专项 + 协议梯 17+ + 对拍 5 逐字节 + QEMU 双内核矩阵 + soak + 六路径基准 + REALITY e2e + <b>GitHub Actions CI（构建/单测/eBPF 对象）</b></td><td><span class="b b-warn">≈80%</span></td><td>方法学密度高、绝对规模小（ADR-0010/0022/0025/0042）；CI 缺特权内核加载类测试</td></tr>
+      <tr><td><b>13 · 质量工程</b></td><td>Go 单测 244 文件/3.9 万行 + CI（bpf-test/build/docker/go-test…）+ fuzz</td><td><b>176 单测</b> + verify 9×2 拓扑 + 6 专项 + 协议梯 17+ + 对拍 5 逐字节 + QEMU 双内核矩阵 + soak + 六路径基准 + REALITY e2e + <b>GitHub Actions CI（构建/单测/eBPF 对象）</b></td><td><span class="b b-warn">≈80%</span></td><td>方法学密度高、绝对规模小（ADR-0010/0022/0025/0042/0043）；CI 缺特权内核加载类测试</td></tr>
       <tr><td><b>14 · 性能</b></td><td>生产级优化（THP/内存上限/连接池/看门狗）</td><td>六路径基准：direct 31Gbps / relay 24.7Gbps / offload 14.6Gbps / ss 2.5Gbps</td><td><span class="b b-warn">≈55%</span></td><td>有数据、<b>缺与 Go 版同机对拍</b>（如实，ADR-0022）</td></tr>
       <tr><td><b>15 · 真实订阅生态</b></td><td>全原生</td><td>订阅#1（50×vless-ws）✅；订阅#2：anytls ✅、<b>REALITY+Vision ✅</b>（自实现 TLS 1.3，ADR-0041；66/66 入组）</td><td><span class="b b-ok">≈85%</span></td><td>ADR-0026/0027/0028/0041；边界外协议可桥接过渡</td></tr>
     </tbody>
@@ -1208,8 +1208,8 @@ wait signal → reload / suspend / shutdown</pre>
     <thead><tr><th>口径</th><th>完成度</th><th>说明</th></tr></thead>
     <tbody>
       <tr><td>研究目标（可行性验证）</td><td><span class="b b-ok">100%</span></td><td>aya 全栈可行、规则逐字节对拍、C 数据面退役、真实节点浏览器可用——结论闭环</td></tr>
-      <tr><td>核心主链路（分流/规则/DNS（含 DoT/DoH）/主流协议/转发/运维）</td><td><span class="b b-ok">≈87%</span></td><td>日常「tproxy 网关 + 主流节点」已可用（P13 真网关本机实测 204 / YouTube 200；P15 订阅组真机 66/66 alive；P18d REALITY/Vision 66/66）</td></tr>
-      <tr><td>dae 全功能面（嗅探/多节点/geo/IPv6/安全 DNS/系统集成）</td><td><span class="b b-warn">≈72%（±5%）</span></td><td>差距集中在结构性 3 项；规则语言 ≈95%、IPv6（TCP 全链）≈80%、DNS（安全上游+分流）≈88%、协议家族 ≈70%</td></tr>
+      <tr><td>核心主链路（分流/规则/DNS（含 DoT/DoH）/主流协议/转发/运维）</td><td><span class="b b-ok">≈88%</span></td><td>日常「tproxy 网关 + 主流节点」已可用（P13 真网关本机实测 204 / YouTube 200；P15 订阅组真机 66/66 alive；P18d REALITY/Vision 66/66；P19 多组分派 lab 交叉 + 真机回归）</td></tr>
+      <tr><td>dae 全功能面（嗅探/多节点/geo/IPv6/安全 DNS/系统集成）</td><td><span class="b b-warn">≈74%（±5%）</span></td><td>结构性缺口收官（P19 多组分派）；规则语言 ≈95%、IPv6（TCP 全链）≈80%、DNS（安全上游+分流）≈88%、协议家族 ≈70%</td></tr>
     </tbody>
   </table>
   </div>
@@ -1217,7 +1217,7 @@ wait signal → reload / suspend / shutdown</pre>
   <h3>Top 缺口（按优先级）</h3>
   <ol style="color:var(--muted);line-height:1.9">
     <li><del>嗅探 + dial_mode（远端域名解析）</del> <b>已完成（P14，ADR-0030）</b>；余项：QUIC SNI（现仅 Initial 识别统计）、sniff-punt（按嗅探域名重判路由）；</li>
-    <li><del>多节点/订阅/组 + 健康检查</del> <b>已完成（P15，ADR-0031）</b>；<b>热更新/udp_check 已完成（P18e）</b>；余项：按规则分派不同组（数据面 outbound id）、sticky IP；</li>
+    <li><del>多节点/订阅/组 + 健康检查</del> <b>已完成（P15，ADR-0031）</b>；<b>热更新/udp_check（P18e）、按规则分派不同组（P19，ADR-0043）已完成</b>——数据面结构性缺口收官；余项：sticky IP；</li>
     <li><del>IPv6 数据面</del> <b>已完成（P16，ADR-0032）</b>；余项：UDP v6（含 DNS over UDP6 接管，需 sockmap key 3）、ICMPv6（分片已处理，P18e）；</li>
     <li><del>geoip/geosite/pname</del> <b>已完成（P17，ADR-0033）</b>；余项：geosite 负载对拍覆盖、pname argv basename（CO-RE）、geodata 流式解析（XDG 已完成，P18e）；</li>
     <li><del>DoH/DoQ + <code>dns.routing</code></del> <b>已完成（P18a/b/c，ADR-0034/0035/0036）</b>；余项：DoH h2/h3、ECS、optimistic cache/<code>ipversion_prefer</code>、bootstrap_resolver、嗅探 punt；</li>
@@ -1238,11 +1238,12 @@ wait signal → reload / suspend / shutdown</pre>
     <li><b>规则语言对齐</b>（P17）：v2ray <code>.dat</code> 编译期展开（attr/ext、v4+v6、2M LPM）+ cgroup2 pname 采集；对拍 5/5 逐字节（含 geoip/pname）。</li>
     <li><b>协议家族与运维面收尾</b>（P18e，ADR-0042）：SS2022（SIP022 三方法，BLAKE3 子密钥，与 shadowsocks-rust 跨实现）+ HTTP CONNECT 出站；<b>订阅热更新</b>（SIGHUP → 成员替换 + 健康继承，拨号热路径零锁竞争）；relay 并发上限；组 UDP DNS 健康检查；eBPF 分片处理；geodata XDG；嗅探 h2c（最小 HPACK）+ QUIC Initial 识别统计。</li>
     <li><b>工程化闭环</b>（P18e）：GitHub Actions CI（构建/单测/eBPF 对象，固定 nightly + bpf-linker）、systemd unit（capability 最小集 + ExecReload）+ <code>install.sh</code>（dry-run/uninstall）+ <code>docs/deploy.md</code>。</li>
+    <li><b>多组分派 + 启动健壮性</b>（P19，ADR-0043）：规则按组名选组（eBPF 零改动，conn_state 回读）；启动期 DNS 自我阻塞修复（initial reload 不重拉订阅）+ 单上游失败不拖垮全量 + DoQ 改 IP+sni + 健康并发 24 + <code>gateway.sh up</code> 启动自检（就绪才返回，失败自动回滚直连）；lab 双组双 ss 交叉 + 真机 66/66。</li>
   </ul>
 </section>
 
 <p style="color:var(--dim);font-family:var(--mono);font-size:.78rem;margin-top:56px;border-top:1px solid var(--line);padding-top:14px">
-  dae → Rust 决策档案 · v2.27 · 生成于 2026-10-04 · 基于 dae main@e3fee8f（nightly）· 本文件自包含，可离线打开<br>
+  dae → Rust 决策档案 · v2.28 · 生成于 2026-10-04 · 基于 dae main@e3fee8f（nightly）· 本文件自包含，可离线打开<br>
   v1.1：新增 4.5 部署形态、4.6 常驻与故障语义、决策点 D8<br>
   v1.2：按 ADR-0009 改为 K 轨道路线图；D7 修订为内核切片先行；K0 第一步（规则 VM + LPM）已实测<br>
   v1.3：K0、K1 均已完成并实测（双 epoch 热重载、conn_state 缓存、五钩子角色、本机 WAN 流量与回程）<br>
@@ -1279,6 +1280,7 @@ wait signal → reload / suspend / shutdown</pre>
                                                 v2.25：DNS `pname()` + `dns-bench` 并发/多轮 p95（ADR-0040）——WAN egress 按 DNS 流（UDP/TCP SYN）把发起进程名写入 `dns_sender_pname_map`（键含主机序源端口，修正网络序错位），控制面 raw `BPF_MAP_LOOKUP_ELEM` 反查 + 120s 陈旧判定 + 60s GC 线程回收；`dns.routing.request/response` 支持 `pname(...)`（等值/多值 OR/`!`，无进程信息不命中）；`dns-bench --rounds/--concurrency` + p95。实测：`cargo test` **154/154**；真网关 python3 被 reject（空应答）、getent/TCP 正常，移除规则后恢复；bench runs=10×rounds=2×concurrency=4：taobao DoH p50 9.2/p95 124.8ms、UDP 1.4/24.8ms（详情见 ADR-0040 与 `mini-dae/NOTES.md` §11.31）<br>
                                                 v2.26：REALITY + Vision（自实现 TLS 1.3，ADR-0041）——零新运行时依赖新增 `tls13.rs`（Chrome 形状 ClientHello + X25519MLKEM768（`ml-kem`）+ 记录层 AES-GCM/ChaCha + HKDF + Finished/KeyUpdate + `raw_read` 直通开关）、`reality.rs`（authKey HKDF、“前 16B AES-GCM 密封” session_id、证书签名域 HMAC-SHA512/ed25519 绑定、极简 DER）、`vision.rs`（UUID/cmd/len/pad 帧、~900B 首帧长填充、下行 `command=0x02` 后裸 TCP splice）；`vless` addons flow + `parse_vless security=reality`。互操作踩坑：key_share 的 GREASE 组必须在 supported_groups、share 数据不可为空、compress_certificate `[02 00 02]`。实测：**154/154** + 3 个 ignored e2e（本机 sing-box 参考服务端 128KB 往返、真站/openssl ClientHello、真实节点 HTTP/HTTPS+内层 TLS 触发 splice）；网关订阅#2 **66/66 节点入组**、`gateway.sh test` PASS、curl http 200 / https 204，lab verify 9/9 无回归（详情见 ADR-0041 与 `mini-dae/NOTES.md` §11.32）<br>
                                                 v2.27：P18e 批量收尾（ADR-0042）——协议：**SS2022**（SIP022 三方法，BLAKE3 `derive_key` 子密钥、TCP 随机 salt/长度域、UDP session+packet id、重放窗口；与 shadowsocks-rust ssserver 跨实现）+ **HTTP CONNECT 出站**（可选 Basic；UDP 不支持→直连回退）；组：**SIGHUP 订阅热更新**（重拉订阅 → `replace_members` 成员整体替换 + 同名继承健康；失败保留旧成员）、`udp_check_dns` 组参数（UDP DNS 探测优先、失败回退 TCP）、`--max-conns` 并发上限 + `limit_rejected`；数据面：**分片处理**（v4 非首片跳过 / v6 分片头，对照 `tproxy.c:1131/1214`，eBPF 对象已重建）；嗅探：**h2c**（preface + 最小 HPACK `:authority`）+ QUIC Initial 识别统计；工程：geodata **XDG**、**GitHub Actions CI**（loader 构建/单测/eBPF 对象，固定 nightly-2026-09-29 + bpf-linker 0.11.1 + LLVM23）、**systemd unit + install.sh（--dry-run/--uninstall）+ docs/deploy.md**。lab 新增 ss2022/http/热更新三用例（含独立 Python CONNECT 代理夹具）。实测：`cargo test` **174/174**（+18）、订阅#2 网关 SIGHUP 热更新、verify 无回归（详情见 ADR-0042 与 `mini-dae/NOTES.md` §11.33）<br>
+                                                v2.28：P19 多组分派（ADR-0043，对标表缺口 #2 收官）——**规则按组名选组**：组索引 = config `group` 段顺序（`GROUP_INDEX_BASE=2`；direct=0/block=1；未定义组名回退 proxy 兼容 K3），`extract_routing` 已定义组名直通；**eBPF 零改动**（outbound u8 本就在 `conn_state_map`），relay/UDP 每连接按 5 元组 raw 回读选组（查不到回退默认组），`GROUP_SET` 存全部组、空组也注册（保索引），SIGHUP 逐组 `replace_members`。同批**修复真机重启后断网**：启动期 `do_reload` 在钩子已挂、DNS 线程未起时重拉订阅解析节点域名 → 自我拦截自阻塞卡死启动（systemd-resolved 缓存为空必现）——startup 跳过订阅重拉；**单上游失败不再拖垮上游集**（跳过+告警）+ gateway.dae DoQ 改 `quic://223.5.5.5?sni=…`；健康探测并发 8→24；**`gateway.sh up` 启动自检**（组就绪 + 204；超时自动 down 回滚直连，`--wait/--no-wait`）。实测：`cargo test` **176/176**；lab `groups-up`/`test-groups`（8080→node-a / 8082→node-b 双 ss 日志交叉 + SIGHUP 复测）verify 9/9；真机启动自检通过、test PASS、SIGHUP「组 proxy 66 成员（继承 44 健康）」、66/66 alive、0 panic（详情见 ADR-0043 与 `mini-dae/NOTES.md` §11.34）<br>
 </p>
 </main>
 

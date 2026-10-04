@@ -67,6 +67,7 @@
 | [0040](./ADR-0040-dns-pname-bench-concurrency.md) | DNS `pname()`（mini 扩展：WAN egress 按 DNS 流写入 `dns_sender_pname_map`，控制面 raw lookup 反查；请求/应答双侧过滤；陈旧条目 GC）+ `dns-bench` 并发/多轮 p95；真机 python3/getent/TCP 三态验证 | 已采纳 | —（P18c 实用化扩展四） |
 | [0041](./ADR-0041-reality-vision.md) | REALITY + Vision（自实现 TLS 1.3 客户端）：Chrome 形状 CH + X25519MLKEM768（ml-kem）+ session_id AES-GCM 密封 + 证书 HMAC-SHA512/ed25519 绑定；Vision 帧层（UUID/cmd/len/pad、长填充、下行 splice 裸读）；订阅#2 48 条 REALITY 入组（对标表缺口 #6 首段） | 已采纳 | —（P18d 执行；缺口 #6 首段） |
 | [0042](./ADR-0042-p18e-batch.md) | P18e 批量收尾：SS2022（SIP022 三方法）+ HTTP CONNECT 出站；SIGHUP 订阅热更新（成员热替换 + 健康继承）；`--max-conns` 并发上限；`udp_check_dns` 组 UDP 检查；eBPF 分片处理；geodata XDG；嗅探 h2c（最小 HPACK）+ QUIC Initial 识别；CI/systemd/install.sh/deploy.md | 已采纳 | —（P18e 执行；缺口 #1/#3/#6/#7/#8/#9/#11/#13 批量） |
+| [0043](./ADR-0043-multi-group-dispatch.md) | P19 多组分派：规则按组名选组（组索引 direct=0/block=1/用户组 2 起，数据面 outbound 经 `conn_state` 回读，eBPF 零改动；未定义组名回退 proxy）；**启动期 DNS 自我阻塞修复**（initial reload 不再重拉订阅）+ 单上游失败不拖垮上游集 + DoQ 改 IP+sni + 健康并发 24 + `gateway.sh up` 启动自检/自动回滚 | 已采纳 | —（P19 执行；对标表缺口 #2 收官） |
 
 ## 新增一条 ADR
 

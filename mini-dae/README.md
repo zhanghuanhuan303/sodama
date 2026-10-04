@@ -5,7 +5,8 @@ netns 实验环境。**K0–K3、P3a（DNS 接管/域位图）、P3b-1（缓存/
 （domain(regex:)/EDNS）、P4（TCP relay / UDP NAT / TCP offload）、P5-G1（shadowsocks +
 trojan）、P5-G2（vless + vmess AEAD）、P5-G3a（tuic v5 / QUIC）、P5-G3b（hysteria2 /
 QUIC + 最小 HTTP/3 认证）、P5-G3b+（salamander 混淆 / Brutal 近似 / udphop）、
-P18a–e（DoT/DoH、DoQ、`dns.routing`、ECS/sip、pname、REALITY+Vision、SS2022/http、热更新、CI/systemd）与
+P18a–e（DoT/DoH、DoQ、`dns.routing`、ECS/sip、pname、REALITY+Vision、SS2022/http、热更新、CI/systemd）、
+P19（多组分派 + 启动健壮性）与
 P6（suspend/reload/metrics/sysdump/日志轮转/整配置热重载）已完成**；P9+ 已删除 C 数据面，
 `ebpf-rs` 的 Rust 对象是**唯一数据面**（ADR-0025）。
 
@@ -132,6 +133,14 @@ P6（suspend/reload/metrics/sysdump/日志轮转/整配置热重载）已完成*
   **GitHub Actions CI**（loader 构建/单测/eBPF 对象，固定 nightly + bpf-linker）+
   **systemd unit + install.sh（--dry-run/--uninstall）+ `docs/deploy.md`**；
   lab 新增 `ss2022-up`/`http-up`/`sub-reload-up` 三用例（ADR-0042、NOTES §11.33）
+- **P19 多组分派（规则按组名选组）+ 启动健壮性**：组索引 = config `group` 段顺序
+  （direct=0/block=1/用户组 `GROUP_INDEX_BASE=2` 起；未定义组名回退 proxy）；
+  **eBPF 零改动**——outbound u8 本就在 `conn_state_map`，relay/UDP 每连接按 5 元组
+  raw 回读选组（查不到回退默认组）；`GROUP_SET` 存全部组（空组也注册保索引），
+  SIGHUP 逐组热替换；**启动期 DNS 自我阻塞修复**（initial reload 不再重拉订阅，
+  详见 NOTES §11.34——重启后必现的启动断网根因）；单上游失败不拖垮上游集；
+  健康并发 8→24；**`gateway.sh up` 启动自检 + 失败自动回滚直连**（`--wait/--no-wait`）；
+  lab `groups-up`/`test-groups` 双组双 ss 交叉验证（ADR-0043、NOTES §11.34）
 - **P5-G3a QUIC（tuic v5）**：惰性 tokio 运行时 + quinn（阻塞 relay 用 block_on 桥接）；
   认证 token = TLS exporter（label=uuid 裸字节、context=password）；TCP 每条中继一条 QUIC
   双向流，UDP 走 QUIC DATAGRAM（含分片/重组）；上游 socket 用自建 `Endpoint` 打 `SO_MARK`；
@@ -177,13 +186,13 @@ ebpf-rs/src/         Rust/aya-ebpf 数据面（唯一）：8 个 tc 程序 + 6 �
                      + 规则 VM + conn_state + 单写者 + sk_skb offload；BTF maps（含 map-in-map）
 loader/src/main.rs   Rust + aya：加载、挂钩子、setns、tproxy/UDP socket、规则下发/热重载、
                      relay/Dialer、UDP NAT、offload 注册、janitor、只读状态面、DNS 线程
-loader/src/rules.rs  迷你规则解析 + 编译（match_set 编码 + LPM trie + regex 编译 + dump/对拍）
+loader/src/rules.rs  迷你规则解析 + 编译（match_set 编码 + LPM trie + regex 编译 + dump/对拍；P19 组名→outbound 索引）
 loader/src/target.rs P14：拨号目标类型（IPv4/IPv6/域名）+ 逐协议编码（vless/vmess/tuic/RFC1928/字符串；v6 形式见 P16）
 loader/src/sniffer.rs P14/P18e：TLS SNI / HTTP Host / h2c（preface + 最小 HPACK :authority）嗅探（纯解析函数 + MSG_PEEK 采集循环）
 loader/src/subscribe.rs P15：订阅拉取（HTTP(S)/file、重定向/chunked/base64）+ 链接解析
 loader/src/group.rs   P15/P18e：节点组 filter/policy/健康探测/失败切换（GroupRuntime）；P18e 成员热替换（replace_members 健康继承）+ udp_check_dns
 loader/src/geodata.rs P17a：v2ray .dat 读取（手写 protobuf）+ geoip/geosite 展开/搜索目录（含 XDG）/缓存
-loader/src/config.rs 全量 .dae 解析（词法/语法、include 合并、schema 校验、deferred 提取）
+loader/src/config.rs 全量 .dae 解析（词法/语法、include 合并、schema 校验、deferred 提取；P19 已定义组名在 routing 提取中直通）
 loader/src/status.rs 状态面（Unix socket：status/rules/config/maps/metrics + reload/suspend/resume 控制命令）
 loader/src/socks5.rs 最小 SOCKS5 客户端（relay 的一种 dialer，握手 + CONNECT）
 loader/src/outbound.rs 拨号器梯度：direct / socks5 / shadowsocks(含 2022) / trojan / vless / vmess / tuic /
@@ -239,7 +248,7 @@ lab/dnsroute.dae     P18c dns.routing 夹具（双上游 up1/up2 + 请求/应答
 lab/rules.regex.dae  P3b-2a regex 域分流规则（api[0-9]+.regex.test 命中）
 lab/rules.udp.dae    P4b UDP NAT 规则（所有 UDP:9998 判 proxy，验证 mark 防自环）
 lab/lab.sh           建/拆 netns 拓扑（标准 + 单臂）、跑测试、热重载、故障注入
-lab/gateway.sh       P13：真网关模式一键脚本（up/down/status/test/--dry-run；宿主流量透明接管；P15 支持 --subscribe/--group；P18c 支持 --config/--dns/--geodata-dir）
+lab/gateway.sh       P13：真网关模式一键脚本（up/down/status/test/--dry-run；宿主流量透明接管；P15 支持 --subscribe/--group；P18c 支持 --config/--dns/--geodata-dir；P19 启动自检 + 失败自动回滚，--wait/--no-wait）
 lab/sub_server.py    P15：订阅服务器夹具（GET /sub 返回指定文件内容；P18e 起按请求重读）
 lab/http_connect_server.py P18e：独立实现的 HTTP CONNECT 代理（可选 Basic；ss/代理跨实现验证用）
 lab/rules.gateway.dae P13：网关模式规则（DNS must 置顶、无私网 sip、QUIC block、fallback proxy）

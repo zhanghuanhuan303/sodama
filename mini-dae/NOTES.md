@@ -1223,6 +1223,36 @@ lab 夹具 `http_connect_server.py` + `sub_server.py` 每次重读。）
 - lab 新命令：`ss2022-up`/`test-ss2022`、`http-up`/`test-http`、`sub-reload-up`/`test-sub-reload`；
   `sub_server.py` 改为按请求重读文件。
 
+### 11.34 P19（多组分派 + 启动期 DNS 自我阻塞修复，ADR-0043）
+
+（实现：`rules.rs`/`config.rs`/`main.rs`/`group.rs`；`lab/gateway.sh`；`lab/gateway.dae`。
+真机两次「重启后断网」的根因排查也在此。）
+
+- **多组分派**：组索引 = config `group` 段顺序（direct=0 / block=1 / 用户组
+  `GROUP_INDEX_BASE=2` 起）；规则编译期 `resolve_outbound_id` 解析组名→索引
+  （未定义回退 proxy，兼容 K3）；`extract_routing` 已定义组名**直通**（不再改写为 proxy）。
+  eBPF **零改动**（outbound u8 本来就在 `conn_state_map`）；relay/UDP 每连接按
+  5 元组 raw lookup（dup fd）回读 → `by_outbound` 选组，查不到/非用户组回退默认组；
+  `GROUP_SET`（RwLock）存全部组 + 默认组（`--group` > proxy > 第一个）；空组也注册
+  （保索引稳定）；SIGHUP 逐组 `replace_members`（组集合变更时重建，不继承健康）。
+- **踩坑（重要）**：`do_reload(startup=true)` **不得**做需要网络/DNS 的事。启动顺序是
+  「挂钩子 → initial do_reload → spawn dns_loop/relay」；其间宿主 DNS 已被拦截但无人
+  应答。P18e 的 `reload_group_members` 在启动期重拉订阅解析 66 个节点域名 →
+  getaddrinfo 超时卡死主线程（日志停在「解析失败」后再无一行）→ 钩子空挂 = 断网。
+  以前 systemd-resolved 缓存有结果时侥幸通过，**重启后缓存为空必现**。修复：startup
+  跳过订阅重拉（`build_groups` 刚拉过）；SIGHUP 路径正常热更新。
+- **单上游不再拖垮全量**：`build_upstream_set_core` 逐条构造，失败条目跳过 + 告警，
+  其余照常生效；legacy = 第一个可用上游；CLI `--dns-upstream` 仍硬错误。
+  `gateway.dae` 的 `ali_quic` 改 `quic://223.5.5.5?sni=dns.alidns.com`（同 DoH：
+  IP 字面量 + SNI，不依赖自身解析）。
+- **启动窗口**：健康探测并发 8→24（66 节点首轮收敛 ~70s→~20s）；`gateway.sh up`
+  增加**启动自检**（组内任一成员探测成功 + wget 204；`--wait <秒>`/`--no-wait`/
+  `GATEWAY_WAIT_SECS`），超时**自动 down 回滚直连**——up 要么返回可用代理，要么回滚。
+- 实测：`cargo test` **176/176**；lab `groups-up`/`test-groups`（8080→node-a /
+  8082→node-b 双 ss 服务端日志交叉 + SIGHUP 复测）、`verify` 9/9、订阅/热更新/
+  config/dnsroute 回归全过；真机启动自检通过、`gateway.sh test` PASS（204 / 出口 IP /
+  DNS ok）、SIGHUP「组 proxy 66 成员（继承 44 健康）」、66/66 alive、0 panic。
+
 ## 12. 用 Rust 重写这套东西的可行性
 
 已验证（本仓库 mini-dae，实测跑通）：
