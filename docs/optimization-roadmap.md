@@ -16,6 +16,7 @@
 | O6 | AES-GCM 方法优先（可选） | chacha20-poly1305 AVX2 ~1.5GB/s/core | ss CPU -30~50%（若节点支持） | 中 | 低 |
 | O7 | UDP 批量（recvmmsg/sendmmsg） | UDP 路径未同口径压测（backlog G1 缺口） | PPS 提升、CPU 降 | 中 | 低 |
 | O8 | 缓冲池/回收与 shutdown 收敛 | 每连接 64KB 缓冲 malloc；SIGTERM 收敛 1–3s | 内存更稳、退出更快 | 低 | 低 |
+| ~~O9~~ | ~~kTLS 内核 TLS + TLS 上 splice~~ **（M2 已完成，实验开关）** | TLS 剖面 memcpy 29.4% + 建页 | ✅ 实测：48MB×4 中位 11.67→**12.32 Gbps**、CPU 420→**400ms**、memcpy→**1.6%**；8 流受同机夹具/内核 AES 速度限制（详见提案 05/07 节） | 中 | 中（需 TLS1.3+modprobe tls；默认关） |
 
 ---
 
@@ -57,11 +58,11 @@
 - **验证**：`perf` 中 syscall/`__check_object_size`/`rep_movs` 占比下降；
   `strace -c -p` syscall 次数对照。
 
-### O6 · AES-GCM 路径（可选，视节点能力）
+### O6 · AES-GCM 方法优先（可选，视节点能力）
 
-- **现状**：chacha20-poly1305 AVX2 在本平台约 1.5 GB/s/core（占 ss CPU ~40%）。
-- **目标**：在有 AES-NI + CLMUL 的 x86 上，AES-256-GCM（如 `aes-gcm` crate 或
-  `ring`）通常为 2–3×；ss 节点支持时优先协商 aes-256-gcm。
+- **现状**：chacha20-poly1305 AVX2 在本平台约 1.5–2.9 GB/s/core（M2 实测：用户态 2.87 GB/s、内核 1.76 GB/s）。
+- **实测（M2 复测）**：AES-128-GCM 本机用户态 **6.57 GB/s**、内核 2.89 GB/s（均 = chacha 的 2.3×/1.6×）；
+  ss/vless 节点支持时应优先协商 aes-*-gcm（含 kTLS 路径）。
 - **做法**：配置/订阅侧对节点方法排序；`ss.rs` 已有 aes-gcm 支持（验证其批处理
   路径是否走 AES-NI）；给出「方法 → 预期 CPU」对照表。
 - **预期收益**：ss CPU -30~50%（受节点方法约束）。
@@ -81,7 +82,24 @@
   VLESS 请求头拨号时发出、响应头由一次 codec 首读消费后切 splice；EINVAL 自动回退旧泵；
   `--no-splice` 开关；`status`/Prometheus 暴露 `splice_total/fallbacks`（命中 720 / 回退 0）。
 - **验证**：`lab.sh verify` 9/9、`cargo test` 236/236、半关闭逐字节 verify=ok。
-- **遗留**：加密/成帧链路不适用（TLS 收益归 M2；vision/ws 不适用）。
+- **遗留**：加密/成帧链路不适用（vision/ws 仍不适用；TLS 已在 O9 以 kTLS 打通）。
+
+### O9 · kTLS（内核 TLS）——✅ M2 已完成（实验开关，2026-10-04）
+
+- **实测**：TLS 48MB×4 中位 11 670 → **12 318 Mbps**（CPU 420 → 400 ms；p50 39→43 µs）；
+  8×64MB：memcpy 29.4% → **1.6%**（达标 ≤3%），吞吐/CPU 受同机夹具封顶
+  （sing-box 服务端与网关同机，四方客户端均 10.7–12.5 Gbps；系统总 CPU 两路径相同 ≈2.87 s）。
+- **实现**：① 逐记录握手驱动（`handshake_record_by_record`：按 TLS 记录边界喂 rustls，
+  服务端 Finished 后立即停止，post-handshake 记录全留给内核，`rec_seq` 从 0 对齐——修复 EBADMSG 根因）；
+  ② KeyLog→HKDF-Expand-Label→`setsockopt(TCP_ULP/TLS_TX/TLS_RX)`（AES-128/256-GCM、chacha20）；
+  ③ `ktls_read` recvmsg+cmsg 处理控制记录（NST 丢弃/alert=EOF）；
+  ④ 下行 splice 遇控制记录（内核返回 EINVAL + requeue）先用 `MSG_PEEK` 核实并消费再重试（≤8 轮）；
+  ⑤ kTLS 成功后 outbound 置位 splice 能力位，TLS 双向零拷贝。
+- **验证**：`TlsDecryptError` 增量 0；`splice_total=4/fallbacks=0`；`lab verify` 9/9（含 `USE_KTLS=1`）、
+  vless-tls/vmess-tls/trojan 均见 kTLS 启用；TLS1.2（shadowtls v1）自动回退 rustls；`cargo test` 236/236；`lab/perf/m2ab.sh` 可复现 A/B。
+- **边界**：需 `modprobe tls` 与 TLS1.3；对端 KeyUpdate 会使内核 RX 拒绝解密（断连不静默丢数据）；
+  **内核 AES-GCM 速度决定收益**：本机 `generic-gcm-aesni-avx` 2.89 GB/s（用户态 6.57 GB/s）故默认仍用 rustls；
+  VAES/AVX-512 平台或 NIC TLS 卸载时开启 `--ktls`（详见 `vless-proposal.html` 05/07 节）。
 
 ### O8 · 缓冲池与回收
 
@@ -150,7 +168,9 @@ sudo lab/perf/run.sh down
 perf record -F 1499 -g -p <sodama> -- sleep 12           # 热点搬家（AEAD→? 拷贝→?）
 ```
 
-目标基线（2026-10-04，M1 后更新）：vless 明文 8 流 **16.2 Gbps / 190 ms**（已达 ≥16 G 目标）、
+目标基线（2026-10-04，M2 后更新）：vless 明文 8 流 **16.2 Gbps / 190 ms**（已达 ≥16 G 目标）、
 48MB×4 中位 **16.9 Gbps / 60 ms**；relay 8 流 **21.6 Gbps / 150 ms**；
-下一步 M2：TLS 8 流 11.3 → **≥13 Gbps**、CPU 1 450 → **≤1 000 ms**；M4：ss 8 流 CPU ≤460 ms、
-四方对比 ss 吞吐超 dae、逼近 sing-box；线程数 O(核数)（10k 连接基准）。
+TLS：kTLS 全链路可用，48MB×4 中位 **12.3 Gbps / 400 ms**，memcpy 1.6%（达标）；
+8 流吞吐/CPU 目标（≥13 Gbps/≤1000 ms）因本机夹具（同机 sing-box TLS 服务端 ≈12.5 Gbps 封顶）
+与内核密码引擎速度（2.89 GB/s）均不可达——需要“服务端异机”口径后再评（M3 重测项）；
+M4：ss 8 流 CPU ≤460 ms、四方对比 ss 吞吐超 dae、逼近 sing-box；线程数 O(核数)（10k 连接基准）。

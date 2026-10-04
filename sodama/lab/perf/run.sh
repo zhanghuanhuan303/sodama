@@ -162,11 +162,13 @@ start_impl() {
   case "$impl" in
     sodama)
       [ -x "$LOADER" ] && [ -f "$OBJ" ] || die "先构建 sodama（lab.sh build + cargo build --release）"
+      # SODAMA_ARGS：附加参数（如 M2 kTLS 实验：SODAMA_ARGS=--ktls）
+      # shellcheck disable=SC2086
       "$LOADER" --ebpf "$OBJ" --lan landae --wan wan \
         --dae0 dae0 --dae0peer dae0peer --daens sodamans \
         --rules "$HERE/rules.perf.dae" \
         --dialer "$sodama_dialer" \
-        --status-socket /tmp/sodama-status.sock >/tmp/perf-sodama.log 2>&1 &
+        --status-socket /tmp/sodama-status.sock ${SODAMA_ARGS:-} >/tmp/perf-sodama.log 2>&1 &
       pid=$!
       ;;
     dae)

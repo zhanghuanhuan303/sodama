@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>sodama · VLESS 性能实测与优化提案（M1 落地版）</title>
+<title>sodama · VLESS 性能实测与优化提案（M1+M2 落地版）</title>
 <style>
   :root{
     --bg:#0f1115; --card:#171a21; --card2:#1d212b; --fg:#e6e9ef; --muted:#9aa3b2;
@@ -69,20 +69,21 @@
 <div class="wrap">
 
 <header class="top">
-  <h1>sodama · VLESS 性能实测与优化提案 <span class="tag ok">M1 已落地</span></h1>
-  <div class="sub">同机四方对拍（sodama / dae v2.1.1 / sing-box 1.14.2 / v2ray 5.52.0）· VLESS 明文与 TLS · 5 轮中位数 · 2026-10-04 · v1.1（M1 splice 零拷贝上线后复测）</div>
+  <h1>sodama · VLESS 性能实测与优化提案 <span class="tag ok">M1+M2 已落地</span></h1>
+  <div class="sub">同机四方对拍（sodama / dae v2.1.1 / sing-box 1.14.2 / v2ray 5.52.0）· VLESS 明文与 TLS · 5 轮中位数 · 2026-10-04 · v1.2（M2：kTLS 内核 TLS + TLS 上 splice，含逐记录握手驱动与控制记录处理）</div>
   <div class="chips">
     <span class="chip">数据口径 <b>5 轮中位</b></span>
     <span class="chip">夹具 <b>全双工 echo · 环回上限 ≈25 Gbps</b></span>
     <span class="chip">上游 <b>sing-box VLESS server（四方共用）</b></span>
     <span class="chip">M1 验收 <b class="ok">全部达标</b></span>
-    <span class="chip">splice 命中 <b>720 / 回退 0</b></span>
-    <span class="chip">回归 <b>verify 9/9 · cargo test 236/236</b></span>
+    <span class="chip">M2 验收 <b class="ok">memcpy 达标</b> · 吞吐/CPU <b class="warnc">夹具受限</b></span>
+    <span class="chip">kTLS <b>TX+RX true · 解密错误 0 · splice 4/4</b></span>
+    <span class="chip">回归 <b>verify 9/9（含 USE_KTLS=1）· cargo test 236/236</b></span>
   </div>
 </header>
 
 <section>
-<h2>01 · 摘要（M1 后）</h2>
+<h2>01 · 摘要（M1+M2 后）</h2>
 <div class="grid">
   <div class="card">
     <div class="sub">VLESS 明文（splice 零拷贝）</div>
@@ -100,9 +101,14 @@
     <div class="sub">+45% · CPU 1 100 → <b class="ok">150 ms</b>（4 流 23 147 Mbps）</div>
   </div>
   <div class="card">
-    <div class="sub">VLESS + TLS（未受影响）</div>
-    <div class="kpi">11 670 <small>Mbps</small></div>
-    <div class="sub">p50 <b>39 µs</b> · CPU 420 ms · 加密路径自动回退用户态泵，无回归</div>
+    <div class="sub">VLESS + TLS（kTLS 内核 TLS）</div>
+    <div class="kpi">12 318 <small>Mbps</small></div>
+    <div class="sub"><span class="tag ok">+5.6%</span> 11 670 → 12 318 · CPU <b>400 ms</b>（−5%）· p50 39→43 µs<br><span class="muted">TX+RX 下沉内核，TLS 上 splice：<code>memcpy 1.6%</code>（目标 ≤3%）</span></div>
+  </div>
+  <div class="card">
+    <div class="sub">kTLS 8×64MB 扩展</div>
+    <div class="kpi">11 147 <small>Mbps</small></div>
+    <div class="sub"><span class="tag warn">夹具饱和</span> 同口径 rustls 11 253 · 解密错误 <b class="ok">0</b> · splice <b class="ok">4/4 命中</b><br><span class="muted">四方客户端（含 sing-box 自己）均聚在 10.7–12.5 Gbps，本机夹具即为天花板</span></div>
   </div>
 </div>
 
@@ -111,6 +117,16 @@
 四方对比中 sodama 与 sing-box 的明文差距从 −26% 收敛到 <b>−4.6%</b>，且 CPU 更低（60 vs 90 ms）、延迟最低（36 µs）。
 验收：<span class="done">vless 8×64MB ≥16 Gbps（16.18 ✓）· CPU ≤150 ms（190*）· relay ≥22 Gbps（21.6 ≈✓，4 流 23.1 ✓）</span>
 <sup class="muted">（*CPU 目标含 8 流场景；48MB×4 主口径为 60 ms，远低于目标）</sup>
+</div>
+
+<div class="note">
+<b>M2 结论（kTLS 内核 TLS，实验开关 <code>--ktls</code>）：</b>已打通「服务器 Finished 后逐记录停止握手 →
+导出 TLS1.3 流量密钥 → 内核 TX/RX 加解密 → TLS 上再做 splice」全链路，控制记录（NewSessionTicket）与
+splice EINVAL 均有正确处理；<b class="ok">libc memcpy 从 29.4% 降到 1.6%，达标（≤3%）</b>。
+但本机（i9-9900KF）内核 AES-GCM 实测 <b>2.89 GB/s</b>，仅为用户态实现（OpenSSL 6.57 GB/s / ring 同级）的 44%，
+因此「搬到内核」在本硬件上是 CPU 平移而非下降：8×64MB 下 sodama CPU 1 510 vs rustls 1 370 ms、
+两类路径的系统总 CPU 相同（≈2.87 s），吞吐同被夹具压在 ≈11 Gbps。<span class="warnc">kTLS 在本机不作为默认</span>；
+VAES/AVX-512 或带 TLS 卸载的 NIC 上预期完全不同（内核变体更快、且可避免用户态拷贝）。
 </div>
 </section>
 
@@ -159,7 +175,66 @@
 </section>
 
 <section>
-<h2>03 · 结果 A：VLESS 明文四方对比（M1 后，5 轮中位）</h2>
+<h2>03 · M2 做了什么（kTLS 内核 TLS）</h2>
+<table>
+  <thead><tr><th>改动</th><th>实现</th><th>效果/证据</th></tr></thead>
+  <tbody>
+    <tr>
+      <td><b>逐记录握手驱动</b><br><span class="sub">kTLS RX 对齐的关键</span></td>
+      <td>握手不再用 <code>complete_io</code> 整块消费：按 TLS 记录边界（5B 头 + 荷载）喂 rustls，
+      <code>is_handshaking()</code> 变 false（刚处理完服务端 Finished）立即停止读取——
+      服务端紧跟的应用 epoch 记录（NewSessionTicket 等）一个都不被 rustls 消费，
+      内核 RX 的 <code>rec_seq</code> 才能与 wire 从 0 对齐；异常时回退 <code>complete_io</code> 并禁用 RX（仅试 TX）</td>
+      <td class="sub">修复了 M2 前半段的 <b>EBADMSG</b> 根因（NST 被 rustls 消费导致序号错位）；
+      实测 <code>/proc/net/tls_stat</code>：<b class="ok">TlsDecryptError 增量 0</b>，全部连接 TX=true RX=true</td>
+    </tr>
+    <tr>
+      <td><b>kTLS 安装</b></td>
+      <td>rustls <code>KeyLog</code> 捕获 <code>CLIENT/SERVER_TRAFFIC_SECRET_0</code> → HKDF-Expand-Label
+      导出 key/iv → <code>setsockopt(TCP_ULP,"tls")</code> + <code>TLS_TX/TLS_RX</code>
+      （AES-128/256-GCM、chacha20-poly1305；TLS1.2/无密钥自动跳过）；<code>TLS_RX_EXPECT_NO_PAD</code>；
+      TX/RX 独立安装、失败各自回退 rustls；<code>--ktls</code> 开关（默认关）、需 <code>modprobe tls</code></td>
+      <td class="sub">TX-only 实验（<code>SODAMA_KTLS_TXONLY=1</code>）先证密钥/派生/安装全对，再攻 RX；
+      安装耗时在连接建立期，数据面零每包开销</td>
+    </tr>
+    <tr>
+      <td><b>控制记录与 splice 互处理</b></td>
+      <td>RX 明文读取：<code>recvmsg</code>+cmsg 按记录类型分流（23=应用数据返回；22=NST 丢弃继续；21=alert 视作关闭）；
+      下行 splice 遇队首控制记录时内核 requeue 并返回 <code>EINVAL</code>——
+      先 <code>MSG_PEEK</code> 核实 cmsg 类型（应用数据不动），是控制记录则消费，再重试 splice（≤8 轮）</td>
+      <td class="sub">NST 在握手后任意时刻到达都不再导致连接被误杀或回退；
+      实测 <code>splice_total=4 / fallbacks=0</code>，TLS 连接全程零拷贝</td>
+    </tr>
+    <tr>
+      <td><b>TLS 上 splice</b></td>
+      <td>kTLS 成功后数据面回到字节透明：outbound 层重新置位 splice 能力位；
+      上行 <code>splice(客户端→kTLS TX socket)</code>（内核加密）、下行 <code>splice(kTLS RX socket→客户端)</code>（内核解密）</td>
+      <td class="sub">8×64MB perf：<code>libc memcpy 29.4% → 1.6%</code>（M2 目标 ≤3% <b class="ok">达标</b>）；
+      <code>rep_movs/建页</code>退出前十，转为 <code>aes_gcm_*</code>（内核）与 splice 管线</td>
+    </tr>
+    <tr>
+      <td><b>记录层缓冲复用</b></td>
+      <td><code>TlsReader</code> 去掉「栈 16KB 临时 → pending Vec」两跳，改为 64KB 复用缓冲 + 游标喂 rustls；读块 16→64KB</td>
+      <td class="sub">rustls 路径少一次拷贝/扩容；配合 kTLS 时直接内核明文读写</td>
+    </tr>
+    <tr>
+      <td><b>可观测性与开关</b></td>
+      <td><code>--ktls</code> / <code>SODAMA_KTLS_DEBUG=1</code>（密钥、安装、控制记录）/ <code>SODAMA_KTLS_TXONLY=1</code>；
+      lab：<code>USE_KTLS=1</code>、<code>SODAMA_ARGS=--ktls</code>、<code>lab/perf/m2ab.sh</code>（路径 A/B）</td>
+      <td class="sub">TlsDecryptError 可直接从 <code>/proc/net/tls_stat</code> 核对；A/B 数据可一键复现</td>
+    </tr>
+  </tbody>
+</table>
+<div class="note">
+<b>为什么 kTLS 没把 CPU 降下来（本机）：</b>内核 kTLS 的 AES-GCM 落在 <code>generic-gcm-aesni-avx</code>（本机 /proc/crypto 无 avx2/vaes 变体），
+AF_ALG 实测加密吞吐 <b>2.89 GB/s</b>；而用户态（OpenSSL 等价测法）AES-128-GCM <b>6.57 GB/s</b>、ring/rustls 同级。
+即「把加解密搬到内核」在 i9-9900KF 上是用 0.44× 的密码引擎换掉用户态拷贝——本机净收益只是 memcpy/建页的消除，
+CPU 总量打平（系统总 CPU ≈2.87 s 两路径相同）；在带 <b>VAES/AVX-512</b> 的新 CPU 或支持 TLS 卸载的 NIC 上结论会反转（内核变体可快于用户态，还能真正卸下 CPU）。
+</div>
+</section>
+
+<section>
+<h2>04 · 结果 A：VLESS 明文四方对比（M1 后，5 轮中位）</h2>
 <table>
   <thead><tr><th>实现</th><th>direct 吞吐<br><span class="sub">Mbps（夹具受限）</span></th><th>direct p50<br>µs</th><th>vless 吞吐<br>Mbps</th><th>vless p50<br>µs</th><th>vless CPU<br>ms</th><th>RSS<br>MB</th><th>线程</th></tr></thead>
   <tbody>
@@ -180,22 +255,28 @@
 </section>
 
 <section>
-<h2>04 · 结果 B：VLESS + TLS 四方对比（M1 后复测）</h2>
+<h2>05 · 结果 B：VLESS + TLS（M2 kTLS 后）</h2>
 <table>
   <thead><tr><th>实现</th><th>vless-tls 吞吐<br>Mbps</th><th>p50<br>µs</th><th>CPU<br>ms</th><th>RSS<br>MB</th><th>线程</th></tr></thead>
   <tbody>
-    <tr><td><b>sodama</b></td><td class="n">11 670</td><td class="n best">39</td><td class="n best">420</td><td class="n best">29.8</td><td class="n best">11</td></tr>
+    <tr><td><b>sodama（M2 kTLS）</b><br><span class="sub">5 轮中位</span></td><td class="n best">12 318</td><td class="n">43</td><td class="n best">400</td><td class="n best">28.8</td><td class="n best">11</td></tr>
+    <tr><td>sodama（M1 rustls）<br><span class="sub">对照 5 轮中位</span></td><td class="n">11 670</td><td class="n best">39</td><td class="n">420</td><td class="n">29.8</td><td class="n">11</td></tr>
     <tr><td>dae v2.1.1</td><td class="n">11 453</td><td class="n">55</td><td class="n">450</td><td class="n">59.5</td><td class="n">20</td></tr>
-    <tr><td>sing-box 1.14.2</td><td class="n best">12 003</td><td class="n">53</td><td class="n">450</td><td class="n">69.3</td><td class="n">18</td></tr>
+    <tr><td>sing-box 1.14.2</td><td class="n">12 003</td><td class="n">53</td><td class="n">450</td><td class="n">69.3</td><td class="n">18</td></tr>
     <tr><td>v2ray 5.52.0</td><td class="n">7 529</td><td class="n">58</td><td class="n worst">800</td><td class="n">74.3</td><td class="n">25</td></tr>
   </tbody>
 </table>
-<p class="sub">TLS 形态 sodama 保持综合第一梯队（吞吐 ≈ sing-box 的 97%、CPU 更低、p50 最低、内存为对手 40–50%）；
-splice 对加密路径不适用，其收益留待 <b>M2（TLS 降本）</b>。</p>
+<p class="sub">sodama 自身对比：<b>11 670 → 12 318 Mbps（+5.6%）· CPU 420 → 400 ms · splice 全命中</b>（dae/sing-box/v2ray 行为 M1 同口径数据，±5–10% 轮间噪声）。
+TLS 路径终于和明文一样走 splice，<code>memcpy</code> 从 29.4% 降到 1.6%；但绝对吞吐已到<b>本机夹具天花板</b>——把 sing-box、dae、甚至 sing-box 自己当客户端都只能跑到 10.7–12.5 Gbps（服务端与网关同机、共用 8 核，sing-box 服务端自身就占 ~4 核）。</p>
+<div class="note warn">
+<b>M2 验收对账（目标 vs 现状）：</b>① <b>libc memcpy ≤3%</b> → <span class="done">1.6% ✓</span>；
+② <b>TLS 8 流 ≥13 Gbps</b> → <span class="warnc">11.1 Gbps，未达标，且不可达</span>：本机夹具（同机 sing-box TLS 服务端）在四方客户端下封顶 ≈12.5 Gbps，13 Gbps 需远端服务端或第二台机器才能测；
+③ <b>CPU ≤1 000 ms</b> → <span class="warnc">1 510 ms（kTLS）/ 1 370 ms（rustls），未达标</span>：两路径系统总 CPU 相同（≈2.87 s / 512MB 双向），瓶颈是密码学总量——用户态 ring AES-GCM ~6.6 GB/s、内核 aesni-avx 仅 2.9 GB/s，在两者间平移不改变总账。
+</div>
 </section>
 
 <section>
-<h2>05 · 结果 C：并发扩展（sodama，64MB/流 + 64×1MB）</h2>
+<h2>06 · 结果 C：并发扩展（sodama，64MB/流 + 64×1MB）</h2>
 <div class="two">
   <div>
     <h3>VLESS 明文（M1 后）</h3>
@@ -229,7 +310,7 @@ splice 对加密路径不适用，其收益留待 <b>M2（TLS 降本）</b>。</
 </section>
 
 <section>
-<h2>06 · perf 剖面前后（VLESS 明文，8×64 MB）</h2>
+<h2>07 · perf 剖面前后（VLESS 明文，8×64 MB）</h2>
 <div class="two">
   <div>
     <h3>M1 前（用户态泵）</h3>
@@ -252,31 +333,71 @@ splice 对加密路径不适用，其收益留待 <b>M2（TLS 降本）</b>。</
 </div>
 <p class="sub">后图分解：<code>skb_splice_from_iter</code> 8.4% + <code>__splice_segment</code>/<code>__skb_splice_bits</code>/<code>splice_to_socket</code>/<code>do_splice</code> ≈ 10.9%；
 其余为 TCP 栈、veth、自旋锁与调度——即“拷贝被换成页引用”后的净余成本。</p>
+
+<h3>TLS 剖面：kTLS+splice vs rustls（M2，8×64 MB）</h3>
+<div class="two">
+  <div>
+    <h3>kTLS + splice（<code>--ktls</code>）</h3>
+    <div class="bars">
+      <div class="lbl">内核 AES-GCM 加密</div><div><span class="bar" style="width:25.2%"></span></div><div class="val">25.2%</div>
+      <div class="lbl">内核 AES-GCM 解密</div><div><span class="bar" style="width:22.8%"></span></div><div class="val">22.8%</div>
+      <div class="lbl">建页（clear_page）</div><div><span class="bar warm" style="width:7.8%"></span></div><div class="val">7.8%</div>
+      <div class="lbl">libc memcpy</div><div><span class="bar alt" style="width:1.6%"></span></div><div class="val">1.6%</div>
+      <div class="lbl">其余（TCP/veth/调度）</div><div><span class="bar alt" style="width:42.6%"></span></div><div class="val">42.6%</div>
+    </div>
+    <div class="sub">memcpy 达标；成本集中到内核密码引擎（本机 2.89 GB/s）与建页</div>
+  </div>
+  <div>
+    <h3>rustls（默认路径）</h3>
+    <div class="bars">
+      <div class="lbl">内核 socket 拷贝</div><div><span class="bar warm" style="width:30.2%"></span></div><div class="val">30.2%</div>
+      <div class="lbl">ring AES-GCM（用户态）</div><div><span class="bar" style="width:16.6%"></span></div><div class="val">16.6%</div>
+      <div class="lbl">建页（clear_page）</div><div><span class="bar warm" style="width:10.8%"></span></div><div class="val">10.8%</div>
+      <div class="lbl">libc memcpy/memset</div><div><span class="bar alt" style="width:5.2%"></span></div><div class="val">5.2%</div>
+      <div class="lbl">其余（rustls 记录层/TCP/veth）</div><div><span class="bar alt" style="width:37.2%"></span></div><div class="val">37.2%</div>
+    </div>
+    <div class="sub">用户态密码引擎（6.57 GB/s）更快，但拷贝/建页占比高——两路径总 CPU 相同，天平两端互补</div>
+  </div>
+</div>
+<div class="note">
+<b>密码引擎微基准（本机 i9-9900KF）：</b>内核 <code>gcm(aes)</code>（AF_ALG，/proc/crypto 选中 <code>generic-gcm-aesni-avx</code>）
+<b>2.89 GB/s</b>；用户态 AES-128-GCM（OpenSSL speed，与 ring 同级 AES-NI+PCLMUL）<b>6.57 GB/s</b>；
+ChaCha20-Poly1305 分别为 1.76 / 2.87 GB/s（因此本机也不存在“换 chacha 回血”空间）。
+内核无 AVX2/VAES GCM 变体是 Coffee Lake + 本内核的局限；新平台选 <code>vaes-*</code> 后内核路径才真正占据优势。
+</div>
 </section>
 
 <section>
-<h2>07 · 分析（M1 后）</h2>
+<h2>08 · 分析（M1+M2 后）</h2>
 <ol>
-  <li><b>零拷贝收益兑现</b>：明文路径 +38% 吞吐 / −84% CPU，sodama 从“明显落后 sing-box”变为“同档且更省”；perf 证据链完整（拷贝/建页占比消失）。</li>
-  <li><b>半关闭语义无回归</b>：splice EOF → <code>SHUT_WR</code> 与旧泵一致；未设 <code>BENCH_NOSHUT</code> 的逐字节校验通过，lab verify 9/9。</li>
-  <li><b>TLS 是下一座山</b>：45% 的 CPU 花在拷贝类操作（27.5% 内核拷贝 + 7.6% libc memcpy + 9.7% 建页），
-  15% 在 AES-NI；rustls 记录层的一次额外拷贝与 skb 建页是 M2 的目标（缓冲池化、就地读写、kTLS 评估）。</li>
-  <li><b>规模模型仍未解</b>：123 线程/64 连接、~175 KB/连接；splice 不改变线程模型，M4 以 worker 池解决。</li>
+  <li><b>零拷贝收益兑现（M1）</b>：明文路径 +38% 吞吐 / −84% CPU，sodama 从“明显落后 sing-box”变为“同档且更省”；perf 证据链完整（拷贝/建页占比消失）。</li>
+  <li><b>半关闭语义无回归</b>：splice EOF → <code>SHUT_WR</code> 与旧泵一致；未设 <code>BENCH_NOSHUT</code> 的逐字节校验通过，lab verify 9/9（含 <code>USE_KTLS=1</code>）。</li>
+  <li><b>kTLS 形制全部打通（M2）</b>：逐记录握手驱动把「rustls 消费边界」精确卡在服务端 Finished，
+  内核 RX 序号与 wire 完美对齐；控制记录（NST）在明文读与 splice 两条路径都能正确跳过；
+  TLS 终于可 splice（memcpy 29.4%→1.6%）。难点不在 ABI（<code>setsockopt</code> 结构体/IV 拆分/ULP 均已验证），而在<b>rustls 与内核的序号一致性与 post-handshake 记录</b>。</li>
+  <li><b>kTLS 的收益是硬件相关的</b>：本机内核 AES-GCM 只有用户态的 0.44×，两路径总 CPU 打平；
+  但 kTLS 已经拿掉了拷贝与建页的一半以上，吞吐也略高（+5.6%）。在 VAES/AVX-512
+  或带 TLS 卸载的 NIC 上，内核路径预期从“平移”变成“净赚”；本项目保留 <code>--ktls</code> 供按硬件开启。</li>
+  <li><b>夹具是当前最大变量</b>：TLS 吞吐被同机 sing-box 服务端封顶 ≈12.5 Gbps（四方客户端一致），
+  CPU 目标也需在服务端不同机的口径下重测；下一步优化（worker 池/缓冲池）应换到可拉开差距的口径验证。</li>
+  <li><b>规模模型仍未解</b>：123 线程/64 连接、~175 KB/连接；splice 与 kTLS 不改变线程模型，M4 以 worker 池解决。</li>
   <li><b>生态缺口仍在</b>：Vision-over-TLS 未实现（sodama 的 vision 仅随 REALITY 生效）；以 VLESS 为主链路时应补齐（M3）。</li>
 </ol>
 </section>
 
 <section>
-<h2>08 · 提案进度与后续（M2–M4）</h2>
+<h2>09 · 提案进度与后续（M3–M4）</h2>
 <table>
   <thead><tr><th>阶段</th><th>内容</th><th>验收目标</th><th>状态</th></tr></thead>
   <tbody>
     <tr><td><b>M1</b></td><td>splice 零拷贝（Direct/VLESS 明文，Group 透传能力位）+ eBPF printk 门控</td>
         <td>vless 8×64 ≥16 Gbps；CPU ≤150 ms；relay ≥22 Gbps</td>
         <td><span class="tag ok">完成</span> 16.18 / 190 ms* / 21.6（4 流 23.1）<br><span class="sub">*48MB×4 主口径 60 ms</span></td></tr>
-    <tr><td><b>M2</b></td><td>TLS 降本：泵/记录层缓冲复用（零热路径分配）、rustls 就地读写、kTLS 评估</td>
+    <tr><td><b>M2</b></td><td>TLS 降本：TlsReader 缓冲复用、rustls 就地读数、<b>kTLS 内核 TLS（TX+RX）</b>、TLS 上 splice</td>
         <td>TLS 8 流 ≥13 Gbps；CPU ≤1 000 ms；libc memcpy ≤3%</td>
-        <td><span class="tag warn">下一步</span></td></tr>
+        <td><span class="tag warn">落地（1/3 达标）</span> memcpy <b class="ok">1.6% ✓</b>；
+        11.1 Gbps / 1 510 ms —— 吞吐被夹具封顶、CPU 为硬件密码引擎所限（见 05/07 节对账）<br>
+        <span class="sub">kTLS 全链路可用（TX+RX、0 解密错误、splice 4/4），<code>--ktls</code> 保留按硬件开启</span></td></tr>
     <tr><td><b>M3</b></td><td>Vision-over-TLS + ws/wss 变体（对齐主流节点组合）</td>
         <td>lab 四方逐字节 + 真实订阅 e2e</td>
         <td><span class="tag">计划</span></td></tr>
@@ -286,26 +407,27 @@ splice 对加密路径不适用，其收益留待 <b>M2（TLS 降本）</b>。</
   </tbody>
 </table>
 <div class="note">
-<b>M2 技术要点（依据本轮剖面）：</b>① 每连接复用读写缓冲（当前每连接 malloc 64KB×2 + rustls 记录缓冲）；
-② rustls 读写走 <code>ReadBuf</code>/vectored 减少一次明文↔记录拷贝（libc memcpy 7.6%）；
-③ <code>sendmsg(MSG_ZEROCOPY)</code> 对加密后大块发送做试点；④ kTLS 需要 rustls 导出流量密钥（未公开），
-先做可行性 spike，不作为 M2 承诺项。
+<b>M2 结论与后续（M3+）：</b>① kTLS 已交付为实验特性（<code>--ktls</code>，TX+RX+控制记录+splice 全链路，
+默认关：本机硬件下 rustls 更省 CPU）；② 吞吐/CPU 目标的下一轮验证需换口径——把 sing-box 服务端放到第二台机器
+（或升级到 VAES 平台复测 kTLS）；③ 缓冲池化/零分配与 <code>sendmsg(MSG_ZEROCOPY)</code> 试点并入 M3 与 worker 池一起做，
+在 rustls 路径上直接攻击剩余 30% 的 rep_movs/建页；④ Vision-over-TLS 补齐后，VLESS+TLS+Vision 组合才能与现代节点对齐。
 </div>
 </section>
 
 <section>
-<h2>09 · 风险与边界</h2>
+<h2>10 · 风险与边界</h2>
 <ul class="sub">
-  <li><b>夹具边界</b>：direct 行与 8 流 vless 可能触及环回 ≈25 Gbps 夹具上限（客户端 pattern 校验 CPU），绝对吞吐不外推到公网；</li>
-  <li><b>splice 适用范围</b>：仅字节透明链路（Direct / VLESS 明文 TCP）。加密、WS、vision、QUIC 系不适用；首次 splice 返回 EINVAL 时自动回退泵（计数可观测）；</li>
-  <li><b>内核依赖</b>：splice 自 2.6.17 起可用，veth/netns 场景常规；管道容量 <code>F_SETPIPE_SZ</code> 失败时静默使用默认 64KB；</li>
+  <li><b>夹具边界</b>：direct 行与 8 流 vless 可能触及环回 ≈25 Gbps 夹具上限（客户端 pattern 校验 CPU），绝对吞吐不外推到公网；TLS 行则受同机 sing-box 服务端 ≈12.5 Gbps 封顶，这组数据只能横向比较；</li>
+  <li><b>splice 适用范围</b>：字节透明链路（Direct / VLESS 明文 TCP）与 kTLS 成功后的 TLS 链路；加密、WS、vision、QUIC 系仍走用户态泵；首次 splice EINVAL 自动回退（计数可观测）；</li>
+  <li><b>kTLS 边界（实验）</b>：需内核 <code>tls</code> 模块（<code>modprobe tls</code>）；仅 TLS 1.3 + 已支持的 AEAD（TLS 1.2 自动跳过、仅用户态）；对端中途发 <b>KeyUpdate</b> 时内核 RX 会 EBADMSG（当前直接断连，不会静默丢数据；xray/sing-box 默认不主动 KeyUpdate）；安装失败/控制记录异常均有回退路径与一次性日志；</li>
+  <li><b>内核依赖</b>：splice 自 2.6.17 起可用；kTLS 自 4.13+（TLS 1.3 RX splice 需要较新内核，本机 6.18 实测）；veth/netns 场景常规；</li>
   <li><b>测量噪声</b>：同机 veth，轮次间 ±5–10%；relay 8 流首测出现 12.7 Gbps 的孤立点，复测 21.6 Gbps，报告取复测值并保留说明；</li>
-  <li><b>上游同源</b>：四方共用 sing-box VLESS 服务端（同 ss 轮的 ssserver 口径），高并发下可能成为共同天花板。</li>
+  <li><b>上游同源</b>：四方共用 sing-box VLESS 服务端（同 ss 轮的 ssserver 口径），TLS 高并发下它就是共同天花板（≈12.5 Gbps），CPU 对账也受其同机竞争影响。</li>
 </ul>
 </section>
 
 <section>
-<h2>10 · 附录：复现与证据</h2>
+<h2>11 · 附录：复现与证据</h2>
 <pre># M1 验收（本机 /tmp 留档）
 sudo PROXY_PROTO=vless     ROUNDS=5 lab/perf/run.sh all   # /tmp/perf-vless-m1.tsv（sodama 16 926 Mbps / 60 ms）
 sudo PROXY_PROTO=vless     lab/perf/scaling.sh all        # /tmp/scaling-vless-m1.tsv（8 流 16 178 / 190 ms）
@@ -313,23 +435,36 @@ sudo PROXY_PROTO=vless     lab/perf/scaling.sh relay      # /tmp/scaling-relay-m
 sudo PROXY_PROTO=vless-tls ROUNDS=5 lab/perf/run.sh bench sodama   # /tmp/perf-vless-tls-m1.tsv（11 670 / 420 ms）
 perf record -F 1499 -g -p &lt;sodama-pid&gt; -- sleep 12        # /tmp/perf-vless-m1.data
 
-# 回归
+# M2 验收（kTLS；SODAMA_ARGS 透传给 loader）
+sudo SODAMA_ARGS=--ktls PROXY_PROTO=vless-tls ROUNDS=5 RESULTS=/tmp/perf-vless-tls-m2-ktls.tsv lab/perf/run.sh bench sodama
+sudo SODAMA_ARGS=--ktls PROXY_PROTO=vless-tls OUT=/tmp/scaling-vless-tls-m2-ktls.tsv lab/perf/scaling.sh vless-tls
+sudo bash lab/perf/m2ab.sh 3                               # kTLS/splice/rustls 路径 A/B（8×64MB）
+perf record -F 999 -g -p &lt;sodama-pid&gt; -- sleep 8           # /tmp/m2-ktls8.data、/tmp/m2-rustls8.data
+sudo cat /proc/net/tls_stat | grep -E 'TlsTxSw|TlsRxSw|TlsDecryptError'   # 解密错误增量应为 0
+/tmp/afalg_bench 'gcm(aes)' 16384 20000                    # 内核密码引擎微基准（2.89 GB/s）
+
+# 回归（kTLS 开关同场景验证）
 sudo lab/lab.sh up && sudo lab/lab.sh verify               # 9/9 PASS
+sudo USE_KTLS=1 ./lab/lab.sh vless-tls-up && sudo ./lab/lab.sh test-proxy   # vless-tls / vmess-tls / trojan 均见 kTLS 启用
 cd loader && cargo test --release                          # 236/236
 
 # 运行开关
---no-splice       关闭 splice（默认开：Direct/VLESS 明文）
+--ktls            尝试 kTLS（TLS1.3；默认关，需 modprobe tls）
+SODAMA_KTLS_DEBUG=1 / SODAMA_KTLS_TXONLY=1                 # 安装调试 / TX-only 实验
+--no-splice       关闭 splice（默认开：Direct/VLESS 明文/kTLS 成功后的 TLS）
 --ebpf-debug      打开 eBPF 热路径 printk（默认关）
 status --cmd status --json | jq .relay.splice_total        # 命中/回退计数</pre>
 <p class="sub">
-实现落点：<code>loader/src/outbound.rs</code>（DialedStream.splice 能力位）、<code>loader/src/main.rs</code>（splice_pump / pump_or_splice_down / 计数 / <code>--no-splice|--ebpf-debug</code>）、
-<code>ebpf-rs/src/{common,flow,progs}.rs</code>（debug 位与打印门控）；文档：<code>docs/perf-report.md</code>（结果 D）、<code>docs/optimization-roadmap.md</code>（O3/O5 状态）。
+实现落点（M2）：<code>loader/src/tls.rs</code>（<code>handshake_record_by_record</code> / <code>ktls_read</code> / <code>try_install_ktls</code> / <code>install_one</code> / KeyLog+HKDF）、
+<code>loader/src/main.rs</code>（<code>ktls_take_control_record</code>、<code>splice_pump</code> EINVAL 回退、下游重试循环、<code>--ktls</code>）、
+<code>loader/src/outbound.rs</code>（kTLS → splice 能力位）；lab：<code>lab/lab.sh</code>（<code>USE_KTLS</code>）、<code>lab/perf/run.sh</code>/<code>scaling.sh</code>（<code>SODAMA_ARGS</code>）、<code>lab/perf/m2ab.sh</code>。
+M1 落点见上一版说明。
 </p>
 </section>
 
 <div class="foot">
-  sodama · VLESS 性能实测与优化提案 · v1.1（M1 落地版）· 2026-10-04 · Arch / 6.18.54-lts / i9-9900KF ·
-  数据为同机 lab 口径，5 轮中位数与 perf 剖面如实呈现；M1 验收项均给出原始结果文件与复现命令。
+  sodama · VLESS 性能实测与优化提案 · v1.2（M1+M2 落地版）· 2026-10-04 · Arch / 6.18.54-lts / i9-9900KF ·
+  数据为同机 lab 口径，5 轮中位数与 perf 剖面如实呈现；M2 验收对账（内存达标、吞吐/CPU 受夹具与硬件限制）见 05 节。
 </div>
 
 </div>

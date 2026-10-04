@@ -1,6 +1,6 @@
 # 对标进度：dae（Go）↔ sodama（全 Rust）
 
-- **版本**：v2.11 · 2026-10-04（M1 零拷贝落地：splice 数据面 + eBPF printk 门控；VLESS 四方与扩展复测）
+- **版本**：v2.12 · 2026-10-04（M2 kTLS 实验落地：内核 TLS TX+RX + TLS 上 splice，控制记录/序号对齐全链路打通；默认关）
 - **口径**：「覆盖度」= 该域**功能点覆盖**的粗估（我方可用 ÷ dae 等价能力），
   **不是代码行数、不是性能等价**；数字是判断值，逐行给出证据出处。
   按口径分两档汇总：主链路（日常代理网关）与 dae 全功能面。
@@ -24,7 +24,7 @@
 | 11 | **部署自动化** | netns 自动搭建（移网卡/sysctl/tproxy 规则，`netns_utils.go`）、systemd（`install/dae.service`）、Docker、发行包、shell 补全 | `lab.sh` / `gateway.sh` 脚本级一键；**systemd unit（`install/sodama.service`，capability 最小集 + SIGHUP ExecReload）+ `install/install.sh`（--dry-run/--uninstall）+ `docs/deploy.md`（P18e）**；无打包/发行包 | **≈65%** | 真网关一键脚本体验接近（ADR-0029）；ADR-0042；缺 Docker/发行包/shell 补全 |
 | 12 | **运维面** | 主线较弱（daed 独立项目提供 GraphQL/Web UI） | SIGHUP/USR2、状态 socket（status/rules/config/maps/metrics/reload/suspend/resume）、Prometheus、sysdump/trace、日志轮转 | **≈90%** | 相对 dae 主线领先；daed 的 UI/鉴权不在范围（ADR-0021） |
 | 13 | **质量工程** | Go 单测 244 文件/3.9 万行 + CI（bpf-test/build/docker/go-test…）+ fuzz | **236 单测** + verify 9×2 拓扑 + 专项用例（嗅探 punt/UDP v6/DoH-h2/DNS 选项/ECS 回填+刷新/QUIC 嗅探/分组/订阅/naive h2+h3/juicity/ssr/shadow-tls v1-v3…）+ 对拍 5 逐字节 + QEMU 双内核矩阵 + soak + 六路径基准 + `dns-bench` + REALITY e2e + RFC 9001/9000 黄金向量 + CI | **≈83%** | ADR-0010/0022/0025/0042–0056；CI 缺特权内核加载类测试 |
-| 14 | **性能** | 生产级优化（THP/内存上限/连接池/看门狗） | 六路径基准（direct 31Gbps / relay 24.7 / offload 14.6 / ss 2.5）+ **同机四方对比（P33.2，5 次中位）：direct 24.3 / dae 24.2 / sing-box 22.6 / v2ray 13.5 Gbps（4×48MB 受夹具限制），ss 9.49 / 9.36 / **10.6** / 6.29 Gbps；RSS 28.6 vs 54.2/66.8/72.2 MB；64 流 direct 35.2 Gbps** + **VLESS 四方（明文/TLS）与 M1 零拷贝（splice 落地：vless 明文 12.2→16.9 Gbps、CPU 380→60 ms；relay 8 流 15→21.6 Gbps；perf 拷贝/建页消失；`--no-splice` 可关）**；并发扩展/perf 剖面/优化方向见 `docs/perf-report.md`、`docs/optimization-roadmap.md`、`docs/vless-proposal.html` | **≈80%** | 同机同拓扑同上游（ssserver/sing-box vless）+ 全双工夹具；余：TLS 降本与 worker 池（M2/M4）、relay/offload/UDP 同机对拍、真实公网口径 |
+| 14 | **性能** | 生产级优化（THP/内存上限/连接池/看门狗） | 六路径基准（direct 31Gbps / relay 24.7 / offload 14.6 / ss 2.5）+ **同机四方对比（P33.2，5 次中位）：direct 24.3 / dae 24.2 / sing-box 22.6 / v2ray 13.5 Gbps（4×48MB 受夹具限制），ss 9.49 / 9.36 / **10.6** / 6.29 Gbps；RSS 28.6 vs 54.2/66.8/72.2 MB；64 流 direct 35.2 Gbps** + **VLESS 四方（明文/TLS）与 M1 零拷贝（splice 落地：vless 明文 12.2→16.9 Gbps、CPU 380→60 ms；relay 8 流 15→21.6 Gbps；perf 拷贝/建页消失；`--no-splice` 可关）** + **M2 kTLS（实验）：TLS 48MB×4 11.67→12.32 Gbps / CPU 420→400 ms；memcpy 29.4%→1.6%（达标）；TX+RX 解密错误 0、splice 4/4；8 流受同机夹具（≈12.5 Gbps）与内核 AES-GCM 速度（2.89 GB/s）限制**；并发扩展/perf 剖面/优化方向见 `docs/perf-report.md`、`docs/optimization-roadmap.md`、`docs/vless-proposal.html` | **≈82%** | 同机同拓扑同上游（ssserver/sing-box vless）+ 全双工夹具；余：TLS 目标需服务端异机口径重测、worker 池（M4）、relay/offload/UDP 同机对拍、真实公网口径 |
 | 15 | **真实订阅生态** | 全原生 | 订阅#1（50×vless-ws）✅；订阅#2：anytls ✅、**REALITY+Vision ✅（自实现 TLS 1.3，ADR-0041）** | **≈85%** | ADR-0026/0027/0028/0041；边界外协议可桥接过渡 |
 
 ## 表 B · 汇总

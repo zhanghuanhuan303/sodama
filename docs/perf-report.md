@@ -130,6 +130,26 @@ splice 零拷贝（Direct / VLESS 明文；见 `optimization-roadmap.md` O3）�
 证据：`splice_total=720 / fallbacks=0`（status/metrics，Prometheus 同源）；lab `verify` 9/9；
 `cargo test` 236/236；eBPF `bpf_printk` 已门控（默认关：单次传输 trace 行 600+ → 0，`--ebpf-debug` 开）。
 
+### M2 落地后（2026-10-04 深夜，kTLS 内核 TLS）
+
+TLS 路径补齐：逐记录握手驱动（rustls 严格不消费服务端 Finished 之后的应用 epoch 记录，
+内核 RX `rec_seq` 从 0 对齐）→ KeyLog/HKDF 导出密钥 → `TLS_TX/TLS_RX` 下沉内核 →
+TLS 上再做双向 splice；控制记录（NST）在 recvmsg 与 splice 两条路径均被正确跳过。
+开关 `loader --ktls`（默认关；实验性，需 `modprobe tls`）。
+
+| 场景 | M1（rustls） | M2（kTLS） | 备注 |
+|---|---:|---:|---|
+| vless-tls 48MB×4（5 轮中位） | 11 670 Mbps / 420 ms / p50 39µs | **12 318 Mbps / 400 ms / p50 43µs** | +5.6% 吞吐；解密错误 0；splice 4/4 命中 |
+| vless-tls 8×64MB（scaling） | 11 253 Mbps / 1 450 ms | 11 147 Mbps / 1 510 ms（A/B 中位） | 夹具封顶：四方客户端均 10.7–12.5 Gbps |
+| perf 热点 | `rep_movs` 30.2% + ring AES 16.6% + 建页 10.8% | 内核 AES 48.0% + 建页 7.8% + **memcpy 1.6%** | memcpy 目标 ≤3% ✓ |
+
+密码引擎微基准（本机 i9-9900KF）：内核 `gcm(aes)`（`generic-gcm-aesni-avx`）**2.89 GB/s**；
+用户态 AES-128-GCM **6.57 GB/s**；ChaCha20-Poly1305 1.76 / 2.87 GB/s（内核/用户态）。
+结论：本机 kTLS 是“拷贝换引擎”的等价交换（系统总 CPU 两路径相同 ≈2.87 s/512MB 双向），
+因此默认仍用 rustls；VAES/AVX-512 或 NIC TLS 卸载平台开 `--ktls`。
+验收对账：memcpy ✓（1.6%）；8 流 ≥13 Gbps ✗（夹具 ≈12.5 Gbps 封顶，需服务端异机重测）；
+CPU ≤1000 ms ✗（1 510/1 370 ms，受两者密码学总量与同机竞争限制）。详见 `vless-proposal.html` 03/05/07 节。
+
 ## perf 热点剖面（8×64MB，`perf record -g`）
 
 **ss 路径（9.5 Gbps，sodama 进程 CPU 1690ms/512MB）**：

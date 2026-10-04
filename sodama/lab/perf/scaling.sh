@@ -27,10 +27,12 @@ rss_kb() { awk '/^VmRSS:/{print $2}' "/proc/$1/status"; }
 thr() { awk '/^Threads:/{print $2}' "/proc/$1/status"; }
 
 start_loader() { # <dialer>
+  # SODAMA_ARGS：附加参数（如 M2 kTLS 实验：SODAMA_ARGS=--ktls）
+  # shellcheck disable=SC2086
   "$LOADER" --ebpf "$OBJ" --lan landae --wan wan \
     --dae0 dae0 --dae0peer dae0peer --daens sodamans \
     --rules "$HERE/rules.perf.dae" --dialer "$1" \
-    --status-socket /tmp/sodama-status.sock >/tmp/scaling-sodama.log 2>&1 &
+    --status-socket /tmp/sodama-status.sock ${SODAMA_ARGS:-} >/tmp/scaling-sodama.log 2>&1 &
   echo $! >"$IMPL_PID"
   sleep 2.5
   kill -0 "$(cat "$IMPL_PID")" 2>/dev/null || { tail -10 /tmp/scaling-sodama.log; die "loader 启动失败"; }

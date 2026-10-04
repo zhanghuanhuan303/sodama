@@ -866,6 +866,8 @@ struct Args {
     splice: bool,
     /// M1：eBPF 热路径调试打印（默认关；`--ebpf-debug` 置 control_flags 位）
     ebpf_debug: bool,
+    /// M2：kTLS（内核 TLS，实验性；成功则加解密与拷贝下沉内核，支持 TLS 上再 splice）
+    ktls: bool,
     /// P3a/P18a：DNS 上游 URL（无 scheme 或 udp://、tcp://、tcp+udp://、tls://(DoT)、
     /// https://(DoH)；缺省时用配置 dns.upstream 或 8.8.8.8:53）
     dns_upstream: Option<String>,
@@ -956,6 +958,7 @@ fn usage() -> ! {
            --offload             P4c：启用 TCP relay offload（内核对拼，需 --dialer）\n\
            --no-splice           M1：关闭 relay splice 零拷贝（默认开：Direct/VLESS 明文）\n\
            --ebpf-debug          M1：eBPF 热路径调试打印（默认关）\n\
+           --ktls                M2：尝试 kTLS（内核 TLS，实验；需 TLS1.3）\n\
            --max-conns <N>       P18e：relay 并发上限（0=不限；超限直接关闭并计数）\n\
            --dns-upstream <url>  P3a：DNS 上游（host:port 或 udp://host:port）\n\
            --dump                打印编译出的 match_set / LPM 内容\n\
@@ -1010,6 +1013,7 @@ fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
         offload: false,
         splice: true,
         ebpf_debug: false,
+        ktls: false,
         dns_upstream: None,
         dump: false,
         compile_dump: None,
@@ -1061,6 +1065,7 @@ fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
             "--offload" => args.offload = true,
             "--no-splice" => args.splice = false,
             "--ebpf-debug" => args.ebpf_debug = true,
+            "--ktls" => args.ktls = true,
             "--max-conns" => args.max_conns = Some(next()?.parse()?),
             "--dns-upstream" => args.dns_upstream = Some(next()?),
             "--dump" => args.dump = true,
@@ -1554,6 +1559,69 @@ enum SpliceErr {
     Fatal(io::Error),
 }
 
+/// M2：kTLS RX 下游 splice 辅助——队首若是已解密控制记录（NST 等）就消费掉。
+///
+/// 内核 `tls_sw_splice_read` 不支持控制记录：遇队首为非应用数据会 requeue 并返回
+/// EINVAL。这里先用 MSG_PEEK 看 cmsg 记录类型（kTLS 应用数据=23 且带 cmsg；
+/// 普通 socket 无 cmsg）：是控制记录才真正读掉；应用数据原封不动留给 splice。
+/// 返回 Ok(true) = 消费了一条控制记录；Ok(false) = 队首是应用数据/暂无可读。
+fn ktls_take_control_record(fd: RawFd) -> io::Result<bool> {
+    #[repr(align(8))]
+    struct Ctl([u8; 64]);
+    fn peek(fd: RawFd, buf: &mut [u8], flags: i32) -> io::Result<(isize, Option<u8>)> {
+        loop {
+            let mut ctl = Ctl([0u8; 64]);
+            let mut iov = libc::iovec {
+                iov_base: buf.as_mut_ptr() as *mut libc::c_void,
+                iov_len: buf.len(),
+            };
+            let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+            msg.msg_iov = &mut iov;
+            msg.msg_iovlen = 1;
+            msg.msg_control = ctl.0.as_mut_ptr() as *mut libc::c_void;
+            msg.msg_controllen = ctl.0.len() as _;
+            let n = unsafe { libc::recvmsg(fd, &mut msg, flags) };
+            if n < 0 {
+                let e = io::Error::last_os_error();
+                if e.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(e);
+            }
+            let mut t = None;
+            unsafe {
+                let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
+                while !cmsg.is_null() {
+                    if (*cmsg).cmsg_level == libc::SOL_TLS
+                        && (*cmsg).cmsg_type == libc::TLS_GET_RECORD_TYPE
+                    {
+                        t = Some(*libc::CMSG_DATA(cmsg));
+                    }
+                    cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
+                }
+            }
+            return Ok((n, t));
+        }
+    }
+    let mut buf = [0u8; 16384];
+    let (n, t) = match peek(fd, &mut buf, libc::MSG_PEEK | libc::MSG_DONTWAIT) {
+        Ok(v) => v,
+        Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    if n == 0 {
+        return Ok(false); // EOF：交给 splice 处理
+    }
+    match t {
+        Some(23) | None => Ok(false), // 应用数据（plain 无 cmsg，kTLS 为 23）：不动
+        Some(_) => {
+            // 控制记录：真正读掉（同一缓冲，忽略返回长度）。
+            let _ = peek(fd, &mut buf, libc::MSG_DONTWAIT)?;
+            Ok(true)
+        }
+    }
+}
+
 /// 单向 splice 泵：`src → pipe → dst`，大块零拷贝搬运（页级），EOF 时对 dst 半关闭。
 /// 与 `pump` 语义对齐：返回 Ok = 已收到 EOF 且已 shutdown(dst, SHUT_WR)。
 fn splice_pump(
@@ -1602,10 +1670,13 @@ fn splice_pump(
             if e.kind() == io::ErrorKind::Interrupted {
                 continue;
             }
-            return Err(if started {
-                SpliceErr::Fatal(e)
-            } else {
+            // EINVAL：kTLS RX socket 遇到控制记录（NewSessionTicket 等）会 requeue
+            // 记录并返回 EINVAL（内核要求改用带 cmsg 的 recvmsg）；此时管道尚未搬入
+            // 任何数据，回退用户态泵（ktls_read 会用 cmsg 丢掉控制记录）即可续传。
+            return Err(if !started || e.raw_os_error() == Some(libc::EINVAL) {
                 SpliceErr::Unsupported(e)
+            } else {
+                SpliceErr::Fatal(e)
             });
         }
         started = true;
@@ -1665,12 +1736,38 @@ fn pump_or_splice_down(
                 return;
             }
         }
-        match splice_pump(
-            upstream_fd,
-            client.as_raw_fd(),
-            last_ns,
-            &RELAY_STATS.bytes_down,
-        ) {
+        // M2：先清掉队首控制记录（kTLS RX 的 NST 等）再 splice；splice 等数据时
+        // 若先等来控制记录会返回 EINVAL（本轮 drain 没看到也正常）——下一轮
+        // drain 会把它消费掉再重试；上限 8 轮。
+        let mut attempts = 0u32;
+        let outcome = loop {
+            let mut moved = 0u32;
+            while moved < 8 {
+                match ktls_take_control_record(upstream_fd) {
+                    Ok(true) => moved += 1,
+                    Ok(false) => break,
+                    Err(e) => {
+                        log(&format!("splice: 读取控制记录失败（{e}）"));
+                        break;
+                    }
+                }
+            }
+            match splice_pump(
+                upstream_fd,
+                client.as_raw_fd(),
+                last_ns,
+                &RELAY_STATS.bytes_down,
+            ) {
+                Err(SpliceErr::Unsupported(e))
+                    if e.raw_os_error() == Some(libc::EINVAL) && attempts < 8 =>
+                {
+                    attempts += 1;
+                    continue;
+                }
+                r => break r,
+            }
+        };
+        match outcome {
             Ok(()) => return,
             Err(SpliceErr::Unsupported(e)) => {
                 RELAY_STATS.splice_fallbacks.fetch_add(1, Ordering::Relaxed);
@@ -3254,6 +3351,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         UDP_IDLE_SECS.store(s, Ordering::SeqCst);
     }
     RELAY_SPLICE.store(args.splice, Ordering::SeqCst);
+    tls::set_ktls_enabled(args.ktls);
 
     // P14：dial_mode（CLI > config global.dial_mode > ip）
     {

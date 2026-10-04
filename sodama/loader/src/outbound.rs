@@ -802,9 +802,9 @@ impl Outbound {
                 let sock = marked_tcp_connect(*server, timeout)?;
                 let kill = sock.try_clone()?;
                 let vision = flow.as_deref() == Some("xtls-rprx-vision");
-                // splice 条件：明文 TCP 且无 vision（字节透明；请求头已在 connect 时一次性发出，
-                // 响应头由 relay 首读消费，之后可直接裸搏）。
-                let splice = !*use_tls
+                // splice 条件：字节透明且无 vision（请求头已在 connect 时一次性发出，
+                // 响应头由 relay 首读消费，之后可直接裸搬）；kTLS 成功时 TLS 路径同样透明。
+                let mut splice = !*use_tls
                     && reality_cfg.is_none()
                     && matches!(*transport, VlessTransport::Tcp)
                     && !vision;
@@ -823,6 +823,12 @@ impl Outbound {
                         }
                     } else if *use_tls {
                         let (r, w) = tls::connect(sock, sni, *insecure, &[], timeout)?;
+                        if r.is_ktls() && w.is_ktls() {
+                            // kTLS：加解密已下沉内核，数据面回到字节透明（同明文）。
+                            splice = reality_cfg.is_none()
+                                && matches!(*transport, VlessTransport::Tcp)
+                                && !vision;
+                        }
                         let (r, w) = apply_ws(r, w, transport)?;
                         let (r, w) =
                             vless::connect_split_flow(r, w, uuid, target, flow.as_deref())?;
