@@ -649,6 +649,29 @@ impl Outbound {
         matches!(self, Self::Direct | Self::Socks5 { .. })
     }
 
+    /// M4 stage 2：该出站链路的读/写半是否已对 WouldBlock 可重入
+    /// （可交 reactor codec 会话，每连接 0 线程）。
+    ///
+    /// 覆盖：Trojan（rustls）与 VLESS TCP（rustls/明文，响应头已改成可重入状态机）；
+    /// 排除：vision（中途切裸 TCP）、ws（成帧解析）、reality/ss/vmess/anytls 等
+    /// （读半/写半未做非阻塞审计）；kTLS 成功的链路走 splice 分支。
+    pub fn codec_reactor_capable(&self) -> bool {
+        match self {
+            Self::Trojan { .. } => true,
+            Self::Vless {
+                reality,
+                transport,
+                flow,
+                ..
+            } => {
+                reality.is_none()
+                    && matches!(transport, VlessTransport::Tcp)
+                    && flow.as_deref() != Some("xtls-rprx-vision")
+            }
+            _ => false,
+        }
+    }
+
     /// 当前支持 UDP 代理的协议：ss（classic + SIP022）、vless/vmess（G2）、tuic（G3）、
     /// hysteria2（G3b）、juicity（P27）；http CONNECT/naive 仅 TCP。
     pub fn supports_udp(&self) -> bool {

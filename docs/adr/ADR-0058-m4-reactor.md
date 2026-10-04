@@ -18,8 +18,10 @@
 1. **epoll worker 池只接管字节透明链路**：`splice == true` 且未 offload 的会话
    （Direct / VLESS 明文 / kTLS 成功的 TLS）提交 reactor；rustls/reality/ss/vmess 等
    仍走线程模型（stage 2 再迁）。开关：`SODAMA_NO_REACTOR=1` 回退，`SODAMA_REACTOR_DEBUG=1` 详细日志。
-2. **N = 核数/2（clamp 2–8）个 worker**，各持独立 epoll + eventfd 唤醒；新会话经
-   `mpsc` 投递到 worker，`LOCATIONS` 表记录 session→worker 归属。
+2. **N 个 worker**，各持独立 epoll + eventfd 唤醒；新会话经 `mpsc` 投递到 worker，
+   `LOCATIONS` 表记录 session→worker 归属。stage 1 取核数/2（clamp 2–8）；stage 2 起改为
+   **完整并行度**（clamp 2–16）——codec 会话是 CPU 密集（TLS/AEAD），需要压满全部核
+   （本机 16 线程 → 16 worker，常驻线程 +8）。
 3. **每会话两方向状态机**（`Dir{src,dst,pipe,pending,eof}`）：splice 管道 1 MB
    （`F_SETPIPE_SZ`）、块 1 MB、高水位 1 MB；EOF → `shutdown(dst, SHUT_WR)`（半关闭语义与旧泵一致）；
    两方向 done → 统一收尾（摘 `RELAY_CONNS` + 活跃计数递减）。
@@ -44,8 +46,9 @@
 
 - 正面：万级连接可行且内存可控；连接风暴吞吐提升；为后续 io_uring A/B 留下骨架。
 - 负面/代价：数据面出现一条并行路径（reactor + 线程泵），维护与回归面变大；
-  stage 1 仅覆盖 splice 链路（rustls/reality/ss/vmess 仍是每连接线程）；
-  prelude/非阻塞切换时序是最易回归点（回归用例需覆盖 VLESS 首包与半关闭）。
+  reactor 现覆盖 splice 链路 + codec 首段（rustls VLESS-TCP/Trojan），
+  reality/vision/ws/ss/vmess 仍是每连接线程（stage 2 余段）；
+  prelude/非阻塞切换/预算补泵是最易回归点（回归用例需覆盖 VLESS 首包、半关闭与长尾流）。
 - 需警惕：offload 会话不交 reactor（两套生命周期）；worker 循环内不得在 `epoll_wait`
   期间持锁（会阻塞其它线程的 `resume`/`kill`）；`SODAMA_NO_REACTOR=1` 保留用于 A/B 与排障。
 
@@ -55,23 +58,45 @@
 
   | 指标 | 线程模型 | reactor |
   |---|---|---|
-  | hold 10 000 | 20 011 线程 / 763 MB、5.16 s（1 938/s） | **20 线程 / 30.2 MB**、2.09 s（4 785/s）、fail=0 |
-  | hold 5 000 / 1 000 | 10 011 / 2 011 线程 | 20 / 20 线程 |
-  | churn 10 s | 20 860 连接/s（41 线程） | **25 974 连接/s**（32 线程） |
+  | hold 10 000 | 20 011 线程 / 763 MB、5.16 s（1 938/s） | **28 线程 / 32.1 MB**、2.12 s（4 717/s）、fail=0 |
+  | hold 5 000 / 1 000 | 10 011 / 2 011 线程 | 28 / 28 线程 |
+  | churn 10 s | 20 860 连接/s | **25 606 连接/s**（40 线程） |
 
 - 吞吐 A/B（同二进制、vless 明文、3 轮均值）：1/2/4/8 流 8 540 / 15 761 / 17 031 / 16 151 Mbps
   vs `SODAMA_NO_REACTOR=1` 8 657 / 14 890 / 16 428 / 15 706——大流不回退（1 流 −1.4% 为噪声），
   64×1 MB **15 783 vs 13 221 Mbps（+19%）**；relay 64×1 MB **37 969 vs 13 647 Mbps**；
 - kTLS + reactor：8×64 MB vless-tls **10 928 Mbps 逐字节一致**、splice 错误 0；
-- 回归：`cargo test --release` 240/240；lab `verify` 9/9；`test-relay` / `test-relay-idle` /
-  `test-offload-lifecycle` / `test-relay-offload` 全 PASS；半关闭逐字节 verify=ok；
-- stage 2（未含）：rustls/ss/vmess 会话接入同一状态机、offload 看门狗/定时器统一、
+- 回归：`cargo test --release` 241/241（含新增响应头 WouldBlock 可重入用例）；lab `verify` 9/9；
+  `test-relay` / `test-relay-idle` / `test-offload-lifecycle` / `test-relay-offload` 全 PASS；
+  半关闭逐字节 verify=ok；
+- stage 2 余段（未含）：reality/vision/ws/ss/vmess 会话接入同一状态机、offload 看门狗/定时器统一、
   io_uring（IORING_OP_SPLICE + 注册缓冲）A/B；UDP 批量化属 O7。
+
+## stage 2（首段）：codec 会话接入（rustls VLESS-TCP / Trojan）
+
+- **机制**：非 splice 且已审计的链路交 `submit_codec`——每方向 `CodecSide`（Sink=写半加密 /
+  Source=读半解密）在 worker 内非阻塞驱动；`out` 缓冲 128 KB 水位 / 64 KB 块；
+  EPOLLIN/EPOLLOUT 由「读侧可读 / 写侧可写」计算；EOF 后经写半 `shutdown_write` / 对端 `SHUT_WR` 半关闭；
+  协议面由 `Outbound::codec_reactor_capable()` 判定（排除 vision/ws/reality/ss/vmess）。
+- **可重入前提（本项核心修复）**：
+  1. `TlsWriter::write`：rustls `writer().write` 只入缓冲（0.23 语义，永不 WouldBlock），
+     `write_tls` 遇 WouldBlock 必须在已消费后降级为「待刷」（否则重试会重复加密/发送）；
+     `flush()` 上抛 WouldBlock，由状态机等 EPOLLOUT 重试；
+  2. `VlessReader` 响应头改**可重入状态机**（原 `read_exact` 在 WouldBlock 时丢进度）；
+  3. **预算耗尽自驱补泵**：pump 每事件限 8 轮，可能在「rustls 内部已有明文、内核无事件」时退出
+     （卡住时两侧 pending=0、interest 挂着 EPOLLIN）；修复：会话入 worker `pending` 队列，
+     事件循环空转时继续泵，直到无内部余量。stress 45 轮（4/8/64 流）0 失败，补泵触发 1.7 万次。
+- **开关**：`SODAMA_REACTOR_CODEC=0` 关闭 codec 入池（回退线程模型）；
+  `SODAMA_REACTOR_DEBUG=1` 含会话状态周期转储（诊断卡尾用）。
+- **实测（vless-tls，同二进制 A/B）**：1/2/4/8×64MB 吞吐 6.1 / 9.1–10.4 / 11.7–12.5 / 10.5–10.9 Gbps
+  vs 线程模型 5.4 / 8.1 / 10.9 / 9.9（+5~25%）；64×1MB 在轮间噪声内（两模式 8.3–15.3 Gbps）；
+  长连接持有 2 000 条 = **27 线程 / 61 MB**（线程模型 4 011 线程 / 222 MB）、fail=0、建立 1 010/s。
 
 ## 相关
 
-- 实现：`loader/src/reactor.rs`（worker 池/会话状态机/prelude）、`loader/src/main.rs`
-  （`handle_relay_conn` 接入、`relay_finish` 收尾）、`loader/src/outbound.rs`
-  （`DialedStream.splice_prelude` 能力位）；
+- 实现：`loader/src/reactor.rs`（worker 池/会话状态机/prelude/codec 泵与自驱补泵）、`loader/src/main.rs`
+  （`handle_relay_conn` 接入、`relay_finish` 收尾、`submit_codec` 分支）、`loader/src/outbound.rs`
+  （`DialedStream.splice_prelude`、`codec_reactor_capable`）、`loader/src/tls.rs`/`vless.rs`
+  （WouldBlock 可重入）；
 - 夹具/基准：`lab/scale/`（echo_server / conn_scale / run.sh）、`lab/perf/scaling.sh`（A/B）；
 - 文档：`docs/vless-proposal.html` 06b 节（M4）、`docs/optimization-roadmap.md` O4。

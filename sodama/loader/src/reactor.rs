@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0
-//! M4：splice 数据面的 epoll worker 池——每连接 0 线程（stage 1：仅字节透明链路）。
-//!
-//! 接管条件：`DialedStream.splice == true`（Direct / VLESS 明文 / kTLS 成功的 TLS）
-//! 且未 offload。加解密/成帧链路（rustls/reality/ss/vmess…）仍走原「每连接线程」
-//! 模型（stage 2 再按「非阻塞可重试」逐个迁移）。
+//! M4：epoll worker 池——每连接 0 线程。stage 1 接管字节透明 splice 链路
+//! （Direct / VLESS 明文 / kTLS 成功的 TLS）；stage 2 起同时接管已对 WouldBlock
+//! 可重入的 codec 链路（rustls VLESS-TCP / Trojan，见 `Outbound::codec_reactor_capable`）：
+//! 读半/写半在 worker 内非阻塞驱动。
+//! 其余加解密/成帧链路（reality/vision/ws/ss/vmess…）仍走「每连接线程」模型。
 //!
 //! 结构：
 //! - N 个 worker 线程，各持独立 epoll；新会话经共享 channel + eventfd 唤醒；
@@ -31,11 +31,18 @@ use crate::{log, monotonic_now_ns, RelayHandle, RELAY_CONNS, RELAY_STATS};
 const CHUNK: usize = 1 << 20;
 const PIPE_SZ: i32 = 1 << 20;
 const HIGH_WM: usize = 1 << 20;
-/// worker 数量上限/下限（按可用并行度取一半）。
-const MAX_WORKERS: usize = 8;
+/// codec 方向水位：out 是用户态保有（万级连接要控内存），比 splice 管道小。
+const CODEC_WM: usize = 128 * 1024;
+/// codec 单次读块（64KB：一次多记录/多分片，少一轮 epoll）。
+const CODEC_CHUNK: usize = 64 * 1024;
+/// worker 数量上限/下限（按可用并行度；codec 会话是 CPU 密集（TLS/AEAD），
+/// 需要能压满全部核，因此取完整并行度而非一半）。
+const MAX_WORKERS: usize = 16;
 const MIN_WORKERS: usize = 2;
 
 static ENABLED: OnceLock<bool> = OnceLock::new();
+/// stage 2 codec 会话开关（`SODAMA_REACTOR_CODEC=0` 关闭；默认开）。
+static CODEC_ENABLED: OnceLock<bool> = OnceLock::new();
 static WORKERS: OnceLock<Vec<Arc<Mutex<Worker>>>> = OnceLock::new();
 static SUBMIT_TX: OnceLock<Sender<Session>> = OnceLock::new();
 static NEXT_WORKER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -49,6 +56,14 @@ fn dbg_on() -> bool {
 /// 是否启用 reactor（`SODAMA_NO_REACTOR=1` 关闭）。
 pub fn enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var("SODAMA_NO_REACTOR").is_err())
+}
+
+/// stage 2：codec 链路是否可交 reactor（worker 池已启动且未被开关关闭）。
+pub fn codec_available() -> bool {
+    *CODEC_ENABLED.get_or_init(|| std::env::var("SODAMA_REACTOR_CODEC").map_or(true, |v| v != "0"))
+        && enabled()
+        && SUBMIT_TX.get().is_some()
+        && WORKERS.get().is_some()
 }
 
 struct Dir {
@@ -80,18 +95,23 @@ impl Dir {
     }
 }
 
+/// 数据面模式：stage 1 字节透明 splice；stage 2 用户态 codec（rustls 等）。
+enum Mode {
+    Splice { c2u: Dir, u2c: Dir },
+    Codec { c2u: CodecDir, u2c: CodecDir },
+}
+
 struct Session {
     id: u64,
     client: OwnedFd,
     upstream: OwnedFd,
-    /// client → upstream
-    c2u: Dir,
-    /// upstream → client
-    u2c: Dir,
+    mode: Mode,
     /// prelude（codec 响应头消费）未完成时，u2c 暂停读取，避免与 header 读半抢字节。
+    /// 仅 Splice 使用（Codec 的读半自身可重入）。
     u2c_paused: bool,
-    /// 两个 socket 是否已设为 O_NONBLOCK：置位后 fill/drain 可循环搬运到 EAGAIN；
-    /// prelude 阶段必须保持阻塞（读半/写在同一 file description 上），resume 后置位。
+    /// 仅 Splice：两个 socket 是否已设为 O_NONBLOCK：置位后 fill/drain 可循环搬运到
+    /// EAGAIN；prelude 阶段必须保持阻塞（读半/写在同一 file description 上），
+    /// resume 后置位。
     nonblock: bool,
     handle: Arc<RelayHandle>,
     client_reg: bool,
@@ -108,15 +128,35 @@ impl Session {
     }
 
     fn interest(&self, fd: RawFd) -> u32 {
-        let u2c_in = if self.u2c_paused {
-            0
-        } else {
-            self.u2c.interest_in()
-        };
-        if fd == self.fd_client() {
-            self.c2u.interest_in() | self.u2c.interest_out()
-        } else {
-            u2c_in | self.c2u.interest_out()
+        match &self.mode {
+            Mode::Splice { c2u, u2c } => {
+                let u2c_in = if self.u2c_paused {
+                    0
+                } else {
+                    u2c.interest_in()
+                };
+                if fd == self.fd_client() {
+                    c2u.interest_in() | u2c.interest_out()
+                } else {
+                    u2c_in | c2u.interest_out()
+                }
+            }
+            Mode::Codec { c2u, u2c } => {
+                let mut mask = 0;
+                if fd == c2u.src {
+                    mask |= c2u.interest_in();
+                }
+                if fd == c2u.dst {
+                    mask |= c2u.interest_out();
+                }
+                if fd == u2c.src {
+                    mask |= u2c.interest_in();
+                }
+                if fd == u2c.dst {
+                    mask |= u2c.interest_out();
+                }
+                mask
+            }
         }
     }
 
@@ -126,10 +166,20 @@ impl Session {
     /// 第二次 splice 会真的阻塞 worker（实测），因此由 EPOLLIN 水平触发
     /// 驱动「每次搬一车」，不做循环预读。
     fn fill(&mut self, c2u: bool) -> io::Result<()> {
+        let handle = self.handle.clone();
+        let nonblock = self.nonblock;
         let mut moved = false;
         {
-            let this = &mut *self;
-            let dir = if c2u { &mut this.c2u } else { &mut this.u2c };
+            let dir = match &mut self.mode {
+                Mode::Splice { c2u: d1, u2c: d2 } => {
+                    if c2u {
+                        d1
+                    } else {
+                        d2
+                    }
+                }
+                Mode::Codec { .. } => return Ok(()),
+            };
             loop {
                 if dir.eof || dir.pending >= HIGH_WM {
                     break;
@@ -155,16 +205,14 @@ impl Session {
                             dir.pending
                         ));
                     }
-                    this.handle
-                        .last_ns
-                        .store(monotonic_now_ns(), Ordering::Relaxed);
+                    handle.last_ns.store(monotonic_now_ns(), Ordering::Relaxed);
                     let c = if c2u {
                         &RELAY_STATS.bytes_up
                     } else {
                         &RELAY_STATS.bytes_down
                     };
                     c.fetch_add(n as u64, Ordering::Relaxed);
-                    if !this.nonblock {
+                    if !nonblock {
                         break; // 阻塞 fd：每次事件只搬一车（多搬会阻塞）
                     }
                 } else if n == 0 {
@@ -203,7 +251,7 @@ impl Session {
         }
         self.maybe_half_close(c2u)?;
         // 非阻塞模式：填完直接尝试排空（不必等下一轮 EPOLLOUT）。
-        if self.nonblock && moved {
+        if nonblock && moved {
             self.drain(c2u)?;
         }
         Ok(())
@@ -211,9 +259,19 @@ impl Session {
 
     /// 管道排空到 dst：**每次事件最多一次 splice**（同上，由 EPOLLOUT 驱动）。
     fn drain(&mut self, c2u: bool) -> io::Result<()> {
+        let handle = self.handle.clone();
+        let nonblock = self.nonblock;
         {
-            let this = &mut *self;
-            let dir = if c2u { &mut this.c2u } else { &mut this.u2c };
+            let dir = match &mut self.mode {
+                Mode::Splice { c2u: d1, u2c: d2 } => {
+                    if c2u {
+                        d1
+                    } else {
+                        d2
+                    }
+                }
+                Mode::Codec { .. } => return Ok(()),
+            };
             if dir.pending > 0 {
                 loop {
                     let n = unsafe {
@@ -235,10 +293,8 @@ impl Session {
                                 dir.pending
                             ));
                         }
-                        this.handle
-                            .last_ns
-                            .store(monotonic_now_ns(), Ordering::Relaxed);
-                        if dir.pending == 0 || !this.nonblock {
+                        handle.last_ns.store(monotonic_now_ns(), Ordering::Relaxed);
+                        if dir.pending == 0 || !nonblock {
                             break;
                         }
                     } else if n < 0 {
@@ -266,7 +322,16 @@ impl Session {
 
     /// EOF 且管道排空 → 向 dst 半关闭（与 splice_pump 语义一致）。
     fn maybe_half_close(&mut self, c2u: bool) -> io::Result<()> {
-        let dir = if c2u { &mut self.c2u } else { &mut self.u2c };
+        let dir = match &mut self.mode {
+            Mode::Splice { c2u: d1, u2c: d2 } => {
+                if c2u {
+                    d1
+                } else {
+                    d2
+                }
+            }
+            Mode::Codec { .. } => return Ok(()),
+        };
         if dir.eof && dir.pending == 0 && !dir.done {
             unsafe {
                 libc::shutdown(dir.dst, libc::SHUT_WR);
@@ -276,8 +341,359 @@ impl Session {
         Ok(())
     }
 
+    /// 单 fd 事件分派（Splice：splice 泵；Codec：读半/写半状态机）。
+    /// 返回 `true` 表示 codec 会话可能仍有内部数据可泵（需自驱补泵）。
+    fn on_event(&mut self, sid: u64, fd: RawFd, revents: u32) -> bool {
+        let is_client = fd == self.fd_client();
+        let mut err = false;
+        let mut more = false;
+        if matches!(self.mode, Mode::Splice { .. }) {
+            // 该 fd 在两个方向中的角色：client 是 c2u 的 src、u2c 的 dst；upstream 反之。
+            if revents & (libc::EPOLLIN as u32)
+                | revents & (libc::EPOLLHUP as u32 | libc::EPOLLERR as u32)
+                != 0
+            {
+                if let Err(e) = self.fill(is_client) {
+                    log(&format!("reactor: splice 读失败 #{sid}（{e}）"));
+                    err = true;
+                }
+            }
+            if revents & (libc::EPOLLOUT as u32) != 0 || revents & (libc::EPOLLERR as u32) != 0 {
+                // EPOLLOUT：另一方向的 dst 可写（client 的 OUT 服务 u2c；upstream 的 OUT 服务 c2u）。
+                if let Err(e) = self.drain(!is_client) {
+                    log(&format!("reactor: splice 写失败 #{sid}（{e}）"));
+                    err = true;
+                }
+            }
+        } else {
+            let has_in = revents
+                & (libc::EPOLLIN as u32 | libc::EPOLLHUP as u32 | libc::EPOLLERR as u32)
+                != 0;
+            let has_out = revents & (libc::EPOLLOUT as u32 | libc::EPOLLERR as u32) != 0;
+            match self.codec_event(fd, has_in, has_out) {
+                Ok(m) => more = m,
+                Err(e) => {
+                    log(&format!("reactor: codec 泵失败 #{sid}（{e}）"));
+                    err = true;
+                }
+            }
+        }
+        if revents & (libc::EPOLLERR as u32) != 0 {
+            self.dead = true;
+        }
+        if err {
+            self.dead = true;
+        }
+        more && !self.dead
+    }
+
+    /// 无事件自驱：两个方向各推一轮（预算耗尽后的补泵）。
+    fn codec_pump_both(&mut self, sid: u64) -> bool {
+        let handle = self.handle.clone();
+        let Mode::Codec { c2u, u2c } = &mut self.mode else {
+            return false;
+        };
+        let mut more = false;
+        match c2u.pump(&handle, true) {
+            Ok(m) => more |= m,
+            Err(e) => {
+                log(&format!("reactor: codec 泵失败 #{sid}（{e}）"));
+                self.dead = true;
+            }
+        }
+        match u2c.pump(&handle, false) {
+            Ok(m) => more |= m,
+            Err(e) => {
+                log(&format!("reactor: codec 泵失败 #{sid}（{e}）"));
+                self.dead = true;
+            }
+        }
+        more && !self.dead
+    }
+
+    fn codec_event(&mut self, fd: RawFd, has_in: bool, has_out: bool) -> io::Result<bool> {
+        let handle = self.handle.clone();
+        let Mode::Codec { c2u, u2c } = &mut self.mode else {
+            return Ok(false);
+        };
+        let mut more = false;
+        if (has_in && fd == c2u.src) || (has_out && fd == c2u.dst) {
+            more |= c2u.pump(&handle, true)?;
+        }
+        if (has_in && fd == u2c.src) || (has_out && fd == u2c.dst) {
+            more |= u2c.pump(&handle, false)?;
+        }
+        Ok(more)
+    }
+
     fn finished(&self) -> bool {
-        (self.c2u.done && self.u2c.done) || self.dead
+        if self.dead {
+            return true;
+        }
+        match &self.mode {
+            Mode::Splice { c2u, u2c } => c2u.done && u2c.done,
+            Mode::Codec { c2u, u2c } => c2u.done && u2c.done,
+        }
+    }
+}
+
+/// codec 单方向状态机（stage 2）：src --（读半解密/解帧）--> out --（写半加密）--> dst。
+struct CodecDir {
+    src: RawFd,
+    dst: RawFd,
+    side: CodecSide,
+    /// 已读出/已解出、待推送的明文字节。
+    out: Vec<u8>,
+    off: usize,
+    eof: bool,
+    /// 写半内部仍有密文未刷出（等 dst EPOLLOUT）。
+    flush_pending: bool,
+    done: bool,
+}
+
+enum CodecSide {
+    /// 写半：接受明文，内部加密/成帧（c2u）。
+    Sink(Box<dyn crate::outbound::WriteHalf>),
+    /// 读半：产出明文，内部解密/解帧（u2c）。
+    Source(Box<dyn crate::outbound::ReadHalf>),
+}
+
+fn retryable(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+    )
+}
+
+impl CodecDir {
+    fn pending(&self) -> usize {
+        self.out.len() - self.off
+    }
+
+    fn interest_in(&self) -> u32 {
+        if !self.eof && self.pending() < CODEC_WM {
+            libc::EPOLLIN as u32
+        } else {
+            0
+        }
+    }
+
+    fn interest_out(&self) -> u32 {
+        if self.pending() > 0 || self.flush_pending {
+            libc::EPOLLOUT as u32
+        } else {
+            0
+        }
+    }
+
+    /// 驱动方向：抽干读侧 → 推送对端 →（必要时）冲刷写半缓冲；每轮有界。
+    /// 返回 `true` 表示预算耗尽、内部（rustls 等）可能仍有已就绪数据——
+    /// 此时内核可能无可读事件，需由 worker 自驱补泵。
+    fn pump(&mut self, handle: &RelayHandle, c2u: bool) -> io::Result<bool> {
+        let mut budget = 8;
+        let mut exhausted = false;
+        loop {
+            let r = self.read_some(handle, c2u)?;
+            let w = self.write_some(handle, c2u)?;
+            budget -= 1;
+            if budget == 0 {
+                exhausted = true;
+                if dbg_on() {
+                    log(&format!(
+                        "reactor-dbg: codec {} pump 预算耗尽（pend={} eof={} fl={} done={}）",
+                        if c2u { "c2u" } else { "u2c" },
+                        self.pending(),
+                        self.eof,
+                        self.flush_pending,
+                        self.done
+                    ));
+                }
+                break;
+            }
+            if self.eof && self.pending() == 0 {
+                if dbg_on() {
+                    log(&format!(
+                        "reactor-dbg: codec {} pump 收尾（pend={} eof={} fl={} done={}）",
+                        if c2u { "c2u" } else { "u2c" },
+                        self.pending(),
+                        self.eof,
+                        self.flush_pending,
+                        self.done
+                    ));
+                }
+                break;
+            }
+            if r == 0 && w == 0 {
+                break;
+            }
+            if self.pending() > 0 {
+                break; // 对端暂不可写：等 EPOLLOUT
+            }
+        }
+        Ok(exhausted)
+    }
+
+    /// 读侧推进；返回读入/解出的字节数（0 = 无新数据或已 EOF）。
+    fn read_some(&mut self, handle: &RelayHandle, c2u: bool) -> io::Result<usize> {
+        let mut total = 0usize;
+        let mut tmp = [0u8; CODEC_CHUNK];
+        while !self.eof && self.pending() < CODEC_WM {
+            let n: isize = match &mut self.side {
+                CodecSide::Source(r) => match r.read(&mut tmp) {
+                    Ok(n) => n as isize,
+                    Err(e) if retryable(&e) => -1,
+                    Err(e) => return Err(e),
+                },
+                CodecSide::Sink(_) => unsafe {
+                    libc::read(self.src, tmp.as_mut_ptr() as *mut libc::c_void, tmp.len())
+                },
+            };
+            if n == 0 {
+                self.eof = true;
+                if dbg_on() {
+                    log(&format!(
+                        "reactor-dbg: codec {} src EOF（pend={}）",
+                        if c2u { "c2u" } else { "u2c" },
+                        self.pending()
+                    ));
+                }
+                break;
+            }
+            if n < 0 {
+                if matches!(self.side, CodecSide::Sink(_)) {
+                    let e = io::Error::last_os_error();
+                    match e.raw_os_error() {
+                        Some(libc::EAGAIN) | Some(libc::EINTR) => {}
+                        _ => return Err(e),
+                    }
+                }
+                break;
+            }
+            let n = n as usize;
+            self.out.extend_from_slice(&tmp[..n]);
+            total += n;
+            handle.last_ns.store(monotonic_now_ns(), Ordering::Relaxed);
+            let c = if c2u {
+                &RELAY_STATS.bytes_up
+            } else {
+                &RELAY_STATS.bytes_down
+            };
+            c.fetch_add(n as u64, Ordering::Relaxed);
+        }
+        Ok(total)
+    }
+
+    /// 写侧推进；返回交付/写出的字节数。
+    fn write_some(&mut self, handle: &RelayHandle, c2u: bool) -> io::Result<usize> {
+        let mut total = 0usize;
+        let mut guard = 64;
+        loop {
+            if guard == 0 {
+                break;
+            }
+            guard -= 1;
+            if self.pending() == 0 {
+                self.compact();
+                if let CodecSide::Sink(w) = &mut self.side {
+                    match w.flush() {
+                        Ok(()) => self.flush_pending = false,
+                        Err(e) if retryable(&e) => {
+                            self.flush_pending = true;
+                            break;
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+                if self.eof && !self.done && !self.flush_pending {
+                    if dbg_on() {
+                        log(&format!(
+                            "reactor-dbg: codec {} 半关闭（shutdown_write）",
+                            if c2u { "c2u" } else { "u2c" }
+                        ));
+                    }
+                    match &mut self.side {
+                        // 写半协议终止（vmess 终止块/裸 FIN 等）；失败按尽力而为。
+                        CodecSide::Sink(w) => {
+                            let _ = w.shutdown_write();
+                        }
+                        CodecSide::Source(_) => unsafe {
+                            libc::shutdown(self.dst, libc::SHUT_WR);
+                        },
+                    }
+                    self.done = true;
+                }
+                break;
+            }
+            match &mut self.side {
+                CodecSide::Sink(w) => match w.write(&self.out[self.off..]) {
+                    Ok(0) => {
+                        if dbg_on() {
+                            log(&format!(
+                                "reactor-dbg: codec 写半缓冲满（pend={}）→ flush 重试",
+                                self.out.len() - self.off
+                            ));
+                        }
+                        // 写半缓冲满：先冲刷再重试；冲刷不动则等 EPOLLOUT。
+                        match w.flush() {
+                            Ok(()) => {
+                                self.flush_pending = false;
+                                continue;
+                            }
+                            Err(e) if retryable(&e) => {
+                                self.flush_pending = true;
+                                break;
+                            }
+                            Err(e) => return Err(e),
+                        }
+                    }
+                    Ok(n) => {
+                        self.off += n;
+                        self.flush_pending = true; // 写半内部可能仍有密文待刷
+                        total += n;
+                        handle.last_ns.store(monotonic_now_ns(), Ordering::Relaxed);
+                    }
+                    Err(e) if retryable(&e) => {
+                        self.flush_pending = true;
+                        break;
+                    }
+                    Err(e) => return Err(e),
+                },
+                CodecSide::Source(_) => {
+                    let n = unsafe {
+                        libc::write(
+                            self.dst,
+                            self.out[self.off..].as_ptr() as *const libc::c_void,
+                            self.out.len() - self.off,
+                        )
+                    };
+                    if n > 0 {
+                        self.off += n as usize;
+                        total += n as usize;
+                        handle.last_ns.store(monotonic_now_ns(), Ordering::Relaxed);
+                    } else if n < 0 {
+                        let e = io::Error::last_os_error();
+                        match e.raw_os_error() {
+                            Some(libc::EAGAIN) | Some(libc::EINTR) => break,
+                            _ => return Err(e),
+                        }
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(total)
+    }
+
+    /// out 已排空：释放游标；异常膨胀时缩容，避免长跑连接常驻大缓冲。
+    fn compact(&mut self) {
+        if self.off > 0 {
+            self.out.drain(..self.off);
+            self.off = 0;
+        }
+        if self.out.capacity() > 2 * CODEC_WM {
+            self.out.shrink_to(CODEC_WM);
+        }
     }
 }
 
@@ -287,6 +703,8 @@ struct Worker {
     wake: OwnedFd,
     sessions: HashMap<u64, Session>,
     fd_index: HashMap<RawFd, u64>,
+    /// 预算耗尽的 codec 会话：无内核事件也要自驱补泵（内部缓冲可能已就绪）。
+    pending: Vec<u64>,
 }
 
 impl Worker {
@@ -318,6 +736,7 @@ impl Worker {
             wake: unsafe { OwnedFd::from_raw_fd(wake) },
             sessions: HashMap::new(),
             fd_index: HashMap::new(),
+            pending: Vec::new(),
         })
     }
 
@@ -425,38 +844,28 @@ impl Worker {
                 "reactor-dbg: 事件 #{sid} fd={fd} revents=0x{revents:x}"
             ));
         }
-        let Some(sess) = self.sessions.get_mut(&sid) else {
-            return;
+        let (more, finished) = {
+            let Some(sess) = self.sessions.get_mut(&sid) else {
+                return;
+            };
+            let more = sess.on_event(sid, fd, revents);
+            (more, sess.finished())
         };
-        let is_client = fd == sess.fd_client();
-        let mut err = false;
-        // 该 fd 在两个方向中的角色：client 是 c2u 的 src、u2c 的 dst；upstream 反之。
-        let (as_src_is_c2u, as_dst_is_u2c) = (is_client, is_client);
-        if revents & (libc::EPOLLIN as u32) != 0
-            || revents & (libc::EPOLLHUP as u32 | libc::EPOLLERR as u32) != 0
-        {
-            if let Err(e) = sess.fill(as_src_is_c2u) {
-                log(&format!("reactor: splice 读失败 #{sid}（{e}）"));
-                err = true;
-            }
+        if more {
+            self.pending.push(sid);
         }
-        if revents & (libc::EPOLLOUT as u32) != 0 || revents & (libc::EPOLLERR as u32) != 0 {
-            // EPOLLOUT：另一方向的 dst 可写（client 的 OUT 服务 u2c；upstream 的 OUT 服务 c2u）。
-            if let Err(e) = sess.drain(!as_dst_is_u2c) {
-                log(&format!("reactor: splice 写失败 #{sid}（{e}）"));
-                err = true;
-            }
-        }
-        if revents & (libc::EPOLLERR as u32) != 0 {
-            sess.dead = true;
-        }
-        if err {
-            sess.dead = true;
-        }
-        if sess.finished() {
+        if finished {
             self.destroy(sid);
             return;
         }
+        self.rearm(sid);
+    }
+
+    /// 依会话当前状态重新武装两个 fd（事件处理与自驱补泵共用）。
+    fn rearm(&mut self, sid: u64) {
+        let Some(sess) = self.sessions.get_mut(&sid) else {
+            return;
+        };
         // 重新武装两个 fd
         let (mut c_reg, mut u_reg) = (sess.client_reg, sess.upstream_reg);
         let (cfd, ufd) = (sess.fd_client(), sess.fd_upstream());
@@ -474,8 +883,44 @@ impl Worker {
         }
     }
 
+    /// 自驱补泵一条 codec 会话（不依赖内核事件）；仍有内部余量则重新入队。
+    fn pump_session(&mut self, sid: u64) {
+        let (more, finished) = {
+            let Some(sess) = self.sessions.get_mut(&sid) else {
+                return;
+            };
+            let more = sess.codec_pump_both(sid);
+            (more, sess.finished())
+        };
+        if more {
+            self.pending.push(sid);
+        }
+        if finished {
+            self.destroy(sid);
+            return;
+        }
+        self.rearm(sid);
+    }
+
     /// 周期检查：被强制 stop（janitor/关停）或注册表已移除的会话收尾。
     fn sweep(&mut self) {
+        if dbg_on() && !self.sessions.is_empty() {
+            let now = std::time::Instant::now();
+            let _ = now;
+            for (sid, s) in &self.sessions {
+                let (cfd, ufd) = (s.fd_client(), s.fd_upstream());
+                let ci = s.interest(cfd);
+                let ui = s.interest(ufd);
+                match &s.mode {
+                    Mode::Codec { c2u, u2c } => log(&format!(
+                        "reactor-dbg: dump #{sid} codec w={} c2u[pend={} eof={} fl={} done={}] u2c[pend={} eof={} fl={} done={}] int=0x{ci:x}/0x{ui:x}",
+                        self.idx, c2u.pending(), c2u.eof, c2u.flush_pending, c2u.done,
+                        u2c.pending(), u2c.eof, u2c.flush_pending, u2c.done
+                    )),
+                    Mode::Splice { .. } => {}
+                }
+            }
+        }
         let dead: Vec<u64> = self
             .sessions
             .iter()
@@ -515,8 +960,8 @@ pub fn init() {
         return;
     }
     let threads = std::thread::available_parallelism()
-        .map(|n| n.get() / 2)
-        .unwrap_or(2)
+        .map(|n| n.get())
+        .unwrap_or(4)
         .clamp(MIN_WORKERS, MAX_WORKERS);
     let (tx, rx) = std::sync::mpsc::channel::<Session>();
     let rx = Arc::new(Mutex::new(rx));
@@ -539,7 +984,7 @@ pub fn init() {
         return;
     }
     log(&format!(
-        "M4 reactor 已启动（{} workers，epoll+splice，每连接 0 线程）",
+        "M4 reactor 已启动（{} workers，epoll/splice+codec，每连接 0 线程）",
         workers.len()
     ));
     let _ = WORKERS.set(workers);
@@ -593,17 +1038,7 @@ pub fn submit(
             prelude.is_some(),
         ));
     }
-    if let Some(workers) = WORKERS.get() {
-        let idx = NEXT_WORKER.fetch_add(1, Ordering::Relaxed) % workers.len();
-        let v: u64 = 1;
-        unsafe {
-            libc::write(
-                workers[idx].lock().unwrap().wake.as_raw_fd(),
-                &v as *const u64 as *const libc::c_void,
-                8,
-            );
-        }
-    }
+    wake_next();
     if let (Some(mut reader), Some(mut cw)) = (prelude, prelude_client) {
         std::thread::spawn(
             move || match self::prelude(&mut *reader, &mut cw, &handle) {
@@ -629,6 +1064,9 @@ pub fn resume(id: u64) {
     let Some(sess) = w.sessions.get_mut(&id) else {
         return;
     };
+    if !matches!(sess.mode, Mode::Splice { .. }) {
+        return; // prelude 仅用于 splice 会话
+    }
     sess.u2c_paused = false;
     // prelude 结束：读/写半不再被 codec 阻塞使用，切非阻塞让 fill/drain 批量搬运。
     set_nonblock(sess.fd_client());
@@ -670,6 +1108,103 @@ fn set_nonblock(fd: RawFd) {
     }
 }
 
+/// 交一条 codec（非 splice）会话给 reactor：读半/写半在 worker 内非阻塞驱动。
+///
+/// 前置：调用方需确认 `codec_available()` 且该出站链路已通过
+/// `Outbound::codec_reactor_capable()`（rustls VLESS-TCP / Trojan 等）。
+/// `reader`/`writer` 必须对 WouldBlock 可重入（rustls 包装与 VLESS 响应头已支持）。
+/// 返回 false 表示投递失败（fd 已随移交关闭，调用方收尾统计）。
+pub fn submit_codec(
+    client: TcpStream,
+    upstream: TcpStream,
+    handle: Arc<RelayHandle>,
+    id: u64,
+    reader: Box<dyn crate::outbound::ReadHalf>,
+    writer: Box<dyn crate::outbound::WriteHalf>,
+) -> bool {
+    let Some(tx) = SUBMIT_TX.get() else {
+        return false;
+    };
+    // 握手期读写超时对非阻塞数据面无意义（且在 epoll 下行为微妙），清掉。
+    let _ = client.set_read_timeout(None);
+    let _ = client.set_write_timeout(None);
+    let _ = upstream.set_read_timeout(None);
+    let _ = upstream.set_write_timeout(None);
+    let sess = new_codec_session(id, client.into(), upstream.into(), handle, reader, writer);
+    if tx.send(sess).is_err() {
+        return false;
+    }
+    wake_next();
+    if dbg_on() {
+        log(&format!("reactor-dbg: codec 投递 #{id}"));
+    }
+    true
+}
+
+fn new_codec_session(
+    id: u64,
+    client: OwnedFd,
+    upstream: OwnedFd,
+    handle: Arc<RelayHandle>,
+    reader: Box<dyn crate::outbound::ReadHalf>,
+    writer: Box<dyn crate::outbound::WriteHalf>,
+) -> Session {
+    let (cfd, ufd) = (client.as_raw_fd(), upstream.as_raw_fd());
+    set_nonblock(cfd);
+    set_nonblock(ufd);
+    Session {
+        id,
+        client,
+        upstream,
+        mode: Mode::Codec {
+            c2u: CodecDir {
+                src: cfd,
+                dst: ufd,
+                side: CodecSide::Sink(writer),
+                out: Vec::new(),
+                off: 0,
+                eof: false,
+                flush_pending: false,
+                done: false,
+            },
+            u2c: CodecDir {
+                src: ufd,
+                dst: cfd,
+                side: CodecSide::Source(reader),
+                out: Vec::new(),
+                off: 0,
+                eof: false,
+                flush_pending: false,
+                done: false,
+            },
+        },
+        u2c_paused: false,
+        nonblock: true,
+        handle,
+        client_reg: false,
+        upstream_reg: false,
+        dead: false,
+    }
+}
+
+/// 唤醒一个 worker（轮转）认领会话队列；`submit`/`submit_codec` 共用。
+fn wake_next() {
+    if let Some(workers) = WORKERS.get() {
+        if workers.is_empty() {
+            return;
+        }
+        let idx = NEXT_WORKER.fetch_add(1, Ordering::Relaxed) % workers.len();
+        let v: u64 = 1;
+        unsafe {
+            libc::write(
+                workers[idx].lock().unwrap().wake.as_raw_fd(),
+                &v as *const u64 as *const libc::c_void,
+                8,
+            );
+        }
+    }
+}
+
 fn new_session(
     id: u64,
     client: OwnedFd,
@@ -702,21 +1237,23 @@ fn new_session(
         id,
         client,
         upstream,
-        c2u: Dir {
-            src: cfd,
-            dst: ufd,
-            pipe: p1,
-            pending: 0,
-            eof: false,
-            done: false,
-        },
-        u2c: Dir {
-            src: ufd,
-            dst: cfd,
-            pipe: p2,
-            pending: 0,
-            eof: false,
-            done: false,
+        mode: Mode::Splice {
+            c2u: Dir {
+                src: cfd,
+                dst: ufd,
+                pipe: p1,
+                pending: 0,
+                eof: false,
+                done: false,
+            },
+            u2c: Dir {
+                src: ufd,
+                dst: cfd,
+                pipe: p2,
+                pending: 0,
+                eof: false,
+                done: false,
+            },
         },
         u2c_paused,
         nonblock,
@@ -729,14 +1266,17 @@ fn new_session(
 
 impl Drop for Session {
     fn drop(&mut self) {
-        for p in [self.c2u.pipe, self.u2c.pipe] {
-            if p[0] >= 0 {
-                unsafe {
-                    libc::close(p[0]);
-                    libc::close(p[1]);
+        if let Mode::Splice { c2u, u2c } = &self.mode {
+            for p in [c2u.pipe, u2c.pipe] {
+                if p[0] >= 0 {
+                    unsafe {
+                        libc::close(p[0]);
+                        libc::close(p[1]);
+                    }
                 }
             }
         }
+        // Codec：读半/写半随 Mode 一并 drop（其 socket dup 随之关闭）。
     }
 }
 
@@ -766,21 +1306,30 @@ fn worker_loop(worker: Arc<Mutex<Worker>>, rx: Arc<Mutex<Receiver<Session>>>, _i
                 worker.lock().unwrap().sweep();
                 last_sweep = std::time::Instant::now();
             }
-            continue;
-        }
-        for ev in events.iter().take(n as usize) {
-            let fd = ev.u64 as RawFd;
-            let revents = ev.events;
-            let mut w = worker.lock().unwrap();
-            if fd == w.wake.as_raw_fd() {
-                // 清 eventfd
-                let mut buf = [0u8; 8];
-                unsafe {
-                    libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, 8);
+        } else {
+            for ev in events.iter().take(n as usize) {
+                let fd = ev.u64 as RawFd;
+                let revents = ev.events;
+                let mut w = worker.lock().unwrap();
+                if fd == w.wake.as_raw_fd() {
+                    // 清 eventfd
+                    let mut buf = [0u8; 8];
+                    unsafe {
+                        libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, 8);
+                    }
+                    continue;
                 }
-                continue;
+                w.handle_event(fd, revents);
             }
-            w.handle_event(fd, revents);
+        }
+        // 预算耗尽的 codec 会话自驱补泵（内部缓冲已就绪但可能无内核事件）。
+        // 每轮上限防饿死其它 fd；剩余项下轮继续。
+        for _ in 0..256 {
+            let mut w = worker.lock().unwrap();
+            match w.pending.pop() {
+                Some(sid) => w.pump_session(sid),
+                None => break,
+            }
         }
     }
 }

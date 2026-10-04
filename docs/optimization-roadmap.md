@@ -11,7 +11,7 @@
 | O1 | ss AEAD 零分配 + 原地加解密 | ss 剖面 AEAD ~38–41%、libc memcpy 3.4% | ss CPU -10~15% | 中 | 低 |
 | O2 | ss 读写 syscall 合并/预缓冲 | 每块 2×read_exact + 2×write；`rep_movs` 中 11.7% | ss CPU -5~10% | 中 | 低 |
 | ~~O3~~ | ~~relay splice 零拷贝~~ **（M1 已完成）** | relay 剖面 `rep_movs` 49.4% + 建页 18.5% | ✅ 实测：relay 8 流 14.9→**21.6 Gbps**、CPU 1100→**150ms**；vless 明文 12.2→**16.9 Gbps**、CPU 380→**60ms** | — | 已交付（`--no-splice` 可关） |
-| ~~O4~~ | ~~每连接线程 → epoll worker 池~~ **（M4 已完成，stage 1）** | hold 10k = 20 011 线程 / 763 MB；64 并发 = 123 线程、~175KB/conn | ✅ 实测：10k 连接 **20 线程 / 30.2 MB**、fail=0、建立 4 785/s；风暴 **25 974/s**（线程模型 20 860/s）；vless 吞吐无回退（64×1 MB +19%）；relay 64×1 MB **37.9 vs 13.6 Gbps** | — | 已交付（仅 splice 链路；`SODAMA_NO_REACTOR=1` 可关；stage 2 见 O4 节与 ADR-0058） |
+| ~~O4~~ | ~~每连接线程 → epoll worker 池~~ **（M4 已完成，stage 1+2 首段）** | hold 10k = 20 011 线程 / 763 MB；64 并发 = 123 线程、~175KB/conn | ✅ 实测：10k 连接 **28 线程 / 32.1 MB**、fail=0、建立 4 717/s；风暴 **25 606/s**（线程模型 20 860/s）；vless 吞吐无回退（64×1 MB +19%）；relay 64×1 MB **37.9 vs 13.6 Gbps**；**vless-tls 2 000 连接 27 线程 / 61 MB（线程模型 4 011 / 222 MB）** | — | 已交付：stage 1 splice + stage 2 首段 codec（rustls VLESS-TCP/Trojan 每连接 0 线程）；`SODAMA_NO_REACTOR=1` / `SODAMA_REACTOR_CODEC=0` 可关；余段见 O4 节与 ADR-0058 |
 | ~~O5~~ | ~~bpf_printk 门控~~ **（M1 已完成）** | direct 剖面 0.3–0.45% 纯开销 | ✅ 默认关：单次传输 trace 600+→**0 行**；`--ebpf-debug` 开 | — | 已交付 |
 | O6 | AES-GCM 方法优先（可选） | chacha20-poly1305 AVX2 ~1.5GB/s/core | ss CPU -30~50%（若节点支持） | 中 | 低 |
 | O7 | UDP 批量（recvmmsg/sendmmsg） | UDP 路径未同口径压测（backlog G1 缺口） | PPS 提升、CPU 降 | 中 | 低 |
@@ -144,14 +144,19 @@
 
   | 指标 | 线程模型 | reactor |
   |---|---|---|
-  | hold 10 000 | 20 011 线程 / 763 MB、建立 5.16 s（1 938/s） | **20 线程 / 30.2 MB**、2.09 s（4 785/s）、fail=0 |
-  | hold 5 000 / 1 000 | 10 011 / 2 011 线程 | 20 / 20 线程 |
-  | churn 10 s | 20 860 连接/s | **25 974 连接/s**（32 线程） |
+  | hold 10 000 | 20 011 线程 / 763 MB、建立 5.16 s（1 938/s） | **28 线程 / 32.1 MB**、2.12 s（4 717/s）、fail=0 |
+  | hold 5 000 / 1 000 | 10 011 / 2 011 线程 | 28 / 28 线程 |
+  | churn 10 s | 20 860 连接/s | **25 606 连接/s**（40 线程） |
   | vless 8×64MB（3 轮均值） | 15.7 Gbps | 16.2 Gbps |
   | vless 64×1MB | 13.2 Gbps | **15.8 Gbps（+19%）** |
   | relay 64×1MB | 13.6 Gbps | **37.9 Gbps** |
 
-- **stage 2 待办**：rustls/ss/vmess 会话接入（codec 泵与 reactor 状态机桥接）、
+  （reactor 为 16 worker 配置——stage 2 起取完整并行度；stage 1 时 8 worker 为 20 线程 / 30.2 MB。）
+- **stage 2 首段：codec 会话接入（2026-10-05，ADR-0058 stage 2 节）**：rustls VLESS-TCP / Trojan
+  会话入池（每连接 0 线程；可重入前提：TlsWriter 待刷语义、VlessReader 响应头状态机、**预算耗尽自驱补泵**）；
+  vless-tls 长连接 2 000 条 = **27 线程 / 61 MB**（线程模型 4 011 / 222 MB）、fail=0；
+  吞吐 A/B 1–8 流 +5~25%，64×1 MB 在噪声内；`SODAMA_REACTOR_CODEC=0` 可关。
+- **stage 2 余段待办**：reality/vision/ws/ss/vmess 会话接入（各自读半需非阻塞审计/改造）、
   offload 看门狗/定时器统一、io_uring（IORING_OP_SPLICE + 注册缓冲）A/B；UDP 批量化属 O7。
 
 ---
@@ -201,6 +206,7 @@ TLS：kTLS 全链路可用，48MB×4 中位 **12.3 Gbps / 400 ms**，memcpy 1.6%
 8 流吞吐/CPU 目标（≥13 Gbps/≤1000 ms）因本机夹具（同机 sing-box TLS 服务端 ≈12.5 Gbps 封顶）
 与内核密码引擎速度（2.89 GB/s）均不可达——需要“服务端异机”口径后再评（重测项）；
 Vision-over-TLS 已交付（双向 DIRECT，ADR-0057）；
-M4（2026-10-05 更新）：✅ 线程数 O(核数)——10k 连接 **20 线程 / 30.2 MB**、fail=0；风暴 **25 974/s**；
+M4（2026-10-05 更新）：✅ 线程数 O(核数)——10k 连接 **28 线程 / 32.1 MB**、fail=0；风暴 **25 606/s**；
 吞吐不回退（vless 8 流 16.2 vs 15.7 Gbps；64×1 MB +19%；relay +178%）；kTLS 链路逐字节无回归。
-stage 2（rustls/ss/vmess 会话接入、io_uring）见 O4；ss 8 流 CPU ≤460 ms、四方对比 ss 吞吐目标待 O1/O2/O6 落地后复测。
+stage 2 首段（codec：rustls VLESS-TCP/Trojan）已交付：vless-tls 2 000 连接 27 线程 / 61 MB（线程模型 4 011 / 222 MB）。
+余段（reality/ss/vmess 会话接入、io_uring）见 O4；ss 8 流 CPU ≤460 ms、四方对比 ss 吞吐目标待 O1/O2/O6 落地后复测。

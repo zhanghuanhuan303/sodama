@@ -2388,6 +2388,9 @@ fn handle_relay_conn(mut client: TcpStream) {
     let offloaded = offload_keys.is_some();
     // M1：splice 零拷贝（仅未 offload 时；直接拨号/VLESS 明文在拨号层置位）。
     let splice = wire_splice && !offloaded && RELAY_SPLICE.load(Ordering::Relaxed);
+    // M4 stage 2：非 splice 的 rustls/明文链路（codec 会话）也可交 reactor——
+    // 读半/写半在 worker 内非阻塞驱动（仅对已审计的协议种类开启）。
+    let wire_codec = !splice && !offloaded && dialer.codec_reactor_capable();
     let upstream_fd = socket.as_ref().map(|s| s.as_raw_fd());
     if splice {
         RELAY_STATS.splice_total.fetch_add(1, Ordering::Relaxed);
@@ -2435,6 +2438,16 @@ fn handle_relay_conn(mut client: TcpStream) {
                 None
             };
             if reactor::submit(client, up, handle.clone(), id, prelude) {
+                return; // 注册表/统计由 reactor 收尾
+            }
+            relay_finish(id);
+            return;
+        }
+    }
+    // M4 stage 2：codec 会话（rustls VLESS-TCP / Trojan）交同一 worker 池（每连接 0 线程）。
+    if wire_codec && reactor::codec_available() {
+        if let Some(up) = socket.take() {
+            if reactor::submit_codec(client, up, handle.clone(), id, from_remote, to_remote) {
                 return; // 注册表/统计由 reactor 收尾
             }
             relay_finish(id);

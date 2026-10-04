@@ -129,9 +129,14 @@ impl Read for TlsReader {
             }
             c.process_new_packets()
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("tls: {e}")))?;
-            // TLS 1.3 的回写（KeyUpdate/alert 等）
+            // TLS 1.3 的回写（KeyUpdate/alert 等）；非阻塞 socket 下 WouldBlock
+            // 留待下次读/写活动重试（rustls 缓冲不丢）。
             while c.wants_write() {
-                c.write_tls(&mut self.sock)?;
+                match c.write_tls(&mut self.sock) {
+                    Ok(_) => {}
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(e) => return Err(e),
+                }
             }
         }
     }
@@ -203,8 +208,14 @@ impl Write for TlsWriter {
         }
         let mut c = self.conn.lock().map_err(poisoned)?;
         let n = c.writer().write(buf)?;
+        // 尽力把密文刷到 socket：非阻塞下 WouldBlock 表示「还有缓冲」，
+        // 由 flush()/后续事件重试（rustls 已接管明文，不会重复消费）。
         while c.wants_write() {
-            c.write_tls(&mut self.sock)?;
+            match c.write_tls(&mut self.sock) {
+                Ok(_) => {}
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(e) => return Err(e),
+            }
         }
         Ok(n)
     }

@@ -79,6 +79,9 @@ pub fn build_request_header_flow(
 }
 
 /// 读响应头：[ver][addonLen][addons]；ver 必须为 0。
+/// 注：TCP 读半（VlessReader）自 M4 stage 2 起用可重入状态机（非阻塞 reactor 可跨多次
+/// read / WouldBlock 续读），此 helper 仅保留给需要的同步调用方（当前无）。
+#[allow(dead_code)]
 fn read_response_header<R: Read>(r: &mut R) -> io::Result<()> {
     let mut head = [0u8; 2];
     r.read_exact(&mut head)?;
@@ -98,15 +101,65 @@ fn read_response_header<R: Read>(r: &mut R) -> io::Result<()> {
 pub struct VlessReader<R> {
     inner: R,
     header_done: bool,
+    /// M4 stage 2：非阻塞（reactor）下响应头可能跨多次 read——就地累积，
+    /// WouldBlock 不丢进度（对照 UDP 版 `pending` 的做法）。
+    hdr: Vec<u8>,
+    hdr_need: usize,
 }
 
 impl<R: Read> Read for VlessReader<R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         if !self.header_done {
-            read_response_header(&mut self.inner)?;
-            self.header_done = true;
+            self.read_header()?;
         }
         self.inner.read(buf)
+    }
+}
+
+impl<R: Read> VlessReader<R> {
+    /// 可重入的响应头读取：不足 2 字节时长度未知，读到多少累积多少；
+    /// 头满后置 `header_done` 并释放缓冲。
+    fn read_header(&mut self) -> io::Result<()> {
+        while self.hdr.len() < 2 {
+            let want = 2 - self.hdr.len();
+            let mut tmp = [0u8; 2];
+            match self.inner.read(&mut tmp[..want]) {
+                Ok(0) => {
+                    return Err(io::Error::new(
+                        ErrorKind::UnexpectedEof,
+                        "vless: 响应头未完成即 EOF",
+                    ))
+                }
+                Ok(n) => self.hdr.extend_from_slice(&tmp[..n]),
+                Err(e) => return Err(e),
+            }
+        }
+        if self.hdr[0] != 0x00 {
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                format!("vless: 响应版本 {} 不支持", self.hdr[0]),
+            ));
+        }
+        if self.hdr_need == 0 {
+            self.hdr_need = 2 + self.hdr[1] as usize;
+        }
+        while self.hdr.len() < self.hdr_need {
+            let want = (self.hdr_need - self.hdr.len()).min(255);
+            let mut tmp = [0u8; 255];
+            match self.inner.read(&mut tmp[..want]) {
+                Ok(0) => {
+                    return Err(io::Error::new(
+                        ErrorKind::UnexpectedEof,
+                        "vless: 响应头未完成即 EOF",
+                    ))
+                }
+                Ok(n) => self.hdr.extend_from_slice(&tmp[..n]),
+                Err(e) => return Err(e),
+            }
+        }
+        self.header_done = true;
+        self.hdr = Vec::new();
+        Ok(())
     }
 }
 
@@ -164,6 +217,8 @@ where
         VlessReader {
             inner: read,
             header_done: false,
+            hdr: Vec::new(),
+            hdr_need: 0,
         },
         VlessWriter { inner: write },
     ))
@@ -440,5 +495,58 @@ mod tests {
             pending: Vec::new(),
         };
         assert_eq!(r.recv_datagram().unwrap(), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn tcp_reader_header_survives_would_block() {
+        // M4 stage 2：逐字节 + 间隔注入 WouldBlock，模拟 reactor 非阻塞读。
+        // 响应头 [ver=0][addonLen=2][addons=0xaa,0xbb] 跨多次 read，若不丢进度则成功。
+        struct Wob<'a> {
+            data: &'a [u8],
+            pos: usize,
+            block_next: bool,
+        }
+        impl Read for Wob<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                if buf.is_empty() {
+                    return Ok(0);
+                }
+                if self.block_next {
+                    self.block_next = false;
+                    return Err(io::ErrorKind::WouldBlock.into());
+                }
+                if self.pos >= self.data.len() {
+                    return Ok(0);
+                }
+                buf[0] = self.data[self.pos];
+                self.pos += 1;
+                self.block_next = true;
+                Ok(1)
+            }
+        }
+        static DATA: &[u8] = &[0x00, 0x02, 0xaa, 0xbb, b'h', b'e', b'l', b'l', b'o'];
+        let mut r = VlessReader {
+            inner: Wob {
+                data: DATA,
+                pos: 0,
+                block_next: false,
+            },
+            header_done: false,
+            hdr: Vec::new(),
+            hdr_need: 0,
+        };
+        let mut out = Vec::new();
+        let mut guard = 0;
+        while out.len() < 5 && guard < 200 {
+            guard += 1;
+            let mut buf = [0u8; 8];
+            match r.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => out.extend_from_slice(&buf[..n]),
+                Err(e) if e.kind() == ErrorKind::WouldBlock => continue,
+                Err(e) => panic!("非预期错误: {e}"),
+            }
+        }
+        assert_eq!(out, b"hello");
     }
 }

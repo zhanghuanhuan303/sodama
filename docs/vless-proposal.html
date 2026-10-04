@@ -70,7 +70,7 @@
 
 <header class="top">
   <h1>sodama · VLESS 性能实测与优化提案 <span class="tag ok">M1–M4 已落地</span></h1>
-  <div class="sub">同机四方对拍（sodama / dae v2.1.1 / sing-box 1.14.2 / v2ray 5.52.0）· VLESS 明文/TLS/Vision/规模 · 5 轮中位数 · 2026-10-05 · v1.4（M3：Vision-over-TLS 四模式逐字节 + 真订阅 e2e；M4：epoll worker 池——10k 连接 20 线程/30.2 MB、风暴 25 974 conn/s、吞吐无回退，<code>SODAMA_NO_REACTOR=1</code> 可关）</div>
+  <div class="sub">同机四方对拍（sodama / dae v2.1.1 / sing-box 1.14.2 / v2ray 5.52.0）· VLESS 明文/TLS/Vision/规模 · 5 轮中位数 · 2026-10-05 · v1.5（M3：Vision-over-TLS 四模式逐字节 + 真订阅 e2e；M4：epoll worker 池——10k 连接 28 线程/32.1 MB、风暴 25 606 conn/s；stage 2：rustls VLESS-TLS/Trojan codec 入池——2 000 连接 27 线程/61 MB（线程模型 4 011/222 MB）、吞吐 +5~25%，<code>SODAMA_REACTOR_CODEC=0</code> 可关）</div>
   <div class="chips">
     <span class="chip">数据口径 <b>5 轮中位</b></span>
     <span class="chip">夹具 <b>全双工 echo · 环回上限 ≈25 Gbps</b></span>
@@ -78,7 +78,7 @@
     <span class="chip">M1 验收 <b class="ok">全部达标</b></span>
     <span class="chip">M2 验收 <b class="ok">memcpy 达标</b> · 吞吐/CPU <b class="warnc">夹具受限</b></span>
     <span class="chip">M3 验收 <b class="ok">Vision-over-TLS 全组合通过</b></span>
-    <span class="chip">M4 验收 <b class="ok">10k 连接 20 线程 / 30.2 MB · fail=0</b></span>
+    <span class="chip">M4 验收 <b class="ok">10k=28 线程/32.1 MB · vless-tls 2k=27 线程/61 MB</b></span>
     <span class="chip">回归 <b>verify 9/9 · cargo test 240/240</b></span>
   </div>
 </header>
@@ -139,11 +139,13 @@ TLS1.2/明文 END 互通、ws/wss 逐字节；真实订阅 48 节点 5MB 下载�
 </div>
 
 <div class="note ok">
-<b>M4 结论（epoll worker 池，ADR-0058）：</b>splice 链路（Direct/VLESS 明文/kTLS 成功的 TLS）从「每连接线程」迁移到
-<b>epoll worker 池</b>（核/2 个 worker；每连接 0 线程；prelude 线程消费 VLESS 响应头后 resume）。
-hold 10 000 连接：<b>20 线程 / 30.2 MB RSS</b>（线程模型 20 011 线程 / 763 MB）、fail=0、建立 4 785/s；
-风暴 <b>25 974 连接/s</b>（线程模型 20 860/s）；同二进制 A/B：vless 1/2/4/8 流吞吐无回退，64×1 MB <b>+19%</b>，
-relay 64×1 MB <b>37.9 vs 13.6 Gbps</b>；kTLS+reactor 8 流逐字节一致。
+<b>M4 结论（epoll worker 池，ADR-0058）：</b>stage 1 把 splice 链路（Direct/VLESS 明文/kTLS 成功的 TLS）迁到
+<b>epoll worker 池</b>（16 worker；每连接 0 线程）；stage 2 首段把 <b>rustls codec 会话</b>（VLESS-TCP/Trojan）
+也纳入同一状态机（可重入修复：TlsWriter 待刷语义、VlessReader 响应头状态机、预算耗尽自驱补泵）。
+hold 10 000 连接：<b>28 线程 / 32.1 MB RSS</b>（线程模型 20 011 线程 / 763 MB）、fail=0、建立 4 717/s；
+风暴 <b>25 606 连接/s</b>（线程模型 20 860/s）；vless-tls 长连接 2 000 条 = <b>27 线程 / 61 MB</b>（线程模型 4 011 / 222 MB）；
+同二进制 A/B：vless 1/2/4/8 流吞吐无回退（64×1 MB +19%）、vless-tls +5~25%，relay 64×1 MB <b>37.9 vs 13.6 Gbps</b>；
+kTLS+reactor 8 流逐字节一致；`SODAMA_REACTOR_CODEC=0` 可关 codec 入池。
 </div>
 </section>
 
@@ -335,9 +337,9 @@ TLS 路径终于和明文一样走 splice，<code>memcpy</code> 从 29.4% 降到
       <thead><tr><th>并发</th><th>实现</th><th>线程</th><th>RSS</th><th>建立</th><th>fail</th></tr></thead>
       <tbody>
         <tr><td>10 000</td><td>线程模型</td><td class="n worst">20 011</td><td class="n worst">763.3 MB</td><td class="n">5.16 s（1 938/s）</td><td class="n">0</td></tr>
-        <tr><td>10 000</td><td><b>reactor</b></td><td class="n best">20</td><td class="n best">30.2 MB</td><td class="n best">2.09 s（4 785/s）</td><td class="n">0</td></tr>
-        <tr><td>5 000</td><td><b>reactor</b></td><td class="n">20</td><td class="n">28.1 MB</td><td class="n">1.07 s（4 673/s）</td><td class="n">0</td></tr>
-        <tr><td>1 000</td><td><b>reactor</b></td><td class="n">20</td><td class="n">26.5 MB</td><td class="n">0.42 s（2 381/s）</td><td class="n">0</td></tr>
+        <tr><td>10 000</td><td><b>reactor</b></td><td class="n best">28</td><td class="n best">32.1 MB</td><td class="n best">2.12 s（4 717/s）</td><td class="n">0</td></tr>
+        <tr><td>5 000</td><td><b>reactor</b></td><td class="n">28</td><td class="n">29.6 MB</td><td class="n">1.09 s（4 587/s）</td><td class="n">0</td></tr>
+        <tr><td>1 000</td><td><b>reactor</b></td><td class="n">28</td><td class="n">27.2 MB</td><td class="n">0.37 s（2 703/s）</td><td class="n">0</td></tr>
       </tbody>
     </table>
   </div>
@@ -347,7 +349,7 @@ TLS 路径终于和明文一样走 splice，<code>memcpy</code> 从 29.4% 降到
       <thead><tr><th>实现</th><th>连接</th><th>速率</th><th>线程</th></tr></thead>
       <tbody>
         <tr><td>线程模型</td><td class="n">≈208 600</td><td class="n">20 860/s</td><td class="n">41</td></tr>
-        <tr><td><b>reactor</b></td><td class="n best">259 824</td><td class="n best">25 974/s</td><td class="n best">32</td></tr>
+        <tr><td><b>reactor</b></td><td class="n best">256 144</td><td class="n best">25 606/s</td><td class="n best">40</td></tr>
       </tbody>
     </table>
     <h3>吞吐 A/B（vless，同二进制，3 轮均值）</h3>
@@ -363,9 +365,38 @@ TLS 路径终于和明文一样走 splice，<code>memcpy</code> 从 29.4% 降到
     </table>
   </div>
 </div>
-<p class="sub">同一构建、<code>SODAMA_NO_REACTOR=1</code> 单变量 A/B；大流吞吐在噪声内不回退（1 流 −1.4% 属轮间噪声），
+<p class="sub">同一构建、<code>SODAMA_NO_REACTOR=1</code> 单变量 A/B；大流吞吐在噪声内不回退，
 多连接/小流（64×1 MB）与 relay 路径显著受益（relay 64×1 MB：37.9 vs 13.6 Gbps）。
-reactor 只接管字节透明 splice 链路（Direct/VLESS 明文/kTLS TLS），rustls/reality/ss/vmess 仍走线程模型（stage 2）。</p>
+reactor 接管字节透明 splice 链路（Direct/VLESS 明文/kTLS TLS）。</p>
+
+<h3>stage 2：rustls codec 会话（vless-tls / Trojan）</h3>
+<div class="two">
+  <div>
+    <table>
+      <thead><tr><th>vless-tls 吞吐 Mbps</th><th>线程模型</th><th>reactor codec</th></tr></thead>
+      <tbody>
+        <tr><td>1×64 MB</td><td class="n">5 425</td><td class="n best">5 686–6 096</td></tr>
+        <tr><td>2×64 MB</td><td class="n">8 063</td><td class="n best">9 090–10 388</td></tr>
+        <tr><td>4×64 MB</td><td class="n">10 865</td><td class="n best">11 706–12 508</td></tr>
+        <tr><td>8×64 MB</td><td class="n">9 881</td><td class="n best">10 513–10 857</td></tr>
+        <tr><td>64×1 MB</td><td class="n">8 293</td><td class="n">9 385–15 310（噪声）</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div>
+    <h3>长连接持有 2 000 条（vless-tls）</h3>
+    <table>
+      <thead><tr><th>实现</th><th>线程</th><th>RSS</th><th>fail</th></tr></thead>
+      <tbody>
+        <tr><td>线程模型</td><td class="n worst">4 011</td><td class="n worst">222 MB</td><td class="n">0</td></tr>
+        <tr><td><b>reactor codec</b></td><td class="n best">27</td><td class="n best">61 MB</td><td class="n">0</td></tr>
+      </tbody>
+    </table>
+    <p class="sub">codec 每连接 0 线程；建立 1 010 条/s；45 轮 4/8/64 流混合压力 0 失败——
+    关键修复是「预算耗尽自驱补泵」（rustls 内部有明文而内核无事件时不再挂尾）。
+    reality/vision/ws/ss/vmess 仍走线程模型（余段）。</p>
+  </div>
+</div>
 </section>
 
 <section>
@@ -465,16 +496,17 @@ ChaCha20-Poly1305 分别为 1.76 / 2.87 GB/s（因此本机也不存在“换 ch
         <td><span class="tag ok">完成</span> tls/reality 内层 TLS1.3 2MB 逐字节 + 双向 DIRECT；
         TLS1.2/明文 END 互通；ws/wss 逐字节；真订阅 48 节点 5MB e2e（6/6 DIRECT）<br>
         <span class="sub">ADR-0057；`lab/vision/run.sh {tls|reality|ws|wss}`；vision 连接旁路 kTLS（DIRECT 需停用外层加解密）</span></td></tr>
-    <tr><td><b>M4</b></td><td>epoll worker 池替代每连接线程（stage 1：splice 链路）；ss 路径零分配；UDP 批量</td>
+    <tr><td><b>M4</b></td><td>epoll worker 池替代每连接线程（stage 1 splice + stage 2 首段 codec：rustls VLESS-TCP/Trojan）；ss 路径零分配；UDP 批量</td>
         <td>10k 连接基准；ss CPU ≤460 ms；UDP 四方对拍</td>
-        <td><span class="tag ok">stage 1 完成</span> 10k 连接 <b class="ok">20 线程 / 30.2 MB</b>、fail=0、建立 4 785/s；
-        风暴 25 974/s；vless 吞吐无回退（64×1 MB +19%）<br>
-        <span class="sub">ADR-0058；stage 2：rustls/ss/vmess 会话接入 + io_uring A/B；ss CPU/UDP 目标随 O1/O2/O7 待做</span></td></tr>
+        <td><span class="tag ok">stage 1+2 首段完成</span> 10k 连接 <b class="ok">28 线程 / 32.1 MB</b>、fail=0、建立 4 717/s；
+        风暴 25 606/s；vless 吞吐无回退（64×1 MB +19%）；vless-tls 2 000 连接 <b class="ok">27 线程 / 61 MB</b>（线程模型 4 011/222 MB）<br>
+        <span class="sub">ADR-0058；余段：reality/vision/ws/ss/vmess 会话接入 + io_uring A/B；ss CPU/UDP 目标随 O1/O2/O7 待做</span></td></tr>
   </tbody>
 </table>
 <div class="note ok">
-<b>M4 结论与后续：</b>① M4 stage 1 已交付（epoll worker 池接管 splice 链路，10k 连接 20 线程 / 30.2 MB、风暴 25 974/s，
-见 06b 节与 ADR-0058）；② stage 2：rustls/reality/ss/vmess 等非 splice 会话接入同一状态机、io_uring（IORING_OP_SPLICE）A/B；
+<b>M4 结论与后续：</b>① stage 1 与 stage 2 首段均已交付（epoll worker 池接管 splice 链路 + rustls codec 会话；
+10k 连接 28 线程 / 32.1 MB、风暴 25 606/s、vless-tls 2 000 连接 27 线程 / 61 MB，见 06b 节与 ADR-0058）；
+② 余段：reality/vision/ws/ss/vmess 等会话接入同一状态机、io_uring（IORING_OP_SPLICE）A/B；
 ③ 缓冲池化/零分配（O8/O1/O2）与 UDP 批量（O7）在其后按 roadmap 推进。
 </div>
 </section>
@@ -484,7 +516,7 @@ ChaCha20-Poly1305 分别为 1.76 / 2.87 GB/s（因此本机也不存在“换 ch
 <ul class="sub">
   <li><b>夹具边界</b>：direct 行与 8 流 vless 可能触及环回 ≈25 Gbps 夹具上限（客户端 pattern 校验 CPU），绝对吞吐不外推到公网；TLS 行则受同机 sing-box 服务端 ≈12.5 Gbps 封顶，这组数据只能横向比较；</li>
   <li><b>splice 适用范围</b>：字节透明链路（Direct / VLESS 明文 TCP）与 kTLS 成功后的 TLS 链路；加密、WS、vision、QUIC 系仍走用户态泵；首次 splice EINVAL 自动回退（计数可观测）；</li>
-  <li><b>reactor 边界（M4）</b>：只接管字节透明且未 offload 的 splice 链路（rustls/reality/ss/vmess 仍为每连接线程，stage 2 再迁）；<code>SPLICE_F_NONBLOCK</code> 仅作用管道端——两端 socket 必须非阻塞，否则 worker 真阻塞；VLESS 响应头由短命 prelude 线程先行消费后 resume；<code>SODAMA_NO_REACTOR=1</code> 回退线程模型，<code>SODAMA_REACTOR_DEBUG=1</code> 打详细日志；</li>
+  <li><b>reactor 边界（M4）</b>：接管字节透明且未 offload 的 splice 链路（Direct/VLESS 明文/kTLS TLS）+ stage 2 codec 首段（rustls VLESS-TCP/Trojan，读半/写半须 WouldBlock 可重入）；reality/vision/ws/ss/vmess 仍为每连接线程（余段再迁）；<code>SPLICE_F_NONBLOCK</code> 仅作用管道端——两端 socket 必须非阻塞，否则 worker 真阻塞；VLESS 响应头由短命 prelude 线程先行消费后 resume；<code>SODAMA_NO_REACTOR=1</code> 回退线程模型、<code>SODAMA_REACTOR_CODEC=0</code> 关 codec 入池，<code>SODAMA_REACTOR_DEBUG=1</code> 打详细日志（含会话状态周期转储）；</li>
   <li><b>kTLS 边界（实验）</b>：需内核 <code>tls</code> 模块（<code>modprobe tls</code>）；仅 TLS 1.3 + 已支持的 AEAD（TLS 1.2 自动跳过、仅用户态）；对端中途发 <b>KeyUpdate</b> 时内核 RX 会 EBADMSG（当前直接断连，不会静默丢数据；xray/sing-box 默认不主动 KeyUpdate）；安装失败/控制记录异常均有回退路径与一次性日志；</li>
   <li><b>内核依赖</b>：splice 自 2.6.17 起可用；kTLS 自 4.13+（TLS 1.3 RX splice 需要较新内核，本机 6.18 实测）；veth/netns 场景常规；</li>
   <li><b>测量噪声</b>：同机 veth，轮次间 ±5–10%；relay 8 流首测出现 12.7 Gbps 的孤立点，复测 21.6 Gbps，报告取复测值并保留说明；</li>
@@ -528,6 +560,11 @@ sudo PROXY_PROTO=vless SODAMA_NO_REACTOR=1 OUT=/tmp/ab-thread.tsv lab/perf/scali
 SODAMA_NO_REACTOR=1                                        # 运行开关：回退每连接线程模型
 SODAMA_REACTOR_DEBUG=1                                     # reactor 详细日志（默认关）
 
+# stage 2 验收（codec：rustls VLESS-TLS / Trojan）
+sudo PROXY_PROTO=vless-tls OUT=/tmp/ab-codec.tsv lab/perf/scaling.sh vless-tls            # 与 SODAMA_NO_REACTOR=1 对比
+sudo bash lab/perf/codec-stress.sh                                                           # 4/8/64 流混合压力（0 失败；含长尾卡死回归）
+SODAMA_REACTOR_CODEC=0                                                                    # 运行开关：codec 回退线程模型
+
 # 运行开关
 --ktls            尝试 kTLS（TLS1.3；默认关，需 modprobe tls；vision 连接自动旁路）
 SODAMA_KTLS_DEBUG=1 / SODAMA_KTLS_TXONLY=1                 # 安装调试 / TX-only 实验
@@ -541,13 +578,15 @@ status --cmd status --json | jq .relay.splice_total        # 命中/回退计数
 实现落点（M3）：<code>loader/src/vision.rs</code>（<code>TlsSniffer</code>/DIRECT 状态机）、<code>loader/src/tls.rs</code>（<code>connect_vision</code>/<code>record_mode</code>/raw 开关）、
 <code>loader/src/tls13.rs</code>（raw 写）、<code>loader/src/outbound.rs</code>（tls/reality 装配与 URL 约束）、<code>lab/vision/</code>（Xray 夹具）、ADR-0057。
 实现落点（M4）：<code>loader/src/reactor.rs</code>（worker 池/会话状态机/prelude）、<code>loader/src/main.rs</code>（<code>handle_relay_conn</code> 接入、<code>relay_finish</code>）、
-<code>loader/src/outbound.rs</code>（<code>splice_prelude</code> 能力位）、<code>lab/scale/</code>（echo_server/conn_scale/run.sh）、ADR-0058。M1 落点见上一版说明。
+<code>loader/src/outbound.rs</code>（<code>splice_prelude</code> 能力位、<code>codec_reactor_capable</code>）、<code>lab/scale/</code>（echo_server/conn_scale/run.sh）、ADR-0058。
+实现落点（stage 2）：<code>loader/src/reactor.rs</code>（<code>CodecDir</code>/<code>CodecSide</code>/自驱补泵）、<code>loader/src/main.rs</code>（<code>submit_codec</code> 分支）、
+<code>loader/src/tls.rs</code>（<code>TlsWriter::write</code> 待刷语义）、<code>loader/src/vless.rs</code>（响应头可重入状态机）。M1 落点见上一版说明。
 </p>
 </section>
 
 <div class="foot">
-  sodama · VLESS 性能实测与优化提案 · v1.4（M1–M4 落地版）· 2026-10-05 · Arch / 6.18.54-lts / i9-9900KF ·
-  数据为同机 lab 口径，5 轮中位数与 perf 剖面如实呈现；M2 验收对账（内存达标、吞吐/CPU 受夹具与硬件限制）见 05 节，M4 规模/风暴/A-B 见 06b 节。
+  sodama · VLESS 性能实测与优化提案 · v1.5（M1–M4 落地 + stage 2 首段版）· 2026-10-05 · Arch / 6.18.54-lts / i9-9900KF ·
+  数据为同机 lab 口径，5 轮中位数与 perf 剖面如实呈现；M2 验收对账（内存达标、吞吐/CPU 受夹具与硬件限制）见 05 节，M4 规模/风暴/codec A-B 见 06b 节。
 </div>
 
 </div>
