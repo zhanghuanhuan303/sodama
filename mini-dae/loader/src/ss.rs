@@ -283,7 +283,7 @@ fn socks_addr_len(buf: &[u8]) -> io::Result<usize> {
 
 /// 客户端方向的 TCP 流（对端为 ss 服务端），建流时发送 salt 并拆成读写两半。
 pub struct SsReader {
-    inner: TcpStream,
+    inner: Box<dyn Read + Send>,
     method: SsMethod,
     master: Vec<u8>,
     key: Option<Vec<u8>>,
@@ -296,8 +296,12 @@ pub struct SsReader {
     ss2022_header_done: bool,
 }
 
+/// 半关闭回调（写半持有；直接拨号时即底层 TcpStream 的 `shutdown(Write)`）。
+pub type ShutdownFn = Box<dyn Fn() -> io::Result<()> + Send>;
+
 pub struct SsWriter {
-    inner: TcpStream,
+    inner: Box<dyn Write + Send>,
+    shutdown: Option<ShutdownFn>,
     method: SsMethod,
     key: Vec<u8>,
     nonce: u64,
@@ -317,11 +321,32 @@ pub fn connect_split(
     method: SsMethod,
     master: &[u8],
 ) -> io::Result<(SsReader, SsWriter)> {
+    let reader_sock = inner.try_clone()?;
+    let kill = inner.try_clone()?;
+    let shutdown: Option<ShutdownFn> =
+        Some(Box::new(move || kill.shutdown(std::net::Shutdown::Write)));
+    connect_split_boxed(
+        Box::new(reader_sock),
+        Box::new(inner),
+        shutdown,
+        method,
+        master,
+    )
+}
+
+/// P31：在任意双工流上建 ss 客户端流（shadow-tls 隧道：读写两半由帧层包装）。
+pub fn connect_split_boxed(
+    reader: Box<dyn Read + Send>,
+    mut writer: Box<dyn Write + Send>,
+    shutdown: Option<ShutdownFn>,
+    method: SsMethod,
+    master: &[u8],
+) -> io::Result<(SsReader, SsWriter)> {
     if method.is_2022() {
         let salt = random_salt(method.salt_len());
         let send_key = derive_subkey_2022(method, master, &salt);
         let reader = SsReader {
-            inner: inner.try_clone()?,
+            inner: reader,
             method,
             master: master.to_vec(),
             key: None,
@@ -332,7 +357,8 @@ pub fn connect_split(
             ss2022_header_done: false,
         };
         let writer = SsWriter {
-            inner,
+            inner: writer,
+            shutdown,
             method,
             key: send_key,
             nonce: 0,
@@ -342,12 +368,11 @@ pub fn connect_split(
         return Ok((reader, writer));
     }
 
-    let mut inner = inner;
     let salt = random_salt(method.salt_len());
-    inner.write_all(&salt)?;
+    writer.write_all(&salt)?;
     let send_key = derive_subkey(master, &salt).to_vec();
     let reader = SsReader {
-        inner: inner.try_clone()?,
+        inner: reader,
         method,
         master: master.to_vec(),
         key: None,
@@ -358,7 +383,8 @@ pub fn connect_split(
         ss2022_header_done: true,
     };
     let writer = SsWriter {
-        inner,
+        inner: writer,
+        shutdown,
         method,
         key: send_key,
         nonce: 0,
@@ -370,7 +396,10 @@ pub fn connect_split(
 
 impl SsWriter {
     pub fn shutdown_write(&self) -> io::Result<()> {
-        self.inner.shutdown(std::net::Shutdown::Write)
+        match &self.shutdown {
+            Some(f) => f(),
+            None => Ok(()),
+        }
     }
 
     fn write_classic(&mut self, buf: &[u8]) -> io::Result<usize> {

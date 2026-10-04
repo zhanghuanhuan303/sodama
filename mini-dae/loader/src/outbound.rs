@@ -20,7 +20,7 @@ use percent_encoding::percent_decode_str;
 use sha2::{Digest as _, Sha256};
 
 use crate::{
-    anytls, group::GroupRuntime, hysteria2, juicity, quicsock, reality, socks5, ss, ssr,
+    anytls, group::GroupRuntime, hysteria2, juicity, quicsock, reality, shadowtls, socks5, ss, ssr,
     target::Target, tls, tls13, trojan, tuic, vision, vless, vmess, ws, DAE_SOCKET_MARK,
 };
 
@@ -520,6 +520,8 @@ pub enum Outbound {
         server: SocketAddr,
         method: ss::SsMethod,
         master: Vec<u8>,
+        /// P31：SIP003 `plugin=shadow-tls;...`（None = 直连 ss 服务端）。
+        shadowtls: Option<shadowtls::ShadowTlsConfig>,
     },
     Trojan {
         server: SocketAddr,
@@ -647,10 +649,13 @@ impl Outbound {
         if let Self::Group(g) = self {
             return g.supports_udp();
         }
+        if let Self::Shadowsocks { shadowtls, .. } = self {
+            // shadow-tls 插件只做 TCP（P31 边界）。
+            return shadowtls.is_none();
+        }
         matches!(
             self,
-            Self::Shadowsocks { .. }
-                | Self::Vless { .. }
+            Self::Vless { .. }
                 | Self::Vmess { .. }
                 | Self::Tuic { .. }
                 | Self::Hysteria2 { .. }
@@ -721,18 +726,42 @@ impl Outbound {
                 server,
                 method,
                 master,
+                shadowtls: plugin,
             } => {
                 let sock = marked_tcp_connect(*server, timeout)?;
                 let kill = sock.try_clone()?;
-                let (reader, mut writer) = ss::connect_split(sock, *method, master)?;
+                let (reader, mut writer): (Box<dyn ReadHalf>, Box<dyn WriteHalf>) =
+                    if let Some(cfg) = plugin {
+                        if method.is_2022() {
+                            return Err(io::Error::new(
+                                io::ErrorKind::Unsupported,
+                                "ss2022 + shadow-tls 插件未实现（P31 边界）",
+                            ));
+                        }
+                        let (r, w) = shadowtls::connect(sock, cfg)?;
+                        let kill2 = kill.try_clone()?;
+                        let shutdown: ss::ShutdownFn =
+                            Box::new(move || kill2.shutdown(std::net::Shutdown::Write));
+                        let (r, w) = ss::connect_split_boxed(
+                            Box::new(r),
+                            Box::new(w),
+                            Some(shutdown),
+                            *method,
+                            master,
+                        )?;
+                        (Box::new(r), Box::new(w))
+                    } else {
+                        let (r, w) = ss::connect_split(sock, *method, master)?;
+                        (Box::new(r), Box::new(w))
+                    };
                 // 首块写 SOCKS5 风格目标地址头（IPv4 / 域名）
                 let mut head = Vec::with_capacity(7 + 1 + 255);
                 target.encode_socks_addr_port(&mut head)?;
                 writer.write_all(&head)?;
                 writer.flush()?;
                 Ok(DialedStream {
-                    from_remote: Box::new(reader),
-                    to_remote: Box::new(writer),
+                    from_remote: reader,
+                    to_remote: writer,
                     socket: Some(kill),
                 })
             }
@@ -993,7 +1022,14 @@ impl Outbound {
                 server,
                 method,
                 master,
+                shadowtls: plugin,
             } => {
+                if plugin.is_some() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "ss + shadow-tls 不支持 UDP（P31 边界）",
+                    ));
+                }
                 let socket = new_marked_udp_for(*server)?;
                 socket.connect(server)?;
                 // SIP022 UDP 需要客户会话 ID/packet id/重放窗口，建会话状态；classic 无状态。
@@ -1916,9 +1952,11 @@ fn parse_ss(rest: &str) -> Result<Outbound, String> {
         Some((m, q)) => (m, q),
         None => (rest, ""),
     };
+    let mut plugin: Option<shadowtls::ShadowTlsConfig> = None;
     for kv in query.split('&').filter(|s| !s.is_empty()) {
-        if kv.starts_with("plugin") {
-            return Err("ss:// 暂不支持 plugin（G1 边界）".into());
+        let (k, v) = kv.split_once('=').unwrap_or((kv, ""));
+        if k.eq_ignore_ascii_case("plugin") {
+            plugin = Some(parse_shadowtls_plugin(&percent_decode(v))?);
         }
     }
     let (userinfo, hostport) = match main.split_once('@') {
@@ -1964,7 +2002,55 @@ fn parse_ss(rest: &str) -> Result<Outbound, String> {
         server: resolve(&hostport)?,
         method,
         master,
+        shadowtls: plugin,
     })
+}
+
+/// SIP003 插件串（`shadow-tls;password=…;version=3;host=…;allowInsecure=1`）。
+/// 当前仅支持 shadow-tls；其余插件显式报错（不静默）。
+fn parse_shadowtls_plugin(raw: &str) -> Result<shadowtls::ShadowTlsConfig, String> {
+    let mut fields = raw.split(';');
+    let name = fields.next().unwrap_or("").trim();
+    if !matches!(
+        name.to_ascii_lowercase().as_str(),
+        "shadow-tls" | "shadowtls"
+    ) {
+        return Err(format!(
+            "ss:// 插件 {name} 未实现（当前仅 shadow-tls；P31 边界）"
+        ));
+    }
+    let mut password = String::new();
+    let mut version = 3u8;
+    let mut sni: Option<String> = None;
+    let mut host: Option<String> = None;
+    let mut allow_insecure = false;
+    for f in fields {
+        let f = f.trim();
+        if f.is_empty() {
+            continue;
+        }
+        let (k, v) = f.split_once('=').unwrap_or((f, ""));
+        let v = percent_decode(v.trim());
+        match k.trim().to_ascii_lowercase().as_str() {
+            "password" | "passwd" | "pwd" => password = v,
+            "version" => {
+                version = v
+                    .parse()
+                    .map_err(|_| format!("shadow-tls 插件版本非法: {v}"))?
+            }
+            "sni" => sni = Some(v),
+            "host" => host = Some(v),
+            "allowinsecure" | "allow_insecure" | "insecure" | "skipverify" | "skip-cert-verify" => {
+                allow_insecure = matches!(v.as_str(), "1" | "true" | "TRUE" | "True")
+            }
+            _ => {}
+        }
+    }
+    let sni = sni
+        .or(host)
+        .ok_or_else(|| "shadow-tls 插件需要 host/sni".to_string())?;
+    shadowtls::ShadowTlsConfig::new(version, password, sni, allow_insecure)
+        .map_err(|e| format!("shadow-tls 插件: {e}"))
 }
 
 /// `trojan://password@host:port?sni=...&allowInsecure=1&type=tcp`

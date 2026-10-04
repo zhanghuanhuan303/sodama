@@ -27,6 +27,8 @@ percent-encoding = "2"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 rustls-pki-types = "1"
 webpki-roots = "0.26"
+# P31：shadow-tls 严格模式的 WebPKI 链/主机名/CV 校验（复用 rustls 生态的 ring 算法集）
+rustls-webpki = { version = "0.103", default-features = false, features = ["ring", "std"] }
 # P5 G2：VMess AEAD（ECB auth id / SHAKE128 长度掩码 / CRC32 校验和）
 aes = "0.8"
 sha3 = "0.10"

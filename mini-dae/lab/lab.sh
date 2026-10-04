@@ -202,6 +202,11 @@ SSR_PASSWORD=testpass
 SSR_PASSWORD_B64=dGVzdHBhc3M
 SSR_LOG=/tmp/mini-dae-ssr-target.txt
 SSR_PID_FILE=/tmp/mini-dae-ssr.pid
+# P31：shadow-tls（ss 插件；v1/v2/v3）参考服务端
+SHADOWTLS_PORT=8399
+SHADOWTLS_PASSWORD=testpass
+SHADOWTLS_LOG=/tmp/mini-dae-shadowtls.log
+SHADOWTLS_PID_FILE=/tmp/mini-dae-shadowtls.pid
 # P25：naive（HTTP/2 CONNECT）参考服务端
 NAIVE_PORT=8663
 NAIVE_LOG=/tmp/mini-dae-naive.log
@@ -347,6 +352,10 @@ cleanup() {
   if [ -f "$SSR_PID_FILE" ]; then
     kill "$(cat "$SSR_PID_FILE")" 2>/dev/null || true
     rm -f "$SSR_PID_FILE"
+  fi
+  if [ -f "$SHADOWTLS_PID_FILE" ]; then
+    kill "$(cat "$SHADOWTLS_PID_FILE")" 2>/dev/null || true
+    rm -f "$SHADOWTLS_PID_FILE"
   fi
   if [ -f "$NAIVE_PID_FILE" ]; then
     kill "$(cat "$NAIVE_PID_FILE")" 2>/dev/null || true
@@ -787,6 +796,20 @@ up() {
     echo $! >"$SSR_PID_FILE"
     sleep 0.3
     kill -0 "$(cat "$SSR_PID_FILE")" 2>/dev/null || { cat /tmp/mini-dae-ssr.stdout; die "SSR 服务端启动失败"; }
+  fi
+
+  # P31：shadow-tls 参考服务端（Go/sing-shadowtls；内层转发到 python ss 后端）
+  if [ -n "${USE_SHADOWTLS:-}" ]; then
+    [ -x "$HERE/proto-check/bin/shadowtls-server" ] \
+      || die "缺 shadow-tls 参考服务端：先运行 lab/proto-check/build-shadowtls-server.sh"
+    rm -f "$SHADOWTLS_LOG"
+    "$HERE/proto-check/bin/shadowtls-server" -port "$SHADOWTLS_PORT" \
+      -version "${USE_SHADOWTLS_VERSION:-3}" -password "$SHADOWTLS_PASSWORD" -host localhost \
+      -backend "127.0.0.1:$SS_PORT" -log "$SHADOWTLS_LOG" \
+      >/tmp/mini-dae-shadowtls.stdout 2>&1 &
+    echo $! >"$SHADOWTLS_PID_FILE"
+    sleep 0.3
+    kill -0 "$(cat "$SHADOWTLS_PID_FILE")" 2>/dev/null || { cat /tmp/mini-dae-shadowtls.stdout; die "shadow-tls 服务端启动失败"; }
   fi
 
   # P18b：DoQ 参考服务端（Go/quic-go，需先构建）
@@ -2961,6 +2984,41 @@ PY
   echo "PASS: SSR（origin+plain + aes-256-cfb 流密码；跨实现 Go 参考服务端）"
 }
 
+# P31：shadow-tls（ss 插件链；v1 裸隧道 / v2 首帧 HMAC / v3 CH session_id + MAC 链）。
+test_shadowtls() {
+  require_root
+  local ver="${1:-3}"
+  echo "== P31：shadow-tls v$ver（ss 插件链）TCP 转发 =="
+  grep -q "STLS server version=$ver" "$SHADOWTLS_LOG" /tmp/mini-dae-shadowtls.stdout 2>/dev/null \
+    || { echo "FAIL: 参考服务端不是 v$ver"; cat "$SHADOWTLS_LOG"; exit 1; }
+  : >"$SHADOWTLS_LOG" 2>/dev/null || true
+  local out
+  out="$(ip netns exec "$CLIENT_NS" timeout 8 python3 "$HERE/client_probe.py" "$PROXY_DST" 8080 2>&1 || true)"
+  echo "$out"
+  echo "$out" | grep -q "wan-echo-ok data=ping" || { echo "FAIL: shadow-tls 链路未把流量转发到真实目标"; exit 1; }
+  out="$(ip netns exec "$CLIENT_NS" timeout 30 python3 "$HERE/stream_probe.py" "$PROXY_DST" 8080 512 2>&1 || true)"
+  echo "$out"
+  echo "$out" | grep -q "^stream-ok bytes=524288" || { echo "FAIL: shadow-tls 大流量（512KB）回显不一致"; exit 1; }
+  grep -q "STLS handler conn backend=" "$SHADOWTLS_LOG" \
+    || { echo "FAIL: shadow-tls 服务端未完成认证交接（HMAC/session_id/帧链？）"; cat "$SHADOWTLS_LOG"; exit 1; }
+  grep -q "TCP target=$PROXY_DST:8080" "$SS_LOG" \
+    || { echo "FAIL: python ss 后端未看到目标（shadow-tls 服务端→ss 转发失败？）"; cat "$SS_LOG"; exit 1; }
+  "$LOADER" status --socket "$STATUS_SOCK" --json >/tmp/mini-dae-status.json
+  python3 - /tmp/mini-dae-status.json <<'PY'
+import json, sys
+v = json.load(open(sys.argv[1]))
+assert v["dialer"].startswith("ss://"), v["dialer"]
+r = v["relay"]
+assert r["conns_total"] >= 2, r
+assert r["dial_errors"] == 0, r
+assert r["bytes_up"] >= 512 * 1024, r
+assert r["bytes_down"] >= 512 * 1024, r
+print("shadowtls tcp: conns=%d bytes_up=%d bytes_down=%d" % (
+    r["conns_total"], r["bytes_up"], r["bytes_down"]))
+PY
+  echo "PASS: shadow-tls v$ver（跨实现：Rust 客户端 ↔ Go/sing-shadowtls 服务端 ↔ python ss）"
+}
+
 # P28：ECS 回填 / ecs_cache（上游回显 scope → 按回填键缓存与阶梯复用）。
 test_ecs_cache() {
   require_root
@@ -3466,6 +3524,15 @@ test-dns-udp) test_dns_udp ;;  # 显式 udp:// 上游（仅 UDP）
     USE_DIALER="juicity://$JUICITY_UUID:$JUICITY_PASSWORD@127.0.0.1:$JUICITY_PORT?sni=localhost&allow_insecure=1" up ;;  # P27
   ssr-up) USE_RULES="$HERE/rules.dae" USE_SSR=1 USE_OFFLOAD=1 USE_RELAY_IDLE=600 \
     USE_DIALER="ssr://127.0.0.1:$SSR_PORT:origin:$SSR_METHOD:plain:$SSR_PASSWORD_B64" up ;;  # P30
+  shadowtls-up) USE_RULES="$HERE/rules.dae" USE_SS=1 USE_SS_METHOD=chacha20-ietf-poly1305 USE_SS_PASSWORD=testpass \
+    USE_SHADOWTLS=1 USE_SHADOWTLS_VERSION=3 USE_OFFLOAD=1 USE_RELAY_IDLE=600 \
+    USE_DIALER="ss://chacha20-ietf-poly1305:testpass@127.0.0.1:$SHADOWTLS_PORT?plugin=shadow-tls;password=$SHADOWTLS_PASSWORD;version=3;sni=localhost;allowInsecure=1" up ;;  # P31
+  shadowtls-v2-up) USE_RULES="$HERE/rules.dae" USE_SS=1 USE_SS_METHOD=chacha20-ietf-poly1305 USE_SS_PASSWORD=testpass \
+    USE_SHADOWTLS=1 USE_SHADOWTLS_VERSION=2 USE_OFFLOAD=1 USE_RELAY_IDLE=600 \
+    USE_DIALER="ss://chacha20-ietf-poly1305:testpass@127.0.0.1:$SHADOWTLS_PORT?plugin=shadow-tls;password=$SHADOWTLS_PASSWORD;version=2;sni=localhost;allowInsecure=1" up ;;  # P31
+  shadowtls-v1-up) USE_RULES="$HERE/rules.dae" USE_SS=1 USE_SS_METHOD=chacha20-ietf-poly1305 USE_SS_PASSWORD=testpass \
+    USE_SHADOWTLS=1 USE_SHADOWTLS_VERSION=1 USE_OFFLOAD=1 USE_RELAY_IDLE=600 \
+    USE_DIALER="ss://chacha20-ietf-poly1305:testpass@127.0.0.1:$SHADOWTLS_PORT?plugin=shadow-tls;version=1;sni=localhost;allowInsecure=1" up ;;  # P31
   hy2-up) USE_RULES="$HERE/rules.dae" USE_HY2=1 USE_OFFLOAD=1 USE_RELAY_IDLE=600 \
     USE_DIALER="hysteria2://$HY2_AUTH@127.0.0.1:$HY2_PORT?sni=localhost&insecure=1&alpn=h3" up ;;
   hy2-udp-up) USE_RULES="$HERE/rules.udp.dae" USE_HY2=1 \
@@ -3522,6 +3589,9 @@ test-dns-udp) test_dns_udp ;;  # 显式 udp:// 上游（仅 UDP）
   test-juicity) test_juicity ;;  # P27
   test-juicity-udp) test_juicity_udp ;;  # P27
   test-ssr) test_ssr ;;  # P30
+  test-shadowtls) test_shadowtls 3 ;;  # P31
+  test-shadowtls-v2) test_shadowtls 2 ;;  # P31
+  test-shadowtls-v1) test_shadowtls 1 ;;  # P31
   test-hy2) test_hy2 ;;
   test-hy2-udp) test_hy2_udp ;;
   test-hy2-obfs) test_hy2_obfs ;;
@@ -3537,5 +3607,5 @@ test-dns-udp) test_dns_udp ;;  # 显式 udp:// 上游（仅 UDP）
   status) status ;;
   trace) trace ;;
   down) down ;;
-  *) echo "usage: $0 {build|up|dual-up|config-up|forward-up|dns-up|dot-up|doh-up|doh-h2-up|doh-h3-up|doq-up|dnsroute-up|dnsopts-up|ecscache-up|dns-udp-up|dns-tcpup-up|geo-up|pname-up|regex-up|relay-up|offload-up|udp-up|ss-up|ss2022-up|http-up|groups-up|ss-udp-up|trojan-up|vless-up|vless-tls-up|vless-udp-up|vmess-up|vmess-tls-up|vmess-udp-up|tuic-up|tuic-udp-up|hy2-up|hy2-udp-up|hy2-obfs-up|hy2-obfs-udp-up|hy2-brutal-up|hy2-hop-up|juicity-up|juicity-udp-up|ssr-up|ops-up|naive-up|test-naive|naive-h3-up|test-naive-h3|ops-reload-up|bench-up|test-proxy|test-direct|test-block|test-host-proxy|test-reload|test-rebind|test-status|test-config|test-forward|test-domain|test-dns-cache|test-dns-tcp|test-dns-reload|test-domain-regex|test-dns-edns|test-dot|test-doh|test-doh-h2|test-doh-h3|test-doq|test-dnsroute|test-dns-options|test-ecs-cache|test-dns-udp|test-dns-tcpup|test-geo|test-pname|test-v6|test-relay|test-relay-idle|test-relay-offload|test-offload-lifecycle|test-udp-relay|test-quic-sniff|test-udp-idle|test-ss|test-ss2022|test-http|test-groups|test-trojan|test-ss-udp|test-vless|test-vless-udp|test-vmess|test-vmess-udp|test-tuic|test-tuic-udp|test-juicity|test-juicity-udp|test-ssr|test-hy2|test-hy2-udp|test-hy2-obfs|test-hy2-obfs-udp|test-hy2-brutal|test-hy2-hop|test-ops|test-config-reload|test-fault-reload|test-fault-kill|reload|verify|status|trace|down|sniff-punt-up|test-sniff-punt}"; exit 2 ;;
+  *) echo "usage: $0 {build|up|dual-up|config-up|forward-up|dns-up|dot-up|doh-up|doh-h2-up|doh-h3-up|doq-up|dnsroute-up|dnsopts-up|ecscache-up|dns-udp-up|dns-tcpup-up|geo-up|pname-up|regex-up|relay-up|offload-up|udp-up|ss-up|ss2022-up|http-up|groups-up|ss-udp-up|trojan-up|vless-up|vless-tls-up|vless-udp-up|vmess-up|vmess-tls-up|vmess-udp-up|tuic-up|tuic-udp-up|hy2-up|hy2-udp-up|hy2-obfs-up|hy2-obfs-udp-up|hy2-brutal-up|hy2-hop-up|juicity-up|juicity-udp-up|ssr-up|shadowtls-up|shadowtls-v2-up|shadowtls-v1-up|ops-up|naive-up|test-naive|naive-h3-up|test-naive-h3|ops-reload-up|bench-up|test-proxy|test-direct|test-block|test-host-proxy|test-reload|test-rebind|test-status|test-config|test-forward|test-domain|test-dns-cache|test-dns-tcp|test-dns-reload|test-domain-regex|test-dns-edns|test-dot|test-doh|test-doh-h2|test-doh-h3|test-doq|test-dnsroute|test-dns-options|test-ecs-cache|test-dns-udp|test-dns-tcpup|test-geo|test-pname|test-v6|test-relay|test-relay-idle|test-relay-offload|test-offload-lifecycle|test-udp-relay|test-quic-sniff|test-udp-idle|test-ss|test-ss2022|test-http|test-groups|test-trojan|test-ss-udp|test-vless|test-vless-udp|test-vmess|test-vmess-udp|test-tuic|test-tuic-udp|test-juicity|test-juicity-udp|test-ssr|test-shadowtls|test-shadowtls-v2|test-shadowtls-v1|test-hy2|test-hy2-udp|test-hy2-obfs|test-hy2-obfs-udp|test-hy2-brutal|test-hy2-hop|test-ops|test-config-reload|test-fault-reload|test-fault-kill|reload|verify|status|trace|down|sniff-punt-up|test-sniff-punt}"; exit 2 ;;
 esac

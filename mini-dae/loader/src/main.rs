@@ -65,6 +65,7 @@ mod quicsock;
 mod quicvarint;
 mod reality;
 mod rules;
+mod shadowtls;
 mod sniffer;
 mod socks5;
 mod socksin;
@@ -1494,7 +1495,22 @@ fn pump(
                 std::thread::sleep(Duration::from_millis(500));
                 continue;
             }
-            Ok(0) | Err(_) => break,
+            Ok(0) => break,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::UnexpectedEof
+                        | std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::ConnectionAborted
+                        | std::io::ErrorKind::BrokenPipe
+                ) =>
+            {
+                break;
+            }
+            Err(e) => {
+                log(&format!("pump: 读失败（{e}）"));
+                break;
+            }
             Ok(n) => {
                 last_ns.store(monotonic_now_ns(), Ordering::Relaxed);
                 bytes.fetch_add(n as u64, Ordering::Relaxed);

@@ -549,6 +549,7 @@ dependencies = [
  "ring",
  "rustls",
  "rustls-pki-types",
+ "rustls-webpki",
  "serde_json",
  "sha1",
  "sha2",

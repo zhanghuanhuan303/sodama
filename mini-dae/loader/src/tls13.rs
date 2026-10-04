@@ -6,8 +6,9 @@
 //! 这些钩子；Vision splice 还要求「解密一个记录、交付、随时可切到裸 TCP 直通」。
 //!
 //! 范围（够用即止）：TLS 1.3 only；AES-128-GCM / AES-256-GCM / ChaCha20-Poly1305；
-//! X25519 与 X25519MLKEM768；服务端证书不做 PKI 校验（REALITY 用 HMAC 绑定替代，
-//! 普通 TLS 场景不走本模块）。不支持：HRR、early data、client cert、PSK 恢复。
+//! X25519 与 X25519MLKEM768；证书校验由 `CertPolicy` 决定（REALITY 用 HMAC 绑定
+//! `Custom`；shadow-tls 伪装站握手用 `WebPki` 或 `Insecure`）。
+//! 不支持：HRR、early data、client cert、PSK 恢复。
 //!
 //! 线程模型：`handshake` 在分裂前同步跑完；之后读半/写半共享 `Shared`（短锁），
 //! 读半阻塞 socket 读在锁外；`raw_read` 开关由 Vision 层置位后读半直通裸 TCP。
@@ -22,6 +23,7 @@ use aes_gcm::aead::{AeadInPlace, KeyInit};
 use aes_gcm::{Aes128Gcm, Aes256Gcm};
 use chacha20poly1305::ChaCha20Poly1305;
 use hmac::{Hmac, Mac};
+use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
 use sha2::{Digest, Sha256, Sha384};
 use x25519_dalek::{PublicKey as X25519Public, StaticSecret};
 
@@ -291,7 +293,8 @@ impl RecordKeys {
     }
 
     /// 解密一条记录（hdr 为 5 字节记录头，ct 为其余部分）；返回（内容类型, 明文）。
-    fn open(&mut self, hdr: &[u8], ct: &[u8]) -> io::Result<(u8, Vec<u8>)> {
+    /// P31：shadow-tls v2 读半用它识别「伪装站握手后的真实 TLS 记录」并跳过。
+    pub(crate) fn open(&mut self, hdr: &[u8], ct: &[u8]) -> io::Result<(u8, Vec<u8>)> {
         let mut buf = ct.to_vec();
         let nonce = self.nonce();
         self.key.decrypt(&nonce, hdr, &mut buf)?;
@@ -378,12 +381,15 @@ pub fn build_client_hello(spec: &ClientHelloSpec, kx: &ClientKx) -> Vec<u8> {
 }
 
 fn build_full_hello(spec: &ClientHelloSpec, kx: &ClientKx) -> Vec<u8> {
-    // Chrome 语义：各位置的 GREASE 取不同值；但 key_share 的 GREASE 组必须
-    // 与 supported_groups 里的 GREASE 组一致（否则严格栈报 illegal_parameter，
-    // 见 OpenSSL extract_keyshares 的 check_in_list）。
-    let grease1 = grease_pool()[(rand_u16() % 16) as usize];
-    let grease2 = grease_pool()[(rand_u16() % 16) as usize];
-    let grease_group = grease_pool()[(rand_u16() % 16) as usize];
+    // GREASE（uTLS greaseSeed 语义：同一次 CH 内各位置取**不同**值；
+    // 全部相同或任意两个扩展类型相撞都会被严格解析器拒收）。
+    let grease_head = grease_pool()[(rand_u16() % 16) as usize];
+    let mut gi = (rand_u16() % 16) as usize;
+    if grease_pool()[gi] == grease_head {
+        gi = (gi + 5) % 16;
+    }
+    let grease_tail = grease_pool()[gi];
+    let grease_group = grease_head;
 
     let mut body = Vec::with_capacity(2048);
     // legacy_version / random / session_id
@@ -393,7 +399,7 @@ fn build_full_hello(spec: &ClientHelloSpec, kx: &ClientKx) -> Vec<u8> {
     body.extend_from_slice(&spec.session_id);
     // cipher suites（Chrome 顺序，含 GREASE）
     let suites: Vec<u16> = vec![
-        grease1,
+        grease_head,
         CS_AES_128_GCM_SHA256,
         CS_AES_256_GCM_SHA384,
         CS_CHACHA20_POLY1305_SHA256,
@@ -420,7 +426,7 @@ fn build_full_hello(spec: &ClientHelloSpec, kx: &ClientKx) -> Vec<u8> {
     // extensions（Chrome 近似顺序；GREASE 兜头兜尾）
     let mut exts: Vec<Ext> = Vec::new();
     exts.push(Ext {
-        t: grease1,
+        t: grease_head,
         body: Vec::new(),
     });
 
@@ -539,10 +545,11 @@ fn build_full_hello(spec: &ClientHelloSpec, kx: &ClientKx) -> Vec<u8> {
         body: vec![1, 1],
     }); // psk_key_exchange_modes
 
-    // supported_versions：GREASE + TLS1.3 + TLS1.2（uTLS HelloChrome_120）
-    let grease_ver = grease_pool()[(rand_u16() % 16) as usize];
+    // supported_versions：GREASE + TLS1.3 + TLS1.2（uTLS HelloChrome_120）。
+    // 注意：ClientHello 里列表长度是 **u8**（ServerHello 才是 u16）。
+    let grease_ver = grease_head;
     let mut sv = Vec::new();
-    push_u16(&mut sv, 6);
+    sv.push(6);
     push_u16(&mut sv, grease_ver);
     push_u16(&mut sv, 0x0304);
     push_u16(&mut sv, 0x0303);
@@ -563,6 +570,9 @@ fn build_full_hello(spec: &ClientHelloSpec, kx: &ClientKx) -> Vec<u8> {
 
     // GREASE ECH（uTLS BoringGREASEECH 形状：outer=0 / HKDF-SHA256+AES-128-GCM /
     // 随机 config_id / 随机 enc / 随机 payload（长度取 144/176/208/240））。
+    // GREASE ECH（uTLS BoringGREASEECH 形状：扩展类型固定 0xfe0d（draft-17 ECH），
+    // outer=0 / HKDF-SHA256+AES-128-GCM / 随机 config_id / 随机 enc / 随机 payload
+    // （长度取 144/176/208/240））。
     {
         use rand::RngCore;
         let mut rng = rand::thread_rng();
@@ -582,14 +592,11 @@ fn build_full_hello(spec: &ClientHelloSpec, kx: &ClientKx) -> Vec<u8> {
         let mut payload = vec![0u8; plen];
         rng.fill_bytes(&mut payload);
         e.extend_from_slice(&payload);
-        exts.push(Ext {
-            t: grease_pool()[(rand_u16() % 16) as usize],
-            body: e,
-        });
+        exts.push(Ext { t: 0xfe0d, body: e });
     }
 
     exts.push(Ext {
-        t: grease2,
+        t: grease_tail,
         body: vec![0],
     });
 
@@ -653,6 +660,17 @@ impl ClientKx {
 /// 证书钩子：拿到叶证书 DER（Finished 之前调用）。返回 Some(ed25519 公钥) 时，
 /// 后续 CertificateVerify 会用该公钥验签（REALITY）；None 表示跳过。
 pub type CertHook<'a> = &'a mut dyn FnMut(&[u8]) -> io::Result<Option<Vec<u8>>>;
+
+/// P31：证书/CertificateVerify 校验策略。
+pub enum CertPolicy<'a> {
+    /// REALITY：hook 返回 Some(ed25519 公钥) 则验 CV，None 跳过（自签对端+HMAC 绑定）。
+    Custom(CertHook<'a>),
+    /// WebPKI：链 + 主机名校验（Certificate 阶段）+ CV 验签（webpki-roots 系统根）。
+    /// shadow-tls 伪装站握手用（严格模式，等价生态默认 allowInsecure=false）。
+    WebPki { sni: String },
+    /// 跳过证书与 CV 校验（allowInsecure=1）。
+    Insecure,
+}
 
 pub struct HsOut {
     pub suite: Suite,
@@ -750,7 +768,7 @@ pub fn client_handshake<S: Read + Write>(
     s: &mut S,
     client_hello: &[u8],
     kx: &ClientKx,
-    cert_hook: CertHook,
+    mut policy: CertPolicy,
 ) -> io::Result<HsOut> {
     let mut io_hs = HsIo {
         hs_buf: Vec::new(),
@@ -833,6 +851,7 @@ pub fn client_handshake<S: Read + Write>(
     // 4) 解密服务端握手飞行：EE / Cert / CV / Fin。
     let server_hs_secret = s_hs;
     let mut cert_pub: Option<Vec<u8>> = None;
+    let mut webpki_certs: Option<(Vec<u8>, Vec<Vec<u8>>)> = None;
     let mut server_finished: Option<Vec<u8>> = None;
     while server_finished.is_none() {
         // 需要时补读 socket（一次可能仅得部分记录：读完必须回到循环顶重判）。
@@ -888,13 +907,49 @@ pub fn client_handshake<S: Read + Write>(
                         }
                         HS_CERTIFICATE => {
                             transcript.extend_from_slice(&wrap_handshake(mtyp, &mbody));
-                            if let Some(leaf) = first_certificate(&mbody)? {
-                                cert_pub = cert_hook(&leaf)?;
+                            match &mut policy {
+                                CertPolicy::Custom(hook) => {
+                                    if let Some(leaf) = first_certificate(&mbody)? {
+                                        cert_pub = hook(&leaf)?;
+                                    }
+                                }
+                                CertPolicy::WebPki { sni } => {
+                                    let certs = all_certificates(&mbody)?;
+                                    if certs.is_empty() {
+                                        return Err(bad("证书链为空"));
+                                    }
+                                    verify_webpki_chain(&certs, sni)?;
+                                    webpki_certs = Some((certs[0].clone(), certs[1..].to_vec()));
+                                }
+                                CertPolicy::Insecure => {}
                             }
                         }
                         HS_CERTIFICATE_VERIFY => {
-                            if let Some(pk) = &cert_pub {
-                                verify_certificate_verify_ed25519(suite, pk, &mbody, &transcript)?;
+                            match &policy {
+                                CertPolicy::Custom(_) => {
+                                    if let Some(pk) = &cert_pub {
+                                        verify_certificate_verify_ed25519(
+                                            suite,
+                                            pk,
+                                            &mbody,
+                                            &transcript,
+                                        )?;
+                                    }
+                                }
+                                CertPolicy::WebPki { .. } => {
+                                    let (leaf, inters) =
+                                        webpki_certs.as_ref().ok_or_else(|| {
+                                            bad("CV 前未收到证书（内部不变量被破坏）")
+                                        })?;
+                                    verify_certificate_verify_webpki(
+                                        suite,
+                                        leaf,
+                                        inters,
+                                        &mbody,
+                                        &transcript,
+                                    )?;
+                                }
+                                CertPolicy::Insecure => {}
                             }
                             transcript.extend_from_slice(&wrap_handshake(mtyp, &mbody));
                         }
@@ -1137,6 +1192,112 @@ fn first_certificate(body: &[u8]) -> io::Result<Option<Vec<u8>>> {
     }
     let _ = list_len;
     Ok(Some(body[pos..pos + cert_len].to_vec()))
+}
+
+fn bad(m: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, format!("tls13: {}", m.into()))
+}
+
+/// 全量证书链解析（P31 WebPKI 用）：返回 `[叶, 中间...]`（DER）。
+fn all_certificates(body: &[u8]) -> io::Result<Vec<Vec<u8>>> {
+    // body: [ctx_len 1B][ctx][list_len 3B][cert_len 3B][cert][exts]...
+    if body.is_empty() {
+        return Ok(Vec::new());
+    }
+    let ctx_len = body[0] as usize;
+    let mut pos = 1 + ctx_len;
+    if pos + 3 > body.len() {
+        return Err(bad("Certificate 越界（list）"));
+    }
+    let list_len =
+        ((body[pos] as usize) << 16) | ((body[pos + 1] as usize) << 8) | (body[pos + 2] as usize);
+    pos += 3;
+    let end = (pos + list_len).min(body.len());
+    let mut out = Vec::new();
+    while pos + 3 <= end {
+        let cert_len = ((body[pos] as usize) << 16)
+            | ((body[pos + 1] as usize) << 8)
+            | (body[pos + 2] as usize);
+        pos += 3;
+        if pos + cert_len > end {
+            return Err(bad("Certificate 越界（entry）"));
+        }
+        out.push(body[pos..pos + cert_len].to_vec());
+        pos += cert_len;
+        if pos + 2 > end {
+            break;
+        }
+        let ext_len = u16::from_be_bytes([body[pos], body[pos + 1]]) as usize;
+        pos += 2 + ext_len;
+    }
+    Ok(out)
+}
+
+/// P31：WebPKI 链 + 主机名校验（在 Certificate 消息阶段执行）。
+fn verify_webpki_chain(certs: &[Vec<u8>], sni: &str) -> io::Result<()> {
+    let leaf = CertificateDer::from(certs[0].as_slice());
+    let inters: Vec<CertificateDer<'_>> = certs[1..]
+        .iter()
+        .map(|c| CertificateDer::from(c.as_slice()))
+        .collect();
+    let ee =
+        webpki::EndEntityCert::try_from(&leaf).map_err(|e| bad(format!("叶证书解析失败: {e}")))?;
+    let name = ServerName::try_from(sni.to_string())
+        .map_err(|e| bad(format!("SNI 非法（{sni}）: {e}")))?;
+    ee.verify_for_usage(
+        webpki::ALL_VERIFICATION_ALGS,
+        webpki_roots::TLS_SERVER_ROOTS,
+        &inters,
+        UnixTime::now(),
+        webpki::KeyUsage::server_auth(),
+        None,
+        None,
+    )
+    .map_err(|e| bad(format!("证书链校验失败（{sni}）: {e}")))?;
+    ee.verify_is_valid_for_subject_name(&name)
+        .map_err(|e| bad(format!("证书主机名不匹配（{sni}）: {e}")))?;
+    Ok(())
+}
+
+/// P31：WebPKI CertificateVerify 验签（按 CV 内的签名算法选 ring 实现）。
+fn verify_certificate_verify_webpki(
+    suite: Suite,
+    leaf_der: &[u8],
+    _intermediates: &[Vec<u8>],
+    body: &[u8],
+    transcript: &[u8],
+) -> io::Result<()> {
+    if body.len() < 4 {
+        return Err(bad("CertificateVerify 过短"));
+    }
+    let scheme = u16::from_be_bytes([body[0], body[1]]);
+    let sig_len = u16::from_be_bytes([body[2], body[3]]) as usize;
+    if body.len() < 4 + sig_len {
+        return Err(bad("CertificateVerify 签名越界"));
+    }
+    let alg = match scheme {
+        0x0403 => webpki::ring::ECDSA_P256_SHA256,
+        0x0503 => webpki::ring::ECDSA_P384_SHA384,
+        0x0804 => webpki::ring::RSA_PSS_2048_8192_SHA256_LEGACY_KEY,
+        0x0805 => webpki::ring::RSA_PSS_2048_8192_SHA384_LEGACY_KEY,
+        0x0806 => webpki::ring::RSA_PSS_2048_8192_SHA512_LEGACY_KEY,
+        0x0807 => webpki::ring::ED25519,
+        _ => {
+            return Err(bad(format!("CV 签名算法 {scheme:#06x} 不支持")));
+        }
+    };
+    // TLS 1.3 签名输入：64 空格 + 上下文串 + 0x00 + transcript 哈希。
+    let hash = suite.hash(transcript);
+    let mut msg = vec![0x20u8; 64];
+    msg.extend_from_slice(b"TLS 1.3, server CertificateVerify");
+    msg.push(0);
+    msg.extend_from_slice(&hash);
+    let leaf = CertificateDer::from(leaf_der);
+    let ee =
+        webpki::EndEntityCert::try_from(&leaf).map_err(|e| bad(format!("叶证书解析失败: {e}")))?;
+    ee.verify_signature(alg, &msg, &body[4..4 + sig_len])
+        .map_err(|e| bad(format!("CertificateVerify 验签失败: {e}")))?;
+    Ok(())
 }
 
 /// TLS 1.3 CertificateVerify：用证书公钥（REALITY 下为服务端静态 ed25519 公钥）验签。
@@ -1436,7 +1597,7 @@ pub fn connect(
 ) -> io::Result<(Tls13Reader, Tls13Writer, Arc<AtomicBool>)> {
     let _ = timeout; // 超时由调用方在 socket 上设置
     let mut s = sock.try_clone()?;
-    let out = client_handshake(&mut s, client_hello, kx, cert_hook)?;
+    let out = client_handshake(&mut s, client_hello, kx, CertPolicy::Custom(cert_hook))?;
     let suite = out.suite;
     let core = Arc::new(Mutex::new(Shared {
         read: out.read,
@@ -1588,7 +1749,44 @@ mod tests {
         sock.set_read_timeout(Some(Duration::from_secs(10)))
             .unwrap();
         let mut hook = |_leaf: &[u8]| -> std::io::Result<Option<Vec<u8>>> { Ok(None) };
-        let out = client_handshake(&mut sock, &hello, &kx, &mut hook).expect("与真站握手");
+        let out = client_handshake(&mut sock, &hello, &kx, CertPolicy::Custom(&mut hook))
+            .expect("与真站握手");
         eprintln!("tls13 真站握手成功，suite={:?}", out.suite);
+    }
+
+    /// P31：WebPKI 策略（shadow-tls 严格模式）对真实站点握手——验证链+主机名+CV
+    /// 验签链路。`cargo test --release -- --ignored tls13_real_server_webpki`。
+    #[test]
+    #[ignore = "需要外网可达 www.microsoft.com:443"]
+    fn tls13_real_server_webpki() {
+        use std::net::{TcpStream, ToSocketAddrs as _};
+        use std::time::Duration;
+        let target = "www.microsoft.com:443";
+        let kx = ClientKx::generate(true);
+        let spec = ClientHelloSpec {
+            server_name: "www.microsoft.com".into(),
+            alpn: vec![b"h2".to_vec(), b"http/1.1".to_vec()],
+            session_id: [0x33; 32],
+            random: [0x44; 32],
+            hybrid: true,
+        };
+        let hello = build_client_hello(&spec, &kx);
+        let mut sock = TcpStream::connect_timeout(
+            &target.to_socket_addrs().unwrap().next().unwrap(),
+            Duration::from_secs(10),
+        )
+        .expect("connect");
+        sock.set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let out = client_handshake(
+            &mut sock,
+            &hello,
+            &kx,
+            CertPolicy::WebPki {
+                sni: "www.microsoft.com".into(),
+            },
+        )
+        .expect("WebPKI 握手");
+        eprintln!("tls13 WebPKI 真站握手成功，suite={:?}", out.suite);
     }
 }

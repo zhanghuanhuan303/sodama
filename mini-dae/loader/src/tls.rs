@@ -229,6 +229,27 @@ pub(crate) fn build_rustls_config(insecure: bool, alpn: &[Vec<u8>]) -> ClientCon
     cfg
 }
 
+/// P31（shadow-tls v1）：TLS 1.2-only 的 rustls 配置。v1 服务端的「握手完成」
+/// 检测不识别 TLS 1.3 的加密飞行，参考实现也把 v1 客户端锁到 TLS 1.2。
+pub(crate) fn build_rustls_config_tls12(insecure: bool, alpn: &[Vec<u8>]) -> ClientConfig {
+    provider_installed();
+    let versions: &[&'static rustls::SupportedProtocolVersion] = &[&rustls::version::TLS12];
+    let b = rustls::ClientConfig::builder_with_protocol_versions(versions);
+    let mut cfg: ClientConfig = if insecure {
+        b.dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoVerify))
+            .with_no_client_auth()
+    } else {
+        let mut roots = rustls::RootCertStore::empty();
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        b.with_root_certificates(roots).with_no_client_auth()
+    };
+    if !alpn.is_empty() {
+        cfg.alpn_protocols = alpn.to_vec();
+    }
+    cfg
+}
+
 /// 在已连接的 TCP 上完成 TLS 握手（超时只用于握手期），返回可并发读写的两半。
 pub fn connect(
     tcp: TcpStream,
