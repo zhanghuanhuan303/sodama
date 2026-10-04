@@ -608,6 +608,8 @@ struct CacheEntry {
 /// P23：新增 optimistic_cache（过期条目在窗口内继续以 stale TTL 供应）。
 pub struct DnsCache {
     map: HashMap<CacheKey, CacheEntry>,
+    /// P29：后台刷新单飞（cache key 字符串 → 正在刷新；da 同源的 CAS 语义，粒度更细）。
+    refreshing: std::collections::HashSet<String>,
     /// optimistic cache（dae 默认 true）：过期后仍可供应（见 stale_reply_ttl）。
     pub optimistic: bool,
     /// 超过到期后仍可供应的窗口秒数（0 = 不限）。
@@ -627,6 +629,7 @@ impl Default for DnsCache {
     fn default() -> Self {
         Self {
             map: HashMap::new(),
+            refreshing: std::collections::HashSet::new(),
             optimistic: true,
             optimistic_ttl: 60,
             stale_reply_ttl: 30,
@@ -640,9 +643,66 @@ impl Default for DnsCache {
     }
 }
 
+/// P29：负应答判定（RFC 2308，对照 dae `isNegativeResponse`）——NXDOMAIN，或
+/// NOERROR 且 answer 里无 qtype 记录也无 CNAME（有 CNAME 视为别名链，不取代正值）。
+pub fn is_negative_response(resp: &[u8], qtype: u16) -> bool {
+    if resp.len() < 12 {
+        return false;
+    }
+    let rcode = resp[3] & 0x0F;
+    if rcode == 3 {
+        return true;
+    }
+    if rcode != 0 {
+        return false;
+    }
+    match parse_rrs(resp) {
+        Some(rrs) => rrs
+            .iter()
+            .filter(|r| r.section == SEC_ANSWER)
+            .all(|r| r.rtype != qtype && r.rtype != 5),
+        None => false,
+    }
+}
+
+/// P29：缓存命中信息（stale 标志 + 命中的作用域键，供 RFC 8767 刷新单飞）。
+pub struct CacheHit {
+    pub resp: Vec<u8>,
+    pub stale: bool,
+    pub scope: String,
+}
+
 impl DnsCache {
     pub fn len(&self) -> usize {
         self.map.len()
+    }
+
+    /// P29：尝试开始一次后台刷新（单飞）；返回 true = 本次由调用方负责刷新。
+    pub fn begin_refresh(&mut self, key: &str) -> bool {
+        self.refreshing.insert(key.to_string())
+    }
+
+    /// P29：刷新结束（无论成败，必须调用）。
+    pub fn end_refresh(&mut self, key: &str) {
+        self.refreshing.remove(key);
+    }
+
+    /// P29：在飞刷新数（状态面）。
+    pub fn refreshing_len(&self) -> usize {
+        self.refreshing.len()
+    }
+
+    /// P29：精确删除一个作用域键（后台刷新得到负应答时取代过期正值）。
+    pub fn remove_scoped(&mut self, q: &Question, do_bit: bool, scope: &str) -> bool {
+        self.map
+            .remove(&CacheKey {
+                qname: q.qname.clone(),
+                qtype: q.qtype,
+                qclass: q.qclass,
+                do_bit,
+                scope: scope.to_string(),
+            })
+            .is_some()
     }
 
     /// 命中则返回给客户端的应答（改 ID、回填 question、递减 TTL）；否则计 miss 并返回 None。
@@ -679,7 +739,7 @@ impl DnsCache {
             scope: scope.to_string(),
         };
         if let Some(resp) = self.get_scoped(&key, query, now) {
-            return Some(resp);
+            return Some(resp.0);
         }
         self.misses += 1;
         None
@@ -687,6 +747,8 @@ impl DnsCache {
 
     /// P28：ECS 作用域化查找——按 `ecs_scope_ladder` 从请求前缀依次尝试
     /// 本机前缀与更宽 scope（上游回填的 scope 键），命中即返回；全部未命中计一次 miss。
+    /// （单元测试用；生产路径走 `answer_from_cache_ecs_full`。）
+    #[allow(dead_code)]
     pub fn answer_from_cache_ecs(
         &mut self,
         query: &[u8],
@@ -696,6 +758,21 @@ impl DnsCache {
         ecs: Option<(IpAddr, u8)>,
         now: Instant,
     ) -> Option<Vec<u8>> {
+        self.answer_from_cache_ecs_full(query, q, edns, base_scope, ecs, now)
+            .map(|h| h.resp)
+    }
+
+    /// P29：同 `answer_from_cache_ecs`，额外报告 stale 标志与命中的作用域键
+    /// （供 RFC 8767 后台刷新单飞与负应答取代）。
+    pub fn answer_from_cache_ecs_full(
+        &mut self,
+        query: &[u8],
+        q: &Question,
+        edns: &EdnsInfo,
+        base_scope: &str,
+        ecs: Option<(IpAddr, u8)>,
+        now: Instant,
+    ) -> Option<CacheHit> {
         if edns.has_options {
             self.misses += 1;
             return None;
@@ -715,18 +792,23 @@ impl DnsCache {
                 qtype: q.qtype,
                 qclass: q.qclass,
                 do_bit: edns.do_bit,
-                scope,
+                scope: scope.clone(),
             };
-            if let Some(resp) = self.get_scoped(&key, query, now) {
-                return Some(resp);
+            if let Some((resp, stale)) = self.get_scoped(&key, query, now) {
+                return Some(CacheHit { resp, stale, scope });
             }
         }
         self.misses += 1;
         None
     }
 
-    /// 单键命中（不改 miss 计数）：命中/乐观 stale 返回应答；过期则移除。
-    fn get_scoped(&mut self, key: &CacheKey, query: &[u8], now: Instant) -> Option<Vec<u8>> {
+    /// 单键命中（不改 miss 计数）：`(应答, 是否 stale)`；过期且超窗则移除。
+    fn get_scoped(
+        &mut self,
+        key: &CacheKey,
+        query: &[u8],
+        now: Instant,
+    ) -> Option<(Vec<u8>, bool)> {
         let Some(e) = self.map.get(key) else {
             return None;
         };
@@ -739,11 +821,9 @@ impl DnsCache {
             {
                 self.stale_hits += 1;
                 self.hits += 1;
-                return Some(prepare_cached_stale(
-                    &e.response,
-                    e.question_end,
-                    query,
-                    self.stale_reply_ttl,
+                return Some((
+                    prepare_cached_stale(&e.response, e.question_end, query, self.stale_reply_ttl),
+                    true,
                 ));
             }
             self.map.remove(key);
@@ -751,7 +831,10 @@ impl DnsCache {
             return None;
         }
         self.hits += 1;
-        Some(prepare_cached(&e.response, e.question_end, query, elapsed))
+        Some((
+            prepare_cached(&e.response, e.question_end, query, elapsed),
+            false,
+        ))
     }
 
     /// P23：作用域内某 (qname, qtype) 是否有未过期的缓存（ipversion_prefer 用）。
@@ -1721,6 +1804,35 @@ mod tests {
         assert_eq!(txt.ttl, 25, "普通 additional RR 应递减（对照 dae）");
         let opt = rrs.iter().find(|r| r.rtype == RR_OPT).unwrap();
         assert_eq!(opt.ttl, 0, "OPT 的 TTL 字段不动");
+    }
+
+    #[test]
+    fn refresh_single_flight() {
+        let mut c = DnsCache::default();
+        assert!(c.begin_refresh("k"));
+        assert!(!c.begin_refresh("k"), "同 key 在飞时应合并");
+        assert_eq!(c.refreshing_len(), 1);
+        c.end_refresh("k");
+        assert!(c.begin_refresh("k"), "结束后可再次发起");
+    }
+
+    #[test]
+    fn negative_response_classification() {
+        let q = query("neg.test", 1);
+        // NXDOMAIN（rcode=3）
+        let mut nx = build_a_response(&q, &[], 30).unwrap();
+        nx[3] = (nx[3] & 0xF0) | 3;
+        assert!(is_negative_response(&nx, 1));
+        // NOERROR 无 A 也无 CNAME
+        let empty = build_a_response(&q, &[], 30).unwrap();
+        assert!(is_negative_response(&empty, 1));
+        // 有 A → 非负
+        let pos = build_a_response(&q, &[[1, 2, 3, 4]], 30).unwrap();
+        assert!(!is_negative_response(&pos, 1));
+        // SERVFAIL 不当作负答（不能取代旧正值）
+        let mut fail = build_a_response(&q, &[[1, 2, 3, 4]], 30).unwrap();
+        fail[3] = (fail[3] & 0xF0) | 2;
+        assert!(!is_negative_response(&fail, 1));
     }
 
     // ------------------------------------------------ P28：ECS 回填 / ecs_cache

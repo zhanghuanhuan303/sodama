@@ -29,7 +29,7 @@
 
 use std::ffi::CString;
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
@@ -489,6 +489,10 @@ struct DnsStats {
     ipversion_filtered: AtomicU64,
     /// P28：上游应答带 ECS 回显（回填 scope）的次数
     ecs_echo: AtomicU64,
+    /// P29：后台刷新：发起（实际执行）次数 / 合并（已有在飞）次数 / 失败
+    refresh_spawned: AtomicU64,
+    refresh_coalesced: AtomicU64,
+    refresh_err: AtomicU64,
 }
 static DNS_STATS: DnsStats = DnsStats {
     queries: AtomicU64::new(0),
@@ -505,6 +509,9 @@ static DNS_STATS: DnsStats = DnsStats {
     relookups: AtomicU64::new(0),
     ipversion_filtered: AtomicU64::new(0),
     ecs_echo: AtomicU64::new(0),
+    refresh_spawned: AtomicU64::new(0),
+    refresh_coalesced: AtomicU64::new(0),
+    refresh_err: AtomicU64::new(0),
 };
 
 /// P28：最近一次 ECS 回填 scope（状态面展示，如 `10.9.10.0/16` / `0.0.0.0/0`）。
@@ -3907,12 +3914,25 @@ fn resolve_dns(
     // 2b) 缓存（按作用域；P28：ECS 阶梯查找——本机前缀/上游回填的更宽 scope）
     if let Some(q) = &parsed {
         let hit = DNS_CACHE.lock().ok().and_then(|mut c| {
-            c.answer_from_cache_ecs(query, q, &edns, &scope, ecs_req, Instant::now())
+            c.answer_from_cache_ecs_full(query, q, &edns, &scope, ecs_req, Instant::now())
         });
-        if let Some(resp) = hit {
+        if let Some(hit) = hit {
             DNS_STATS.responses.fetch_add(1, Ordering::Relaxed);
-            publish_live(q, &resp, tx, true);
-            return Some(serve_response(query, resp, proto));
+            publish_live(q, &hit.resp, tx, true);
+            if hit.stale {
+                // P29：RFC 8767——已返回 stale，尝试单飞后台刷新（对照 dae 的
+                // refreshing CAS；失败保留旧条目，不影响本次应答）。
+                maybe_spawn_optimistic_refresh(
+                    q.clone(),
+                    edns,
+                    query_send.to_vec(),
+                    scope.clone(),
+                    hit.scope.clone(),
+                    ecs_req,
+                    up.clone(),
+                );
+            }
+            return Some(serve_response(query, hit.resp, proto));
         }
     }
     // 3) 上游 + 应答路由（对照 dae resolveDNSUpstream 的递归重查；深度上限 3）
@@ -3991,21 +4011,14 @@ fn resolve_dns(
         // P28：ECS 回填——应答带 ECS 时按上游声明的 scope 入缓存
         // （scope=0 → 全局键 `0.0.0.0/0`，可跨子网复用）；无回显则回退请求前缀。
         let mut insert_scope = scope.clone();
-        if let Some((cip, cp)) = last_injected {
-            let max = if cip.is_ipv4() { 32 } else { 128 };
-            let echoed = dns::parse_ecs_echo(&resp)
-                .filter(|e| e.family == if cip.is_ipv4() { 1 } else { 2 } && e.scope_prefix <= max);
-            let (ip, p) = match echoed {
-                Some(e) => {
-                    DNS_STATS.ecs_echo.fetch_add(1, Ordering::Relaxed);
-                    let t = dns::truncate_prefix(e.src, e.scope_prefix);
-                    if let Ok(mut g) = ECS_SCOPE_LAST.lock() {
-                        *g = Some(format!("{t}/{}", e.scope_prefix));
-                    }
-                    (t, e.scope_prefix)
+        if let Some(injected) = last_injected {
+            let ((ip, p), echoed) = ecs_effective_scope(&resp, injected);
+            if echoed {
+                DNS_STATS.ecs_echo.fetch_add(1, Ordering::Relaxed);
+                if let Ok(mut g) = ECS_SCOPE_LAST.lock() {
+                    *g = Some(format!("{ip}/{p}"));
                 }
-                None => (cip, cp),
-            };
+            }
             insert_scope.push_str(&format!("|ecs={ip}/{p}"));
         }
         if let Ok(mut c) = DNS_CACHE.lock() {
@@ -4021,6 +4034,87 @@ fn serve_response(query: &[u8], response: Vec<u8>, proto: ClientProto) -> Vec<u8
         ClientProto::Udp => dns::truncate_for_udp(&response, dns::client_udp_size(query)),
         ClientProto::Tcp => response,
     }
+}
+
+/// P28：入缓存时生效的 ECS 作用域——有回显则 `(truncate(回显地址, scope), scope)`
+/// 且 `echoed=true`；无回显/家族不符则回退请求注入前缀。
+fn ecs_effective_scope(resp: &[u8], injected: (IpAddr, u8)) -> ((IpAddr, u8), bool) {
+    let (cip, cp) = injected;
+    let max = if cip.is_ipv4() { 32 } else { 128 };
+    match dns::parse_ecs_echo(resp)
+        .filter(|e| e.family == if cip.is_ipv4() { 1 } else { 2 } && e.scope_prefix <= max)
+    {
+        Some(e) => (
+            (dns::truncate_prefix(e.src, e.scope_prefix), e.scope_prefix),
+            true,
+        ),
+        None => ((cip, cp), false),
+    }
+}
+
+/// P29：stale 命中后的 RFC 8767 后台刷新（对照 dae `backgroundRefresh`）——
+/// 单飞（同一 key 只跑一个）；失败保留旧条目；成功则按 ECS 回填 scope 入缓存，
+/// 若得到不能入缓存的负应答则取代过期正值。
+#[allow(clippy::too_many_arguments)]
+fn maybe_spawn_optimistic_refresh(
+    q: dns::Question,
+    edns: dns::EdnsInfo,
+    query_send: Vec<u8>,
+    base_scope: String,
+    hit_scope: String,
+    injected: Option<(IpAddr, u8)>,
+    up: Arc<dnsup::Upstream>,
+) {
+    let key = format!("{}|{}|{}|{}", hit_scope, q.qname, q.qtype, up.url);
+    let started = match DNS_CACHE.lock() {
+        Ok(mut c) => c.begin_refresh(&key),
+        Err(p) => p.into_inner().begin_refresh(&key),
+    };
+    if !started {
+        DNS_STATS.refresh_coalesced.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    DNS_STATS.refresh_spawned.fetch_add(1, Ordering::Relaxed);
+    std::thread::spawn(move || {
+        let result = up.exchange(&query_send);
+        let mut c = DNS_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        match result {
+            Ok(bytes) => {
+                let mut insert_scope = base_scope;
+                if let Some(injected) = injected {
+                    let ((ip, p), echoed) = ecs_effective_scope(&bytes, injected);
+                    if echoed {
+                        DNS_STATS.ecs_echo.fetch_add(1, Ordering::Relaxed);
+                        if let Ok(mut g) = ECS_SCOPE_LAST.lock() {
+                            *g = Some(format!("{ip}/{p}"));
+                        }
+                    }
+                    insert_scope.push_str(&format!("|ecs={ip}/{p}"));
+                }
+                let fixed = DNS_OPTS
+                    .lock()
+                    .ok()
+                    .and_then(|g| g.fixed_domain_ttl.get(&dns_key(&q.qname)).copied());
+                let cached = c.insert_scoped_with_fixed(
+                    &q,
+                    &edns,
+                    &insert_scope,
+                    &bytes,
+                    Instant::now(),
+                    fixed,
+                );
+                if !cached && dns::is_negative_response(&bytes, q.qtype) {
+                    // 负答不可入缓存：取代被它推翻的过期正值（RFC 8767 §4）。
+                    c.remove_scoped(&q, edns.do_bit, &hit_scope);
+                }
+            }
+            Err(e) => {
+                DNS_STATS.refresh_err.fetch_add(1, Ordering::Relaxed);
+                log(&format!("dns 后台刷新 {} 失败: {e}（保留旧条目）", up.url));
+            }
+        }
+        c.end_refresh(&key);
+    });
 }
 
 /// P3a/P3b/P4b UDP 线程（host ns）：一个透明监听同时承载
@@ -5172,6 +5266,12 @@ fn status_json(ebpf: &mut Ebpf) -> serde_json::Value {
             "ecs": {
                 "echo": DNS_STATS.ecs_echo.load(Ordering::Relaxed),
                 "scope": ECS_SCOPE_LAST.lock().ok().and_then(|g| g.clone()),
+            },
+            "refresh": {
+                "spawned": DNS_STATS.refresh_spawned.load(Ordering::Relaxed),
+                "coalesced": DNS_STATS.refresh_coalesced.load(Ordering::Relaxed),
+                "err": DNS_STATS.refresh_err.load(Ordering::Relaxed),
+                "inflight": DNS_CACHE.lock().map(|c| c.refreshing_len()).unwrap_or(0),
             },
             "responses": DNS_STATS.responses.load(Ordering::Relaxed),
             "published_ips": DNS_STATS.published_ips.load(Ordering::Relaxed),

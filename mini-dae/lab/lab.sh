@@ -1979,8 +1979,11 @@ test_dns_options() {
   echo "$out"
   printf '%s\n' "$out" | grep -q '^answer=10.9.10.71' || { echo "FAIL: stale.test 第二次未解析（optimistic 未生效）"; exit 1; }
   printf '%s\n' "$out" | grep -q '^ttl=7' || { echo "FAIL: stale 应答 TTL 未压到 optimistic_stale_reply_ttl=7"; exit 1; }
-  [ "$(grep -c '^QUERY stale.test ' "$FAKE_DNS_LOG" || true)" = "1" ] \
-    || { echo "FAIL: optimistic 命中后仍重查了上游（fixed_ttl 未生效？）"; cat "$FAKE_DNS_LOG"; exit 1; }
+  # P29：stale 命中触发 RFC 8767 后台刷新（单飞）——等待假上游恰好收到 1 次刷新（共 2 次）
+  local i=0
+  while [ "$(grep -c '^QUERY stale.test ' "$FAKE_DNS_LOG" || true)" != "2" ] && [ "$i" -lt 30 ]; do sleep 0.1; i=$((i+1)); done
+  [ "$(grep -c '^QUERY stale.test ' "$FAKE_DNS_LOG" || true)" = "2" ] \
+    || { echo "FAIL: 后台刷新未发生或重复（期望共 2 次上游查询，实际 $(grep -c '^QUERY stale.test ' "$FAKE_DNS_LOG" || true)）"; cat "$FAKE_DNS_LOG"; exit 1; }
   # 3) ipversion_prefer=4：先 A（入缓存），AAAA 查询应得到空 NOERROR（ancount=0）
   out="$(ip netns exec "$CLIENT_NS" timeout 8 python3 "$HERE/dns_probe.py" 9.9.9.9 pref.test 2>&1 || true)"
   printf '%s\n' "$out" | grep -q '^answer=10.9.10.72' || { echo "FAIL: pref.test A 未解析"; exit 1; }
@@ -2001,10 +2004,13 @@ assert d.get("ipversion_prefer") == 4, d
 assert d.get("fixed_domain_ttl") == 1, d
 assert d.get("stale_hits", 0) >= 1, d
 assert d.get("ipversion_filtered", 0) >= 1, d
-print("dns opts: stale_hits=%d ipversion_filtered=%d fixed=%d" % (
-    d["stale_hits"], d["ipversion_filtered"], d["fixed_domain_ttl"]))
+assert d["refresh"]["spawned"] >= 1, d["refresh"]
+assert d["refresh"]["err"] == 0, d["refresh"]
+print("dns opts: stale_hits=%d ipversion_filtered=%d fixed=%d refresh=%d/%d" % (
+    d["stale_hits"], d["ipversion_filtered"], d["fixed_domain_ttl"],
+    d["refresh"]["spawned"], d["refresh"]["coalesced"]))
 PY
-  echo "PASS: fixed_domain_ttl / optimistic cache（stale TTL 上限）/ ipversion_prefer"
+  echo "PASS: fixed_domain_ttl / optimistic cache（stale TTL 上限 + RFC 8767 后台刷新单飞）/ ipversion_prefer"
 }
 
 # P25：naive（HTTP/2 CONNECT）TCP 转发 + Basic 认证 + 用户态流控（offload 互斥）。

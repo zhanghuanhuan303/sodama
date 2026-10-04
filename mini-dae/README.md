@@ -192,6 +192,9 @@ P6（suspend/reload/metrics/sysdump/日志轮转/整配置热重载）已完成*
   作用域化缓存；`ecs_scope_ladder` 阶梯查找（请求前缀 → 本机 /32 → 更宽 /20/16/12/8/0，
   只向宽复用）；状态面 `dns.ecs.echo/scope`；lab `ecscache-up`/`test-ecs-cache`
   （scope=0 全局与 /16 跨子网复用；ADR-0052、NOTES §11.43）
+- **P29 optimistic 后台刷新（RFC 8767）**：stale 命中后单飞异步重查（失败保留旧条目；
+  负应答取代过期正值；保留原查询 ECS 语义）；状态面 `dns.refresh.*`；lab
+  `test-dns-options` 断言上游恰好 1 次刷新（ADR-0053、NOTES §11.44）
 - **P5-G3a QUIC（tuic v5）**：惰性 tokio 运行时 + quinn（阻塞 relay 用 block_on 桥接）；
   认证 token = TLS exporter（label=uuid 裸字节、context=password）；TCP 每条中继一条 QUIC
   双向流，UDP 走 QUIC DATAGRAM（含分片/重组）；上游 socket 用自建 `Endpoint` 打 `SO_MARK`；

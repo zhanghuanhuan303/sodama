@@ -1,6 +1,6 @@
 # 对标进度：dae（Go）↔ mini-dae（全 Rust）
 
-- **版本**：v2.5 · 2026-10-04（P21 sniff-punt + P22 UDP v6 全链 + P23 sticky IP/DoH h2/bootstrap/DNS 选项 + P24 uTLS Chrome-120/Vision splice/TUIC 0-RTT + P25 naive/HTTP-2 CONNECT + P26 HTTP/3 + P27 juicity + P28 ECS 回填/ecs_cache）
+- **版本**：v2.6 · 2026-10-04（P25 naive + P26 HTTP/3 + P27 juicity + P28 ECS 回填 + P29 optimistic 后台刷新）
 - **口径**：「覆盖度」= 该域**功能点覆盖**的粗估（我方可用 ÷ dae 等价能力），
   **不是代码行数、不是性能等价**；数字是判断值，逐行给出证据出处。
   按口径分两档汇总：主链路（日常代理网关）与 dae 全功能面。
@@ -15,7 +15,7 @@
 | 2 | **分流主链路** | tproxy/direct/block、控制面 DNS override、五钩子角色、conn_state、双 epoch 热重载、redirect_track 单写者 | 同上全有 | **≈95%** | K0–K3 九用例 ×2 拓扑全过；`verify` 9/9（ADR-0009/0010，NOTES §11.16） |
 | 3 | **规则引擎** | dip/sip/dport/sport/l4proto/ipversion/dscp/mac/pname/domain/geoip/geosite/fallback + not/and + mark/must + sub/subnode | dae 现有函数集全覆盖（geoip/geosite 自 `.dat` 编译期展开，含 attr/ext；pname 走 cgroup2 采集；domain 走 DNS 位图 + 预计算索引）；`sub/subnode` 本版 dae 无此函数 | **≈95%** | **编译产物与 dae 逐字节对拍 5/5**（ADR-0010/0033）；真实 `.dat` 计数与上游清点一致（geoip:cn 15,357 / geosite:cn 6,623）；余项：geosite 负载未纳入对拍、流式解析、pname 用 comm 非 argv basename（CO-RE）；geodata 搜索目录已含 XDG（P18e） |
 | 4 | **配置系统** | 全量 `.dae`（global/dns/routing/group/subscription/node/include）全部生效 | 全量解析 + schema 校验 + 行级诊断；生效 routing 子集 + dns.upstream + **config 的 subscription/node/group 运行时**（ADR-0031）；deferred 项显式列出 | **≈65%** | 解析面与 `config_merger/parser` 语义逐条对齐；执行面为子集，deferred 不静默丢（ADR-0011）；缺 include 展开/全局健康参数全量、多组分派 |
-| 5 | **DNS 子系统** | 透明 UDP/TCP、缓存、EDNS、regex、DoT/DoH/DoQ/H3 上游、`dns.routing` 请求/应答分流、ECS、嗅探 punt | 透明 UDP/TCP（含 **UDP6 接管**）、正负缓存 TTL（**optimistic cache** + **fixed_domain_ttl** + **ipversion_prefer**）、域位图、regex、EDNS/截断、reload 重投影、TCP keep-alive、**DoT/DoH(h2,h1,h3)/DoQ 上游**、**多上游 + `dns.routing`**、**bootstrap_resolver**、ECS 注入/**响应 ECS 回填（scope 作用域缓存 + ecs_cache 阶梯复用）**、`qname(file:)`/`sip()`/`pname()`（mini 扩展） | **≈96%** | ADR-0034–0040/0047/0050/0052；余 optimistic 后台刷新 |
+| 5 | **DNS 子系统** | 透明 UDP/TCP、缓存、EDNS、regex、DoT/DoH/DoQ/H3 上游、`dns.routing` 请求/应答分流、ECS、嗅探 punt | 透明 UDP/TCP（含 **UDP6 接管**）、正负缓存 TTL（**optimistic cache + RFC 8767 后台刷新单飞** + **fixed_domain_ttl** + **ipversion_prefer**）、域位图、regex、EDNS/截断、reload 重投影、TCP keep-alive、**DoT/DoH(h2,h1,h3)/DoQ 上游**、**多上游 + `dns.routing`**、**bootstrap_resolver**、ECS 注入/**响应回填/ecs_cache**、`qname(file:)`/`sip()`/`pname()`（mini 扩展） | **≈97%** | ADR-0034–0040/0047/0050/0052/0053；余 H3 推送/动态表等细节不涉；ECS 为 mini 扩展（dae 无） |
 | 6 | **出站协议栈** | ss（含 2022/插件/shadowtls）、ssr、trojan、vmess、vless、tuic、hysteria2、juicity、naive、http、socks5、anytls | ss classic + **ss2022**、trojan、vmess、vless(tcp/ws/**reality+vision**)、tuic v5（**0-RTT 尝试**）、hy2、**juicity v0（QUIC + exporter 认证 + trojan 风格元数据，TCP+UDP）**、anytls、socks5、http、**naive（HTTP/2 与 HTTP/3 CONNECT + Basic）**、direct；**REALITY ClientHello 对齐 uTLS Chrome-120** | **≈80%**（家族）· **≈98%**（主流可用性） | ADR-0016–0020/0026/0027/0041/0042/0048–0051；**12 家族完成 11**（余 ssr）；**48 条真机 REALITY 全健康**；余 插件/shadowtls、ECH、rustls 路径 uTLS；naive 边界：Basic 依赖外层 TLS |
 | 7 | **转发面** | relay（并发上限/backlog fuse/计费）、UDP endpoint pool（full-cone）、offload 完整 | relay（SO_MARK/半关闭/janitor/**`--max-conns` 并发上限 + `limit_rejected` 指标**）、UDP NAT（ss/vless/vmess/tuic/hy2 协议侧可用；网关策略默认 UDP 直连）、offload 最小实现 | **≈78%** | 512KB 逐字节、UDP 会话复用、offload 用户态零字节均实测（ADR-0015/0022）；并发上限已补（P18e，ADR-0042）；缺 backlog fuse/计费 |
 | 8 | **多节点·订阅·健康检查** | subscription + node + group（min/max/random/fixed）+ alive set + 间隔/容忍度 + 延迟策略 + sticky IP 等 | `--subscribe`/config 订阅（HTTP(S)/file）、group filter/policy、经节点健康探测（TCP+UDP）、拨号失败切换、SIGHUP 订阅热更新、按规则分派不同组、**代理域名粘滞 IP（3 次失败作废 + reload 重置）** | **≈85%** | ADR-0031/0042/0043/0047；lab 双组交叉 + 真机 66/66；余组级 override 细节 |
@@ -23,7 +23,7 @@
 | 10 | **IPv6** | 数据面 + 规则 + 协议全支持 | **TCP+UDP 全链**：v6 解析/tproxy（key 2）/UDP（key 3）/全部协议 v6 目标（含 ss UDP ATYP=4）/v6 direct/**DNS over UDP6 接管**/v6 嗅探；余 ICMPv6/分片 | **≈95%** | ADR-0032/0046；lab `test-v6` 四段全过（TCP、direct、UDP 2/2 跨实现、v6 DNS 源地址正确） |
 | 11 | **部署自动化** | netns 自动搭建（移网卡/sysctl/tproxy 规则，`netns_utils.go`）、systemd（`install/dae.service`）、Docker、发行包、shell 补全 | `lab.sh` / `gateway.sh` 脚本级一键；**systemd unit（`install/dae-mini.service`，capability 最小集 + SIGHUP ExecReload）+ `install/install.sh`（--dry-run/--uninstall）+ `docs/deploy.md`（P18e）**；无打包/发行包 | **≈65%** | 真网关一键脚本体验接近（ADR-0029）；ADR-0042；缺 Docker/发行包/shell 补全 |
 | 12 | **运维面** | 主线较弱（daed 独立项目提供 GraphQL/Web UI） | SIGHUP/USR2、状态 socket（status/rules/config/maps/metrics/reload/suspend/resume）、Prometheus、sysdump/trace、日志轮转 | **≈90%** | 相对 dae 主线领先；daed 的 UI/鉴权不在范围（ADR-0021） |
-| 13 | **质量工程** | Go 单测 244 文件/3.9 万行 + CI（bpf-test/build/docker/go-test…）+ fuzz | **215 单测** + verify 9×2 拓扑 + 专项用例（嗅探 punt/UDP v6/DoH-h2/DNS 选项/ECS 回填/QUIC 嗅探/分组/订阅/naive h2+h3/juicity…）+ 对拍 5 逐字节 + QEMU 双内核矩阵 + soak + 六路径基准 + `dns-bench` + REALITY e2e + RFC 9001/9000 黄金向量 + CI | **≈82%** | ADR-0010/0022/0025/0042/0043/0044/0045–0052；CI 缺特权内核加载类测试 |
+| 13 | **质量工程** | Go 单测 244 文件/3.9 万行 + CI（bpf-test/build/docker/go-test…）+ fuzz | **217 单测** + verify 9×2 拓扑 + 专项用例（嗅探 punt/UDP v6/DoH-h2/DNS 选项/ECS 回填+刷新/QUIC 嗅探/分组/订阅/naive h2+h3/juicity…）+ 对拍 5 逐字节 + QEMU 双内核矩阵 + soak + 六路径基准 + `dns-bench` + REALITY e2e + RFC 9001/9000 黄金向量 + CI | **≈82%** | ADR-0010/0022/0025/0042/0043/0044/0045–0053；CI 缺特权内核加载类测试 |
 | 14 | **性能** | 生产级优化（THP/内存上限/连接池/看门狗） | 六路径基准：direct 31Gbps / relay 24.7Gbps / offload 14.6Gbps / ss 2.5Gbps | **≈55%** | 有数据、缺与 Go 版同机对拍（如实，ADR-0022） |
 | 15 | **真实订阅生态** | 全原生 | 订阅#1（50×vless-ws）✅；订阅#2：anytls ✅、**REALITY+Vision ✅（自实现 TLS 1.3，ADR-0041）** | **≈85%** | ADR-0026/0027/0028/0041；边界外协议可桥接过渡 |
 
@@ -32,8 +32,8 @@
 | 口径 | 完成度 | 说明 |
 |---|---|---|
 | 研究目标（可行性验证） | **100%** | aya 全栈可行、规则逐字节对拍、C 数据面退役、真实节点浏览器可用——结论闭环 |
-| 核心主链路（分流/规则/DNS（含 DoT/DoH h2+h3）/主流协议/转发/运维） | **≈93%** | 日常「tproxy 网关 + 主流节点」已可用；P21–P28 补齐嗅探 punt/粘滞 IP/DoH/DNS 选项（含 ECS 回填）/UDP v6/Chrome-120/naive/HTTP-3/juicity；215 单测 + lab 专项全绿 + 真机自检 66/66 |
-| dae 全功能面（嗅探/多节点/geo/IPv6/安全 DNS/系统集成） | **≈81%（±5%）** | 结构性缺口（P19–P28）收官；IPv6（TCP+UDP）≈95%、规则≈95%、DNS≈96%、嗅探≈90%、协议家族≈80%（12 家族完成 11，余 ssr 与插件/ECH 细项） |
+| 核心主链路（分流/规则/DNS（含 DoT/DoH h2+h3）/主流协议/转发/运维） | **≈93%** | 日常「tproxy 网关 + 主流节点」已可用；P21–P29 补齐嗅探 punt/粘滞 IP/DoH/DNS 选项（含 ECS 回填与后台刷新）/UDP v6/Chrome-120/naive/HTTP-3/juicity；217 单测 + lab 专项全绿 + 真机自检 66/66 |
+| dae 全功能面（嗅探/多节点/geo/IPv6/安全 DNS/系统集成） | **≈81%（±5%）** | 结构性缺口（P19–P29）收官；IPv6（TCP+UDP）≈95%、规则≈95%、DNS≈97%、嗅探≈90%、协议家族≈80%（12 家族完成 11，余 ssr 与插件/ECH 细项） |
 
 ## Top 缺口（按优先级）
 
@@ -41,7 +41,7 @@
 2. ~~多节点/订阅/组 + 健康检查~~ **已完成（P15/P18e/P19）**；~~sticky IP~~ **已完成（P23，ADR-0047）**——余：组级 override 细节；
 3. ~~IPv6 数据面~~ **TCP（P16，ADR-0032）/UDP（P22，ADR-0046）均已完成**；余：ICMPv6/分片；
 4. ~~geoip/geosite/pname~~ **已完成（P17，ADR-0033）**；余项：geosite 对拍覆盖、pname argv basename（CO-RE）、geodata 流式解析；
-5. ~~DoH/DoQ + `dns.routing`~~ **已完成（P18a/b/c）**；~~DoH h2、optimistic cache/`fixed_domain_ttl`/`ipversion_prefer`、bootstrap_resolver~~ **已完（P23，ADR-0047）**；~~DoH h3~~ **已完成（P26，ADR-0050）**；~~上游 ECS 回填/ecs_cache~~ **已完成（P28，ADR-0052）**；余：optimistic 后台刷新；
+5. ~~DoH/DoQ + `dns.routing`~~ **已完成（P18a/b/c）**；~~DoH h2/H3、optimistic cache（含 **RFC 8767 后台刷新**）/`fixed_domain_ttl`/`ipversion_prefer`/bootstrap_resolver~~ **全部完成（P23/P26/P29，ADR-0047/0050/0053）**；~~ECS 注入/响应回填/ecs_cache~~ **已完成（P18/P28，ADR-0038/0052，mini 扩展，dae 无）**——DNS 域闭环；
 6. ~~协议细节：REALITY/Vision/uTLS~~ **REALITY+Vision（P18d）、ss2022/http（P18e）**；**uTLS Chrome-120 对齐 + Vision 上行 splice + TUIC 0-RTT 已完成（P24，ADR-0048）**；~~naive（HTTP/2 CONNECT）~~ **已完成（P25，ADR-0049）**；~~naive H3/`naive+quic`~~ **已完成（P26，ADR-0050）**；~~juicity~~ **已完成（P27，ADR-0051）**；余：ECH（rustls 无客户端 ECH）、插件/shadowtls（依赖 fork rustls 暴露 randoms）、ssr、rustls 路径 uTLS、ML-DSA/gecko；
 7. ~~systemd/打包/daed~~ **systemd/安装脚本/CI 已完成（P18e，ADR-0042）**；余 Docker/发行包/shell 补全；daed（Web UI）不在范围；
 8. offload 完整形态（fuse/计费）；~~relay 并发上限~~ **已完成（P18e，`--max-conns`，ADR-0042）**。
@@ -71,6 +71,7 @@
 - **HTTP/3 双项**（P26，ADR-0050）：`h3client` 最小 HTTP/3（控制流 + SETTINGS + QPACK 静态编解码 + DATA 帧 + CONNECT 隧道读写半），DoH 上游新增 `h3://`（连接复用 + 失败重建）、`naive+quic://`（ALPN=h3 CONNECT）；quic-go fork 离线夹具跨实现（h3 512KB 双向 + 连接复用断言）；varint 抽 `quicvarint` 共享（RFC 9000 §A.1 向量）；
 - **juicity v0 出站**（P27，ADR-0051）：quinn + TLS exporter 认证（保持打开的认证单向流）+ trojan 风格元数据（IPv4/IPv6/域名）；TCP 每连接一条流、UDP 每 NAT 会话一条流（`[元数据][len u16][载荷]` 双工帧）；Go/quic-go 参考服务端跨实现（TCP 512KB + UDP 3/3）；
 - **ECS 回填/ecs_cache**（P28，ADR-0052）：解析上游应答的 ECS 回显（RFC 7871 scope），按回填 scope 作用域化缓存 + 阶梯查找（请求前缀 → 本机 /32 → 更宽 /20//16//12//8//0），只向宽复用；状态面 `dns.ecs.echo/scope`；lab scope=0 与 /16 复用断言；
+- **optimistic 后台刷新**（P29，ADR-0053）：stale 命中后单飞异步重查（失败保留旧条目、负应答取代过期正值、保留原查询 ECS 语义）；状态面 `dns.refresh.*`；lab「上游恰好 1 次刷新」断言；
 - **嗅探组合收齐 + 重判**（P20/P21，ADR-0044/0045）：QUIC Initial 解密取 SNI + 用户态规则 VM 重放（域/LPM/not/AND/OR/must，与数据面逐条对齐）——嗅探四类 + punt 三路径（direct/block/组重选）均有 lab 交叉证据；
 - **工程化验收**：QEMU 双内核矩阵、soak 三模式、六路径基准、协议三方交叉（Go 客户端/Python+Go 参考服务端）。
 

@@ -1474,3 +1474,18 @@ lab 夹具 `http_connect_server.py` + `sub_server.py` 每次重读。）
   `test-dns-cache`/`test-dns-options`/`test-dnsroute` 全 PASS；真机网关重启自检 + 66/66 + 0 panic。
 - 边界：不做乐观预取/后台刷新；客户端自带 OPT（含 ECS）仍透传且不入缓存（既有语义）；
   阶梯只覆盖规范前缀，非规范回显 scope（如 /22）按 miss 保守处理。
+
+### 11.44 P29（optimistic cache 后台刷新，ADR-0053）已验收的行为
+
+- `dns.rs`：`DnsCache` 增 `refreshing: HashSet<String>`（key = 命中的作用域键 +
+  qname + qtype + 上游 URL）+ `begin_refresh`/`end_refresh`/`refreshing_len`
+  （单飞）；`answer_from_cache_ecs_full` 返回 `CacheHit{resp, stale, scope}`；
+  `remove_scoped` 精确删键；`is_negative_response`（NXDOMAIN / 空 NOERROR /
+  有 A / SERVFAIL 四态）。
+- `main.rs`：stale 命中→照常回客户端→单飞 spawn 刷新线程（同一 `query_send` 含
+  ECS；失败保留旧条目；成功按 `ecs_effective_scope` 入缓存；负答不可缓存时
+  取代过期正值）；状态面 `dns.refresh.{spawned,coalesced,err,inflight}`。
+- 实测：`cargo test --release` **217/217**；lab `test-dns-options`：stale TTL=7 后
+  假上游在 3s 内恰好收到 1 次刷新（共 2 次，单飞）；状态面 spawned≥1、err=0。
+- 边界：刷新不做应答路由重查（用原上游结果）；刷新线程与主路径共享全局缓存锁
+  （短临界区）。
