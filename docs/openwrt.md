@@ -13,6 +13,23 @@
   内存稳态 ~12MB（见 `docs/memory-report.html`），很适合路由器。
 - QEMU 冒烟（§5）在自编镜像上自动验证：二进制运行 → veth/netns/datapath → eBPF 加载/TCX 挂载 → status。
 
+## 0.1 当前进度（2026-10-05：P0 应用侧已完成，自编内核冒烟阶段暂停）
+
+- ✅ **已完成**：
+  - musl 静态交叉构建（x86_64/aarch64/armv7，`sodama/lab/build-openwrt.sh`）；
+  - ipk 预编译包（`install/openwrt/`：Makefile/procd/uci/数据面对 helper）；
+  - 内核 fragment（`install/openwrt/kernel-fragment.config`）与平台要求文档（本文件）；
+  - 官方镜像 QEMU 冒烟（`sodama/lab/openwrt-smoke.sh`）：跑通「ipk 安装 → 二进制运行 → 数据面报错定位」，
+    并**实测确认官方内核缺 `CONFIG_NAMESPACES`**；脚本已支持 `OPENWRT_IMG=` 指向自定义镜像。
+- ⏸️ **暂停（移到后续阶段）**：自编内核镜像上的完整 eBPF 冒烟。
+  - 源码/构建目录留在 `<openwrt-build-dir>`（~1.1GB，v24.10.4）。
+  - **已定位构建宿主问题**（与 sodama 无关）：Arch/GCC 15 下 `tools/cmake 3.30.5` bootstrap 链接失败
+    （`cmGlobalGhsMultiGenerator` 未定义）。最小补丁（已验证预处理/编译思路）：删除 `Source/cmake.cxx` 中
+    GHS 的 include 与 `NewFactory()` 注册两行，固化为 `tools/cmake/patches/161-*.patch`。
+  - 恢复步骤：应用补丁 → `make -j$(nproc)` → `bin/targets/x86/64/*ext4-combined.img.gz` →
+    `OPENWRT_IMG=<img> sodama/lab/openwrt-smoke.sh`。
+- 后续：aarch64 真机验证；SDK 内出 ipk 一键化。
+
 ## 1. 交付物与快速开始
 
 ```bash

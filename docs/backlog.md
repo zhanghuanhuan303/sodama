@@ -33,7 +33,7 @@ G1 同机 + 真实节点口径均已交付。以下为余项。
 | A8 | **许可证一致性审计** | `LICENSE`=AGPL-3.0，但部分源码头为 `SPDX GPL-2.0`（不一致）；依赖需 SBOM | 全部源码/配置文件头统一为 AGPL-3.0-only（或逐文件说明例外）；`cargo deny`/SBOM 跑通并记录第三方许可证清单 |
 | A9 | **install.sh 升级/回滚** | 当前只有装/卸 | `--upgrade`：保留上一版二进制，systemd 启动失败自动回滚；dry-run 覆盖新路径 |
 | A10 | **容器/内核兼容性矩阵文档** | eBPF 对内核/BTF/CAP 有要求 | ✅ 已完成：`docs/openwrt.md` §2 给出 kernel fragment（**NAMESPACES/NET_NS 是硬前提，官方镜像默认未开**——已用 QEMU 实测确认）与逐项排障；`docs/deploy.md` 含容器 capability 清单 |
-| A11 | **OpenWrt 支持（P0）** | ✅ 已完成（2026-10-05）：musl 静态交叉构建（x86_64 7.2MB / aarch64 6.3MB / armv7 6.2MB，`lab/build-openwrt.sh`，zig+cargo-zigbuild）；`install/openwrt/` ipk 包（预编译产物 + procd + uci + 数据面对 helper）；内核 fragment 已实战验证（自编镜像 + QEMU 冒烟 `lab/openwrt-smoke.sh`）；文档 `docs/openwrt.md`。代码侧仅一处 musl 适配（`MSG_WAITFORONE` 类型；`malloc_trim` 已有 cfg 门控） | 后续：真机（aarch64 路由器）验证；SDK 内出 ipk 一键化（已给步骤） |
+| A11 | **OpenWrt 支持（P0）** | ✅ 应用侧已完成（2026-10-05）：musl 静态交叉构建（x86_64 7.2MB / aarch64 6.3MB / armv7 6.2MB，`lab/build-openwrt.sh`，zig+cargo-zigbuild）；`install/openwrt/` ipk 包（预编译产物 + procd + uci + 数据面对 helper）；内核 fragment 与文档 `docs/openwrt.md`。代码侧仅一处 musl 适配（`MSG_WAITFORONE` 类型；`malloc_trim` 已有 cfg 门控）。官方镜像 QEMU 冒烟跑通 ipk/二进制并实测确认**官方内核缺 CONFIG_NAMESPACES**；⏸️ **暂停**（按用户指示移到后续）：自编内核镜像上的完整 eBPF 冒烟（cmake 3.30.5 bootstrap 宿主补丁已定位，构建目录 <openwrt-build-dir> 保留） | 后续：应用 cmake 补丁 → 自编镜像跑通完整冒烟；aarch64 真机验证；SDK 一键出 ipk |
 
 ## B. 出站协议余项（如实边界）
 

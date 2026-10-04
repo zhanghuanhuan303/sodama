@@ -1,0 +1,394 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>sodama · 项目总结报告（整体工程）</title>
+<style>
+  :root{
+    --bg:#0f1115; --card:#171a21; --card2:#1d212b; --fg:#e6e9ef; --muted:#9aa3b2;
+    --line:#2a2f3a; --accent:#5ee0a0; --accent2:#7cc4ff; --warn:#ffcc66; --bad:#ff7b72;
+    --ok:#5ee0a0; --shadow:0 8px 28px rgba(0,0,0,.35); --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+    --sans:-apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans CJK SC","PingFang SC","Microsoft YaHei",sans-serif;
+  }
+  @media (prefers-color-scheme: light){
+    :root{ --bg:#f6f7fa; --card:#ffffff; --card2:#f0f2f6; --fg:#1c2028; --muted:#5b6472; --line:#e2e6ee;
+           --shadow:0 6px 20px rgba(20,30,60,.08); }
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.65 var(--sans);}
+  .wrap{max-width:1080px;margin:0 auto;padding:32px 20px 80px}
+  header.top{border-bottom:1px solid var(--line);padding-bottom:18px;margin-bottom:26px}
+  h1{font-size:26px;margin:0 0 6px;letter-spacing:.2px}
+  h2{font-size:20px;margin:38px 0 12px;padding-top:10px;border-top:1px solid var(--line)}
+  h3{font-size:16px;margin:24px 0 8px}
+  p{margin:8px 0}
+  .sub{color:var(--muted);font-size:13.5px}
+  .chips{display:flex;flex-wrap:wrap;gap:8px;margin:12px 0 0}
+  .chip{background:var(--card2);border:1px solid var(--line);border-radius:999px;padding:3px 11px;font-size:12.5px;color:var(--muted)}
+  .chip b{color:var(--fg);font-weight:600}
+  .grid{display:grid;gap:14px;grid-template-columns:repeat(auto-fit,minmax(230px,1fr))}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:16px 16px 14px;box-shadow:var(--shadow)}
+  .kpi{font-size:26px;font-weight:700;letter-spacing:.3px}
+  .kpi small{font-size:12.5px;color:var(--muted);font-weight:500;margin-left:4px}
+  .tag{display:inline-block;font-size:11.5px;padding:2px 8px;border-radius:6px;border:1px solid var(--line);color:var(--muted);margin-right:6px}
+  .tag.ok{color:var(--ok);border-color:rgba(94,224,160,.35)}
+  .tag.warn{color:var(--warn);border-color:rgba(255,204,102,.35)}
+  .tag.bad{color:var(--bad);border-color:rgba(255,123,114,.35)}
+  table{width:100%;border-collapse:collapse;margin:12px 0;font-size:14px}
+  th,td{border:1px solid var(--line);padding:7px 9px;text-align:right}
+  th:first-child,td:first-child{text-align:left}
+  thead th{background:var(--card2);color:var(--muted);font-weight:600;font-size:12.5px}
+  td.n{font-family:var(--mono)}
+  .best{color:var(--accent);font-weight:700}
+  .worst{color:var(--bad)}
+  .bar{height:10px;border-radius:5px;background:linear-gradient(90deg,var(--accent2),var(--accent));min-width:2px;display:inline-block;vertical-align:middle}
+  .bar.alt{background:linear-gradient(90deg,#8f9bb3,#c2cbd9)}
+  .bar.warm{background:linear-gradient(90deg,#e0a060,#ffcc66)}
+  .bars{display:grid;grid-template-columns:170px 1fr 100px;gap:6px 10px;align-items:center;margin:10px 0}
+  .bars .lbl{color:var(--muted);font-size:13px;text-align:left}
+  .bars .val{font-family:var(--mono);font-size:13px;text-align:right}
+  .note{background:var(--card2);border-left:3px solid var(--accent2);border-radius:8px;padding:10px 12px;margin:12px 0;color:var(--muted);font-size:13.5px}
+  .note b{color:var(--fg)}
+  .note.ok{border-left-color:var(--accent)}
+  .note.warn{border-left-color:var(--warn)}
+  code,pre{font-family:var(--mono)}
+  pre{background:var(--card2);border:1px solid var(--line);border-radius:10px;padding:12px;overflow:auto;font-size:12.5px;line-height:1.5}
+  .ok{color:var(--ok)} .warnc{color:var(--warn)} .badc{color:var(--bad)} .muted{color:var(--muted)}
+  .foot{margin-top:46px;border-top:1px solid var(--line);padding-top:14px;color:var(--muted);font-size:12.5px}
+  .two{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+  @media (max-width:760px){ .two{grid-template-columns:1fr} }
+  .flow{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px;margin:12px 0}
+  .step{background:var(--card2);border:1px solid var(--line);border-radius:10px;padding:8px 10px;font-size:13px}
+  .step b{display:block;font-size:12.5px;color:var(--muted)}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header class="top">
+  <h1>sodama · 项目总结报告 <span class="tag ok">整体工程</span></h1>
+  <div class="sub">dae（Go + Go-eBPF 透明代理网关）→ 全 Rust 重写：数据面纯 Rust eBPF（C 已退役）+ 用户态 reactor/零拷贝/协议栈 ·
+  2026-10-05 · v1.0 · 仓库 <code>github.com/zhanghuanhuan303/dae-rust</code></div>
+  <div class="chips">
+    <span class="chip">数据面 <b>8 程序 / 14 map（TCX，单一 Rust 对象）</b></span>
+    <span class="chip">单测 <b class="ok">257/257</b></span>
+    <span class="chip">ADR <b>×58</b></span>
+    <span class="chip">对标 dae <b>研究 100% · 核心 ≈93% · 全功能 ≈83%</b></span>
+    <span class="chip">同机 VLESS <b class="ok">16.9 Gbps / CPU 60 ms</b></span>
+    <span class="chip">真实节点 CPU/GB <b class="ok">6233</b> vs dae 8820 / sing-box 8557</span>
+    <span class="chip">内存稳态 <b class="ok">12.5 MB</b> · 10k 连接 34.8 MB / 29 线程</span>
+  </div>
+</header>
+
+<section>
+<h2>01 · 摘要（六张卡片）</h2>
+<div class="grid">
+  <div class="card">
+    <div class="sub">全 Rust 化</div>
+    <div class="kpi">100%</div>
+    <div class="sub">eBPF 数据面 8 程序 / 14 BTF map（~1.4k 行）+ 控制面 ~40k 行；<b class="ok">C 数据面退役</b>（ADR-0025），TCX 退出即自动摘钩</div>
+  </div>
+  <div class="card">
+    <div class="sub">吞吐（同机 lab 口径）</div>
+    <div class="kpi">16.9 <small>Gbps</small></div>
+    <div class="sub">VLESS 明文 48MB×4 / CPU <b class="ok">60 ms</b>（M1 splice）；relay 21.6 Gbps；TLS 12.3 Gbps（受同机夹具 ≈12.5 Gbps 封顶）</div>
+  </div>
+  <div class="card">
+    <div class="sub">真实节点（G1，客户端 CPU/GB）</div>
+    <div class="kpi">6 233</div>
+    <div class="sub">vs dae 8 820（−29%）/ sing-box 8 557（−27%）；同后端轮 4 987 vs 8 613 / 10 290（−42% / −52%）</div>
+  </div>
+  <div class="card">
+    <div class="sub">内存（五方终测，含 mihomo）</div>
+    <div class="kpi">12.5 <small>MB</small></div>
+    <div class="sub">静置稳态；hold 2000 仅 29–30.5 MB（dae 297–299 = <b class="ok">1/10</b>）；UDP 20k pps 29.2 MB / 580 ms 最低</div>
+  </div>
+  <div class="card">
+    <div class="sub">规模模型</div>
+    <div class="kpi">29 <small>线程 / 10k 连接</small></div>
+    <div class="sub">34.8 MB；同二进制线程模型对照 20 012 线程 / 527 MB（<b class="ok">ADR-0058</b>）；风暴 26 026 conn/s</div>
+  </div>
+  <div class="card">
+    <div class="sub">交付形态</div>
+    <div class="kpi">3 <small>平台</small></div>
+    <div class="sub">真网关一键（自检+回滚）、systemd 安装、静态 musl x86_64/aarch64/armv7、OpenWrt ipk（P0 应用侧完成）</div>
+  </div>
+</div>
+<div class="note ok">
+<b>一句话：</b>把 dae 从 Go+C-eBPF 全量重写为 Rust（数据面纯 aya-eBPF + 用户态 reactor/零拷贝），
+在<b>同机与真实节点两种口径下吞吐同档、CPU 与内存全面最低</b>；功能面对标 dae 核心主链路 ≈93%，
+剩余为 L2/桥接族、插件余项等边界项；发布工程化（Docker/发行包/许可证审计）与 OpenWrt 自编内核验证为下一阶段。
+</div>
+</section>
+
+<section>
+<h2>02 · 工程历程（阶段）</h2>
+<table>
+  <thead><tr><th>阶段</th><th>内容</th><th>验收/产出</th></tr></thead>
+  <tbody>
+    <tr><td><b>K0–K3 内核攻坚</b></td>
+      <td>dae eBPF 数据面源码级研究（反汇编+逐函数移植）；规则 VM 逐字节对拍；数据面 Rust 化（aya-ebpf/BTF）</td>
+      <td>8 程序/14 map；规则对拍逐字节一致；<b class="ok">C 数据面退役</b>（ADR-0025）；lab 拓扑/verify 夹具成型</td></tr>
+    <tr><td><b>P3–P33 功能与生态</b></td>
+      <td>分流主链路（domain/sip/dip/port/pname/mac/dscp）；DNS 子系统（缓存/路由/DoT/DoH h2+h3/DoQ/ECS）；12 协议家族 + shadow-tls；订阅/节点组/健康检查/粘滞 IP；嗅探+dial_mode+sniff-punt（TLS/HTTP/QUIC）；IPv6 TCP+UDP 全链；真网关模式；运维状态面</td>
+      <td>lab 专项全绿；真机浏览器验收（YouTube 200 / 出口 IP 正确）；订阅#1（50×vless-ws）与订阅#2（REALITY+Vision / anytls）真实节点可用</td></tr>
+    <tr><td><b>M1–M4 性能</b></td>
+      <td>M1 splice 零拷贝（Direct/VLESS 明文）；M2 kTLS 内核 TLS + TLS 上 splice；M3 Vision-over-TLS（双向 XTLS DIRECT）；M4 epoll worker 池（每连接 0 线程）+ offload 看门狗单线程</td>
+      <td>vless 12.2→16.9 Gbps / CPU 380→60 ms；relay 8 流 21.6 Gbps；TLS memcpy 29.4%→1.6%；10k 连接 28→29 线程 / 34.8 MB（线程模型 527 MB）；风暴 26k/s</td></tr>
+    <tr><td><b>O3–O10 专项优化</b></td>
+      <td>O5 printk 门控；O6 AEAD 实测定调（chacha 保留）；O7 UDP recvmmsg/sendmmsg + 分片会话表；O8 缓冲池（按字节封顶 8MB）+ 有界优雅退出 + 30s trim；O9 kTLS；O10 vision</td>
+      <td>20k pps 0 丢包 CPU 580 ms/40k 包（五方最低）；退出整机 462 ms 无残留；churn 300 条 RSS 无增长</td></tr>
+    <tr><td><b>G1 真实口径</b></td>
+      <td>真实订阅节点/公网基准（sodama/dae/sing-box 共用同一节点与固定后端 IP；v2ray 无 REALITY 显式 skip）；CPU 计量升级 ns 级 schedstat</td>
+      <td>17 轮/实现：CPU/GB <b class="ok">6233 vs 8820 / 8557</b>；文档 P5/06c 节；工具 <code>real.sh</code>/<code>probe-node*</code> 入库</td></tr>
+    <tr><td><b>内存终测</b></td>
+      <td>五方五阶段（idle→吞吐→hold2000→churn→静置回收），新纳入 mihomo（Clash Verge 内核）</td>
+      <td>五阶段全部最低（见 05 节）；独立报告 <code>docs/memory-report.html</code></td></tr>
+    <tr><td><b>OpenWrt P0</b> <span class="tag warn">应用侧完成，内核冒烟暂停</span></td>
+      <td>musl 静态交叉构建三架构；ipk 包（procd/uci/数据面对）；内核 fragment；QEMU 自动冒烟</td>
+      <td>官方内核缺 <code>CONFIG_NAMESPACES</code>（实测确认，dae 同样依赖）；自编内核镜像冒烟移至后续（cmake bootstrap 宿主补丁已定位）</td></tr>
+  </tbody>
+</table>
+</section>
+
+<section>
+<h2>03 · 架构总览</h2>
+<div class="two">
+  <div>
+    <h3>数据面（eBPF，全 Rust）</h3>
+    <table>
+      <thead><tr><th>组件</th><th>要点</th></tr></thead>
+      <tbody>
+        <tr><td>程序/hook</td><td>7×TC + sk_skb；TCX 挂载（退出自动摘除）；LAN ingress / WAN egress+ingress / dae0 / dae0peer / 单臂 dual-role</td></tr>
+        <tr><td>分流 VM</td><td>domain/sip/dip/sport/dport/l4proto/ipversion/dscp/pname/mac + fallback + 逻辑与或非 + must；epoch 双槽热重载</td></tr>
+        <tr><td>透明代理</td><td>tproxy v4/v6；sockmap offload；UDP 批量 + 16 分片会话表</td></tr>
+        <tr><td>DNS/嗅探</td><td>DNS 接管与 dns.routing；TLS/HTTP/QUIC SNI 嗅探（用户态 MSG_PEEK，不消费字节）</td></tr>
+        <tr><td>进程名</td><td>cgroup2 钩子 6/6（connect4/6、sendmsg4/6、sock_create/release）</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div>
+    <h3>控制面（用户态 Rust）</h3>
+    <table>
+      <thead><tr><th>组件</th><th>要点</th></tr></thead>
+      <tbody>
+        <tr><td>relay/reactor</td><td>epoll worker 池；字节透明链路 splice 零拷贝；codec 会话入池（VLESS 全组合/Trojan/vmess/ss 系/anytls）</td></tr>
+        <tr><td>TLS/REALITY/Vision</td><td>rustls（ring）+ 自实现 REALITY/Vision（XTLS DIRECT 双向）；kTLS 实验开关；ws/wss</td></tr>
+        <tr><td>协议栈</td><td>12 家族 + shadow-tls 插件：vless/vmess/trojan/ss/ss2022/ssr/hysteria2/tuic/juicity/naive/shadow-tls/anytls</td></tr>
+        <tr><td>路由/组/DNS</td><td>订阅/组/健康检查/粘滞 IP；DNS 缓存/路由/加密上游/ECS</td></tr>
+        <tr><td>资源治理</td><td>缓冲池封顶 8MB；UDP 槽按需；30s malloc_trim；SIGTERM 有界退出</td></tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+<h3>运维面</h3>
+<p class="sub">Unix socket 状态面（status/rules/config/maps/metrics/reload/suspend/resume）、Prometheus 文本导出、sysdump/trace、
+日志文件轮转（SIGHUP reopen）、启动自检与失败自动回滚（真网关一键脚本）。</p>
+<div class="flow">
+  <div class="step"><b>1 客户端</b>LAN/WAN 钩子（TCX）</div>
+  <div class="step"><b>2 分流 VM</b>规则命中 → proxy/direct/block</div>
+  <div class="step"><b>3 控制面对</b>dae0 veth + tproxy（netns daens）</div>
+  <div class="step"><b>4 relay/reactor</b>splice / codec / offload</div>
+  <div class="step"><b>5 节点</b>协议栈 + 真实出口</div>
+</div>
+</section>
+
+<section>
+<h2>04 · 对标 dae 完成度（parity-status 摘要）</h2>
+<table>
+  <thead><tr><th>口径</th><th>完成度</th><th>说明</th></tr></thead>
+  <tbody>
+    <tr><td>研究目标（可行性验证）</td><td class="n best">100%</td><td>aya 全栈可行、规则逐字节对拍、C 数据面退役、真实节点浏览器可用——结论闭环</td></tr>
+    <tr><td>核心主链路（分流/规则/DNS/主协议/转发/运维）</td><td class="n best">≈93%</td><td>日常「tproxy 网关 + 主流节点」已可用；嗅探 punt/粘滞 IP/DoH/DNS 选项（含 ECS 回填）/UDP v6/naive/juicity/SSR/shadow-tls 已补齐</td></tr>
+    <tr><td>dae 全功能面</td><td class="n">≈83%（±5%）</td><td>结构性缺口收官；IPv6 ≈95%、规则 ≈95%、DNS ≈97%、嗅探 ≈90%、协议家族 ≈85%</td></tr>
+  </tbody>
+</table>
+<div class="two">
+  <div>
+    <h3>已对齐的高价值能力</h3>
+    <ul class="sub">
+      <li>分流规则词汇全覆盖 + epoch 热重载（SIGHUP 不断流）</li>
+      <li>12 协议家族 + shadow-tls；REALITY/Vision 自实现</li>
+      <li>DNS 全链：缓存/路由/DoT/DoH h2+h3/DoQ/ECS/透明接管</li>
+      <li>嗅探：TLS/HTTP/QUIC SNI + dial_mode（ip/domain/domain+）+ sniff-punt 出口重选</li>
+      <li>订阅/组/健康检查/粘滞 IP；真网关一键 + 自检回滚</li>
+      <li>IPv6 TCP+UDP 全链（v6 嗅探/tproxy/DNS/协议目标）</li>
+      <li>运维面（相对 dae 主线<b>领先</b>）：状态 socket/Prometheus/sysdump/trace</li>
+    </ul>
+  </div>
+  <div>
+    <h3>已知缺口（下版本/边界）</h3>
+    <ul class="sub">
+      <li>eBPF：L2/桥接变体族、kprobe/fentry、ringbuf 事件通道、XDP 调研（C1/C3/C4）</li>
+      <li>协议：其余 SIP003 插件（simple-obfs/v2ray-plugin）、SSR 全形态、ECH、rustls uTLS 指纹（B1–B5）</li>
+      <li>转发：UDP full-cone/endpoint pool、backlog fuse/计费（E1–E3）</li>
+      <li>嗅探/IPv6：QUIC 域名拨号/punt、ICMPv6、v6 分片（F1–F3）</li>
+      <li>发布工程化：许可证一致性（A8）、版本/CHANGELOG、Docker/发行包/发行 CI、shell 补全、Makefile/PKGBUILD（A 类）</li>
+      <li>质量：fuzz、特权内核 CI、夜间 soak、verify 夹具修复（G3–G6）</li>
+    </ul>
+  </div>
+</div>
+</section>
+
+<section>
+<h2>05 · 性能与内存汇总（数据口径）</h2>
+<div class="two">
+  <div>
+    <h3>同机吞吐（VLESS 主线）</h3>
+    <table>
+      <thead><tr><th>口径</th><th>sodama</th><th>对照</th></tr></thead>
+      <tbody>
+        <tr><td>VLESS 明文 48MB×4</td><td class="n best">16 926 Mbps / 60 ms</td><td class="n">sing-box 17 738/90 · dae 12 706/420 · v2ray 10 971/670</td></tr>
+        <tr><td>VLESS 明文 8×64MB</td><td class="n best">16 177 Mbps / 190 ms</td><td class="n">—（M1 前 11 678 / 1 100 ms）</td></tr>
+        <tr><td>relay 8×64MB</td><td class="n best">21 580 Mbps / 150 ms</td><td class="n">4 流 23 147</td></tr>
+        <tr><td>VLESS+TLS（kTLS）</td><td class="n">12 318 Mbps / 400 ms</td><td class="n">同机夹具封顶 ≈12.5 Gbps</td></tr>
+        <tr><td>UDP 20k pps</td><td class="n best">580 ms / 40k 包 · RSS 29.2 MB</td><td class="n">dae 2 100 · sing-box 1 620 · v2ray 1 770 · mihomo 2 425</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div>
+    <h3>内存终测（五方五阶段，MB 峰值）</h3>
+    <table>
+      <thead><tr><th>实现</th><th>idle</th><th>hold 2000</th><th>churn 10s</th><th>静置 30s</th></tr></thead>
+      <tbody>
+        <tr><td><b>sodama</b></td><td class="n best">27–28.5</td><td class="n best">29–30.5</td><td class="n best">29.7–31.2</td><td class="n best">12.4–12.5</td></tr>
+        <tr><td>dae</td><td class="n">50.3–50.5</td><td class="n worst">297–299</td><td class="n worst">406–419</td><td class="n">81.7–83.3</td></tr>
+        <tr><td>sing-box</td><td class="n">58.7–60.2</td><td class="n">90.6–94.5</td><td class="n">92.7–94.5</td><td class="n">76.8–78.4</td></tr>
+        <tr><td>v2ray</td><td class="n">43.4–45.7</td><td class="n">139–144</td><td class="n">463–495</td><td class="n">190–318</td></tr>
+        <tr><td>mihomo</td><td class="n">50.5–51.4</td><td class="n">168–174</td><td class="n">191–233</td><td class="n">68.4–72.3</td></tr>
+      </tbody>
+    </table>
+    <p class="sub">两遍独立复测（偏差 ≤3%）；sodama 10k 连接 = 34.8 MB / 29 线程、churn 26 026 conn/s；
+    完整方法见 <code>docs/memory-report.html</code>。</p>
+  </div>
+</div>
+<div class="note">
+<b>真实节点（G1）：</b>三方共用同一 VLESS-REALITY 节点与固定后端 IP、8 MiB×17 轮，
+客户端 CPU_ms/GB：<b class="ok">sodama 6 233 &lt; sing-box 8 557 &lt; dae 8 820</b>；
+同后端轮差距扩大到 −42% / −52%（节点带宽 7–14 Mbps 为共同上限，吞吐不可分辨）。
+</div>
+</section>
+
+<section>
+<h2>06 · 工程质量与文档体系</h2>
+<div class="two">
+  <div>
+    <table>
+      <thead><tr><th>项</th><th>状态</th></tr></thead>
+      <tbody>
+        <tr><td>单元测试</td><td class="n best">257/257（release；7 ignored）</td></tr>
+        <tr><td>ADR</td><td class="n">×58（0001–0058）</td></tr>
+        <tr><td>lab 夹具</td><td>verify 拓扑 + 专项（嗅探/UDP v6/DoH/ECS/vision 四模式逐字节/对拍 5/QEMU 双内核矩阵/soak/六路径基准）</td></tr>
+        <tr><td>CI</td><td>eBPF 对象 + loader 编译/单测（无特权内核加载；G4 待补）</td></tr>
+        <tr><td>性能/内存冻结口径</td><td class="n">run.sh / real.sh / mem.sh / udp.sh / scaling.sh</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div>
+    <table>
+      <thead><tr><th>文档</th><th>内容</th></tr></thead>
+      <tbody>
+        <tr><td><code>architecture-decision.html</code> v2.43</td><td>决策档案（主文档）</td></tr>
+        <tr><td><code>vless-proposal.html</code> v1.9</td><td>VLESS 性能实测与优化提案（M1–M4/G1）</td></tr>
+        <tr><td><code>memory-report.html</code> v1.0</td><td>内存终测（五方五阶段）</td></tr>
+        <tr><td><code>project-summary.html</code> v1.0</td><td>本文件：整体工程总结</td></tr>
+        <tr><td><code>optimization-roadmap.md</code></td><td>O1–O10 优化方向与验收</td></tr>
+        <tr><td><code>parity-status.md</code></td><td>dae ↔ sodama 分域覆盖度与证据</td></tr>
+        <tr><td><code>openwrt.md</code></td><td>OpenWrt 平台前提/打包/集成/验证</td></tr>
+        <tr><td><code>backlog.md</code></td><td>余项登记（A–H 类）</td></tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+</section>
+
+<section>
+<h2>07 · 部署与生态</h2>
+<table>
+  <thead><tr><th>形态</th><th>状态</th><th>入口</th></tr></thead>
+  <tbody>
+    <tr><td>真网关（宿主透明接管）</td><td class="n best">可用</td><td><code>lab/gateway.sh up|test|down</code>（启动自检 + 失败自动回滚；浏览器零配置）</td></tr>
+    <tr><td>systemd 安装</td><td class="n">可用</td><td><code>install/install.sh</code> + <code>install/sodama.service</code>（capability 最小集 + ExecReload）</td></tr>
+    <tr><td>静态二进制（musl）</td><td class="n">x86_64 7.2 / aarch64 6.3 / armv7 6.2 MB</td><td><code>lab/build-openwrt.sh</code>（zig + cargo-zigbuild）</td></tr>
+    <tr><td>OpenWrt ipk</td><td class="n">应用侧完成（procd/uci/数据面对）</td><td><code>install/openwrt/</code> + <code>docs/openwrt.md</code>（内核需自编：NAMESPACES/NET_NS）</td></tr>
+    <tr><td>真实订阅生态</td><td class="n best">可用</td><td>订阅#1（50×vless-ws）；订阅#2（REALITY+Vision 48 节点 + anytls 18 节点）；浏览器实测通过</td></tr>
+    <tr><td>Docker / 发行包 / shell 补全</td><td class="n warnc">未做（A1–A3/A5）</td><td>下一阶段「发布工程化」</td></tr>
+  </tbody>
+</table>
+</section>
+
+<section>
+<h2>08 · 当前状态与后续路线</h2>
+<div class="grid">
+  <div class="card">
+    <div class="sub">下一阶段（建议主题：发布工程化 v3.0）</div>
+    <ul class="sub">
+      <li><b>A8 许可证一致性审计</b>（LICENSE=AGPL-3.0 与部分源码头 GPL-2.0 不一致；开源前必做）</li>
+      <li>A4 版本号 + CHANGELOG（<code>--version</code> 输出 git sha）</li>
+      <li>A1–A3 Docker / tarball / 发行 CI（tag 触发 + SHA256SUMS）</li>
+      <li>A5–A7 shell 补全 / Makefile / PKGBUILD；A9 升级回滚</li>
+      <li>H1 README 重写（状态区与当前 257 单测/ADR-0058 对齐）</li>
+    </ul>
+  </div>
+  <div class="card">
+    <div class="sub">功能余项（v3.1+）</div>
+    <ul class="sub">
+      <li>E1 UDP full-cone/endpoint pool；F1 QUIC 域名拨号 + punt</li>
+      <li>D1 <code>include</code> 展开、D2 健康检查参数全量、D4 组级 override</li>
+      <li>F2/F3 ICMPv6 error、IPv6 分片</li>
+      <li>C3 ringbuf 事件通道、C4 XDP 调研、C1 L2/桥接族（按需）</li>
+      <li>B1/B2 协议插件族（ss 方向暂缓，按 VLESS 主线）</li>
+    </ul>
+  </div>
+  <div class="card">
+    <div class="sub">OpenWrt（P0 续项）</div>
+    <ul class="sub">
+      <li>应用 cmake bootstrap 宿主补丁 → 自编内核镜像（fragment 与构建目录已就绪）</li>
+      <li><code>OPENWRT_IMG=… lab/openwrt-smoke.sh</code> 跑通完整 eBPF 冒烟</li>
+      <li>aarch64 真机验证；SDK 内出 ipk 一键化</li>
+    </ul>
+  </div>
+  <div class="card">
+    <div class="sub">质量与长稳</div>
+    <ul class="sub">
+      <li>G3 fuzz（.dae 解析 / DNS / CH）；G4 特权内核 CI；G5 夜间 soak</li>
+      <li>G6 verify 夹具修复（<code>orig_dst=</code> 陈旧断言，6 项）</li>
+      <li>O1/O2（ss 加密环路）按方向暂缓</li>
+    </ul>
+  </div>
+</div>
+</section>
+
+<section>
+<h2>09 · 复现入口</h2>
+<pre># 构建 + 单测
+cd sodama/loader && cargo build --release && cargo test --release      # 257/257
+
+# lab 功能回归（netns 夹具）
+sudo lab/lab.sh up && sudo lab/lab.sh verify
+sudo ./lab/gateway.sh up --config lab/gateway.dae --subscribe ...     # 真网关 + 自检
+
+# 性能/内存/真实节点
+sudo lab/perf/run.sh all                     # 同机四方（vless 主线）
+sudo REAL_NODE_FILE=/tmp/real-node.url lab/perf/real.sh all   # 真实节点口径（G1）
+sudo lab/perf/mem.sh all                     # 五方五阶段内存（含 mihomo）
+sudo lab/perf/udp.sh all                     # UDP 五方
+
+# OpenWrt（应用侧）
+lab/build-openwrt.sh --arch aarch64          # musl 静态产物
+lab/build-openwrt.sh --arch x86_64 && OPENWRT_IMG=... lab/openwrt-smoke.sh   # QEMU 冒烟（自定义镜像恢复后）</pre>
+<p class="sub">报告与入口：<code>docs/architecture-decision.html</code>（决策档案）· <code>docs/vless-proposal.html</code>（性能提案）·
+<code>docs/memory-report.html</code>（内存终测）· <code>docs/openwrt.md</code>（平台）· <code>docs/parity-status.md</code>（对标）· <code>docs/backlog.md</code>（余项）。</p>
+</section>
+
+<div class="foot">
+  sodama · 项目总结报告（整体工程）· v1.0 · 2026-10-05 · Arch / 6.18.54-lts / i9-9900KF ·
+  数据来自同机 lab 口径、真实订阅节点口径（G1）与五方内存终测；结论均为真实运行结果，未做外推。
+  仓库：<code>github.com/zhanghuanhuan303/dae-rust</code>；许可证 AGPL-3.0（头部一致性审计待 A8）。
+</div>
+
+</div>
+</body>
+</html>

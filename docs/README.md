@@ -12,6 +12,7 @@ docs/
 ├── perf-report.md                # 性能对比报告（四方对拍 / 并发扩展 / perf 剖面 / 夹具校准）
 ├── vless-proposal.html           # VLESS 性能实测与优化提案（自包含 HTML，可离线打开）
 ├── memory-report.html            # 内存终测报告（五方对照：sodama/dae/sing-box/v2ray/mihomo，自包含 HTML）
+├── project-summary.html          # 项目总结报告（整体工程：历程/架构/对标/性能/路线，自包含 HTML）
 ├── openwrt.md                    # OpenWrt 支持（musl 构建/内核 fragment/ipk/procd/QEMU 冒烟）
 ├── optimization-roadmap.md       # 优化方向（数据驱动，O1–O10 优先级与验收）
 ├── adr/                          # 已采纳决策记录（ADR-0001..0031）
@@ -27,6 +28,7 @@ docs/
 | 对标进度 | `parity-status.md` | dae（Go）↔ sodama（全 Rust）分域覆盖度对照（15 域 + 汇总 + Top 缺口 + 优势项，附证据锚点） |
 | VLESS 提案 | `vless-proposal.html` | VLESS（明文/TLS）四方实测 + perf 剖面 + 分阶段优化提案（自包含，可离线打开） |
 | 内存终测 | `memory-report.html` | 五方（sodama/dae/sing-box/v2ray/mihomo）五阶段内存对照 + sodama 规模/UDP/回收专项（自包含，可离线打开） |
+| 项目总结 | `project-summary.html` | 整体工程总结：阶段历程/架构总览/对标完成度/性能与内存汇总/工程质量/部署生态/后续路线（自包含，可离线打开） |
 | OpenWrt | `openwrt.md` | musl 交叉构建、内核 fragment（NAMESPACES/NET_NS 关键项）、ipk/procd/uci、拓扑集成与 QEMU 冒烟 |
 | 数据面核心笔记 | `sodama/NOTES.md` | eBPF 分流/tproxy/回程机制的源码级笔记（带行号） |
 | 实验手册 | `sodama/README.md` | sodama 的构建、拓扑、测试与实测输出 |
@@ -88,6 +90,7 @@ go mod edit -json | python3 -c "import json,sys; d=json.load(sys.stdin); \
 | `architecture-decision.html` | v2.43 · 2026-10-04 | dae `main@e3fee8f`（tag `nightly`） |
 | `parity-status.md` | v2.10 · 2026-10-04 | 同上（P33.2 性能深挖后清点；覆盖度为功能点粗估，逐行附证据） |
 | `memory-report.html` | v1.0 · 2026-10-05 | 本版内核收口（M1–M4 + O 系列 + G1）五方内存终测 |
+| `project-summary.html` | v1.0 · 2026-10-05 | 整体工程总结（main@c669ece 基线；OpenWrt P0 应用侧、自编内核冒烟暂停） |
 | `openwrt.md` | v1.0 · 2026-10-05 | OpenWrt 24.10+（内核 ≥6.6 + fragment）；x86_64/aarch64/armv7 musl 构建 |
 | `adr/ADR-0001..0031` | 已采纳 · 2026-10-04 | 同上；D1–D8 决策（0007 被 0009 取代；0010 = K2；0011 = K3；0012 = P3a；0013 = P3b-1；0014 = P3b-2a；0015 = P4；0016 = P5-G1；0017 = P5-G2；0018 = P5-G3a；0019 = P5-G3b；0020 = P5-G3b+；0021 = P6；0022 = P7；0023 = P8；0024 = P9；0025 = 移除 C 数据面；0026 = P10 vless-ws；0027 = P11 anytls；0028 = P12 本地 SOCKS5 入口；0029 = P13 真网关模式；0030 = P14 嗅探 + dial_mode；0031 = P15 订阅/节点组/健康检查） |
 | `sodama/`（K0–K3 + P3–P12 工作台） | 已完成 · 2026-10-04 | ……（P7 剖面/soak/静态发布）+ P8/P9 数据面 Rust 化（8 程序/14 map 全量移植、BTF maps、默认数据面切 Rust）+ **P9+ 移除 C 数据面（单一 Rust 对象，ADR-0025）与完整性回归**（DNS 6/6、转发面 6/6、协议梯 15 会话 17/17、运维 5/5、对拍 5/5、联调 3/4（1 为已知 Go 客户端偏差）、双内核矩阵 9/9、soak 三模式无泄漏；见 NOTES §11.16）+ **P10 vless-ws（ADR-0026/§11.17）+ P11 AnyTLS（ADR-0027/§11.18，真实节点 e2e 204）+ P12 本地 SOCKS5 入口（ADR-0028/§11.19，浏览器验收 YouTube 200）与 P13 真网关模式（ADR-0029/§11.20，`--lan none` + `lab/gateway.sh`，宿主流量透明接管：204/YouTube 200、出口 IP=节点侧、down 后无残留）** |
