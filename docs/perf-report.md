@@ -210,8 +210,9 @@ python 上游 GIL 约 2.4 Gbps，把 ss 路径全部压平；保留作为方法�
 # 依赖：root；python3；ssserver（shadowsocks-rust）；sing-box/v2ray 已安装；
 #       dae release 解包到 /tmp/perf，或 DAE_BIN=<path> 指定
 lab/perf/run.sh build
-sudo SS_UPSTREAM=ssserver ROUNDS=5 lab/perf/run.sh all   # 四方对比 + 汇总
-sudo lab/perf/scaling.sh all                              # 并发扩展（sodama）
+sudo ROUNDS=5 PROXY_PROTO=vless lab/perf/run.sh all        # VLESS（默认协议）
+sudo ROUNDS=5 PROXY_PROTO=ss SS_UPSTREAM=ssserver lab/perf/run.sh all   # ss 口径对照
+sudo PROXY_PROTO=vless lab/perf/scaling.sh all             # 并发扩展（sodama）
 sudo lab/perf/run.sh down
 ```
 

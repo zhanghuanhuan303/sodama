@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # sodama 扩展性/效率测量：并发流 1/2/4/8（大流量）+ 64（小流量，看每连接内存/线程）。
 # 路径：direct（eBPF 直转）、ss（Rust ss + 用户态泵）、relay（无加密用户态泵）。
-# 前置：先跑 `sudo SS_UPSTREAM=ssserver lab/perf/run.sh prepare`（建拓扑 + WAN 侧服务）。
+# 前置：先跑 `sudo PROXY_PROTO=vless lab/perf/run.sh prepare`（默认 vless；建拓扑 + WAN 侧服务）。
 # 用法：sudo lab/perf/scaling.sh [direct|ss|relay|all]
 # 输出：OUT=/tmp/scaling.tsv（path/streams/MB/mbps/p50_us/cpu_ms/rss_kb/threads）
 set -euo pipefail
@@ -67,9 +67,9 @@ measure() { # <path> <dialer> <host> <port>
   stop_loader
 }
 
-# 代理路径拨号器（PROXY_PROTO 选择，与 run.sh 对齐；先跑 run.sh prepare 建拓扑）
+# 代理路径拨号器（PROXY_PROTO 选择，与 run.sh 对齐；默认 vless；先跑 run.sh prepare 建拓扑）
 VLESS_UUID=b831381d-6324-4d53-ad4f-8cda48b30811
-PROXY_PROTO="${PROXY_PROTO:-ss}"
+PROXY_PROTO="${PROXY_PROTO:-vless}"
 case "$PROXY_PROTO" in
   ss) PROXY_DIALER='ss://chacha20-ietf-poly1305:testpass@10.9.9.2:8388' ;;
   vless) PROXY_DIALER="vless://$VLESS_UUID@10.9.9.2:8543?type=tcp&security=none" ;;

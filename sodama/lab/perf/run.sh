@@ -15,7 +15,7 @@
 #   DAE_BIN=/tmp/perf/usr/bin/dae   SINGBOX_BIN=sing-box   V2RAY_BIN=v2ray
 #   BENCH_MB=48（每流）BENCH_STREAMS=4 ROUNDS=3 WARMUP=1 BENCH_LAT=500
 #   SS_UPSTREAM=python|ssserver   # ss 上游选择（默认 python；性能测量用 ssserver）
-#   PROXY_PROTO=ss|vless|vless-tls # 代理路径协议（默认 ss；vless 上游 = sing-box 服务端）
+#   PROXY_PROTO=ss|vless|vless-tls # 代理路径协议（默认 vless；ss 为兼容对照）
 #   BENCH_RING_MB=128             # 全双工 echo 夹具 ring 容量
 set -euo pipefail
 
@@ -35,8 +35,8 @@ HTTP_PORT=8390
 VLESS_PORT=8543
 VLESS_TLS_PORT=8544
 VLESS_UUID=b831381d-6324-4d53-ad4f-8cda48b30811
-# 代理路径协议：ss（shadowsocks 上游）| vless（sing-box vless 服务端明文）| vless-tls（自签 TLS）
-PROXY_PROTO="${PROXY_PROTO:-ss}"
+# 代理路径协议（默认 vless——VLESS 为主测/优化方向；ss 为兼容对照）
+PROXY_PROTO="${PROXY_PROTO:-vless}"
 case "$PROXY_PROTO" in
   ss) UPSTREAM_PORT="$SS_PORT" ;;
   vless) UPSTREAM_PORT="$VLESS_PORT" ;;
