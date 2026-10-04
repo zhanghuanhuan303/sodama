@@ -11,7 +11,7 @@ P20（QUIC Initial SNI 嗅探）、P21（sniff-punt）、P22（UDP over IPv6 全
 P23（sticky IP / DoH h2 / bootstrap / DNS 选项）、P24（uTLS Chrome-120 / Vision splice / TUIC 0-RTT）、
 P25（naive / HTTP-2 CONNECT）、P26（HTTP/3：DoH h3 / naive+quic）、P27（juicity v0）、
 P28（ECS 回填 / ecs_cache）、P29（optimistic 后台刷新）、P30（SSR origin+plain）、
-P31（shadow-tls v1/v2/v3，ss 插件）与
+P31（shadow-tls v1/v2/v3，ss 插件）、P32（ECH 边界：已评估不实现）与
 P6（suspend/reload/metrics/sysdump/日志轮转/整配置热重载）已完成**；P9+ 已删除 C 数据面，
 `ebpf-rs` 的 Rust 对象是**唯一数据面**（ADR-0025）。
 
@@ -206,6 +206,9 @@ P6（suspend/reload/metrics/sysdump/日志轮转/整配置热重载）已完成*
   `ss://…?plugin=shadow-tls;…`（ss classic；ss2022/UDP 显式报错）；lab Go/
   sing-shadowtls 夹具 `shadowtls-up`/`test-shadowtls` 三版（交互 + 512KB；
   ADR-0055、NOTES §11.46）；附带修复 TLS1.3 CH 严格解析兼容性
+- **P32 ECH 边界（已评估，不实现）**：dae 生态 ECH 仅 hy2 `?ech=`（ot/quic-go
+  fork）；rustls/quinn 无客户端 ECH → `ech=` 解析即显式报错不静默（单测锁定；
+  ADR-0056、NOTES §11.47）
 - **P5-G3a QUIC（tuic v5）**：惰性 tokio 运行时 + quinn（阻塞 relay 用 block_on 桥接）；
   认证 token = TLS exporter（label=uuid 裸字节、context=password）；TCP 每条中继一条 QUIC
   双向流，UDP 走 QUIC DATAGRAM（含分片/重组）；上游 socket 用自建 `Endpoint` 打 `SO_MARK`；

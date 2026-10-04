@@ -1547,3 +1547,17 @@ lab 夹具 `http_connect_server.py` + `sub_server.py` 每次重读。）
 - 边界：v1 需 TLS 1.2 伪装站（协议使然，参考实现同）；v2/v3 需 TLS 1.3
   伪装站；仅 ss classic、仅 TCP；simple-obfs/v2ray-plugin 等其余 SIP003
   未做（解析即报错）。
+
+### 11.47 P32（ECH 边界，ADR-0056）已验收的行为
+
+- 核实：dae 生态 ECH 仅存在于 hysteria2 链接参数 `?ech=<base64 ECHConfigList>`
+  （`olicesx/outbound` 透传给 `olicesx/quic-go` fork 的
+  `EncryptedClientHelloConfigList`；真实 ECH 密码学在 fork 里），dae 主体无 ECH。
+- 决策：**不实现**客户端 ECH——rustls/quinn 无客户端 ECH 且不暴露 ClientHello
+  构造（ECH 需 HPKE 封装内层 CH），自实现 `tls13` 只做 TLS-over-TCP 不能作
+  QUIC 的 TLS；`ech=` 解析即显式报错（含 ADR 指引），**不静默降级**为明文 SNI。
+- 单测：`hy2_ech_rejected_loudly`（ech 与 pinSHA256 均显式报错）。
+- 实测：`cargo test` **236/236**；其余 hy2 参数语义不变（lab `hy2-*` 回归在
+  P31 批次一并跑过）。
+- 未来解的前置条件见 ADR-0056（rustls/quinn 提供 ECH 或可插拔 TLS + HPKE
+  依赖 + ot/quic-go ECH 服务端夹具），届时新 ADR 覆盖。
