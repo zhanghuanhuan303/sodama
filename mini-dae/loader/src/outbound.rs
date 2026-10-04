@@ -1721,7 +1721,12 @@ fn parse_hysteria2(rest: &str) -> Result<Outbound, String> {
             },
             "obfs-password" | "obfspassword" => obfs_password = Some(percent_decode(v)),
             "pinsha256" | "pin-sha256" => return Err("hysteria2:// pinSHA256 未实现".into()),
-            "ech" => return Err("hysteria2:// ech 未实现".into()),
+            "ech" => {
+                return Err(
+                    "hysteria2:// ech 未实现（rustls/quinn 无客户端 ECH；dae 侧由 ot/quic-go fork 提供；见 ADR-0056）"
+                        .into(),
+                )
+            }
             "ca" => return Err("hysteria2:// 自定义 ca 未实现".into()),
             "upmbps" => max_tx = mbps_to_bps(v, "upmbps")?,
             "downmbps" => max_rx = mbps_to_bps(v, "downmbps")?,
@@ -2101,6 +2106,68 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::net::ToSocketAddrs;
+
+    #[test]
+    fn parse_ss_shadowtls_plugin() {
+        let ob = parse(
+            "ss://chacha20-ietf-poly1305:testpass@127.0.0.1:8399\
+             ?plugin=shadow-tls;password=pw;version=3;sni=cdn.example.com;allowInsecure=1",
+        )
+        .unwrap();
+        match ob {
+            Outbound::Shadowsocks {
+                method,
+                shadowtls: Some(cfg),
+                ..
+            } => {
+                assert_eq!(method, ss::SsMethod::Chacha20IetfPoly1305);
+                assert_eq!(cfg.version, 3);
+                assert_eq!(cfg.password, "pw");
+                assert_eq!(cfg.sni, "cdn.example.com");
+                assert!(cfg.allow_insecure);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_ss_shadowtls_plugin_defaults_and_percent_encoding() {
+        // 百分号编码的 SIP003 串（生态里常见）与 version 缺省（3）、host→sni。
+        let ob = parse(
+            "ss://chacha20-ietf-poly1305:testpass@127.0.0.1:8399\
+             ?plugin=shadow-tls%3Bpassword%3Dpw%3Bhost%3Dwww.microsoft.com",
+        )
+        .unwrap();
+        match ob {
+            Outbound::Shadowsocks {
+                shadowtls: Some(cfg),
+                ..
+            } => {
+                assert_eq!(cfg.version, 3);
+                assert_eq!(cfg.sni, "www.microsoft.com");
+                assert!(!cfg.allow_insecure);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_ss_unknown_plugin_rejected() {
+        let e = parse(
+            "ss://chacha20-ietf-poly1305:testpass@127.0.0.1:8388?plugin=obfs-local;obfs=http",
+        )
+        .unwrap_err();
+        assert!(e.contains("未实现"), "{e}");
+    }
+
+    #[test]
+    fn hy2_ech_rejected_loudly() {
+        // P32：ECH 是如实边界（ADR-0056）——带 ech 的链接必须显式报错，不得静默降级为明文 SNI。
+        let e = parse("hysteria2://auth@127.0.0.1:8753?sni=localhost&ech=AAECAwQ=").unwrap_err();
+        assert!(e.contains("ech 未实现"), "{e}");
+        let e = parse("hysteria2://auth@127.0.0.1:8753?sni=localhost&pinSHA256=abcd").unwrap_err();
+        assert!(e.contains("pinSHA256 未实现"), "{e}");
+    }
 
     #[test]
     fn parse_vless_ws_url() {
