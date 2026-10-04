@@ -1480,7 +1480,8 @@ fn pump(
             Ok(n) => {
                 last_ns.store(monotonic_now_ns(), Ordering::Relaxed);
                 bytes.fetch_add(n as u64, Ordering::Relaxed);
-                if w.write_all(&buf[..n]).is_err() {
+                if let Err(e) = w.write_all(&buf[..n]) {
+                    log(&format!("pump: 写失败（{e}）"));
                     break;
                 }
             }

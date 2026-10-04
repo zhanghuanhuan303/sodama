@@ -242,6 +242,12 @@ impl WriteHalf for tls13::Tls13Writer {
     }
 }
 
+impl WriteHalf for crate::h2client::TunnelWriter {
+    fn shutdown_write(&self) -> io::Result<()> {
+        crate::h2client::TunnelWriter::end_stream(self)
+    }
+}
+
 impl<W: WriteHalf> WriteHalf for vision::VisionWriter<W> {
     fn shutdown_write(&self) -> io::Result<()> {
         self.inner().shutdown_write()
@@ -528,6 +534,14 @@ pub enum Outbound {
         sni: String,
         insecure: bool,
     },
+    /// P25：naive（HTTP/2 CONNECT，Basic 认证；TLS 固定开启、仅 h2，无 QUIC/H3）。
+    Naive {
+        server: SocketAddr,
+        user: String,
+        pass: String,
+        sni: String,
+        insecure: bool,
+    },
     /// P15：节点组（订阅/内联节点池）+ policy + 健康检查；拨号层选择与失败切换。
     Group(std::sync::Arc<GroupRuntime>),
 }
@@ -576,6 +590,7 @@ impl Outbound {
             Self::Tuic { dialer } => dialer.name(),
             Self::Hysteria2 { dialer } => dialer.name(),
             Self::AnyTls { server, sni, .. } => format!("anytls://{server}?sni={sni}"),
+            Self::Naive { server, .. } => format!("naive+https://{server}"),
             Self::Group(g) => format!("group:{}（{} 节点）", g.name, g.member_count()),
         }
     }
@@ -611,6 +626,7 @@ impl Outbound {
             | Self::Vless { server, .. }
             | Self::Vmess { server, .. }
             | Self::AnyTls { server, .. } => Some(*server),
+            Self::Naive { server, .. } => Some(*server),
             _ => None,
         }
     }
@@ -766,6 +782,45 @@ impl Outbound {
                         socket: Some(kill),
                     })
                 }
+            }
+            Self::Naive {
+                server,
+                user,
+                pass,
+                sni,
+                insecure,
+            } => {
+                use base64::Engine as _;
+                let sock = marked_tcp_connect(*server, timeout)?;
+                let kill = sock.try_clone()?;
+                let ((mut r, mut w), alpn) =
+                    tls::connect_alpn(sock, sni, *insecure, &[b"h2".to_vec()], timeout)?;
+                if alpn.as_deref() != Some(b"h2") {
+                    return Err(io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "naive: 服务端未协商 ALPN=h2（naive+quic/H3 未实现）",
+                    ));
+                }
+                let mut h2 =
+                    crate::h2client::H2Conn::handshake(&mut r, &mut w).map_err(io::Error::other)?;
+                let auth = format!(
+                    "Basic {}",
+                    base64::engine::general_purpose::STANDARD.encode(format!("{user}:{pass}"))
+                );
+                let (tr, tw) = h2
+                    .connect_tunnel(
+                        r,
+                        w,
+                        kill.try_clone()?,
+                        &target.to_string(),
+                        &[("proxy-authorization", auth.as_str())],
+                    )
+                    .map_err(io::Error::other)?;
+                Ok(DialedStream {
+                    from_remote: Box::new(tr),
+                    to_remote: Box::new(tw),
+                    socket: Some(kill),
+                })
             }
             Self::Tuic { dialer } => {
                 // QUIC 无底层 TcpStream：socket=None（不与 offload 搭配，见 supports_offload）
@@ -972,6 +1027,16 @@ pub fn parse(url: &str) -> Result<Outbound, String> {
     if let Some(rest) = url.strip_prefix("anytls://") {
         return parse_anytls(rest);
     }
+    // P25：naive（HTTP/2 CONNECT）；naive+quic（H3）显式未实现
+    if let Some(rest) = url.strip_prefix("naive+https://") {
+        return parse_naive(rest);
+    }
+    if let Some(rest) = url.strip_prefix("naive://") {
+        return parse_naive(rest);
+    }
+    if url.starts_with("naive+quic://") {
+        return Err("naive+quic（HTTP/3）未实现；可用 naive+https://（h2）".into());
+    }
     if url.starts_with("socks5://") || url.contains(':') {
         return Ok(Outbound::Socks5 {
             server: resolve(socks5::parse_proxy(url)?.as_str())?,
@@ -1025,6 +1090,55 @@ fn parse_anytls(rest: &str) -> Result<Outbound, String> {
     Ok(Outbound::AnyTls {
         server: resolve(&hostport)?,
         password_sha256,
+        sni: sni.unwrap_or(default_sni),
+        insecure,
+    })
+}
+
+/// `naive+https://user:pass@host:port?sni=…&insecure=1`（naiveproxy，HTTP/2 CONNECT）。
+///
+/// 仅 h2（ALPN 协商不到即报错）；`naive+quic://`（H3）未实现。
+fn parse_naive(rest: &str) -> Result<Outbound, String> {
+    let rest = rest.split('#').next().unwrap_or(rest);
+    let (main, query) = match rest.split_once('?') {
+        Some((m, q)) => (m, q),
+        None => (rest, ""),
+    };
+    let (userinfo, hostport) = main
+        .rsplit_once('@')
+        .ok_or_else(|| "naive:// 需要 user:pass@host:port".to_string())?;
+    let (user, pass) = match userinfo.split_once(':') {
+        Some((u, p)) => (percent_decode(u), percent_decode(p)),
+        None => (percent_decode(userinfo), String::new()),
+    };
+    let mut sni: Option<String> = None;
+    let mut insecure = false;
+    for kv in query.split('&').filter(|s| !s.is_empty()) {
+        let (k, v) = kv.split_once('=').unwrap_or((kv, ""));
+        match k.to_ascii_lowercase().as_str() {
+            "sni" | "peer" | "servername" => sni = Some(percent_decode(v)),
+            "insecure" | "allowinsecure" | "allow_insecure" | "skipverify" => {
+                insecure = matches!(v, "1" | "true" | "TRUE" | "True")
+            }
+            "alpn" => { /* naive+https 固定 h2，忽略 */ }
+            _ => {}
+        }
+    }
+    let hostport = percent_decode(hostport);
+    let default_sni = if let Some(r) = hostport.strip_prefix('[') {
+        r.split_once(']')
+            .map(|(h, _)| h.to_string())
+            .unwrap_or_else(|| hostport.clone())
+    } else {
+        hostport
+            .rsplit_once(':')
+            .map(|(h, _)| h.to_string())
+            .unwrap_or_else(|| hostport.clone())
+    };
+    Ok(Outbound::Naive {
+        server: resolve(&hostport)?,
+        user,
+        pass,
         sni: sni.unwrap_or(default_sni),
         insecure,
     })
@@ -1827,6 +1941,44 @@ mod tests {
         // anytls 已实现（P11）：空密码必须报错，不能静默降级
         let e = parse("anytls://@1.2.3.4:8443").unwrap_err();
         assert!(e.contains("密码"), "{e}");
+    }
+
+    #[test]
+    fn parse_naive_url() {
+        let ob =
+            parse("naive+https://alice:s3cret@1.2.3.4:8443?sni=example.com&insecure=1").unwrap();
+        match ob {
+            Outbound::Naive {
+                user,
+                pass,
+                sni,
+                insecure,
+                ..
+            } => {
+                assert_eq!(user, "alice");
+                assert_eq!(pass, "s3cret");
+                assert_eq!(sni, "example.com");
+                assert!(insecure);
+            }
+            other => panic!("应为 Naive: {other:?}"),
+        }
+        // 无 query 时 SNI 取自 host（去端口）
+        match parse("naive://bob@127.0.0.1:9443").unwrap() {
+            Outbound::Naive {
+                user, pass, sni, ..
+            } => {
+                assert_eq!(user, "bob");
+                assert!(pass.is_empty());
+                assert_eq!(sni, "127.0.0.1");
+            }
+            other => panic!("应为 Naive: {other:?}"),
+        }
+        // H3 显式未实现
+        assert!(parse("naive+quic://u:p@h:443")
+            .unwrap_err()
+            .contains("naive+quic"));
+        // 缺少 userinfo 报错
+        assert!(parse("naive+https://127.0.0.1:8443").is_err());
     }
 
     #[test]

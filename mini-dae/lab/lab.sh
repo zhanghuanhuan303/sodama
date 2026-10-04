@@ -189,6 +189,12 @@ HY2_LOG=/tmp/mini-dae-hy2-target.txt
 HY2_PID_FILE=/tmp/mini-dae-hy2.pid
 # P5-G3b+：udphop 服务端额外端口（逗号/范围列表，与客户端链接里的端口并集对应）
 HY2_HOP_PORTS="8754,8755-8756"
+# P25：naive（HTTP/2 CONNECT）参考服务端
+NAIVE_PORT=8663
+NAIVE_LOG=/tmp/mini-dae-naive.log
+NAIVE_PID_FILE=/tmp/mini-dae-naive.pid
+NAIVE_USER=user
+NAIVE_PASS=pass
 
 # P6：运维面
 OPS_LOG=/tmp/mini-dae-ops.log
@@ -312,6 +318,10 @@ cleanup() {
   if [ -f "$HY2_PID_FILE" ]; then
     kill "$(cat "$HY2_PID_FILE")" 2>/dev/null || true
     rm -f "$HY2_PID_FILE"
+  fi
+  if [ -f "$NAIVE_PID_FILE" ]; then
+    kill "$(cat "$NAIVE_PID_FILE")" 2>/dev/null || true
+    rm -f "$NAIVE_PID_FILE"
   fi
   if [ -f "$FAKE_DNS_PID_FILE" ]; then
     kill "$(cat "$FAKE_DNS_PID_FILE")" 2>/dev/null || true
@@ -668,6 +678,21 @@ up() {
     echo $! >"$DOH_H2_PID_FILE"
     sleep 0.3
     kill -0 "$(cat "$DOH_H2_PID_FILE")" 2>/dev/null || { cat /tmp/mini-dae-doh-h2.stdout; die "DoH h2 服务端启动失败"; }
+  fi
+
+  # P25：naive（HTTP/2 CONNECT）参考服务端（Go 标准库；仅收 h2）
+  if [ -n "${USE_NAIVE:-}" ]; then
+    [ -x "$HERE/proto-check/bin/naive-server" ] \
+      || die "缺 naive 参考服务端：先运行 lab/proto-check/build-naive-server.sh"
+    [ -f "$CERTS_DIR/cert.pem" ] && [ -f "$CERTS_DIR/key.pem" ] \
+      || die "缺自签证书：先运行 lab/gen-certs.sh"
+    rm -f "$NAIVE_LOG"
+    "$HERE/proto-check/bin/naive-server" -port "$NAIVE_PORT" -cert "$CERTS_DIR/cert.pem" \
+      -key "$CERTS_DIR/key.pem" -user "$NAIVE_USER" -pass "$NAIVE_PASS" -log "$NAIVE_LOG" \
+      >/tmp/mini-dae-naive.stdout 2>&1 &
+    echo $! >"$NAIVE_PID_FILE"
+    sleep 0.3
+    kill -0 "$(cat "$NAIVE_PID_FILE")" 2>/dev/null || { cat /tmp/mini-dae-naive.stdout; die "naive 服务端启动失败"; }
   fi
 
   # P18b：DoQ 参考服务端（Go/quic-go，需先构建）
@@ -1911,6 +1936,37 @@ PY
   echo "PASS: fixed_domain_ttl / optimistic cache（stale TTL 上限）/ ipversion_prefer"
 }
 
+# P25：naive（HTTP/2 CONNECT）TCP 转发 + Basic 认证 + 用户态流控（offload 互斥）。
+test_naive() {
+  require_root
+  echo "== P25：naive（HTTP/2 CONNECT）=="
+  local out
+  out="$(ip netns exec "$CLIENT_NS" timeout 8 python3 "$HERE/client_probe.py" "$PROXY_DST" 8080 2>&1 || true)"
+  echo "$out"
+  echo "$out" | grep -q "wan-echo-ok data=ping" || { echo "FAIL: naive 链路未把流量转发到真实目标"; exit 1; }
+  out="$(ip netns exec "$CLIENT_NS" timeout 30 python3 "$HERE/stream_probe.py" "$PROXY_DST" 8080 512 2>&1 || true)"
+  echo "$out"
+  echo "$out" | grep -q "^stream-ok bytes=524288" || { echo "FAIL: naive 大流量（512KB）回显不一致（双向流控？）"; exit 1; }
+  grep -q "NAIVE connect target=$PROXY_DST:8080" "$NAIVE_LOG" \
+    || { echo "FAIL: 参考服务端未收到 h2 CONNECT（认证/ALPN？）"; cat "$NAIVE_LOG"; exit 1; }
+  grep -q "proto=HTTP/2.0" "$NAIVE_LOG" || { echo "FAIL: 连接不是 HTTP/2"; exit 1; }
+  grep -q "NAIVE auth-fail" "$NAIVE_LOG" && { echo "FAIL: 出现认证失败（Basic 头编码？）"; exit 1; }
+  "$LOADER" status --socket "$STATUS_SOCK" --json >/tmp/mini-dae-status.json
+  python3 - /tmp/mini-dae-status.json <<'PY'
+import json, sys
+v = json.load(open(sys.argv[1]))
+assert v["dialer"].startswith("naive+https://"), v["dialer"]
+r = v["relay"]
+assert r["conns_total"] >= 2, r
+assert r["dial_errors"] == 0, r
+assert r["offload_enabled"], r
+assert r["offloaded_total"] == 0, r  # h2 隧道不可内核拼接
+assert r["bytes_up"] >= 512 * 1024, r
+print("naive tcp: conns=%d bytes_up=%d offloaded=%d" % (r["conns_total"], r["bytes_up"], r["offloaded_total"]))
+PY
+  echo "PASS: naive（Go 标准库参考服务端 h2 CONNECT + Basic 认证 + 512KB 双向流控）"
+}
+
 # P4b：UDP NAT 会话 janitor（会话用 --udp-idle-timeout 2 启动）。
 test_udp_idle() {
   require_root
@@ -3097,6 +3153,9 @@ test-dns-udp) test_dns_udp ;;  # 显式 udp:// 上游（仅 UDP）
     USE_DIALER="$(vmess_link 127.0.0.1 "$VMESS_TLS_PORT" "$VMESS_UUID" aes-128-gcm tls)" up ;;
   vmess-udp-up) USE_RULES="$HERE/rules.udp.dae" USE_VMESS=1 \
     USE_DIALER="$(vmess_link 127.0.0.1 "$VMESS_PORT" "$VMESS_UUID" aes-128-gcm none)" up ;;
+  naive-up) USE_RULES="$HERE/rules.dae" USE_NAIVE=1 USE_OFFLOAD=1 USE_RELAY_IDLE=600 \
+    USE_DIALER="naive+https://$NAIVE_USER:$NAIVE_PASS@127.0.0.1:$NAIVE_PORT?sni=localhost&insecure=1" up ;;  # P25
+  test-naive) test_naive ;;  # P25：h2 CONNECT + Basic + 流控
   tuic-up) USE_RULES="$HERE/rules.dae" USE_TUIC=1 USE_OFFLOAD=1 USE_RELAY_IDLE=600 \
     USE_DIALER="tuic://$TUIC_UUID:$TUIC_PASSWORD@127.0.0.1:$TUIC_PORT?sni=localhost&allow_insecure=1&alpn=h3" up ;;
   tuic-udp-up) USE_RULES="$HERE/rules.udp.dae" USE_TUIC=1 \
@@ -3169,5 +3228,5 @@ test-dns-udp) test_dns_udp ;;  # 显式 udp:// 上游（仅 UDP）
   status) status ;;
   trace) trace ;;
   down) down ;;
-  *) echo "usage: $0 {build|up|dual-up|config-up|forward-up|dns-up|dot-up|doh-up|doh-h2-up|doq-up|dnsroute-up|dnsopts-up|dns-udp-up|dns-tcpup-up|geo-up|pname-up|regex-up|relay-up|offload-up|udp-up|ss-up|ss2022-up|http-up|groups-up|ss-udp-up|trojan-up|vless-up|vless-tls-up|vless-udp-up|vmess-up|vmess-tls-up|vmess-udp-up|tuic-up|tuic-udp-up|hy2-up|hy2-udp-up|hy2-obfs-up|hy2-obfs-udp-up|hy2-brutal-up|hy2-hop-up|ops-up|ops-reload-up|bench-up|test-proxy|test-direct|test-block|test-host-proxy|test-reload|test-rebind|test-status|test-config|test-forward|test-domain|test-dns-cache|test-dns-tcp|test-dns-reload|test-domain-regex|test-dns-edns|test-dot|test-doh|test-doh-h2|test-doq|test-dnsroute|test-dns-options|test-dns-udp|test-dns-tcpup|test-geo|test-pname|test-v6|test-relay|test-relay-idle|test-relay-offload|test-offload-lifecycle|test-udp-relay|test-quic-sniff|test-udp-idle|test-ss|test-ss2022|test-http|test-groups|test-trojan|test-ss-udp|test-vless|test-vless-udp|test-vmess|test-vmess-udp|test-tuic|test-tuic-udp|test-hy2|test-hy2-udp|test-hy2-obfs|test-hy2-obfs-udp|test-hy2-brutal|test-hy2-hop|test-ops|test-config-reload|test-fault-reload|test-fault-kill|reload|verify|status|trace|down|sniff-punt-up|test-sniff-punt}"; exit 2 ;;
+  *) echo "usage: $0 {build|up|dual-up|config-up|forward-up|dns-up|dot-up|doh-up|doh-h2-up|doq-up|dnsroute-up|dnsopts-up|dns-udp-up|dns-tcpup-up|geo-up|pname-up|regex-up|relay-up|offload-up|udp-up|ss-up|ss2022-up|http-up|groups-up|ss-udp-up|trojan-up|vless-up|vless-tls-up|vless-udp-up|vmess-up|vmess-tls-up|vmess-udp-up|tuic-up|tuic-udp-up|hy2-up|hy2-udp-up|hy2-obfs-up|hy2-obfs-udp-up|hy2-brutal-up|hy2-hop-up|ops-up|naive-up|test-naive|ops-reload-up|bench-up|test-proxy|test-direct|test-block|test-host-proxy|test-reload|test-rebind|test-status|test-config|test-forward|test-domain|test-dns-cache|test-dns-tcp|test-dns-reload|test-domain-regex|test-dns-edns|test-dot|test-doh|test-doh-h2|test-doq|test-dnsroute|test-dns-options|test-dns-udp|test-dns-tcpup|test-geo|test-pname|test-v6|test-relay|test-relay-idle|test-relay-offload|test-offload-lifecycle|test-udp-relay|test-quic-sniff|test-udp-idle|test-ss|test-ss2022|test-http|test-groups|test-trojan|test-ss-udp|test-vless|test-vless-udp|test-vmess|test-vmess-udp|test-tuic|test-tuic-udp|test-hy2|test-hy2-udp|test-hy2-obfs|test-hy2-obfs-udp|test-hy2-brutal|test-hy2-hop|test-ops|test-config-reload|test-fault-reload|test-fault-kill|reload|verify|status|trace|down|sniff-punt-up|test-sniff-punt}"; exit 2 ;;
 esac

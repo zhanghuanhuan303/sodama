@@ -10,7 +10,11 @@
 //! HPACK 编码不用 Huffman（静态表索引 + literal 原样），解码只取 `:status`。
 //! 与 dae（Go net/http2 完整实现）的差异如实记录在 ADR。
 
+use std::collections::VecDeque;
 use std::io::{Read, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 use crate::hpack;
 use crate::tls;
@@ -37,12 +41,47 @@ const FLAG_PRIORITY: u8 = 0x20;
 /// 单条查询的响应上限（DNS 报文远小于此；防止坏服务端耗尽内存）。
 const MAX_RESPONSE: usize = 65536;
 
+/// CONNECT 隧道：单帧 DATA 上限（= RFC 7540 默认 MAX_FRAME_SIZE）。
+const MAX_DATA_FRAME: usize = 16384;
+/// CONNECT 隧道：对端迟迟不发 WINDOW_UPDATE 时的等待上限。
+const SEND_WINDOW_TIMEOUT: Duration = Duration::from_secs(15);
+
 pub struct H2Conn {
     next_stream: u32,
+    /// 对端 SETTINGS 的 INITIAL_WINDOW_SIZE（新流的发送窗口初值；默认 65535）。
+    peer_initial_window: i64,
 }
 
 fn err(msg: impl Into<String>) -> String {
     msg.into()
+}
+
+fn write_frame_raw<W: Write>(
+    w: &mut W,
+    ty: u8,
+    flags: u8,
+    stream: u32,
+    payload: &[u8],
+) -> std::io::Result<()> {
+    let len = payload.len();
+    if len > 0x00ff_ffff {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "HTTP/2 帧超长",
+        ));
+    }
+    let mut h = [0u8; 9];
+    h[0] = (len >> 16) as u8;
+    h[1] = (len >> 8) as u8;
+    h[2] = len as u8;
+    h[3] = ty;
+    h[4] = flags;
+    h[5..9].copy_from_slice(&(stream & 0x7fff_ffff).to_be_bytes());
+    w.write_all(&h)?;
+    if !payload.is_empty() {
+        w.write_all(payload)?;
+    }
+    w.flush()
 }
 
 fn write_frame<W: Write>(
@@ -52,43 +91,31 @@ fn write_frame<W: Write>(
     stream: u32,
     payload: &[u8],
 ) -> Result<(), String> {
-    let len = payload.len();
-    if len > 0x00ff_ffff {
-        return Err(err("HTTP/2 帧超长"));
-    }
-    let mut h = [0u8; 9];
-    h[0] = (len >> 16) as u8;
-    h[1] = (len >> 8) as u8;
-    h[2] = len as u8;
-    h[3] = ty;
-    h[4] = flags;
-    h[5..9].copy_from_slice(&(stream & 0x7fff_ffff).to_be_bytes());
-    w.write_all(&h)
-        .map_err(|e| err(format!("h2 写帧头: {e}")))?;
-    if !payload.is_empty() {
-        w.write_all(payload)
-            .map_err(|e| err(format!("h2 写帧体: {e}")))?;
-    }
-    w.flush().map_err(|e| err(format!("h2 flush: {e}")))
+    write_frame_raw(w, ty, flags, stream, payload).map_err(|e| err(format!("h2 写帧: {e}")))
 }
 
-fn read_frame<R: Read>(r: &mut R) -> Result<(u8, u8, u32, Vec<u8>), String> {
+fn read_frame_raw<R: Read>(r: &mut R) -> std::io::Result<(u8, u8, u32, Vec<u8>)> {
     let mut h = [0u8; 9];
-    r.read_exact(&mut h)
-        .map_err(|e| err(format!("h2 读帧头: {e}")))?;
+    r.read_exact(&mut h)?;
     let len = ((h[0] as usize) << 16) | ((h[1] as usize) << 8) | h[2] as usize;
     if len > 1 << 20 {
-        return Err(err(format!("h2 帧过大（{len}）")));
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("h2 帧过大（{len}）"),
+        ));
     }
     let ty = h[3];
     let flags = h[4];
     let sid = u32::from_be_bytes([h[5] & 0x7f, h[6], h[7], h[8]]);
     let mut payload = vec![0u8; len];
     if len > 0 {
-        r.read_exact(&mut payload)
-            .map_err(|e| err(format!("h2 读帧体: {e}")))?;
+        r.read_exact(&mut payload)?;
     }
     Ok((ty, flags, sid, payload))
+}
+
+fn read_frame<R: Read>(r: &mut R) -> Result<(u8, u8, u32, Vec<u8>), String> {
+    read_frame_raw(r).map_err(|e| err(format!("h2 读帧: {e}")))
 }
 
 // ---------------------------------------------------------------- HPACK 编码
@@ -124,6 +151,25 @@ fn hpack_indexed(out: &mut Vec<u8>, idx: u64) {
 fn hpack_literal(out: &mut Vec<u8>, name_idx: u64, value: &str) {
     hpack_int(out, 4, 0x00, name_idx);
     hpack_str(out, value);
+}
+
+/// 名字与值都为字面量的 literal（不加入索引表）；静态表没有的头（如
+/// proxy-authorization）用这个。
+fn hpack_literal_name(out: &mut Vec<u8>, name: &str, value: &str) {
+    hpack_int(out, 4, 0x00, 0);
+    hpack_str(out, name);
+    hpack_str(out, value);
+}
+
+/// P25：CONNECT 请求头块（naive 用；纯函数，单测覆盖）。
+pub(crate) fn encode_connect_headers(authority: &str, extra_headers: &[(&str, &str)]) -> Vec<u8> {
+    let mut b = Vec::with_capacity(96);
+    hpack_literal(&mut b, 2, "CONNECT"); // :method（静态名索引 2）+ CONNECT
+    hpack_literal(&mut b, 1, authority); // :authority
+    for (n, v) in extra_headers {
+        hpack_literal_name(&mut b, n, v);
+    }
+    b
 }
 
 fn encode_request_headers(authority: &str, path: &str) -> Vec<u8> {
@@ -268,8 +314,27 @@ impl H2Conn {
             match ty {
                 FRAME_SETTINGS => {
                     if flags & FLAG_ACK == 0 {
+                        // 解析 INITIAL_WINDOW_SIZE（id=4）——CONNECT 隧道发送流控用
+                        let mut i = 0usize;
+                        let mut init_window = 65535i64;
+                        while i + 6 <= payload.len() {
+                            let id = u16::from_be_bytes([payload[i], payload[i + 1]]);
+                            let v = u32::from_be_bytes([
+                                payload[i + 2],
+                                payload[i + 3],
+                                payload[i + 4],
+                                payload[i + 5],
+                            ]);
+                            if id == 4 {
+                                init_window = v as i64;
+                            }
+                            i += 6;
+                        }
                         write_frame(w, FRAME_SETTINGS, FLAG_ACK, 0, &[])?;
-                        return Ok(Self { next_stream: 1 });
+                        return Ok(Self {
+                            next_stream: 1,
+                            peer_initial_window: init_window,
+                        });
                     }
                 }
                 FRAME_PING => {
@@ -405,9 +470,432 @@ impl H2Conn {
     }
 }
 
+// ---------------------------------------------------------------- P25：CONNECT 隧道（naive）
+
+/// 隧道共享状态：读缓冲（reader 线程 → Read 半）、发送窗口（Write 半 ↔ reader 线程）。
+struct TunnelShared {
+    rx: Mutex<VecDeque<u8>>,
+    rx_cond: Condvar,
+    eof: AtomicBool,
+    err: Mutex<Option<(std::io::ErrorKind, String)>>,
+    /// 发送窗口：(连接级, 流级)。reader 线程收到 WINDOW_UPDATE 后增加。
+    send_window: Mutex<(i64, i64)>,
+    send_cond: Condvar,
+    /// 两个半都 drop 后 shutdown 底层 TCP，唤醒 reader 线程
+    halves: std::sync::atomic::AtomicU8,
+    kill: std::sync::Mutex<Option<std::net::TcpStream>>,
+}
+
+impl TunnelShared {
+    fn set_err(&self, kind: std::io::ErrorKind, msg: String) {
+        let mut g = self.err.lock().unwrap_or_else(|p| p.into_inner());
+        if g.is_none() {
+            *g = Some((kind, msg));
+        }
+        self.eof.store(true, Ordering::SeqCst);
+        self.rx_cond.notify_all();
+        self.send_cond.notify_all();
+    }
+
+    fn half_dropped(&self) {
+        use std::sync::atomic::Ordering as O;
+        if self.halves.fetch_sub(1, O::SeqCst) == 1 {
+            if let Some(k) = self.kill.lock().unwrap_or_else(|p| p.into_inner()).take() {
+                let _ = k.shutdown(std::net::Shutdown::Both);
+            }
+        }
+    }
+}
+
+/// CONNECT 隧道的读半（服务端 DATA → 字节流）。
+pub struct TunnelReader {
+    shared: Arc<TunnelShared>,
+    leftover: Vec<u8>,
+}
+
+impl Read for TunnelReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        if !self.leftover.is_empty() {
+            let n = self.leftover.len().min(buf.len());
+            buf[..n].copy_from_slice(&self.leftover[..n]);
+            self.leftover.drain(..n);
+            return Ok(n);
+        }
+        let mut q = self.shared.rx.lock().unwrap_or_else(|p| p.into_inner());
+        loop {
+            if !q.is_empty() {
+                let n = q.len().min(buf.len());
+                for (i, b) in q.drain(..n).enumerate() {
+                    buf[i] = b;
+                }
+                return Ok(n);
+            }
+            if let Some((kind, msg)) = self
+                .shared
+                .err
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .take()
+            {
+                return Err(std::io::Error::new(kind, msg));
+            }
+            if self.shared.eof.load(Ordering::SeqCst) {
+                return Ok(0);
+            }
+            let (g, _) = self
+                .shared
+                .rx_cond
+                .wait_timeout(q, Duration::from_secs(1))
+                .unwrap_or_else(|p| p.into_inner());
+            q = g;
+        }
+    }
+}
+
+impl Drop for TunnelReader {
+    fn drop(&mut self) {
+        self.shared.half_dropped();
+    }
+}
+
+/// CONNECT 隧道的写半（字节流 → 服务端 DATA，带双向流控）。
+pub struct TunnelWriter {
+    shared: Arc<TunnelShared>,
+    w: Arc<Mutex<tls::TlsWriter>>,
+    sid: u32,
+    ended: AtomicBool,
+}
+
+impl TunnelWriter {
+    fn wait_window(&self, need: usize) -> std::io::Result<()> {
+        let mut g = self
+            .shared
+            .send_window
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let deadline = Instant::now() + SEND_WINDOW_TIMEOUT;
+        loop {
+            if self.shared.eof.load(Ordering::SeqCst) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotConnected,
+                    "naive: 隧道已关闭",
+                ));
+            }
+            let (c, s) = *g;
+            if c.min(s) >= need as i64 {
+                *g = (c - need as i64, s - need as i64);
+                return Ok(());
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "naive: 等待发送窗口超时",
+                ));
+            }
+            let (ng, _) = self
+                .shared
+                .send_cond
+                .wait_timeout(g, deadline - now)
+                .unwrap_or_else(|p| p.into_inner());
+            g = ng;
+        }
+    }
+
+    /// 半关闭：空 DATA + END_STREAM（幂等）。
+    pub fn end_stream(&self) -> std::io::Result<()> {
+        if self.ended.swap(true, Ordering::SeqCst) {
+            return Ok(());
+        }
+        let mut w = self.w.lock().unwrap_or_else(|p| p.into_inner());
+        write_frame_raw(&mut *w, FRAME_DATA, FLAG_END_STREAM, self.sid, &[])
+    }
+}
+
+impl Write for TunnelWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        if self.ended.load(Ordering::SeqCst) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "naive: 写半已关闭",
+            ));
+        }
+        let mut off = 0usize;
+        while off < buf.len() {
+            let end = (off + MAX_DATA_FRAME).min(buf.len());
+            self.wait_window(end - off)?;
+            let mut w = self.w.lock().unwrap_or_else(|p| p.into_inner());
+            write_frame_raw(&mut *w, FRAME_DATA, 0, self.sid, &buf[off..end])?;
+            off = end;
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Drop for TunnelWriter {
+    fn drop(&mut self) {
+        let _ = self.end_stream();
+        self.shared.half_dropped();
+    }
+}
+
+fn strip_padding_io(flags: u8, payload: &[u8]) -> std::io::Result<&[u8]> {
+    let mut p = payload;
+    if flags & FLAG_PADDED != 0 {
+        let pad = *p.first().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "h2 PADDED 缺 pad")
+        })? as usize;
+        p = p
+            .get(1..)
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "h2 头截断"))?;
+        p = p
+            .get(..p.len().saturating_sub(pad))
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "h2 pad 越界"))?;
+    }
+    Ok(p)
+}
+
+/// 隧道 reader 线程：解 DATA/控制帧 → 读缓冲；发送窗口更新 → 唤醒写端。
+fn tunnel_reader_loop(
+    mut r: tls::TlsReader,
+    w: Arc<Mutex<tls::TlsWriter>>,
+    sid: u32,
+    sh: Arc<TunnelShared>,
+) {
+    crate::log("naive: 隧道 reader 线程启动");
+    loop {
+        match read_frame_raw(&mut r) {
+            Err(e) => {
+                crate::log(&format!("naive: h2 读失败: {e}"));
+                sh.set_err(e.kind(), format!("naive: h2 读失败: {e}"));
+                break;
+            }
+            Ok((ty, flags, fsid, payload)) => match ty {
+                FRAME_DATA if fsid == sid => {
+                    let data = match strip_padding_io(flags, &payload) {
+                        Ok(d) => d,
+                        Err(e) => {
+                            sh.set_err(e.kind(), format!("naive: h2 DATA: {e}"));
+                            break;
+                        }
+                    };
+                    if !data.is_empty() {
+                        {
+                            let mut q = sh.rx.lock().unwrap_or_else(|p| p.into_inner());
+                            q.extend(data.iter().copied());
+                        }
+                        sh.rx_cond.notify_all();
+                        let inc = (data.len() as u32).to_be_bytes();
+                        if let Ok(mut wg) = w.lock() {
+                            let _ = write_frame_raw(&mut *wg, FRAME_WINDOW_UPDATE, 0, 0, &inc);
+                            let _ = write_frame_raw(&mut *wg, FRAME_WINDOW_UPDATE, 0, sid, &inc);
+                        }
+                    }
+                    if flags & FLAG_END_STREAM != 0 {
+                        sh.eof.store(true, Ordering::SeqCst);
+                        sh.rx_cond.notify_all();
+                        break;
+                    }
+                }
+                FRAME_HEADERS if fsid == sid => {
+                    if flags & FLAG_END_STREAM != 0 {
+                        sh.eof.store(true, Ordering::SeqCst);
+                        sh.rx_cond.notify_all();
+                        break;
+                    }
+                }
+                FRAME_SETTINGS => {
+                    if flags & FLAG_ACK == 0 {
+                        if let Ok(mut wg) = w.lock() {
+                            let _ = write_frame_raw(&mut *wg, FRAME_SETTINGS, FLAG_ACK, 0, &[]);
+                        }
+                    }
+                }
+                FRAME_PING => {
+                    if flags & FLAG_ACK == 0 && payload.len() == 8 {
+                        if let Ok(mut wg) = w.lock() {
+                            let _ = write_frame_raw(&mut *wg, FRAME_PING, FLAG_ACK, 0, &payload);
+                        }
+                    }
+                }
+                FRAME_WINDOW_UPDATE => {
+                    if payload.len() >= 4 {
+                        let inc =
+                            (u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]])
+                                & 0x7fff_ffff) as i64;
+                        {
+                            let mut g = sh.send_window.lock().unwrap_or_else(|p| p.into_inner());
+                            if fsid == 0 {
+                                g.0 += inc;
+                            } else if fsid == sid {
+                                g.1 += inc;
+                            }
+                        }
+                        sh.send_cond.notify_all();
+                    }
+                }
+                FRAME_RST_STREAM if fsid == sid => {
+                    sh.set_err(
+                        std::io::ErrorKind::ConnectionReset,
+                        "naive: 流被重置".into(),
+                    );
+                    break;
+                }
+                FRAME_GOAWAY => {
+                    sh.set_err(
+                        std::io::ErrorKind::ConnectionAborted,
+                        "naive: GOAWAY".into(),
+                    );
+                    break;
+                }
+                _ => {}
+            },
+        }
+    }
+    sh.eof.store(true, Ordering::SeqCst);
+    sh.rx_cond.notify_all();
+    sh.send_cond.notify_all();
+}
+
+impl H2Conn {
+    /// P25：HTTP/2 CONNECT 隧道（naiveproxy）——HEADERS(CONNECT，无 END_STREAM)，
+    /// 等 200 后返回可并发的读写两半（reader 线程 + 流控写端）。
+    /// `extra_headers` 为额外的 (名字, 值)，如 ("proxy-authorization", "Basic …")。
+    pub fn connect_tunnel(
+        &mut self,
+        mut r: tls::TlsReader,
+        w: tls::TlsWriter,
+        kill: std::net::TcpStream,
+        authority: &str,
+        extra_headers: &[(&str, &str)],
+    ) -> Result<(TunnelReader, TunnelWriter), String> {
+        let sid = self.next_stream;
+        self.next_stream += 2;
+        let w = Arc::new(Mutex::new(w));
+        let hdr = encode_connect_headers(authority, extra_headers);
+        {
+            let mut wg = w.lock().unwrap_or_else(|p| p.into_inner());
+            write_frame(&mut *wg, FRAME_HEADERS, FLAG_END_HEADERS, sid, &hdr)?;
+        }
+        // 等响应头（:status 必须 200）
+        let mut block: Vec<u8> = Vec::new();
+        let mut status: Option<u16> = None;
+        loop {
+            let (ty, flags, fsid, payload) = read_frame(&mut r)?;
+            match ty {
+                FRAME_SETTINGS if flags & FLAG_ACK == 0 => {
+                    let mut wg = w.lock().unwrap_or_else(|p| p.into_inner());
+                    let _ = write_frame(&mut *wg, FRAME_SETTINGS, FLAG_ACK, 0, &[]);
+                }
+                FRAME_PING if flags & FLAG_ACK == 0 && payload.len() == 8 => {
+                    let mut wg = w.lock().unwrap_or_else(|p| p.into_inner());
+                    let _ = write_frame(&mut *wg, FRAME_PING, FLAG_ACK, 0, &payload);
+                }
+                FRAME_HEADERS | FRAME_CONTINUATION if fsid == sid => {
+                    let p = payload.as_slice();
+                    let p = if ty == FRAME_HEADERS {
+                        let mut q = p;
+                        if flags & FLAG_PADDED != 0 {
+                            let pad = *q.first().ok_or("naive: PADDED 头缺 pad")? as usize;
+                            q = &q[1..];
+                            q = q
+                                .get(..q.len().saturating_sub(pad))
+                                .ok_or("naive: pad 越界")?;
+                        }
+                        if flags & FLAG_PRIORITY != 0 {
+                            q = q.get(5..).ok_or("naive: PRIORITY 头截断")?;
+                        }
+                        q
+                    } else {
+                        p
+                    };
+                    block.extend_from_slice(p);
+                    if flags & FLAG_END_HEADERS != 0 && status.is_none() {
+                        status = decode_status(&block);
+                    }
+                    if let Some(s) = status {
+                        if s != 200 {
+                            return Err(format!("naive: CONNECT 被拒（HTTP {s}）"));
+                        }
+                        break;
+                    }
+                    if flags & FLAG_END_STREAM != 0 {
+                        return Err("naive: 服务端在应答前结束流".into());
+                    }
+                }
+                FRAME_RST_STREAM if fsid == sid => {
+                    return Err("naive: CONNECT 流被重置".into());
+                }
+                FRAME_GOAWAY => return Err("naive: 连接被 GOAWAY 关闭".into()),
+                _ => {}
+            }
+        }
+        let shared = Arc::new(TunnelShared {
+            rx: Mutex::new(VecDeque::new()),
+            rx_cond: Condvar::new(),
+            eof: AtomicBool::new(false),
+            err: Mutex::new(None),
+            send_window: Mutex::new((65535, self.peer_initial_window)),
+            send_cond: Condvar::new(),
+            halves: std::sync::atomic::AtomicU8::new(2),
+            kill: std::sync::Mutex::new(Some(kill)),
+        });
+        let sh = shared.clone();
+        let w2 = w.clone();
+        std::thread::spawn(move || tunnel_reader_loop(r, w2, sid, sh));
+        Ok((
+            TunnelReader {
+                shared: shared.clone(),
+                leftover: Vec::new(),
+            },
+            TunnelWriter {
+                shared,
+                w,
+                sid,
+                ended: AtomicBool::new(false),
+            },
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn connect_headers_encode() {
+        let h = encode_connect_headers(
+            "1.1.1.1:443",
+            &[("proxy-authorization", "Basic dXNlcjpwYXNz")],
+        );
+        // :method 静态名索引 2（literal without indexing，4 位前缀）+ "CONNECT"
+        assert_eq!(h[0], 0x02);
+        assert_eq!(h[1], 7);
+        assert_eq!(&h[2..9], b"CONNECT");
+        // :authority 静态名索引 1 + "1.1.1.1:443"（11 字节）
+        assert_eq!(h[9], 0x01);
+        assert_eq!(h[10], 11);
+        assert_eq!(&h[11..22], b"1.1.1.1:443");
+        // 名字字面量（name_idx=0）
+        assert_eq!(h[22], 0x00);
+        assert_eq!(h[23] as usize, "proxy-authorization".len());
+        let name_end = 24 + "proxy-authorization".len();
+        assert_eq!(&h[24..name_end], b"proxy-authorization");
+        let val = "Basic dXNlcjpwYXNz";
+        assert_eq!(h[name_end] as usize, val.len());
+        assert_eq!(&h[name_end + 1..name_end + 1 + val.len()], val.as_bytes());
+        assert_eq!(h.len(), name_end + 1 + val.len());
+    }
 
     #[test]
     fn hpack_encodes_expected_bytes() {
