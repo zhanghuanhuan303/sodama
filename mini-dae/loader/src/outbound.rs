@@ -20,8 +20,8 @@ use percent_encoding::percent_decode_str;
 use sha2::{Digest as _, Sha256};
 
 use crate::{
-    anytls, group::GroupRuntime, hysteria2, quicsock, reality, socks5, ss, target::Target, tls,
-    tls13, trojan, tuic, vision, vless, vmess, ws, DAE_SOCKET_MARK,
+    anytls, group::GroupRuntime, hysteria2, juicity, quicsock, reality, socks5, ss, target::Target,
+    tls, tls13, trojan, tuic, vision, vless, vmess, ws, DAE_SOCKET_MARK,
 };
 
 const SO_MARK_OPT: libc::c_int = 36;
@@ -230,6 +230,12 @@ impl WriteHalf for hysteria2::Hy2WriteHalf {
     }
 }
 
+impl WriteHalf for juicity::JuicityWriteHalf {
+    fn shutdown_write(&self) -> io::Result<()> {
+        self.shutdown_write()
+    }
+}
+
 impl<W: WriteHalf> WriteHalf for vless::VlessWriter<W> {
     fn shutdown_write(&self) -> io::Result<()> {
         self.inner().shutdown_write()
@@ -372,6 +378,8 @@ enum UdpKind {
     Tuic { udp: Box<tuic::TuicUdp> },
     /// hysteria2：QUIC datagram（每会话一个 SessionID，一个 NAT 会话对应一个 ID）。
     Hy2 { udp: Box<hysteria2::Hy2Udp> },
+    /// juicity：QUIC 双向流帧（元数据 + len u16 + 载荷）。
+    Juicity { udp: Box<juicity::JuicityUdp> },
 }
 
 /// UDP 会话的出口（direct / ss / vless / vmess）。
@@ -394,6 +402,10 @@ impl UdpRelay {
                 Ok(())
             }
             UdpKind::Hy2 { udp } => {
+                udp.set_read_timeout(d);
+                Ok(())
+            }
+            UdpKind::Juicity { udp } => {
                 udp.set_read_timeout(d);
                 Ok(())
             }
@@ -436,6 +448,7 @@ impl UdpRelay {
             }
             UdpKind::Tuic { udp } => udp.send(data),
             UdpKind::Hy2 { udp } => udp.send(data),
+            UdpKind::Juicity { udp } => udp.send(data),
         }
     }
 
@@ -467,6 +480,7 @@ impl UdpRelay {
             }
             UdpKind::Tuic { udp } => udp.recv(),
             UdpKind::Hy2 { udp } => udp.recv(),
+            UdpKind::Juicity { udp } => udp.recv(),
         }
     }
 }
@@ -540,6 +554,10 @@ pub enum Outbound {
         sni: String,
         insecure: bool,
     },
+    /// P27：juicity v0（QUIC + TUIC 式认证 + trojan 风格元数据）。
+    Juicity {
+        dialer: std::sync::Arc<juicity::JuicityDialer>,
+    },
     /// P25/P26：naive（CONNECT + Basic）；`h3=false` 走 HTTP/2（`naive+https://`），
     /// `h3=true` 走 HTTP/3（`naive+quic://`，QUIC 无底层 TcpStream）。
     Naive {
@@ -597,6 +615,7 @@ impl Outbound {
             }
             Self::Tuic { dialer } => dialer.name(),
             Self::Hysteria2 { dialer } => dialer.name(),
+            Self::Juicity { dialer } => dialer.name(),
             Self::AnyTls { server, sni, .. } => format!("anytls://{server}?sni={sni}"),
             Self::Naive {
                 server, h3: true, ..
@@ -612,7 +631,7 @@ impl Outbound {
     }
 
     /// 当前支持 UDP 代理的协议：ss（classic + SIP022）、vless/vmess（G2）、tuic（G3）、
-    /// hysteria2（G3b）；http CONNECT 仅 TCP。
+    /// hysteria2（G3b）、juicity（P27）；http CONNECT/naive 仅 TCP。
     pub fn supports_udp(&self) -> bool {
         if let Self::Group(g) = self {
             return g.supports_udp();
@@ -624,6 +643,7 @@ impl Outbound {
                 | Self::Vmess { .. }
                 | Self::Tuic { .. }
                 | Self::Hysteria2 { .. }
+                | Self::Juicity { .. }
         )
     }
 
@@ -903,6 +923,15 @@ impl Outbound {
                     socket: None,
                 })
             }
+            Self::Juicity { dialer } => {
+                // QUIC 无底层 TcpStream：socket=None（不与 offload 搭配，见 supports_offload）
+                let (r, w) = dialer.connect_tcp(target, timeout)?;
+                Ok(DialedStream {
+                    from_remote: Box::new(r),
+                    to_remote: Box::new(w),
+                    socket: None,
+                })
+            }
             Self::AnyTls {
                 server,
                 password_sha256,
@@ -1041,6 +1070,12 @@ impl Outbound {
                     udp: Box::new(dialer.connect_udp(target)?),
                 },
             })),
+            Self::Juicity { dialer } => Ok(Some(UdpRelay {
+                target,
+                kind: UdpKind::Juicity {
+                    udp: Box::new(dialer.connect_udp(target)?),
+                },
+            })),
             Self::Group(g) => g.dial_udp(target, timeout),
             _ => Ok(None),
         }
@@ -1090,6 +1125,9 @@ pub fn parse(url: &str) -> Result<Outbound, String> {
     if let Some(rest) = url.strip_prefix("anytls://") {
         return parse_anytls(rest);
     }
+    if let Some(rest) = url.strip_prefix("juicity://") {
+        return parse_juicity(rest);
+    }
     // P25/P26：naive（h2 = naive+https/naive；h3 = naive+quic）
     if let Some(rest) = url.strip_prefix("naive+https://") {
         return parse_naive(rest, false);
@@ -1107,7 +1145,8 @@ pub fn parse(url: &str) -> Result<Outbound, String> {
     }
     Err(format!(
         "--dialer 不支持 {url}（direct / socks5:// / http:// / ss:// / trojan:// / vless:// / \
-         vmess:// / tuic:// / hysteria2:// / hy2:// / anytls:// / naive+https:// / naive+quic://）"
+         vmess:// / tuic:// / hysteria2:// / hy2:// / anytls:// / naive+https:// / naive+quic:// / \
+         juicity://）"
     ))
 }
 
@@ -1204,6 +1243,69 @@ fn parse_naive(rest: &str, h3: bool) -> Result<Outbound, String> {
         sni: sni.unwrap_or(default_sni),
         insecure,
         h3,
+    })
+}
+
+/// `juicity://uuid:password@host:port?sni=…&allow_insecure=1`（juicity v0，QUIC）。
+///
+/// 本地 CC 参数（`congestion_control`/`cwnd`/`cc_override`）与
+/// `pinned_certchain_sha256` 未实现（忽略，边界见 ADR-0051）。
+fn parse_juicity(rest: &str) -> Result<Outbound, String> {
+    let rest = rest.split('#').next().unwrap_or(rest);
+    let (main, query) = match rest.split_once('?') {
+        Some((m, q)) => (m, q),
+        None => (rest, ""),
+    };
+    let (userinfo, hostport) = main
+        .split_once('@')
+        .ok_or_else(|| "juicity:// 需要 uuid:password@host:port".to_string())?;
+    let (uuid_s, password_raw) = userinfo
+        .split_once(':')
+        .ok_or_else(|| "juicity:// userinfo 需要 uuid:password".to_string())?;
+    let uuid_s = percent_decode(uuid_s);
+    let compact: String = uuid_s.chars().filter(|c| *c != '-').collect();
+    if compact.len() != 32 || !compact.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(format!("juicity:// uuid 非法: {uuid_s}"));
+    }
+    let uuid = vless::parse_uuid(&uuid_s).ok_or_else(|| "juicity:// uuid 非法".to_string())?;
+    let password = percent_decode(password_raw);
+    let mut sni: Option<String> = None;
+    let mut insecure = false;
+    for kv in query.split('&').filter(|s| !s.is_empty()) {
+        let (k, v) = kv.split_once('=').unwrap_or((kv, ""));
+        match k.to_ascii_lowercase().as_str() {
+            "sni" | "peer" | "servername" => sni = Some(percent_decode(v)),
+            "allowinsecure" | "allow_insecure" | "insecure" | "skipverify" => {
+                insecure = matches!(v, "1" | "true" | "TRUE" | "True")
+            }
+            // 本地 CC/证书固定：忽略（见 ADR-0051 边界）
+            "congestion_control"
+            | "congestion"
+            | "cc_override"
+            | "cwnd"
+            | "pinned_certchain_sha256" => {}
+            _ => {}
+        }
+    }
+    let hostport = percent_decode(hostport);
+    let default_sni = if let Some(r) = hostport.strip_prefix('[') {
+        r.split_once(']')
+            .map(|(h, _)| h.to_string())
+            .unwrap_or_else(|| hostport.clone())
+    } else {
+        hostport
+            .rsplit_once(':')
+            .map(|(h, _)| h.to_string())
+            .unwrap_or_else(|| hostport.clone())
+    };
+    Ok(Outbound::Juicity {
+        dialer: Arc::new(juicity::JuicityDialer::new(juicity::JuicityConfig {
+            server: resolve(&hostport)?,
+            uuid,
+            password,
+            sni: sni.unwrap_or(default_sni),
+            insecure,
+        })),
     })
 }
 
@@ -2060,6 +2162,31 @@ mod tests {
         // 缺少 userinfo 报错
         assert!(parse("naive+https://127.0.0.1:8443").is_err());
         assert!(parse("naive+quic://127.0.0.1:443").is_err());
+    }
+
+    #[test]
+    fn parse_juicity_url() {
+        let ob = parse(
+            "juicity://b831381d-6324-4d53-ad4f-8cda48b30811:pw%40x@1.2.3.4:18964?sni=example.com&allow_insecure=1&congestion_control=bbr",
+        )
+        .unwrap();
+        match ob {
+            Outbound::Juicity { dialer } => {
+                let cfg = dialer.config();
+                assert_eq!(cfg.server, "1.2.3.4:18964".parse().unwrap());
+                assert_eq!(cfg.uuid[0], 0xb8);
+                assert_eq!(cfg.uuid[15], 0x11);
+                assert_eq!(cfg.password, "pw@x");
+                assert_eq!(cfg.sni, "example.com");
+                assert!(cfg.insecure);
+                assert_eq!(dialer.name(), "juicity://1.2.3.4:18964");
+            }
+            other => panic!("应为 Juicity: {other:?}"),
+        }
+        // uuid 非法 / 缺 userinfo / 缺 password 分隔
+        assert!(parse("juicity://not-a-uuid:pw@1.2.3.4:443").is_err());
+        assert!(parse("juicity://1.2.3.4:443").is_err());
+        assert!(parse("juicity://b831381d-6324-4d53-ad4f-8cda48b30811@1.2.3.4:443").is_err());
     }
 
     #[test]

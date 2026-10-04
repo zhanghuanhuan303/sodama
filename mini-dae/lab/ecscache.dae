@@ -1,0 +1,20 @@
+# P28：ECS 回填 / ecs_cache——上游 URL 带 ecs=auto 注入客户端子网；应答若回显 ECS
+# （RFC 7871 scope），按回显 scope 入缓存并从更宽 scope 复用：
+#   scope=0（ecs0.test）      → 全局键 0.0.0.0/0，任意子网命中；
+#   scope=/16（ecs16.test）   → 同 /16 内不同 /24 命中（跨子网复用）。
+# 窄 scope（/32 仅本机、不跨客户端）语义由 loader 单测覆盖。
+# 回显域名与 scope 由 lab/fake_dns.py 的 ECS_ECHO 表决定。
+global {
+    dial_mode: 'ip'
+}
+
+dns {
+    upstream {
+        ecs: 'udp://127.0.0.1:5353?ecs=auto'
+    }
+}
+
+routing {
+    dport(5353) -> direct(must)
+    fallback: proxy
+}

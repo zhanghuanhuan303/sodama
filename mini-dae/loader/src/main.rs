@@ -58,6 +58,7 @@ mod h3client;
 mod hpack;
 mod huffman_table;
 mod hysteria2;
+mod juicity;
 mod outbound;
 mod quicsniff;
 mod quicsock;
@@ -486,6 +487,8 @@ struct DnsStats {
     relookups: AtomicU64,
     /// P23：ipversion_prefer 过滤（非首选族回空 NOERROR）数
     ipversion_filtered: AtomicU64,
+    /// P28：上游应答带 ECS 回显（回填 scope）的次数
+    ecs_echo: AtomicU64,
 }
 static DNS_STATS: DnsStats = DnsStats {
     queries: AtomicU64::new(0),
@@ -501,7 +504,11 @@ static DNS_STATS: DnsStats = DnsStats {
     response_rejects: AtomicU64::new(0),
     relookups: AtomicU64::new(0),
     ipversion_filtered: AtomicU64::new(0),
+    ecs_echo: AtomicU64::new(0),
 };
+
+/// P28：最近一次 ECS 回填 scope（状态面展示，如 `10.9.10.0/16` / `0.0.0.0/0`）。
+static ECS_SCOPE_LAST: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
 extern "C" fn on_sighup(_sig: libc::c_int) {
     RELOAD.store(true, Ordering::SeqCst);
@@ -3855,7 +3862,7 @@ fn resolve_dns(
         }
         return Some(serve_response(query, resp, proto));
     }
-    let (mut up, mut scope, mut served) = match selected {
+    let (mut up, scope, mut served) = match selected {
         Selected::Up(u, scope, s) => (u, scope, s),
         Selected::Reject => unreachable!(),
     };
@@ -3882,21 +3889,26 @@ fn resolve_dns(
         }
     }
     let ecs_prefix = match up.spec.ecs {
-        Some(dnsup::EcsMode::Auto) => client.map(dns::ecs_auto_prefix),
+        // P28：阶梯需要客户端**完整**地址（带主机位）——add_ecs 自己按前缀截断地址；
+        // 上游回填的 scope 可能宽于/等于注入前缀，命中判定靠 truncate_prefix。
+        Some(dnsup::EcsMode::Auto) => client.map(|c| (c, if c.is_ipv4() { 24 } else { 56 })),
         Some(dnsup::EcsMode::Prefix(ip, p)) => Some((ip, p)),
         None => None,
     };
     let ecs_query = ecs_prefix.and_then(|p| dns::add_ecs(query, p));
-    if let (Some((ip, p)), Some(_)) = (ecs_prefix, ecs_query.as_ref()) {
-        scope.push_str(&format!("|ecs={ip}/{p}"));
-    }
+    // P28：只有实际注入时才参与作用域（客户端自带 OPT 时透传，仍用基础作用域）。
+    let ecs_req = if ecs_query.is_some() {
+        ecs_prefix
+    } else {
+        None
+    };
+    let mut last_injected = ecs_req;
     let query_send: &[u8] = ecs_query.as_deref().unwrap_or(query);
-    // 2b) 缓存（按作用域）
+    // 2b) 缓存（按作用域；P28：ECS 阶梯查找——本机前缀/上游回填的更宽 scope）
     if let Some(q) = &parsed {
-        let hit = DNS_CACHE
-            .lock()
-            .ok()
-            .and_then(|mut c| c.answer_from_cache_scoped(query, q, &edns, &scope, Instant::now()));
+        let hit = DNS_CACHE.lock().ok().and_then(|mut c| {
+            c.answer_from_cache_ecs(query, q, &edns, &scope, ecs_req, Instant::now())
+        });
         if let Some(resp) = hit {
             DNS_STATS.responses.fetch_add(1, Ordering::Relaxed);
             publish_live(q, &resp, tx, true);
@@ -3943,12 +3955,19 @@ fn resolve_dns(
                 up = next;
                 served = dnsroute::ReqOut::Tag(t);
                 // 重查也按新上游的 ECS 配置注入
-                let ecs_query2 = match up.spec.ecs {
-                    Some(dnsup::EcsMode::Auto) => client.map(dns::ecs_auto_prefix),
+                let ecs_prefix2 = match up.spec.ecs {
+                    Some(dnsup::EcsMode::Auto) => {
+                        client.map(|c| (c, if c.is_ipv4() { 24 } else { 56 }))
+                    }
                     Some(dnsup::EcsMode::Prefix(ip, p)) => Some((ip, p)),
                     None => None,
-                }
-                .and_then(|p| dns::add_ecs(query, p));
+                };
+                let ecs_query2 = ecs_prefix2.and_then(|p| dns::add_ecs(query, p));
+                last_injected = if ecs_query2.is_some() {
+                    ecs_prefix2
+                } else {
+                    None
+                };
                 resp = match up.exchange(ecs_query2.as_deref().unwrap_or(query)) {
                     Ok(r) => r,
                     Err(e) => {
@@ -3969,8 +3988,28 @@ fn resolve_dns(
             .lock()
             .ok()
             .and_then(|g| g.fixed_domain_ttl.get(&dns_key(&q.qname)).copied());
+        // P28：ECS 回填——应答带 ECS 时按上游声明的 scope 入缓存
+        // （scope=0 → 全局键 `0.0.0.0/0`，可跨子网复用）；无回显则回退请求前缀。
+        let mut insert_scope = scope.clone();
+        if let Some((cip, cp)) = last_injected {
+            let max = if cip.is_ipv4() { 32 } else { 128 };
+            let echoed = dns::parse_ecs_echo(&resp)
+                .filter(|e| e.family == if cip.is_ipv4() { 1 } else { 2 } && e.scope_prefix <= max);
+            let (ip, p) = match echoed {
+                Some(e) => {
+                    DNS_STATS.ecs_echo.fetch_add(1, Ordering::Relaxed);
+                    let t = dns::truncate_prefix(e.src, e.scope_prefix);
+                    if let Ok(mut g) = ECS_SCOPE_LAST.lock() {
+                        *g = Some(format!("{t}/{}", e.scope_prefix));
+                    }
+                    (t, e.scope_prefix)
+                }
+                None => (cip, cp),
+            };
+            insert_scope.push_str(&format!("|ecs={ip}/{p}"));
+        }
         if let Ok(mut c) = DNS_CACHE.lock() {
-            c.insert_scoped_with_fixed(q, &edns, &scope, &resp, Instant::now(), fixed);
+            c.insert_scoped_with_fixed(q, &edns, &insert_scope, &resp, Instant::now(), fixed);
         }
     }
     Some(serve_response(query, resp, proto))
@@ -5130,6 +5169,10 @@ fn status_json(ebpf: &mut Ebpf) -> serde_json::Value {
                 "notes": dns_router().map(|r| r.notes.clone()).unwrap_or_default(),
             },
             "queries": DNS_STATS.queries.load(Ordering::Relaxed),
+            "ecs": {
+                "echo": DNS_STATS.ecs_echo.load(Ordering::Relaxed),
+                "scope": ECS_SCOPE_LAST.lock().ok().and_then(|g| g.clone()),
+            },
             "responses": DNS_STATS.responses.load(Ordering::Relaxed),
             "published_ips": DNS_STATS.published_ips.load(Ordering::Relaxed),
             "bitmap_matched": DNS_STATS.bitmap_matched.load(Ordering::Relaxed),

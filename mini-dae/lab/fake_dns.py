@@ -65,6 +65,16 @@ TABLE = {
     # P23：DNS 选项夹具（fixed_domain_ttl / ipversion_prefer）
     "stale.test": "10.9.10.71",
     "pref.test": "10.9.10.72",
+    # P28：ECS 回填/ecs_cache 夹具（回显 scope；窄 scope 语义由单测覆盖）
+    "ecs0.test": "10.9.10.81",
+    "ecs16.test": "10.9.10.82",
+}
+
+# P28：这些域名在应答里带回显 ECS（值 = scope prefix）：
+#   ecs0.test -> 0（全局）、ecs16.test -> 16（跨 /16 共享）
+ECS_ECHO = {
+    "ecs0.test": 0,
+    "ecs16.test": 16,
 }
 
 # P23：按名覆盖上游 TTL（默认 30）
@@ -179,6 +189,18 @@ def respond(query, proto="UDP"):
         resp[6:8] = b"\x00\x00"
         resp[8:10] = b"\x00\x00"
         resp[10:12] = b"\x00\x00"
+    # P28：按域回显 ECS（scope 来自 ECS_ECHO）；地址/source-prefix 照抄客户端请求
+    if qname in ECS_ECHO and ecs and resp[6:8] != b"\x00\x00":
+        fam_s, src_s, addr_s = ecs.split("/", 2)
+        fam = int(fam_s)
+        if fam == 1:
+            addr = bytes(int(b) for b in addr_s.split("."))
+        else:
+            addr = bytes.fromhex(addr_s)
+        opt_body = struct.pack("!HBB", fam, int(src_s), ECS_ECHO[qname]) + addr
+        rdata = struct.pack("!HH", 8, len(opt_body)) + opt_body
+        resp[10:12] = struct.pack("!H", 1)
+        resp += b"\x00" + struct.pack("!HHIH", 41, 4096, 0, len(rdata)) + rdata
     return bytes(resp)
 
 

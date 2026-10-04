@@ -367,6 +367,126 @@ pub fn add_ecs(query: &[u8], prefix: (IpAddr, u8)) -> Option<Vec<u8>> {
     Some(out)
 }
 
+// ---------------------------------------------------------------- P28 ECS 回填
+
+/// 上游应答中的 ECS 回显（RFC 7871 §7.3：FAMILY/SOURCE-PREFIX/SCOPE/ADDRESS）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EcsEcho {
+    /// 1 = IPv4，2 = IPv6
+    pub family: u16,
+    /// OPTION-DATA 里的地址（客户端子网回显）
+    pub src: IpAddr,
+    pub src_prefix: u8,
+    /// 上游声明的作用域前缀（0 = 全局）
+    pub scope_prefix: u8,
+}
+
+/// 从上游应答的 OPT RR 里解出 ECS 回显；没有/非法 → None。
+pub fn parse_ecs_echo(resp: &[u8]) -> Option<EcsEcho> {
+    let opt = parse_rrs(resp)?.into_iter().find(|r| r.rtype == RR_OPT)?;
+    let rd = resp.get(opt.rdata_off..opt.rdata_off.checked_add(opt.rdlen)?)?;
+    let mut pos = 0usize;
+    while pos + 4 <= rd.len() {
+        let code = u16::from_be_bytes([rd[pos], rd[pos + 1]]);
+        let len = u16::from_be_bytes([rd[pos + 2], rd[pos + 3]]) as usize;
+        pos += 4;
+        let data = rd.get(pos..pos.checked_add(len)?)?;
+        if code == 8 {
+            if data.len() < 4 {
+                return None;
+            }
+            let family = u16::from_be_bytes([data[0], data[1]]);
+            let src_prefix = data[2];
+            let scope_prefix = data[3];
+            let max = match family {
+                1 => 32u8,
+                2 => 128u8,
+                _ => return None,
+            };
+            if src_prefix > max || scope_prefix > max {
+                return None;
+            }
+            let nbytes = (src_prefix as usize).div_ceil(8);
+            let addr = data.get(4..4 + nbytes)?;
+            let src = match family {
+                1 => {
+                    let mut o = [0u8; 4];
+                    o[..nbytes.min(4)].copy_from_slice(&addr[..nbytes.min(4)]);
+                    IpAddr::V4(std::net::Ipv4Addr::from(o))
+                }
+                _ => {
+                    let mut o = [0u8; 16];
+                    o[..nbytes.min(16)].copy_from_slice(&addr[..nbytes.min(16)]);
+                    IpAddr::V6(std::net::Ipv6Addr::from(o))
+                }
+            };
+            return Some(EcsEcho {
+                family,
+                src,
+                src_prefix,
+                scope_prefix,
+            });
+        }
+        pos += len;
+    }
+    None
+}
+
+/// 地址按前缀截断（主机位清零）。
+pub fn truncate_prefix(ip: IpAddr, prefix: u8) -> IpAddr {
+    match ip {
+        IpAddr::V4(v4) => {
+            let p = prefix.min(32) as u32;
+            let masked = if p == 0 {
+                0
+            } else {
+                u32::from(v4) & (!0u32 << (32 - p))
+            };
+            IpAddr::V4(masked.into())
+        }
+        IpAddr::V6(v6) => {
+            let p = prefix.min(128) as u32;
+            let raw = u128::from(v6);
+            let masked = if p == 0 {
+                0
+            } else {
+                raw & (!0u128 << (128 - p))
+            };
+            IpAddr::V6(masked.into())
+        }
+    }
+}
+
+/// P28：ECS 作用域候选阶梯（从请求前缀到更宽 scope，再到本机前缀）：
+/// - 请求前缀（注入时用的 /24 或 /56，等值命中）；
+/// - 本机前缀（/32、/128；上游回填 scope=32 时同一客户端仍能命中）；
+/// - 更粗规范前缀（命中上游回填的较宽 scope，如 /16、/0 全局）。
+/// 只会“向宽”复用（候选前缀 ⊆ 条目 scope），不会把窄答案给宽网段。
+pub fn ecs_scope_ladder(ip: IpAddr, prefix: u8) -> Vec<(IpAddr, u8)> {
+    let host = if ip.is_ipv4() { 32 } else { 128 };
+    let mut out: Vec<(IpAddr, u8)> = Vec::new();
+    let mut push = |out: &mut Vec<(IpAddr, u8)>, p: u8| {
+        let p = p.min(host);
+        let t = truncate_prefix(ip, p);
+        if !out.iter().any(|(a, b)| *a == t && *b == p) {
+            out.push((t, p));
+        }
+    };
+    push(&mut out, prefix);
+    push(&mut out, host);
+    let coarser: &[u8] = if ip.is_ipv4() {
+        &[24, 20, 16, 12, 8, 0]
+    } else {
+        &[56, 48, 32, 0]
+    };
+    for &p in coarser {
+        if p < prefix {
+            push(&mut out, p);
+        }
+    }
+    out
+}
+
 /// UDP 截断：超过客户端公布尺寸时丢弃 answer/authority/additional、置 TC=1；
 /// 若原应答带 OPT 则保留（EDNS 客户端期望看到 OPT）。逐跳 IP 分片不属于本层，
 /// 交给内核（本地回包 MTU 足够）。
@@ -558,8 +678,56 @@ impl DnsCache {
             do_bit: edns.do_bit,
             scope: scope.to_string(),
         };
-        let Some(e) = self.map.get(&key) else {
+        if let Some(resp) = self.get_scoped(&key, query, now) {
+            return Some(resp);
+        }
+        self.misses += 1;
+        None
+    }
+
+    /// P28：ECS 作用域化查找——按 `ecs_scope_ladder` 从请求前缀依次尝试
+    /// 本机前缀与更宽 scope（上游回填的 scope 键），命中即返回；全部未命中计一次 miss。
+    pub fn answer_from_cache_ecs(
+        &mut self,
+        query: &[u8],
+        q: &Question,
+        edns: &EdnsInfo,
+        base_scope: &str,
+        ecs: Option<(IpAddr, u8)>,
+        now: Instant,
+    ) -> Option<Vec<u8>> {
+        if edns.has_options {
             self.misses += 1;
+            return None;
+        }
+        let mut candidates: Vec<String> = Vec::new();
+        match ecs {
+            Some((ip, p)) => {
+                for (a, pl) in ecs_scope_ladder(ip, p) {
+                    candidates.push(format!("{base_scope}|ecs={a}/{pl}"));
+                }
+            }
+            None => candidates.push(base_scope.to_string()),
+        }
+        for scope in candidates {
+            let key = CacheKey {
+                qname: q.qname.clone(),
+                qtype: q.qtype,
+                qclass: q.qclass,
+                do_bit: edns.do_bit,
+                scope,
+            };
+            if let Some(resp) = self.get_scoped(&key, query, now) {
+                return Some(resp);
+            }
+        }
+        self.misses += 1;
+        None
+    }
+
+    /// 单键命中（不改 miss 计数）：命中/乐观 stale 返回应答；过期则移除。
+    fn get_scoped(&mut self, key: &CacheKey, query: &[u8], now: Instant) -> Option<Vec<u8>> {
+        let Some(e) = self.map.get(key) else {
             return None;
         };
         let elapsed = now.saturating_duration_since(e.stored).as_secs() as u32;
@@ -578,9 +746,8 @@ impl DnsCache {
                     self.stale_reply_ttl,
                 ));
             }
-            self.map.remove(&key);
+            self.map.remove(key);
             self.expired += 1;
-            self.misses += 1;
             return None;
         }
         self.hits += 1;
@@ -1554,5 +1721,186 @@ mod tests {
         assert_eq!(txt.ttl, 25, "普通 additional RR 应递减（对照 dae）");
         let opt = rrs.iter().find(|r| r.rtype == RR_OPT).unwrap();
         assert_eq!(opt.ttl, 0, "OPT 的 TTL 字段不动");
+    }
+
+    // ------------------------------------------------ P28：ECS 回填 / ecs_cache
+
+    /// 构一个带 ECS 回显 OPT 的应答（QR=1，附一条 A）。
+    fn build_a_response_ecs(q: &[u8], addr: [u8; 4], src_prefix: u8, scope_prefix: u8) -> Vec<u8> {
+        let resp = build_a_response(q, &[addr], 30).unwrap();
+        let mut resp = resp;
+        // 追加 OPT RR：RDATA = ECS option（带 scope 回显）
+        let mut opt_data = Vec::new();
+        opt_data.extend_from_slice(&1u16.to_be_bytes()); // family v4
+        opt_data.push(src_prefix);
+        opt_data.push(scope_prefix);
+        let nbytes = (src_prefix as usize).div_ceil(8);
+        opt_data.extend_from_slice(&addr[..nbytes]);
+        let rdlen = 4 + opt_data.len();
+        let ar = u16::from_be_bytes([resp[10], resp[11]]) + 1;
+        resp[10..12].copy_from_slice(&ar.to_be_bytes());
+        resp.push(0);
+        resp.extend_from_slice(&RR_OPT.to_be_bytes());
+        resp.extend_from_slice(&4096u16.to_be_bytes());
+        resp.extend_from_slice(&0u32.to_be_bytes());
+        resp.extend_from_slice(&(rdlen as u16).to_be_bytes());
+        resp.extend_from_slice(&8u16.to_be_bytes());
+        resp.extend_from_slice(&(opt_data.len() as u16).to_be_bytes());
+        resp.extend_from_slice(&opt_data);
+        resp
+    }
+
+    #[test]
+    fn parse_ecs_echo_variants() {
+        let q = query("echo.test", 1);
+        let resp = build_a_response_ecs(&q, [10, 1, 2, 0], 24, 0);
+        let e = parse_ecs_echo(&resp).unwrap();
+        assert_eq!(e.family, 1);
+        assert_eq!(e.src.to_string(), "10.1.2.0");
+        assert_eq!((e.src_prefix, e.scope_prefix), (24, 0));
+        let resp = build_a_response_ecs(&q, [10, 1, 0, 0], 16, 16);
+        let e = parse_ecs_echo(&resp).unwrap();
+        assert_eq!(
+            (e.src.to_string().as_str(), e.scope_prefix),
+            ("10.1.0.0", 16)
+        );
+        // 无 OPT → None；普通应答不报错
+        let plain = build_a_response(&q, &[[1, 2, 3, 4]], 30).unwrap();
+        assert!(parse_ecs_echo(&plain).is_none());
+        assert!(parse_ecs_echo(&q).is_none());
+    }
+
+    #[test]
+    fn ecs_scope_ladder_order_and_truncation() {
+        let ip: IpAddr = "10.1.2.3".parse().unwrap();
+        let ladder = ecs_scope_ladder(ip, 24);
+        assert_eq!(
+            ladder,
+            vec![
+                ("10.1.2.0".parse().unwrap(), 24),
+                ("10.1.2.3".parse().unwrap(), 32),
+                ("10.1.0.0".parse().unwrap(), 20),
+                ("10.1.0.0".parse().unwrap(), 16),
+                ("10.0.0.0".parse().unwrap(), 12),
+                ("10.0.0.0".parse().unwrap(), 8),
+                ("0.0.0.0".parse().unwrap(), 0),
+            ]
+        );
+        let v6: IpAddr = "2001:db8:1:2::5".parse().unwrap();
+        let ladder6 = ecs_scope_ladder(v6, 56);
+        assert_eq!(ladder6[0], ("2001:db8:1::".parse().unwrap(), 56));
+        assert_eq!(ladder6[1], (v6, 128));
+        assert!(ladder6.contains(&("2001:db8::".parse().unwrap(), 32)));
+        assert_eq!(ladder6.last().unwrap().1, 0);
+    }
+
+    #[test]
+    fn ecs_cache_reuses_echoed_broader_scope() {
+        let q = query("share.test", 1);
+        let resp = build_a_response(&q, &[[7, 7, 7, 7]], 30).unwrap();
+        let t0 = Instant::now();
+        let mut c = DnsCache::default();
+        // 上游声明 scope=/16（地址截断到 /16）→ 按回填键插入
+        assert!(c.insert_scoped(
+            &parse_query(&q).unwrap(),
+            &no_edns(),
+            "legacy|up|ecs=10.1.0.0/16",
+            &resp,
+            t0
+        ));
+        // 同 /16 内另一个 /24 的客户端（请求前缀 /24）命中
+        let hit = c.answer_from_cache_ecs(
+            &q,
+            &parse_query(&q).unwrap(),
+            &no_edns(),
+            "legacy|up",
+            Some(("10.1.9.9".parse().unwrap(), 24)),
+            t0 + Duration::from_secs(5),
+        );
+        assert!(hit.is_some());
+        // 不同 /16 的客户端不命中
+        assert!(c
+            .answer_from_cache_ecs(
+                &q,
+                &parse_query(&q).unwrap(),
+                &no_edns(),
+                "legacy|up",
+                Some(("10.2.9.9".parse().unwrap(), 24)),
+                t0 + Duration::from_secs(5),
+            )
+            .is_none());
+    }
+
+    #[test]
+    fn ecs_cache_global_scope_zero_and_host_prefix() {
+        let q = query("global.test", 1);
+        let resp = build_a_response(&q, &[[8, 8, 8, 8]], 30).unwrap();
+        let t0 = Instant::now();
+        let mut c = DnsCache::default();
+        // scope=0（全局）→ 任何子网（含本机 /32 候选）都能命中
+        assert!(c.insert_scoped(
+            &parse_query(&q).unwrap(),
+            &no_edns(),
+            "legacy|up|ecs=0.0.0.0/0",
+            &resp,
+            t0
+        ));
+        assert!(c
+            .answer_from_cache_ecs(
+                &q,
+                &parse_query(&q).unwrap(),
+                &no_edns(),
+                "legacy|up",
+                Some(("192.0.2.254".parse().unwrap(), 24)),
+                t0 + Duration::from_secs(1),
+            )
+            .is_some());
+        // scope=32（仅本机）→ 同一客户端的 /32 候选命中；别的客户端不命中
+        let q2 = query("narrow.test", 1);
+        let resp2 = build_a_response(&q2, &[[9, 9, 9, 9]], 30).unwrap();
+        assert!(c.insert_scoped(
+            &parse_query(&q2).unwrap(),
+            &no_edns(),
+            "legacy|up|ecs=10.9.9.9/32",
+            &resp2,
+            t0
+        ));
+        assert!(c
+            .answer_from_cache_ecs(
+                &q2,
+                &parse_query(&q2).unwrap(),
+                &no_edns(),
+                "legacy|up",
+                Some(("10.9.9.9".parse().unwrap(), 24)),
+                t0 + Duration::from_secs(1),
+            )
+            .is_some());
+        assert!(c
+            .answer_from_cache_ecs(
+                &q2,
+                &parse_query(&q2).unwrap(),
+                &no_edns(),
+                "legacy|up",
+                Some(("10.9.9.10".parse().unwrap(), 24)),
+                t0 + Duration::from_secs(1),
+            )
+            .is_none());
+        // 带 EDNS options（客户端自带 ECS）不进缓存（既有语义）
+        let opt = EdnsInfo {
+            present: true,
+            udp_size: 1232,
+            do_bit: false,
+            has_options: true,
+        };
+        assert!(c
+            .answer_from_cache_ecs(
+                &q,
+                &parse_query(&q).unwrap(),
+                &opt,
+                "legacy|up",
+                Some(("192.0.2.254".parse().unwrap(), 24)),
+                t0 + Duration::from_secs(1),
+            )
+            .is_none());
     }
 }
