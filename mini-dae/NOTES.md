@@ -1489,3 +1489,28 @@ lab 夹具 `http_connect_server.py` + `sub_server.py` 每次重读。）
   假上游在 3s 内恰好收到 1 次刷新（共 2 次，单飞）；状态面 spawned≥1、err=0。
 - 边界：刷新不做应答路由重查（用原上游结果）；刷新线程与主路径共享全局缓存锁
   （短临界区）。
+
+### 11.45 P30（SSR origin+plain，ADR-0054）已验收的行为
+
+- `ssr_cipher.rs`：流密码层对齐 Go `ciphers/stream_cipher.go`——方法 aes-128/192/256-cfb、
+  aes-128/192/256-ctr、chacha20-ietf、rc4-md5、rc4-md5-6；key 用 EVP_BytesToKey(MD5，无盐)
+  派生（`d_i = MD5(d_{i-1} || password)`）；CFB-128/CTR 在 AES 块加密上自实现、跨调用
+  保持流状态；`rc4-md5(-6)` 为 RC4(MD5(key||iv))；`chacha20-ietf` 用 RustCrypto
+  `chacha20`；`init_encrypt()` 首调用生成随机 IV，连接内复用。
+- `ssr.rs`：`ssr://` 链接解析（外层 base64 或内层明文均可；password 字段 URL-safe
+  base64；格式 `server:port:proto:method:obfs:pwd`）；连接层 origin proto + plain obfs：
+  首写 `[IV][E(目标地址||载荷)]`、首读先取对端 IV；`proto`/`obfs` 非 origin/plain
+  解析即报错（不静默降级）；无插件。
+- `outbound.rs`：`Outbound::Ssr`（name/server_addr/dial_tcp）+ `parse()` 支持 `ssr://`
+  （先剥 `#fragment`）。
+- lab：`lab/proto-check/ssr-server`（从 olicesx/outbound 移植的 Go 参考服务端；
+  上游 socket 打 `SO_MARK=0x233`）；`ssr-up`/`test-ssr`：交互 + 512KB 逐字节 +
+  服务端 `SSR connect target=` 日志 + 状态面（conns>=2、dial_errors=0、
+  bytes_up/down>=512KiB、offloaded=0）。
+- 实测：`cargo test` **225/225**（ssr_cipher 5 例（含 Go 黄金向量）+ ssr 3 例）；
+  lab `test-ssr` PASS；回归 `verify` 9/9 + `test-juicity`/`test-tuic`/`test-dns-options`
+  PASS；真机网关 down→up 自检通过 + `gateway.sh test`（出口 IP + DNS 快检）+
+  日志 0 panic。
+- 边界：`auth_*`（auth_aes128_md5/sha1、auth_sha1_v4、auth_chain_a/b）与 `obfs_*`
+  （http_simple/http_post/random_head/tls1.2_ticket_auth）及 UDP 未做——
+  解析即显式报错；SSR 连接不可与 TCP offload 拼接。

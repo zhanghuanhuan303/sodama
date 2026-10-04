@@ -78,6 +78,7 @@
 | [0051](./ADR-0051-p27-juicity.md) | P27 juicity v0 出站：quinn + TLS exporter 认证（认证单向流保持打开）+ trojan 风格元数据（1/4/3/2）；TCP 每连接一条流、UDP 每 NAT 会话一条流（`[元数据][len u16][载荷]` 双工）；链接 `juicity://uuid:password@host:port`；lab 上游 e2e 服务端移植夹具跨实现（TCP 512KB + UDP 3/3）；边界：full-cone underlay/0-RTT/本地 CC 不做 | 已采纳 | —（P27 执行；对标表缺口 #6 juicity 收官） |
 | [0052](./ADR-0052-p28-ecs-cache.md) | P28 ECS 回填 / ecs_cache：解析上游应答 ECS 回显（RFC 7871 scope）并按回填 scope 作用域化缓存；`ecs_scope_ladder` 阶梯查找（请求前缀 → 本机 /32 → 更宽规范前缀，只向宽复用）；`ecs=auto` 改传完整客户端地址（修 /32 回填键覆盖 /24 的语义瑕疵）；状态面 `dns.ecs.echo/scope`；lab scope=0//16 复用断言 | 已采纳 | —（P28 执行；对标表缺口 #5 收官） |
 | [0053](./ADR-0053-p29-optimistic-refresh.md) | P29 optimistic cache 后台刷新（RFC 8767）：`DnsCache.refreshing` 单飞集合 + `CacheHit{resp,stale,scope}` + `is_negative_response` 四态；stale 命中后异步重查（失败保留旧条目、负答取代过期正值、保留 ECS 语义）；状态面 `dns.refresh.*`；lab「上游恰好 1 次刷新」断言 | 已采纳 | —（P29 执行；对标表缺口 #5 DNS 域闭环） |
+| [0054](./ADR-0054-p30-ssr.md) | P30 SSR 出站（shadowsocksr-stream，origin+plain 首段）：流密码层（aes-*-cfb/ctr、chacha20-ietf、rc4-md5(-6)；EVP_BytesToKey(MD5) 派生；CFB/CTR 自实现保流状态）+ 连接层（IV/首段目标地址/URL-safe base64 链接解析；`auth_*`/`obfs_*` 与 UDP 显式报错、不静默）；Go/outbound 夹具跨实现（交互 + 512KB）——出站 12 家族全有 | 已采纳 | —（P30 执行；对标表缺口 #6 ssr 收官） |
 
 ## 新增一条 ADR
 
