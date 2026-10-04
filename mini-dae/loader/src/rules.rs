@@ -69,6 +69,9 @@ pub const OUTBOUND_PROXY: u8 = GROUP_INDEX_BASE;
 pub const OUTBOUND_MUST_RULES: u8 = 0xFC;
 pub const OUTBOUND_LOGICAL_OR: u8 = 0xFE;
 pub const OUTBOUND_LOGICAL_AND: u8 = 0xFF;
+/// 逻辑编码掩码（= `ebpf-rs/src/common.rs` 的 `MINI_OUTBOUND_LOGICAL_MASK`）；
+/// `outbound & MASK != MASK` 表示这是一个真实出口。
+pub const OUTBOUND_LOGICAL_MASK: u8 = 0xFE;
 
 /// 与 C 侧 `struct mini_match_set` 完全同位（24 字节）。
 #[repr(C)]
@@ -1229,9 +1232,276 @@ impl CompiledRules {
     }
 }
 
+// ------------------------------------------------------------------
+// P21：嗅探重判（sniff-punt）——在用户态重放与数据面等价的规则 VM
+// ------------------------------------------------------------------
+
+/// 用户态重判的输入（relay 侧已掌握的五元组 + 嗅探到的域名）。
+#[derive(Debug, Clone)]
+pub struct PuntCtx<'a> {
+    /// 嗅探到的域名（SNI/Host）；None = 未嗅探到（域规则一律不命中）。
+    pub domain: Option<&'a str>,
+    /// 原始目的地址（relay 的 local_addr）。
+    pub dip: std::net::IpAddr,
+    /// 客户端源地址（relay 的 peer_addr）。
+    pub sip: std::net::IpAddr,
+    pub dport: u16,
+    pub sport: u16,
+    /// 6=TCP / 17=UDP（IPPROTO_*；与数据面编码一致）。
+    pub l4proto: u8,
+}
+
+/// 重判结果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PuntOutcome {
+    /// 命中一条真实 outbound（编码与数据面一致：0=direct / 1=block / ≥2=用户组）。
+    Outbound { id: u8, mark: u32, must: bool },
+    /// 规则全部耗尽仍未命中（保持数据面/默认组的原有决策）。
+    NoMatch,
+    /// 命中 DNS 查询路径（dport=53 且非 must；数据面交给控制面，保持原状）。
+    ControlPlane,
+}
+
+/// IP → 与 LPM 键一致的 16 字节形式（v4-mapped / v6 原始）。
+fn ip16_of(ip: std::net::IpAddr) -> [u8; 16] {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            let mut b = [0u8; 16];
+            b[10] = 0xff;
+            b[11] = 0xff;
+            b[12..16].copy_from_slice(&v4.octets());
+            b
+        }
+        std::net::IpAddr::V6(v6) => v6.octets(),
+    }
+}
+
+/// LPM 前缀集合是否命中某地址（16 字节统一形式，前缀位数 0..=128）。
+fn lpm_prefix_hit(prefixes: &[(u32, [u8; 16])], addr: &[u8; 16]) -> bool {
+    prefixes.iter().any(|(plen, data)| {
+        let full = (*plen / 8) as usize;
+        let rem = (*plen % 8) as u8;
+        if full > 16 || data[..full] != addr[..full] {
+            return false;
+        }
+        rem == 0 || full >= 16 || data[full] >> (8 - rem) == addr[full] >> (8 - rem)
+    })
+}
+
+impl CompiledRules {
+    /// P21：用户态重放规则 VM（逐条对照 `ebpf-rs/src/route.rs` 的 state 机与
+    /// `ebpf_generated.go` 的 outbound 编码）。
+    ///
+    /// 未掌握的字段（mac/dscp/pname）按「不命中」处理：嗅探重判面向经 tproxy 转发的
+    /// 连接（LAN→WAN，数据面 `is_wan=0`，pname 恒不命中），mac 是 LAN 侧源 MAC、dscp
+    /// 需读原始包，二者在用户态均不可得。
+    pub fn punt_match(&self, ctx: &PuntCtx<'_>) -> PuntOutcome {
+        const ST_BAD: u8 = 1;
+        const ST_GOOD: u8 = 2;
+        const ST_MUST: u8 = 4;
+
+        let dip = ip16_of(ctx.dip);
+        let sip = ip16_of(ctx.sip);
+        let l4bit: u32 = if ctx.l4proto == 6 { 1 } else { 2 };
+        let verbit: u32 = if ctx.dip.is_ipv4() { 1 } else { 2 };
+
+        let mut state = 0u8;
+        for (i, ms) in self.sets.iter().enumerate() {
+            if state & (ST_BAD | ST_GOOD) == 0 {
+                let good = match ms.type_ {
+                    MATCH_DOMAIN_SET => ctx.domain.is_some_and(|name| {
+                        self.domain_sets
+                            .iter()
+                            .find(|d| d.match_set_index == i as u32)
+                            .is_some_and(|d| crate::dns::domain_set_matches(d, name))
+                    }),
+                    MATCH_IP_SET => self
+                        .lpm_tries
+                        .get(&ms.lpm_index())
+                        .is_some_and(|p| lpm_prefix_hit(p, &dip)),
+                    MATCH_SOURCE_IP_SET => self
+                        .lpm_tries
+                        .get(&ms.lpm_index())
+                        .is_some_and(|p| lpm_prefix_hit(p, &sip)),
+                    MATCH_PORT => {
+                        let (a, b) = ms.port_range();
+                        ctx.dport >= a && ctx.dport <= b
+                    }
+                    MATCH_SOURCE_PORT => {
+                        let (a, b) = ms.port_range();
+                        ctx.sport >= a && ctx.sport <= b
+                    }
+                    MATCH_L4_PROTO => ms.mask() & l4bit != 0,
+                    MATCH_IP_VERSION => ms.mask() & verbit != 0,
+                    MATCH_FALLBACK => true,
+                    // MAC / DSCP / pname：用户态不可得，按不命中（见方法注释）。
+                    _ => false,
+                };
+                if good {
+                    state |= ST_GOOD;
+                }
+            }
+            if ms.outbound != OUTBOUND_LOGICAL_OR {
+                let good = state & ST_GOOD != 0;
+                if good == (ms.not != 0) {
+                    state |= ST_BAD;
+                }
+                state &= !ST_GOOD;
+            }
+            if ms.outbound & OUTBOUND_LOGICAL_MASK != OUTBOUND_LOGICAL_MASK {
+                if state & ST_BAD == 0 {
+                    if ms.outbound == OUTBOUND_MUST_RULES {
+                        state |= ST_MUST;
+                    } else {
+                        let must = state & ST_MUST != 0 || ms.must != 0;
+                        if !must && ctx.dport == 53 {
+                            return PuntOutcome::ControlPlane;
+                        }
+                        return PuntOutcome::Outbound {
+                            id: ms.outbound,
+                            mark: ms.mark,
+                            must,
+                        };
+                    }
+                }
+                state &= !ST_BAD;
+            }
+        }
+        PuntOutcome::NoMatch
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn punt_ctx<'a>(domain: Option<&'a str>, dport: u16) -> PuntCtx<'a> {
+        PuntCtx {
+            domain,
+            dip: "1.1.1.1".parse().unwrap(),
+            sip: "10.0.0.2".parse().unwrap(),
+            dport,
+            sport: 33333,
+            l4proto: 6,
+        }
+    }
+
+    #[test]
+    fn punt_reselects_by_domain() {
+        let c =
+            parse_and_compile("domain(suffix:direct.test) -> direct\nfallback -> proxy").unwrap();
+        assert_eq!(
+            c.punt_match(&punt_ctx(Some("direct.test"), 8080)),
+            PuntOutcome::Outbound {
+                id: OUTBOUND_DIRECT,
+                mark: 0,
+                must: false
+            }
+        );
+        assert_eq!(
+            c.punt_match(&punt_ctx(Some("a.dirECT.test"), 8080)),
+            PuntOutcome::Outbound {
+                id: OUTBOUND_DIRECT,
+                mark: 0,
+                must: false
+            }
+        );
+        assert_eq!(
+            c.punt_match(&punt_ctx(Some("other.test"), 8080)),
+            PuntOutcome::Outbound {
+                id: OUTBOUND_PROXY,
+                mark: 0,
+                must: false
+            }
+        );
+        // 域名未知（未嗅探到）：域规则不命中，落到 fallback
+        assert_eq!(
+            c.punt_match(&punt_ctx(None, 8080)),
+            PuntOutcome::Outbound {
+                id: OUTBOUND_PROXY,
+                mark: 0,
+                must: false
+            }
+        );
+    }
+
+    #[test]
+    fn punt_not_domain_and_block() {
+        let c = parse_and_compile(
+            "domain(full:keep.test) -> direct\n\
+             !domain(suffix:keep.test) && fallback -> block\nfallback -> proxy",
+        )
+        .unwrap();
+        // !domain 命中（不在 keep.test）→ 第二函数 fallback 也命中 → block
+        assert_eq!(
+            c.punt_match(&punt_ctx(Some("x.test"), 9090)),
+            PuntOutcome::Outbound {
+                id: OUTBOUND_BLOCK,
+                mark: 0,
+                must: false
+            }
+        );
+        // 是 keep.test（full）→ 规则1 直接 direct
+        assert_eq!(
+            c.punt_match(&punt_ctx(Some("keep.test"), 9090)),
+            PuntOutcome::Outbound {
+                id: OUTBOUND_DIRECT,
+                mark: 0,
+                must: false
+            }
+        );
+        // 子域 sub.keep.test：full 不中；!suffix 也不中（命中是子域）→ fallback -> proxy
+        assert_eq!(
+            c.punt_match(&punt_ctx(Some("sub.keep.test"), 9090)),
+            PuntOutcome::Outbound {
+                id: OUTBOUND_PROXY,
+                mark: 0,
+                must: false
+            }
+        );
+    }
+
+    #[test]
+    fn punt_ip_and_port_and_sticky_or() {
+        let c = parse_and_compile(
+            "sip(10.0.0.0/24) && dport(80, 443) && fallback -> direct\nfallback -> proxy",
+        )
+        .unwrap();
+        for p in [80u16, 443] {
+            assert_eq!(
+                c.punt_match(&punt_ctx(None, p)),
+                PuntOutcome::Outbound {
+                    id: OUTBOUND_DIRECT,
+                    mark: 0,
+                    must: false
+                }
+            );
+        }
+        assert_eq!(
+            c.punt_match(&punt_ctx(None, 8080)),
+            PuntOutcome::Outbound {
+                id: OUTBOUND_PROXY,
+                mark: 0,
+                must: false
+            }
+        );
+        let mut ctx = punt_ctx(None, 80);
+        ctx.sip = "10.1.0.9".parse().unwrap();
+        assert_eq!(
+            c.punt_match(&ctx),
+            PuntOutcome::Outbound {
+                id: OUTBOUND_PROXY,
+                mark: 0,
+                must: false
+            }
+        );
+    }
+
+    #[test]
+    fn punt_dns_query_is_control_plane() {
+        let c = parse_and_compile("fallback -> proxy").unwrap();
+        assert_eq!(c.punt_match(&punt_ctx(None, 53)), PuntOutcome::ControlPlane);
+    }
 
     #[test]
     fn and_or_encoding_matches_dae() {

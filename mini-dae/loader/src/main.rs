@@ -164,6 +164,8 @@ static UDP_IDLE_SECS: AtomicU64 = AtomicU64::new(60);
 static DIAL_MODE: AtomicU8 = AtomicU8::new(0);
 /// 嗅探等待上限（毫秒）；只在 dial_mode != ip 时生效。
 static SNIFF_TIMEOUT_MS: AtomicU64 = AtomicU64::new(100);
+/// P21：嗅探重判开关（`--sniff-punt` 或 config `global.auto_sniff_punt: true`）。
+static SNIFF_PUNT: AtomicBool = AtomicBool::new(false);
 
 struct SniffStats {
     attempts: AtomicU64,
@@ -173,6 +175,12 @@ struct SniffStats {
     quic_initial: AtomicU64,
     /// P20：Initial 解密后成功解出 SNI 的计数。
     quic_sni: AtomicU64,
+    /// P21：重判尝试 / 判为 direct / 判为 block / 判为用户组 / 保持原决策。
+    punt_attempts: AtomicU64,
+    punt_direct: AtomicU64,
+    punt_block: AtomicU64,
+    punt_group: AtomicU64,
+    punt_keep: AtomicU64,
 }
 impl SniffStats {
     const fn new() -> Self {
@@ -182,6 +190,11 @@ impl SniffStats {
             misses: AtomicU64::new(0),
             quic_initial: AtomicU64::new(0),
             quic_sni: AtomicU64::new(0),
+            punt_attempts: AtomicU64::new(0),
+            punt_direct: AtomicU64::new(0),
+            punt_block: AtomicU64::new(0),
+            punt_group: AtomicU64::new(0),
+            punt_keep: AtomicU64::new(0),
         }
     }
 }
@@ -712,6 +725,8 @@ struct Args {
     dial_mode: Option<String>,
     /// P14：嗅探等待上限（毫秒，默认 100；仅 dial_mode != ip 时生效）
     sniffing_timeout_ms: Option<u64>,
+    /// P21：嗅探重判（sniff-punt）——嗅到域名后按规则在 relay 侧重选出口
+    sniff_punt: bool,
     /// P15：订阅 URL（可重复；每次都拉取并解析为节点池）
     subscribe: Vec<String>,
     /// P17a：geodata 搜索目录（可重复；优先于 DAE_LOCATION_ASSET/系统目录）
@@ -805,7 +820,8 @@ fn usage() -> ! {
            --relay-idle-timeout <s> P4：relay 空闲回收秒数（默认 300）
            --dial-timeout <s>       P11：relay 拨号超时秒数（默认 5；真实节点慢首连可调大）
            --dial-mode <m>          P14：ip|domain|domain+（默认 ip；域名模式嗅探 SNI/Host 后远端解析，绕 DNS 污染）
-           --sniffing-timeout-ms <n> P14：嗅探等待上限毫秒（默认 100；仅 dial_mode != ip 生效）
+           --sniffing-timeout-ms <n> P14：嗅探等待上限毫秒（默认 100；仅 dial_mode != ip 时生效）
+           --sniff-punt             P21：嗅探命中域名后按规则在 relay 侧重选出口（direct/block/用户组）
            --subscribe <url>        P15：订阅（可重复；config subscription 段同源），与 --group 搭配
            --group <name>           P15：选用 config 中的组（默认 proxy / 唯一组）
            --geodata-dir <dir>      P17a：geoip.dat/geosite.dat 搜索目录（可重复；优先于 DAE_LOCATION_ASSET）
@@ -857,6 +873,7 @@ fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
         dial_timeout: None,
         dial_mode: None,
         sniffing_timeout_ms: None,
+        sniff_punt: false,
         subscribe: Vec::new(),
         geodata_dir: Vec::new(),
         group: None,
@@ -905,6 +922,7 @@ fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
                 }
             }
             "--sniffing-timeout-ms" => args.sniffing_timeout_ms = Some(next()?.parse()?),
+            "--sniff-punt" => args.sniff_punt = true,
             "--subscribe" => args.subscribe.push(next()?),
             "--geodata-dir" => args.geodata_dir.push(next()?),
             "--group" => args.group = Some(next()?),
@@ -1525,8 +1543,13 @@ fn resolve_group_dialer(
     local: SocketAddr,
     l4proto: u8,
 ) -> Option<outbound::Outbound> {
-    let lock = GROUP_SET.get()?;
     let outbound = lookup_conn_outbound(remote, local, l4proto)?;
+    group_dialer_by_outbound(outbound)
+}
+
+/// P21：按 outbound 索引取用户组拨号器（嗅探重判结果 → 组；非用户组返回 None）。
+fn group_dialer_by_outbound(outbound: u8) -> Option<outbound::Outbound> {
+    let lock = GROUP_SET.get()?;
     let gs = match lock.read() {
         Ok(g) => g,
         Err(p) => p.into_inner(),
@@ -1811,7 +1834,7 @@ fn handle_relay_conn(mut client: TcpStream) {
         .peer_addr()
         .ok()
         .and_then(|peer| resolve_group_dialer(peer, orig, 6));
-    let dialer = resolved.as_ref().unwrap_or(default_dialer);
+    let mut active = resolved;
     // P14：dial_mode != ip 时先做用户态嗅探（MSG_PEEK 只读，不消费字节流）
     let mode = DIAL_MODE.load(Ordering::Relaxed);
     let target = if mode != 0 {
@@ -1821,7 +1844,82 @@ fn handle_relay_conn(mut client: TcpStream) {
             Some(name) => {
                 SNIFF_STATS.hits.fetch_add(1, Ordering::Relaxed);
                 log(&format!("sniff {orig} → {name}（域名交节点远端解析）"));
-                target::Target::domain(name, orig.port())
+                // P21：嗅探重判——用 (域名, 五元组) 在用户态重放规则（与数据面同语义）；
+                // 命中 direct/block/用户组时在 relay 侧重选出口。
+                if SNIFF_PUNT.load(Ordering::Relaxed) {
+                    let peer = client.peer_addr().ok();
+                    let ctx = rules::PuntCtx {
+                        domain: Some(name.as_str()),
+                        dip: orig.ip(),
+                        sip: peer
+                            .map(|p| p.ip())
+                            .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)),
+                        dport: orig.port(),
+                        sport: peer.map(|p| p.port()).unwrap_or(0),
+                        l4proto: 6,
+                    };
+                    SNIFF_STATS.punt_attempts.fetch_add(1, Ordering::Relaxed);
+                    let outcome = match LAST_RULES.lock() {
+                        Ok(g) => g.as_ref().map(|r| r.punt_match(&ctx)),
+                        Err(p) => p.into_inner().as_ref().map(|r| r.punt_match(&ctx)),
+                    };
+                    match outcome {
+                        Some(rules::PuntOutcome::Outbound {
+                            id: rules::OUTBOUND_BLOCK,
+                            ..
+                        }) => {
+                            SNIFF_STATS.punt_block.fetch_add(1, Ordering::Relaxed);
+                            log(&format!(
+                                "punt {name}（{orig}）→ block（嗅探重判，关闭连接）"
+                            ));
+                            let _ = client.shutdown(std::net::Shutdown::Both);
+                            return;
+                        }
+                        Some(rules::PuntOutcome::Outbound {
+                            id: rules::OUTBOUND_DIRECT,
+                            must,
+                            ..
+                        }) => {
+                            SNIFF_STATS.punt_direct.fetch_add(1, Ordering::Relaxed);
+                            log(&format!(
+                                "punt {name}（{orig}）→ direct（嗅探重判{}）",
+                                if must { "，must" } else { "" }
+                            ));
+                            active = Some(outbound::Outbound::Direct);
+                            // 直连用原始目的 IP：与内核 direct 行为一致，避免本地解析嗅探域名。
+                            target::Target::Ip(orig.ip(), orig.port())
+                        }
+                        Some(rules::PuntOutcome::Outbound { id, must, mark }) => {
+                            match group_dialer_by_outbound(id) {
+                                Some(d) => {
+                                    SNIFF_STATS.punt_group.fetch_add(1, Ordering::Relaxed);
+                                    log(&format!(
+                                        "punt {name}（{orig}）→ outbound 0x{id:02x}（组 {}）{}",
+                                        d.name(),
+                                        if must { "[must]" } else { "" }
+                                    ));
+                                    active = Some(d);
+                                }
+                                None => {
+                                    // 不是用户组（must_rules/控制面等）：保持原决策
+                                    SNIFF_STATS.punt_keep.fetch_add(1, Ordering::Relaxed);
+                                    if mark != 0 {
+                                        log(&format!("punt {name}：outbound 0x{id:02x} mark=0x{mark:x} 无组映射，保持原决策"));
+                                    }
+                                }
+                            }
+                            target::Target::domain(name, orig.port())
+                        }
+                        Some(rules::PuntOutcome::ControlPlane)
+                        | Some(rules::PuntOutcome::NoMatch)
+                        | None => {
+                            SNIFF_STATS.punt_keep.fetch_add(1, Ordering::Relaxed);
+                            target::Target::domain(name, orig.port())
+                        }
+                    }
+                } else {
+                    target::Target::domain(name, orig.port())
+                }
             }
             None => {
                 SNIFF_STATS.misses.fetch_add(1, Ordering::Relaxed);
@@ -1837,6 +1935,7 @@ fn handle_relay_conn(mut client: TcpStream) {
             Err(_) => return,
         }
     };
+    let dialer = active.as_ref().unwrap_or(default_dialer);
     let dial_timeout = Duration::from_millis(RELAY_DIAL_TIMEOUT_MS.load(Ordering::Relaxed));
     let dialed = match dialer.dial_tcp(&target, dial_timeout) {
         Ok(d) => d,
@@ -2812,6 +2911,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         DIAL_MODE.store(m, Ordering::SeqCst);
         if let Some(ms) = args.sniffing_timeout_ms {
             SNIFF_TIMEOUT_MS.store(ms, Ordering::SeqCst);
+        }
+        // P21：sniff-punt 开关（CLI --sniff-punt > config global.auto_sniff_punt > 关）。
+        let mut punt = args.sniff_punt;
+        if !punt {
+            if let Some(cfg_path) = &args.config {
+                if let Ok(cfg) = config::load(std::path::Path::new(cfg_path)) {
+                    if let Some(v) = config::global_value(&cfg, "auto_sniff_punt") {
+                        punt = matches!(v.as_str(), "true" | "1" | "yes" | "on");
+                    }
+                }
+            }
+        }
+        SNIFF_PUNT.store(punt, Ordering::SeqCst);
+        if punt {
+            if m == 0 {
+                log("sniff-punt: 已开启，但 dial_mode=ip 不嗅探 → 不生效（需 domain/domain+）");
+            } else {
+                log("sniff-punt: 嗅探命中域名后将在 relay 侧按规则重选出口（direct/block/组）");
+            }
         }
         if m != 0 {
             log(&format!(
@@ -4673,6 +4791,12 @@ fn status_json(ebpf: &mut Ebpf) -> serde_json::Value {
             "misses": SNIFF_STATS.misses.load(Ordering::Relaxed),
             "quic_initial": SNIFF_STATS.quic_initial.load(Ordering::Relaxed),
             "quic_sni": SNIFF_STATS.quic_sni.load(Ordering::Relaxed),
+            "punt_enabled": SNIFF_PUNT.load(Ordering::Relaxed),
+            "punt_attempts": SNIFF_STATS.punt_attempts.load(Ordering::Relaxed),
+            "punt_direct": SNIFF_STATS.punt_direct.load(Ordering::Relaxed),
+            "punt_block": SNIFF_STATS.punt_block.load(Ordering::Relaxed),
+            "punt_group": SNIFF_STATS.punt_group.load(Ordering::Relaxed),
+            "punt_keep": SNIFF_STATS.punt_keep.load(Ordering::Relaxed),
         },
         // P17b：pname 采集面（cgroup2 钩子 + cookie→pname map）
         "pname": {

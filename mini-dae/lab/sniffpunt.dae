@@ -1,0 +1,30 @@
+# P21：sniff-punt 夹具——嗅探域名在 relay 侧重判出口（direct/block/组重选）。
+# 两组成员后端均为跨实现 Python ss 服务端（node-a=8388 / node-b=9488），
+# 通过 ss 日志交叉验证「重判到 alt 组后不再经过 proxy 组」。
+global {
+    tcp_check_url: 'http://10.9.9.2:9999'
+    check_interval: '1s'
+    check_tolerance: '1'
+    # 配置面开关（CLI --sniff-punt 同源；lab 两者都开）
+    auto_sniff_punt: true
+}
+node {
+    a: 'ss://chacha20-ietf-poly1305:testpass@127.0.0.1:8388#node-a'
+    b: 'ss://chacha20-ietf-poly1305:testpass@127.0.0.1:9488#node-b'
+}
+group {
+    proxy {
+        filter: name(a)
+        policy: min_moving_avg
+    }
+    alt {
+        filter: name(b)
+        policy: min_moving_avg
+    }
+}
+routing {
+    domain(suffix:direct.test) -> direct
+    domain(full:1.1.1.1) -> alt
+    domain(suffix:blocked.test) -> block
+    fallback: proxy
+}

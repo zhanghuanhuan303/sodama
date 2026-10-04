@@ -58,6 +58,8 @@
 #   sudo lab/lab.sh hy2-brutal-up    # P5-G3b+：cc_override=brutal + 带宽声明（窗口近似）
 #   sudo lab/lab.sh hy2-hop-up       # P5-G3b+：udphop（多端口 mux + 5s 跳端口）
 #   sudo lab/lab.sh test-hy2-brutal / test-hy2-hop
+#   sudo lab/lab.sh sniff-punt-up     # P21：嗅探重判（dial_mode domain+ + ss 后端 + --sniff-punt）
+#   sudo lab/lab.sh test-sniff-punt   # direct(直连不经 ss)/组(ss 远端解析)/block(关连接) 三条路径
 #   sudo lab/lab.sh ops-up           # P6：运维面会话（--log-file + 状态面控制命令）
 #   sudo lab/lab.sh test-ops         # suspend/reload/metrics/sysdump/日志轮转
 #   sudo lab/lab.sh bench-up         # P7：基准直连会话（rules.bench.dae；供 lab/bench.sh）
@@ -690,6 +692,7 @@ up() {
   [ -n "${USE_DIAL_TIMEOUT:-}" ] && extra_args+=(--dial-timeout "$USE_DIAL_TIMEOUT")
   [ -n "${USE_DIAL_MODE:-}" ] && extra_args+=(--dial-mode "$USE_DIAL_MODE")
   [ -n "${USE_SNIFF_TIMEOUT:-}" ] && extra_args+=(--sniffing-timeout-ms "$USE_SNIFF_TIMEOUT")
+  [ -n "${USE_SNIFF_PUNT:-}" ] && extra_args+=(--sniff-punt)
   [ -n "${USE_UDP_IDLE:-}" ] && extra_args+=(--udp-idle-timeout "$USE_UDP_IDLE")
   [ -n "${USE_OFFLOAD:-}" ] && extra_args+=(--offload)
   [ -n "${USE_LOG_FILE:-}" ] && extra_args+=(--log-file "$OPS_LOG")
@@ -1768,6 +1771,48 @@ assert s.get("quic_sni", 0) >= 1, s
 print("quic sniff: initial=%d sni=%d" % (s["quic_initial"], s["quic_sni"]))
 PY
   echo "PASS: QUIC Initial SNI 嗅探（Initial 解密 + sni=www.example.com）"
+}
+
+# P21：sniff-punt——嗅探命中域名后在 relay 侧按规则重选出口（direct/block/组）。
+test_sniff_punt() {
+  require_root
+  echo "== P21：sniff-punt（嗅探重判）=="
+  rm -f "$SS_LOG" "${SS_LOG}.b"
+  local out
+  # 1) SNI=direct.test → 规则 domain(suffix:direct.test) -> direct：直连（不经 ss 服务端）
+  out="$(ip netns exec "$CLIENT_NS" timeout 10 python3 "$HERE/tls_sniff_probe.py" "$PROXY_DST" 8080 direct.test 2>&1 || true)"
+  echo "$out"
+  echo "$out" | grep -q "tls-probe-ok sni=direct.test" || { echo "FAIL: punt→direct 链路不通"; exit 1; }
+  grep -q "punt direct.test（$PROXY_DST:8080）→ direct" "$LOG" || { echo "FAIL: 日志无 punt→direct"; tail -5 "$LOG"; exit 1; }
+  if grep -q "TCP target=$PROXY_DST:8080" "$SS_LOG"; then echo "FAIL: punt→direct 不应经过 ss 服务端（仅有健康检查）"; exit 1; fi
+  # 2) SNI="1.1.1.1" → 规则 domain(full:1.1.1.1) -> alt（node-b）：从数据面选的 proxy
+  #    重判为 alt，ss-B 日志为证（数字域名由 ss 服务端远端解析，跨实现）。
+  out="$(ip netns exec "$CLIENT_NS" timeout 10 python3 "$HERE/tls_sniff_probe.py" "$PROXY_DST" 8080 1.1.1.1 2>&1 || true)"
+  echo "$out"
+  echo "$out" | grep -q "tls-probe-ok sni=1.1.1.1" || { echo "FAIL: punt→组（ss）链路不通"; exit 1; }
+  grep -q "punt 1.1.1.1（$PROXY_DST:8080）→ outbound 0x03（组" "$LOG" || { echo "FAIL: 日志无 punt→alt 组"; tail -5 "$LOG"; exit 1; }
+  grep -q "TCP target=$PROXY_DST:8080" "${SS_LOG}.b" || { echo "FAIL: ss-B（alt 组）未看到目标"; cat "${SS_LOG}.b"; exit 1; }
+  if grep -q "TCP target=$PROXY_DST:8080" "$SS_LOG"; then echo "FAIL: 重判后不应再经过 ss-A（proxy 组）"; exit 1; fi
+  # 3) SNI=blocked.test → 规则 block：连接被关闭
+  out="$(ip netns exec "$CLIENT_NS" timeout 10 python3 "$HERE/tls_sniff_probe.py" "$PROXY_DST" 8080 blocked.test 2>&1 || true)"
+  echo "$out"
+  echo "$out" | grep -q "tls-probe-closed sni=blocked.test" || { echo "FAIL: punt→block 未关闭连接"; exit 1; }
+  grep -q "punt blocked.test（$PROXY_DST:8080）→ block" "$LOG" || { echo "FAIL: 日志无 punt→block"; tail -5 "$LOG"; exit 1; }
+  "$LOADER" status --socket "$STATUS_SOCK" --json >/tmp/mini-dae-status.json
+  python3 - /tmp/mini-dae-status.json <<'PY'
+import json, sys
+v = json.load(open(sys.argv[1]))
+s = v["sniffing"]
+assert s.get("punt_enabled") is True, s
+assert s.get("punt_attempts", 0) >= 3, s
+assert s.get("punt_direct", 0) >= 1, s
+assert s.get("punt_block", 0) >= 1, s
+assert s.get("punt_group", 0) >= 1, s
+print("punt: attempts=%d direct=%d block=%d group=%d keep=%d" % (
+    s["punt_attempts"], s["punt_direct"], s["punt_block"],
+    s["punt_group"], s["punt_keep"]))
+PY
+  echo "PASS: sniff-punt（direct / block / 组重选 三条路径）"
 }
 
 # P4b：UDP NAT 会话 janitor（会话用 --udp-idle-timeout 2 启动）。
@@ -2971,6 +3016,10 @@ case "${1:-}" in
   test-relay-idle) test_relay_idle ;;
   test-udp-relay) test_udp_relay ;;
   test-quic-sniff) test_quic_sniff ;;  # P20：QUIC Initial SNI 嗅探
+  sniff-punt-up) chmod 640 "$HERE/sniffpunt.dae"; \
+    USE_CONFIG="$HERE/sniffpunt.dae" USE_SS=1 USE_SS_METHOD=chacha20-ietf-poly1305 USE_SS_PASSWORD=testpass \
+    USE_SS_B=1 USE_DIAL_MODE=domain+ USE_SNIFF_TIMEOUT=500 USE_SNIFF_PUNT=1 USE_RELAY_IDLE=600 up ;;  # P21
+  test-sniff-punt) test_sniff_punt ;;  # P21：嗅探重判（direct/block/组重选）
   test-udp-idle) test_udp_idle ;;
   test-relay-offload) test_relay_offload ;;
   test-offload-lifecycle) test_offload_lifecycle ;;
@@ -3000,5 +3049,5 @@ case "${1:-}" in
   status) status ;;
   trace) trace ;;
   down) down ;;
-  *) echo "usage: $0 {build|up|dual-up|config-up|forward-up|dns-up|dot-up|doh-up|doq-up|dnsroute-up|dns-udp-up|dns-tcpup-up|geo-up|pname-up|regex-up|relay-up|offload-up|udp-up|ss-up|ss2022-up|http-up|groups-up|ss-udp-up|trojan-up|vless-up|vless-tls-up|vless-udp-up|vmess-up|vmess-tls-up|vmess-udp-up|tuic-up|tuic-udp-up|hy2-up|hy2-udp-up|hy2-obfs-up|hy2-obfs-udp-up|hy2-brutal-up|hy2-hop-up|ops-up|ops-reload-up|bench-up|test-proxy|test-direct|test-block|test-host-proxy|test-reload|test-rebind|test-status|test-config|test-forward|test-domain|test-dns-cache|test-dns-tcp|test-dns-reload|test-domain-regex|test-dns-edns|test-dot|test-doh|test-doq|test-dnsroute|test-dns-udp|test-dns-tcpup|test-geo|test-pname|test-v6|test-relay|test-relay-idle|test-relay-offload|test-offload-lifecycle|test-udp-relay|test-quic-sniff|test-udp-idle|test-ss|test-ss2022|test-http|test-groups|test-trojan|test-ss-udp|test-vless|test-vless-udp|test-vmess|test-vmess-udp|test-tuic|test-tuic-udp|test-hy2|test-hy2-udp|test-hy2-obfs|test-hy2-obfs-udp|test-hy2-brutal|test-hy2-hop|test-ops|test-config-reload|test-fault-reload|test-fault-kill|reload|verify|status|trace|down}"; exit 2 ;;
+  *) echo "usage: $0 {build|up|dual-up|config-up|forward-up|dns-up|dot-up|doh-up|doq-up|dnsroute-up|dns-udp-up|dns-tcpup-up|geo-up|pname-up|regex-up|relay-up|offload-up|udp-up|ss-up|ss2022-up|http-up|groups-up|ss-udp-up|trojan-up|vless-up|vless-tls-up|vless-udp-up|vmess-up|vmess-tls-up|vmess-udp-up|tuic-up|tuic-udp-up|hy2-up|hy2-udp-up|hy2-obfs-up|hy2-obfs-udp-up|hy2-brutal-up|hy2-hop-up|ops-up|ops-reload-up|bench-up|test-proxy|test-direct|test-block|test-host-proxy|test-reload|test-rebind|test-status|test-config|test-forward|test-domain|test-dns-cache|test-dns-tcp|test-dns-reload|test-domain-regex|test-dns-edns|test-dot|test-doh|test-doq|test-dnsroute|test-dns-udp|test-dns-tcpup|test-geo|test-pname|test-v6|test-relay|test-relay-idle|test-relay-offload|test-offload-lifecycle|test-udp-relay|test-quic-sniff|test-udp-idle|test-ss|test-ss2022|test-http|test-groups|test-trojan|test-ss-udp|test-vless|test-vless-udp|test-vmess|test-vmess-udp|test-tuic|test-tuic-udp|test-hy2|test-hy2-udp|test-hy2-obfs|test-hy2-obfs-udp|test-hy2-brutal|test-hy2-hop|test-ops|test-config-reload|test-fault-reload|test-fault-kill|reload|verify|status|trace|down|sniff-punt-up|test-sniff-punt}"; exit 2 ;;
 esac
