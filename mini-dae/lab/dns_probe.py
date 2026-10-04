@@ -53,7 +53,10 @@ def recv_exact(sock, n):
     return buf
 
 
-s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM if not use_tcp else socket.SOCK_STREAM)
+s = socket.socket(
+    socket.AF_INET6 if ":" in server else socket.AF_INET,
+    socket.SOCK_DGRAM if not use_tcp else socket.SOCK_STREAM,
+)
 s.settimeout(5)
 try:
     if use_tcp:

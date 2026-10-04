@@ -63,7 +63,7 @@ pub static mini_stats_map: PerCpuArray<u64, 5> = PerCpuArray::new();
 pub static control_flags_map: Array<u32, 1> = Array::new();
 
 #[btf_map]
-pub static listen_socket_map: SockMap<3> = SockMap::new();
+pub static listen_socket_map: SockMap<4> = SockMap::new();
 
 #[btf_map]
 pub static fast_sock: SockHash<MiniTuple, 4096> = SockHash::new();

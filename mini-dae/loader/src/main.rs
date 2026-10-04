@@ -3142,6 +3142,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         args.tproxy_port
     ));
 
+    // P22：IPv6 UDP/DNS 监听（sockmap key 3）；IPv6 不可用/被禁用时降级为仅 v4。
+    let udp_listener6 = match make_transparent_udp6(args.tproxy_port) {
+        Ok(l6) => {
+            {
+                let map = ebpf
+                    .map_mut("listen_socket_map")
+                    .ok_or("map listen_socket_map not found")?;
+                let mut sockmap: SockMap<_> = SockMap::try_from(map)?;
+                sockmap.set(3, &l6, 0)?;
+            }
+            log(&format!(
+                "udp v6 listener registered: [::]:{} (sockmap key 3, IPv6)",
+                args.tproxy_port
+            ));
+            Some(l6)
+        }
+        Err(e) => {
+            log(&format!("IPv6 udp listener 未启用（降级为仅 v4）: {e}"));
+            None
+        }
+    };
+
     attach(
         &mut ebpf,
         "mini_dae0peer_ingress",
@@ -3198,6 +3220,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let dns_tx = _keep_tx.clone();
         std::thread::spawn(move || dns_loop(udp_listener, dns_tx));
+    }
+    // P22：v6 UDP/DNS 线程（同一处理逻辑，orig_dst/回包走 v6）。
+    if let Some(l6) = udp_listener6 {
+        let dns_tx = _keep_tx.clone();
+        std::thread::spawn(move || dns_loop(l6, dns_tx));
     }
 
     // P3b-1：TCP DNS 处理线程（host ns）。accept 在 daens，连接经通道转交到这里；
@@ -3296,6 +3323,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 const IP_TRANSPARENT_OPT: libc::c_int = 19;
 /// IP_ORIGDSTADDR 与 IP_RECVORIGDSTADDR 同值（linux/in.h）。
 const IP_ORIGDSTADDR_OPT: libc::c_int = 20;
+/// P22：IPV6_TRANSPARENT（linux/in6.h）；IPV6_RECVORIGDSTADDR 与 IPV6_ORIGDSTADDR 同值。
+const IPV6_TRANSPARENT_OPT: libc::c_int = 75;
+const IPV6_ORIGDSTADDR_OPT: libc::c_int = 74;
 
 fn set_int_opt(
     fd: RawFd,
@@ -3318,45 +3348,80 @@ fn set_int_opt(
     Ok(())
 }
 
-fn sockaddr_in_of(addr: SocketAddr) -> libc::sockaddr_in {
-    let mut sin: libc::sockaddr_in = unsafe { std::mem::zeroed() };
-    sin.sin_family = libc::AF_INET as libc::sa_family_t;
-    sin.sin_port = addr.port().to_be();
-    if let std::net::IpAddr::V4(v4) = addr.ip() {
-        sin.sin_addr.s_addr = u32::from(v4).to_be();
+/// v4/v6 通用 sockaddr 构造：返回 (storage, 长度)。
+fn sockaddr_any_of(addr: SocketAddr) -> (libc::sockaddr_storage, libc::socklen_t) {
+    let mut st: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    match addr {
+        SocketAddr::V4(a) => {
+            let sin = unsafe { &mut *(&mut st as *mut _ as *mut libc::sockaddr_in) };
+            sin.sin_family = libc::AF_INET as libc::sa_family_t;
+            sin.sin_port = a.port().to_be();
+            sin.sin_addr.s_addr = u32::from(*a.ip()).to_be();
+            (
+                st,
+                std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+            )
+        }
+        SocketAddr::V6(a) => {
+            let sin6 = unsafe { &mut *(&mut st as *mut _ as *mut libc::sockaddr_in6) };
+            sin6.sin6_family = libc::AF_INET6 as libc::sa_family_t;
+            sin6.sin6_port = a.port().to_be();
+            sin6.sin6_addr.s6_addr = a.ip().octets();
+            sin6.sin6_scope_id = a.scope_id();
+            (
+                st,
+                std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
+            )
+        }
     }
-    sin
 }
 
 fn sockaddr_to_std(st: &libc::sockaddr_storage) -> Option<SocketAddr> {
-    if st.ss_family as libc::c_int != libc::AF_INET {
-        return None;
+    match st.ss_family as libc::c_int {
+        libc::AF_INET => {
+            let sin = unsafe { &*(st as *const _ as *const libc::sockaddr_in) };
+            Some(SocketAddr::from(std::net::SocketAddrV4::new(
+                std::net::Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr)),
+                u16::from_be(sin.sin_port),
+            )))
+        }
+        // P22：UDP v6 回包/客户端地址
+        libc::AF_INET6 => {
+            let sin6 = unsafe { &*(st as *const _ as *const libc::sockaddr_in6) };
+            Some(SocketAddr::from(std::net::SocketAddrV6::new(
+                std::net::Ipv6Addr::from(sin6.sin6_addr.s6_addr),
+                u16::from_be(sin6.sin6_port),
+                0,
+                sin6.sin6_scope_id,
+            )))
+        }
+        _ => None,
     }
-    let sin = unsafe { &*(st as *const _ as *const libc::sockaddr_in) };
-    Some(SocketAddr::from(std::net::SocketAddrV4::new(
-        std::net::Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr)),
-        u16::from_be(sin.sin_port),
-    )))
 }
 
-fn new_udp_socket() -> std::io::Result<OwnedFd> {
-    let raw = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
+/// UDP 透明 socket（P22 起支持 v4/v6）。
+fn new_udp_socket(family: libc::c_int) -> std::io::Result<OwnedFd> {
+    let raw = unsafe { libc::socket(family, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
     if raw < 0 {
         return Err(std::io::Error::last_os_error());
     }
     let fd = unsafe { OwnedFd::from_raw_fd(raw) };
-    set_int_opt(fd.as_raw_fd(), libc::IPPROTO_IP, IP_TRANSPARENT_OPT, 1)?;
+    if family == libc::AF_INET6 {
+        set_int_opt(fd.as_raw_fd(), libc::IPPROTO_IPV6, IPV6_TRANSPARENT_OPT, 1)?;
+    } else {
+        set_int_opt(fd.as_raw_fd(), libc::IPPROTO_IP, IP_TRANSPARENT_OPT, 1)?;
+    }
     set_int_opt(fd.as_raw_fd(), libc::SOL_SOCKET, libc::SO_REUSEADDR, 1)?;
     Ok(fd)
 }
 
 fn bind_udp(fd: &OwnedFd, addr: SocketAddr) -> std::io::Result<()> {
-    let sin = sockaddr_in_of(addr);
+    let (st, len) = sockaddr_any_of(addr);
     let rc = unsafe {
         libc::bind(
             fd.as_raw_fd(),
-            &sin as *const _ as *const libc::sockaddr,
-            std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+            &st as *const _ as *const libc::sockaddr,
+            len,
         )
     };
     if rc != 0 {
@@ -3368,7 +3433,7 @@ fn bind_udp(fd: &OwnedFd, addr: SocketAddr) -> std::io::Result<()> {
 /// 透明 UDP 监听（在 daens 创建）：接收被 `bpf_sk_assign` 交付的 DNS，
 /// 并用 IP_ORIGDSTADDR 取回原始目的地址（回包源地址/端口要一致）。
 fn make_transparent_udp(port: u16) -> std::io::Result<OwnedFd> {
-    let fd = new_udp_socket()?;
+    let fd = new_udp_socket(libc::AF_INET)?;
     set_int_opt(fd.as_raw_fd(), libc::IPPROTO_IP, IP_ORIGDSTADDR_OPT, 1)?;
     bind_udp(
         &fd,
@@ -3380,23 +3445,45 @@ fn make_transparent_udp(port: u16) -> std::io::Result<OwnedFd> {
     Ok(fd)
 }
 
-/// 回包 socket：绑定原始目的地址（IP_TRANSPARENT），源地址/端口与客户端预期一致。
+/// P22：IPv6 透明 UDP 监听（sockmap key 3）。V6ONLY + IPV6_RECVORIGDSTADDR；
+/// 接收被 `bpf_sk_assign` 交付的 v6 DNS 与普通 UDP。
+fn make_transparent_udp6(port: u16) -> std::io::Result<OwnedFd> {
+    let fd = new_udp_socket(libc::AF_INET6)?;
+    set_int_opt(fd.as_raw_fd(), libc::IPPROTO_IPV6, libc::IPV6_V6ONLY, 1)?;
+    set_int_opt(fd.as_raw_fd(), libc::IPPROTO_IPV6, IPV6_ORIGDSTADDR_OPT, 1)?;
+    bind_udp(
+        &fd,
+        SocketAddr::from(std::net::SocketAddrV6::new(
+            std::net::Ipv6Addr::UNSPECIFIED,
+            port,
+            0,
+            0,
+        )),
+    )?;
+    Ok(fd)
+}
+
+/// 回包 socket：绑定原始目的地址（IP_TRANSPARENT/IPV6_TRANSPARENT），源地址/端口与客户端预期一致。
 fn make_transparent_udp_bound(addr: SocketAddr) -> std::io::Result<OwnedFd> {
-    let fd = new_udp_socket()?;
+    let fd = new_udp_socket(if addr.is_ipv6() {
+        libc::AF_INET6
+    } else {
+        libc::AF_INET
+    })?;
     bind_udp(&fd, addr)?;
     Ok(fd)
 }
 
 fn send_to_udp(fd: RawFd, to: SocketAddr, data: &[u8]) -> std::io::Result<()> {
-    let sin = sockaddr_in_of(to);
+    let (st, len) = sockaddr_any_of(to);
     let rc = unsafe {
         libc::sendto(
             fd,
             data.as_ptr() as *const libc::c_void,
             data.len(),
             0,
-            &sin as *const _ as *const libc::sockaddr,
-            std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+            &st as *const _ as *const libc::sockaddr,
+            len,
         )
     };
     if rc < 0 {
@@ -3440,6 +3527,16 @@ fn recv_with_orig_dst(
                 orig = Some(SocketAddr::from(std::net::SocketAddrV4::new(
                     std::net::Ipv4Addr::from(u32::from_be(a4.sin_addr.s_addr)),
                     u16::from_be(a4.sin_port),
+                )));
+            } else if c.cmsg_level == libc::IPPROTO_IPV6 && c.cmsg_type == IPV6_ORIGDSTADDR_OPT {
+                // P22：v6 原始目的地址（IPV6_RECVORIGDSTADDR）
+                let sa = libc::CMSG_DATA(cmsg) as *const libc::sockaddr_in6;
+                let a6 = &*sa;
+                orig = Some(SocketAddr::from(std::net::SocketAddrV6::new(
+                    std::net::Ipv6Addr::from(a6.sin6_addr.s6_addr),
+                    u16::from_be(a6.sin6_port),
+                    0,
+                    a6.sin6_scope_id,
                 )));
             }
             cmsg = libc::CMSG_NXTHDR(&msg, cmsg);

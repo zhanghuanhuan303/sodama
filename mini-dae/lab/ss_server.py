@@ -210,7 +210,7 @@ def serve_udp():
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     s.bind(("127.0.0.1", PORT))
     print(f"ss-server UDP on 127.0.0.1:{PORT} method={METHOD}", flush=True)
-    # client addr -> 已建立的出口 socket（服务端映射，回包走同一 socket）
+    # (client addr, 地址族) -> 已建立的出口 socket（回包走同一 socket）
     out = {}
     while True:
         data, peer = s.recvfrom(65536)
@@ -223,18 +223,15 @@ def serve_udp():
         except Exception:
             continue
         ip, port, off = parse_addr(plain, 0)
-        if peer not in out:
-            us = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        fam = socket.AF_INET6 if ":" in ip else socket.AF_INET
+        us = out.get((peer, fam))
+        if us is None:
+            us = socket.socket(fam, socket.SOCK_DGRAM)
             us.setsockopt(socket.SOL_SOCKET, SO_MARK, MARK)
-            us.bind(("0.0.0.0", 0))
-            out[peer] = (us, None, 0)
+            us.bind(("::" if fam == socket.AF_INET6 else "0.0.0.0", 0))
+            out[(peer, fam)] = us
             threading.Thread(target=udp_reply_loop, args=(us, peer, s), daemon=True).start()
-        us, _, _ = out[peer]
         log_line(f"UDP target={ip}:{port}")
-        if ":" in ip:
-            # lab 参考服务端的 UDP 出口固定 v4；v6 UDP 目标不在 P16 范围。
-            log_line(f"UDP v6 target unsupported by lab server: {ip}:{port}")
-            continue
         us.sendto(plain[off:], (ip, port))
 
 

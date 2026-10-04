@@ -12,7 +12,7 @@ port = int(sys.argv[2])
 count = int(sys.argv[3]) if len(sys.argv) > 3 else 1
 interval = float(sys.argv[4]) if len(sys.argv) > 4 else 0.1
 
-s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s = socket.socket(socket.AF_INET6 if ":" in host else socket.AF_INET, socket.SOCK_DGRAM)
 s.settimeout(3)
 got = 0
 for i in range(count):

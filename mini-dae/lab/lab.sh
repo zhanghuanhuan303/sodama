@@ -1845,6 +1845,25 @@ test_v6() {
   echo "$out"
   echo "$out" | grep -q "wan-echo-ok" || { echo "FAIL: IPv6 direct 路径不通"; exit 1; }
   echo "PASS: IPv6 direct 由内核转发（未经 tproxy）"
+
+  # ---- P22：IPv6 UDP 全链 ----
+  grep -q "udp v6 listener registered: \[::\]:" "$LOG" || { echo "FAIL: 未见 IPv6 UDP listener 注册"; tail -5 "$LOG"; exit 1; }
+  echo "== P22：IPv6 UDP 代理（client → tproxy v6 UDP → NAT → ss UDP v6 目标）=="
+  rm -f "$SS_LOG"
+  out="$(ip netns exec "$CLIENT_NS" timeout 10 python3 "$HERE/udp_probe.py" 2001:db8:aa::1 9998 2 0.2 2>&1 || true)"
+  echo "$out"
+  echo "$out" | grep -q "reply=udp-echo-ok data=ping0" || { echo "FAIL: v6 UDP 未转发到真实目标/回包不对"; exit 1; }
+  echo "$out" | grep -q "^summary=2/2" || { echo "FAIL: v6 UDP 报文丢失"; exit 1; }
+  grep -q "UDP target=2001:db8:aa::1:9998" "$SS_LOG" || { echo "FAIL: ss 服务端未看到 v6 UDP 目标（跨实现失败）"; cat "$SS_LOG"; exit 1; }
+  echo "PASS: IPv6 UDP 报文经 tproxy v6 → NAT → ss UDP（v6 目标，跨实现）"
+
+  echo "== P22：IPv6 DNS（client → [2001:db8:aa::1]:53 → 控制面 v6 UDP → 假上游）=="
+  out="$(ip netns exec "$CLIENT_NS" timeout 8 python3 "$HERE/dns_probe.py" 2001:db8:aa::1 udpup.test 2>&1 || true)"
+  echo "$out"
+  printf '%s\n' "$out" | grep -q '^answer=10.9.10.35' || { echo "FAIL: v6 DNS 未解析（控制面 v6 UDP 接管失败）"; exit 1; }
+  printf '%s\n' "$out" | grep -q 'from=2001:db8:aa::1:53' || { echo "FAIL: v6 DNS 回包源地址不是原始目的地址"; exit 1; }
+  [ "$(grep -c '^QUERY udpup.test ' "$FAKE_DNS_LOG" || true)" = "1" ] || { echo "FAIL: 假上游未收到恰好 1 次 v6 DNS 查询"; exit 1; }
+  echo "PASS: IPv6 DNS 经 v6 UDP 透明监听（IPV6_RECVORIGDSTADDR）回包源地址正确"
 }
 
 # P17a：geoip/geosite 展开端到端（geoip → LPM 直连；geosite → 域位图代理）。
@@ -2925,7 +2944,7 @@ case "${1:-}" in
   test-subscribe) test_subscribe ;;
   v6-up) USE_RULES="$HERE/rules.v6.dae" USE_SS=1 USE_SS_METHOD=chacha20-ietf-poly1305 \
     USE_SS_PASSWORD=testpass USE_DIALER="ss://chacha20-ietf-poly1305:testpass@127.0.0.1:$SS_PORT" \
-    USE_RELAY_IDLE=600 up ;;
+    USE_FAKE_DNS=1 USE_DNS_UPSTREAM="127.0.0.1:$FAKE_DNS_PORT" USE_RELAY_IDLE=600 up ;;  # P22：+假 DNS（v6 DNS 接管用）
   test-v6) test_v6 ;;
   pname-up) USE_RULES="$HERE/rules.pname.dae" up ;;
   test-pname) test_pname ;;

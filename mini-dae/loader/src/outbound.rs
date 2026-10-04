@@ -170,7 +170,17 @@ pub fn marked_tcp_connect(addr: SocketAddr, timeout: Duration) -> io::Result<Tcp
 
 /// 带 SO_MARK 的 UDP socket（未绑定；用于 DNS 上游与 UDP NAT/relay 出口）。
 pub fn new_marked_udp() -> io::Result<UdpSocket> {
-    let raw = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
+    new_marked_udp_for(std::net::SocketAddr::from(([0, 0, 0, 0], 0)))
+}
+
+/// P22：按对端地址族创建（v6 目标/服务端需要 AF_INET6 才能 sendto）。
+pub fn new_marked_udp_for(peer: SocketAddr) -> io::Result<UdpSocket> {
+    let family = if peer.is_ipv6() {
+        libc::AF_INET6
+    } else {
+        libc::AF_INET
+    };
+    let raw = unsafe { libc::socket(family, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
     if raw < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -388,17 +398,16 @@ impl UdpRelay {
                 session,
             } => {
                 // ss UDP：载荷 = SOCKS5 风格目标地址头 + 数据（服务端据此路由）
-                let mut frame = Vec::with_capacity(data.len() + 7);
+                let mut frame = Vec::with_capacity(data.len() + 19);
                 match self.target {
                     SocketAddr::V4(v4) => {
                         frame.push(0x01);
                         frame.extend_from_slice(&v4.ip().octets());
                     }
-                    SocketAddr::V6(_) => {
-                        return Err(io::Error::new(
-                            io::ErrorKind::Unsupported,
-                            "ss udp 目标仅支持 IPv4",
-                        ))
+                    // P22：IPv6 目标（RFC1928 ATYP=0x04，16 字节地址）
+                    SocketAddr::V6(v6) => {
+                        frame.push(0x04);
+                        frame.extend_from_slice(&v6.ip().octets());
                     }
                 }
                 frame.extend_from_slice(&self.target.port().to_be_bytes());
@@ -782,7 +791,7 @@ impl Outbound {
                 method,
                 master,
             } => {
-                let socket = new_marked_udp()?;
+                let socket = new_marked_udp_for(*server)?;
                 socket.connect(server)?;
                 // SIP022 UDP 需要客户会话 ID/packet id/重放窗口，建会话状态；classic 无状态。
                 let session = if method.is_2022() {
@@ -889,7 +898,7 @@ impl Outbound {
     pub fn direct_udp(target: SocketAddr) -> io::Result<UdpRelay> {
         Ok(UdpRelay {
             target,
-            kind: UdpKind::Plain(new_marked_udp()?),
+            kind: UdpKind::Plain(new_marked_udp_for(target)?),
         })
     }
 }

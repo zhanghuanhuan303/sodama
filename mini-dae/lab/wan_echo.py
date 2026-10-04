@@ -5,7 +5,7 @@
   9999  TCP 单次应答（"wan-echo-ok data=..."，direct 用例）
   8080  TCP 首包应答 + 后续原样回显（fail-open 与 relay 用例）
   8082  TCP 纯回显（P4 relay 大流量完整性用例）
-  9998  UDP 回显（P4 UDP NAT 用例，回复 "udp-echo-ok data=..."）
+  9998  UDP 回显（P4 UDP NAT 用例，回复 "udp-echo-ok data=..."；P22 起 v4/v6 双栈）
 """
 import socket
 import threading
@@ -55,14 +55,28 @@ def handle(conn, first_line):
             conn.sendall(data)
 
 
+def serve_udp_sock(s):
+    while True:
+        data, addr = s.recvfrom(65536)
+        s.sendto(b"udp-echo-ok data=" + data, addr)
+
+
 def serve_udp(port):
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     s.bind(("0.0.0.0", port))
     print(f"wan-echo UDP listening on 0.0.0.0:{port}", flush=True)
-    while True:
-        data, addr = s.recvfrom(65536)
-        s.sendto(b"udp-echo-ok data=" + data, addr)
+    # P22：并行监听 IPv6 UDP（V6ONLY），供 v6 UDP relay 用例
+    try:
+        s6 = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+        s6.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s6.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+        s6.bind(("::", port))
+        print(f"wan-echo UDP listening on [::]:{port}", flush=True)
+        threading.Thread(target=serve_udp_sock, args=(s6,), daemon=True).start()
+    except OSError as e:  # 内核无 IPv6 时降级为仅 v4
+        print(f"wan-echo UDP IPv6 不可用，仅 v4: {e}", flush=True)
+    serve_udp_sock(s)
 
 
 threading.Thread(target=serve, args=(9999, True), daemon=True).start()
