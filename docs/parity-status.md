@@ -77,6 +77,15 @@
 - **嗅探组合收齐 + 重判**（P20/P21，ADR-0044/0045）：QUIC Initial 解密取 SNI + 用户态规则 VM 重放（域/LPM/not/AND/OR/must，与数据面逐条对齐）——嗅探四类 + punt 三路径（direct/block/组重选）均有 lab 交叉证据；
 - **工程化验收**：QEMU 双内核矩阵、soak 三模式、六路径基准、协议三方交叉（Go 客户端/Python+Go 参考服务端）。
 
+## 后续版本 Backlog（本版不做）
+
+余项（协议/数据面/配置/转发/性能/文档）与**工程化打包**全量清单见 [`docs/backlog.md`](./backlog.md)：
+A 类为工程化与发布（Docker 镜像/发行包/发行 CI/版本与 CHANGELOG/shell 补全/
+Makefile/发行版打包/许可证一致性审计/升级回滚/内核兼容矩阵），B–H 为协议与数据面余项
+（simple-obfs+v2ray-plugin、SSR auth_*/obfs_* 与 UDP、ECH 前置条件、eBPF L2/cgroup/ringbuf、
+include 展开、UDP endpoint pool、fuzz、同机对拍、顶层 README 重写等）。
+当前版本口径：A–H 均**不在本版范围**（含 ECH 边界，ADR-0056）；完成时同步本表与 CHANGELOG。
+
 ## 维护说明
 
 - 每完成一个阶段（P14+），更新受影响行的「mini-dae」「覆盖度」「证据」三列，并在文首版本行记录日期；

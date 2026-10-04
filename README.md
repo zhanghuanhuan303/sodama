@@ -34,6 +34,12 @@ byte-exact parity tests against dae's Go rule compiler and a netns test lab.*
 | soak（tcp 60s / ss 30s / udp 30s） | 无失败轮、无泄漏 |
 | 内核矩阵（6.18.54-lts 宿主 + 7.2.8 QEMU） | 9/9 · 9/9 |
 
+> **后续版本（Backlog，本版不做）**：工程化打包（Docker 镜像、发行包、发行 CI、
+> shell 补全、Makefile、PKGBUILD、许可证一致性审计、install.sh 升级回滚…）与
+> 协议/数据面余项（其余 SIP003 插件、SSR auth_*/obfs_*、ECH 前置条件、eBPF L2/cgroup/ringbuf、
+> include 展开、UDP endpoint pool、fuzz、同机对拍、README 状态区重写等）已固化为全量清单
+> （含验收标准）：[`docs/backlog.md`](docs/backlog.md)。
+
 ## 仓库结构
 
 ```

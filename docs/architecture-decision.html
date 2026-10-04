@@ -205,7 +205,7 @@
     <span class="chip">代码量 <b>~65k 非测试 LOC / ~40k 测试</b></span>
     <span class="chip">数据面 <b>tproxy.c 4403 行 · 23 个程序 · 24 个 map</b></span>
     <span class="chip">许可 <b>AGPL-3.0</b></span>
-    <span class="chip">文档版本 <b>v2.40 · 2026-10-04</b></span>
+    <span class="chip">文档版本 <b>v2.41 · 2026-10-04</b></span>
   </div>
 </header>
 
@@ -1241,12 +1241,24 @@ wait signal → reload / suspend / shutdown</pre>
     <li><b>多组分派 + 启动健壮性</b>（P19，ADR-0043）：规则按组名选组（eBPF 零改动，conn_state 回读）；启动期 DNS 自我阻塞修复（initial reload 不重拉订阅）+ 单上游失败不拖垮全量 + DoQ 改 IP+sni + 健康并发 24 + <code>gateway.sh up</code> 启动自检（就绪才返回，失败自动回滚直连）；lab 双组双 ss 交叉 + 真机 66/66。</li>
     <li><b>嗅探组合收齐</b>（P20，ADR-0044）：用户态解 QUIC Initial（RFC 9001 固定盐 HKDF + 头部保护 + AES-GCM + CRYPTO→ClientHello）取 SNI；RFC A.1/A.2 黄金向量 + 真实 quinn 首包 + lab Python 跨实现；<code>sniffing.quic_sni</code>。</li>
     <li><b>SSR 出站（origin+plain）</b>（P30，ADR-0054）：流密码层（EVP_BytesToKey(MD5) 派生 + CFB/CTR 自实现保流状态 + chacha20-ietf/rc4-md5(-6)）+ 连接层（IV/首段目标地址/URL-safe base64 链接解析）；<code>auth_*</code>/<code>obfs_*</code> 与 UDP 显式报错不静默；Go/outbound 夹具跨实现（交互 + 512KB）——出站 12 家族全有。</li>
-    <li><b>shadow-tls 插件（v1/v2/v3）</b>（P31，ADR-0055）：v1（rustls TLS1.2 + 裸隧道）/ v2（首帧 HMAC-SHA1 前缀 + 应用密钥甄别票据）/ v3（CH session_id HMAC + 握手期 relay 帧反变换 + 链式 MAC）；<code>CertPolicy::WebPki</code>（rustls-webpki 链+主机名+CV 验签）；<code>ss://…?plugin=shadow-tls;…</code>（ss classic；ss2022/UDP 显式报错）；Go/sing-shadowtls 夹具三版跨实现；<b>附带修复 TLS1.3 CH 的 supported_versions u8 与 GREASE 碰撞</b>（严格解析器兼容性，REALITY 路径同受益）。</li>
   </ul>
 </section>
 
+<section id="backlog" class="reveal" style="margin-top:64px">
+  <h2><span style="color:var(--dim);font-size:.62em">11 · </span>后续版本 Backlog（本版不做）</h2>
+  <p style="color:var(--muted)">余项已固化为全量清单（含验收标准）：<code>docs/backlog.md</code>。摘要：</p>
+  <ul style="color:var(--muted);line-height:1.9">
+    <li><b>A · 工程化与发布（打包，最高优先级）</b>：Docker 镜像（对照 dae Dockerfile/docker-compose）、发行包（tar.zst：loader + eBPF 对象 + systemd + install.sh）、发行 CI（tag→工件 + SHA256SUMS）、版本与 CHANGELOG（当前 Cargo 0.1.0、无版本标识）、shell 补全（bash/zsh/fish）、Makefile、发行版打包（PKGBUILD）、<b>许可证一致性审计</b>（<code>LICENSE</code>=AGPL-3.0 与部分源码头 <code>GPL-2.0</code> 不一致 + 依赖 SBOM）、install.sh 升级/回滚、容器/内核兼容矩阵；</li>
+    <li><b>B · 协议余项</b>：其余 SIP003 插件（simple-obfs、v2ray-plugin）、SSR <code>auth_*</code>/<code>obfs_*</code> 与 UDP、ECH（ADR-0056 前置条件）、rustls 路径 uTLS、ML-DSA/gecko；</li>
+    <li><b>C · eBPF</b>：L2/桥接变体、cgroup 钩子、ringbuf；<b>D · 配置</b>：include 展开、全局健康参数全量、组级 override；</li>
+    <li><b>E · 转发面</b>：UDP endpoint pool/full-cone、backlog fuse/计费、offload 完整形态；</li>
+    <li><b>F · 嗅探/IPv6</b>：QUIC 域名拨号/punt、ICMPv6、分片；<b>G · 性能质量</b>：与 Go 同机对拍、生产优化（THP/连接池/看门狗）、fuzz、特权内核 CI、夜间 soak；<b>H · 文档</b>：顶层 README 状态区重写（数字停留在 P5 时期）、用户手册/迁移指南、基准报告。</li>
+  </ul>
+  <p style="color:var(--muted)">明确永久不做：daed Web UI/GraphQL/鉴权（独立项目）、与 dae 二进制/配置 100% 兼容、Windows/macOS（数据面依赖 Linux eBPF）。</p>
+</section>
+
 <p style="color:var(--dim);font-family:var(--mono);font-size:.78rem;margin-top:56px;border-top:1px solid var(--line);padding-top:14px">
-  dae → Rust 决策档案 · v2.40 · 生成于 2026-10-04 · 基于 dae main@e3fee8f（nightly）· 本文件自包含，可离线打开<br>
+  dae → Rust 决策档案 · v2.41 · 生成于 2026-10-04 · 基于 dae main@e3fee8f（nightly）· 本文件自包含，可离线打开<br>
   v1.1：新增 4.5 部署形态、4.6 常驻与故障语义、决策点 D8<br>
   v1.2：按 ADR-0009 改为 K 轨道路线图；D7 修订为内核切片先行；K0 第一步（规则 VM + LPM）已实测<br>
   v1.3：K0、K1 均已完成并实测（双 epoch 热重载、conn_state 缓存、五钩子角色、本机 WAN 流量与回程）<br>
@@ -1296,6 +1308,7 @@ wait signal → reload / suspend / shutdown</pre>
                                                                                                                                                                                                 v2.38：P30 SSR 出站（ADR-0054，对标表缺口 #6 ssr 收官——出站 12 家族全有）——新模块 `ssr_cipher.rs`（流密码层对齐 Go：aes-128/192/256-cfb、aes-*-ctr、chacha20-ietf、rc4-md5(-6)；EVP_BytesToKey(MD5，无盐) 派生；CFB-128/CTR 在 AES 块加密上自实现、跨调用保持流状态）+ `ssr.rs`（`ssr://` 链接解析（外层 base64 或内层明文；password URL-safe base64）；连接层 origin proto + plain obfs：首写 `[IV][E(目标地址||载荷)]`、首读取对端 IV；`auth_*`/`obfs_*` 与 UDP 解析即显式报错不静默）+ `outbound::Ssr`。lab：从 olicesx/outbound 移植 Go 参考服务端（上游 socket 打 SO_MARK）+ `ssr-up`/`test-ssr`（交互 + 512KB 逐字节 + 服务端 `SSR connect target=` 日志 + offloaded=0）。实测：`cargo test` **225/225**（含 Go 黄金向量）；lab `test-ssr` PASS、回归 `verify` 9/9 + juicity/tuic/dns-options PASS、真机网关重启自检 + 66/66 + 0 panic（详情见 ADR-0054 与 `mini-dae/NOTES.md` §11.45）<br>
                                                                                                                                                                                                 v2.39：P31 shadow-tls 客户端（ADR-0055，对标表缺口 #6 插件/shadowtls 收官）+ **TLS1.3 ClientHello 严格解析修复**——新模块 `shadowtls.rs`：v1（rustls TLS1.2 握手后裸隧道）/ v2（`HashIo` 哈希服务端握手字节 → 首帧前置 8B HMAC-SHA1；按 0x17 分帧；**应用读密钥甄别并跳过伪装站票据**）/ v3（CH `session_id` 末 4B = HMAC(pw, CH 零位)；`V3HandshakeIo` 握手期对 `[mac4][xor(payload)]` 记录反变换重帧；读方向 relay 帧跳过/链式 MAC 帧交付；写方向 `"C"` 链式 MAC）；证书默认 **WebPKI**（`tls13::CertPolicy::WebPki`：rustls-webpki 链+主机名+CV 验签），`allowInsecure=1` 跳过。**ss 插件接入**：`ss://…?plugin=shadow-tls;password=…;version=3;sni=…`（SIP003；默认 v3；ss classic 可组合，ss2022/UDP 显式报错）；`ss.rs` 读写半 boxed 化 + `ShutdownFn`（同一数据路径可跑在帧层上）。**附带修复**：P24 Chrome 形状 CH 的 `supported_versions` 列表长度误用 u16（应 u8）+ GREASE 值各处独立随机偶发重复扩展类型 → Go/OpenSSL 等严格解析器直接拒收（`tls13_real_server_handshake` 由失败转通过；REALITY 服务端解析宽松此前未暴露）。lab：`lab/proto-check/shadowtls-server`（复用 sing-shadowtls `Service`：v1/v2/v3 + 自签 TLS1.2/1.3 伪装站 + handler 转发到 python ss 后端）+ `shadowtls-up`/`shadowtls-v2-up`/`shadowtls-v1-up` 与 `test-shadowtls{,-v2,-v1}`（交互 + 512KB + `STLS handler conn` + `TCP target=` 三方交叉）。实测：`cargo test` **232/232**（shadowtls 7 例）；lab v3/v2/v1 全 PASS；回归 `test-ss`/`test-ss2022`/`test-ssr` + `verify` 9/9；真机网关 down→up 自检 + 66 节点组 + `gateway.sh test`（出口 IP + DNS）+ 0 panic；真站 WebPKI 握手通过（详情见 ADR-0055 与 `mini-dae/NOTES.md` §11.46）<br>
                                                                                                                                                                                                 v2.40：P32 ECH 边界（ADR-0056，对标表缺口 #6 ECH 转边界闭环）——核实 dae 生态 ECH 仅存在于 hysteria2 链接参数 `?ech=<base64 ECHConfigList>`（`olicesx/outbound` 透传给 `olicesx/quic-go` fork 的 `EncryptedClientHelloConfigList`，**真实 ECH 密码学在 fork 里**；dae 主体无 ECH）；我方 hysteria2 为 `quinn + rustls`：rustls 无客户端 ECH 且不暴露 ClientHello 构造，quinn 无法替换 TLS 后端，自实现 `tls13` 只做 TLS-over-TCP 不能作 QUIC 的 TLS。决策：**不实现**；`ech=` 解析即显式报错（含 ADR 指引，**不静默降级**为明文 SNI）+ 单测锁定（`hy2_ech_rejected_loudly`，ech/pinSHA256）；ADR-0056 记录未来解的前置条件（rustls/quinn 提供 ECH 或可插拔 TLS + HPKE 依赖 + ot/quic-go ECH 服务端夹具）。实测：`cargo test` **236/236**（详情见 ADR-0056 与 `mini-dae/NOTES.md` §11.47）<br>
+                                                                                                                                                                                                v2.41：**后续版本 Backlog 固化**（新增 `docs/backlog.md`：A 工程化与发布 / B 协议余项 / C eBPF / D 配置 / E 转发面 / F 嗅探与 IPv6 / G 性能质量 / H 文档，逐条附验收标准）——明确本版不做：Docker 镜像、发行包、发行 CI、版本与 CHANGELOG、shell 补全、Makefile、PKGBUILD、许可证一致性审计（`LICENSE`=AGPL-3.0 与部分源码头 GPL-2.0 不一致）、install.sh 升级回滚；协议余项（其余 SIP003 插件、SSR auth_*/obfs_* 与 UDP、ECH 前置、rustls 路径 uTLS、ML-DSA/gecko）；eBPF（L2/cgroup/ringbuf）；配置（include/健康参数/组级 override）；转发面（UDP endpoint pool/fuse 计费）；嗅探/IPv6（QUIC 域名拨号、ICMPv6、分片）；性能质量（同机对拍/生产优化/fuzz/特权 CI/夜间 soak）；文档（顶层 README 重写等）。parity 新增 Backlog 小节互链<br>
 </p>
 </main>
 
