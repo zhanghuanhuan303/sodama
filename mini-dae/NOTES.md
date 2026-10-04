@@ -1253,6 +1253,25 @@ lab 夹具 `http_connect_server.py` + `sub_server.py` 每次重读。）
   config/dnsroute 回归全过；真机启动自检通过、`gateway.sh test` PASS（204 / 出口 IP /
   DNS ok）、SIGHUP「组 proxy 66 成员（继承 44 健康）」、66/66 alive、0 panic。
 
+### 11.35 P20（QUIC Initial SNI 嗅探，ADR-0044）
+
+（实现：`loader/src/quicsniff.rs`；`sniffer.rs` 抽出 `parse_client_hello_body` 共用；
+`main.rs` UDP 新会话接入 + `sniffing.quic_sni`；lab `quic_probe.py` + `test-quic-sniff`。）
+
+- **解密链**（RFC 9001，纯用户态、零新依赖）：固定盐 HKDF-SHA256 → `client in` →
+  `quic key/iv/hp`（标签带 `tls13 ` 前缀）→ 头部保护（sample=pn+4 处 16B，AES-ECB 掩码，
+  首字节低 4 位出 pn_len）→ AAD=去保护头、AES-128-GCM → CRYPTO(0x06)/PADDING 帧 →
+  handshake → 共用 ClientHello 解析取 SNI。
+- **接入**：`udp_nat_handle` 新会话慢路径（长头 + ≥1200B）：先计 `quic_initial`，
+  命中记 `sniffing.quic_sni` + 日志 `quic sniff … → …（SNI，Initial 解密）`。
+- **边界（如实）**：v1 首包、单包（CH 跨包→No）；仅观测不拨号（UDP 域名拨号未做）。
+- **测试学**：RFC 9001 A.1 密钥向量 + A.2 官方包（SNI=example.com）黄金用例；
+  **真实 quinn 栈**环回口首包跨实现；lab Python 按 RFC 独立造包。
+  注意：`quinn::Endpoint::connect` 必须在 tokio 上下文里调（否则 driver spawn panic）；
+  测试收尾（drop connecting / close endpoint）也回到运行时上下文。
+- 实测：`cargo test` **181/181**；lab `test-quic-sniff` PASS（initial=1 sni=1）、
+  `test-udp-relay`（改为前后增量断言，+1 会话）、`test-udp-idle`、`verify` 9/9 全过。
+
 ## 12. 用 Rust 重写这套东西的可行性
 
 已验证（本仓库 mini-dae，实测跑通）：
