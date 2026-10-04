@@ -24,6 +24,9 @@
  *     routing 函数已全部覆盖；
  *   - pname 由 cgroup2 钩子采集（comm，非 argv basename；见 cgroup.rs / ADR-0033）。
  */
+// status_json 的 json! 对象随功能增长逼近宏默认递归上限（P23 起）。
+#![recursion_limit = "512"]
+
 use std::ffi::CString;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -42,6 +45,7 @@ use aya::Ebpf;
 use serde_json::json;
 
 mod anytls;
+mod bootstrap;
 mod brutal;
 mod config;
 mod dns;
@@ -49,6 +53,7 @@ mod dnsroute;
 mod dnsup;
 mod geodata;
 mod group;
+mod h2client;
 mod hpack;
 mod huffman_table;
 mod hysteria2;
@@ -62,6 +67,7 @@ mod socks5;
 mod socksin;
 mod ss;
 mod status;
+mod sticky;
 mod subscribe;
 mod target;
 mod tls;
@@ -369,6 +375,90 @@ fn upstream() -> Option<Arc<dnsup::Upstream>> {
     upstreams().map(|s| s.legacy.clone())
 }
 static DOMAIN_SETS: Mutex<Vec<rules::DomainSetSpec>> = Mutex::new(Vec::new());
+/// P23：dns 段选项（optimistic cache / fixed_domain_ttl / ipversion_prefer）。
+#[derive(Default, Clone)]
+struct DnsOpts {
+    ipversion_prefer: u8,
+    fixed_domain_ttl: std::collections::HashMap<String, u32>,
+}
+static DNS_OPTS: std::sync::LazyLock<Mutex<DnsOpts>> =
+    std::sync::LazyLock::new(|| Mutex::new(DnsOpts::default()));
+
+/// 域名归一化（fixed_domain_ttl 的键匹配）。
+fn dns_key(name: &str) -> String {
+    name.trim_end_matches('.').to_ascii_lowercase()
+}
+
+/// P23：从配置 dns 段读取选项并应用到缓存（启动/reload 均可）。
+fn apply_dns_options(cfg: Option<&config::Config>) {
+    let mut opts = DnsOpts::default();
+    let mut optimistic = true;
+    let mut optimistic_ttl = 60u32;
+    let mut stale_ttl = 30u32;
+    if let Some(cfg) = cfg {
+        for sec in cfg.sections.iter().filter(|s| s.name == "dns") {
+            for item in &sec.items {
+                match item {
+                    config::Item::Param(p) => {
+                        let key = p.key.as_deref().unwrap_or("");
+                        let val = p.val.as_deref().unwrap_or("").trim().to_string();
+                        match key {
+                            "ipversion_prefer" => {
+                                opts.ipversion_prefer = match val.as_str() {
+                                    "4" => 4,
+                                    "6" => 6,
+                                    _ => 0,
+                                }
+                            }
+                            "optimistic_cache" => {
+                                optimistic = matches!(val.as_str(), "true" | "1" | "yes" | "on")
+                            }
+                            "optimistic_cache_ttl" => optimistic_ttl = val.parse().unwrap_or(60),
+                            "optimistic_stale_reply_ttl" => stale_ttl = val.parse().unwrap_or(30),
+                            _ => {}
+                        }
+                    }
+                    config::Item::Section(s) if s.name == "fixed_domain_ttl" => {
+                        for it in &s.items {
+                            if let config::Item::Param(p) = it {
+                                if let (Some(k), Some(v)) = (&p.key, &p.val) {
+                                    match v.trim().parse::<u32>() {
+                                        Ok(t) => {
+                                            opts.fixed_domain_ttl.insert(dns_key(k), t);
+                                        }
+                                        Err(e) => log(&format!(
+                                            "dns.fixed_domain_ttl {k}: TTL 非法（{e}），忽略"
+                                        )),
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    if let Ok(mut c) = DNS_CACHE.lock() {
+        c.set_options(optimistic, optimistic_ttl, stale_ttl);
+    }
+    let summary = format!(
+        "dns 选项: ipversion_prefer={} optimistic_cache={optimistic} \
+         optimistic_cache_ttl={optimistic_ttl} optimistic_stale_reply_ttl={stale_ttl} \
+         fixed_domain_ttl={}",
+        opts.ipversion_prefer,
+        opts.fixed_domain_ttl.len()
+    );
+    let changed = opts.ipversion_prefer != 0 || !opts.fixed_domain_ttl.is_empty();
+    *DNS_OPTS.lock().unwrap_or_else(|p| p.into_inner()) = opts;
+    if changed {
+        log(&summary);
+    }
+}
+
+fn dns_opts() -> DnsOpts {
+    DNS_OPTS.lock().map(|g| g.clone()).unwrap_or_default()
+}
 /// P3b-1：DNS 应答缓存（UDP/TCP 共用；锁仅短暂持有）
 static DNS_CACHE: std::sync::LazyLock<Mutex<dns::DnsCache>> =
     std::sync::LazyLock::new(|| Mutex::new(dns::DnsCache::default()));
@@ -392,6 +482,8 @@ struct DnsStats {
     response_rejects: AtomicU64,
     /// P18c：应答路由换上游重查数
     relookups: AtomicU64,
+    /// P23：ipversion_prefer 过滤（非首选族回空 NOERROR）数
+    ipversion_filtered: AtomicU64,
 }
 static DNS_STATS: DnsStats = DnsStats {
     queries: AtomicU64::new(0),
@@ -406,6 +498,7 @@ static DNS_STATS: DnsStats = DnsStats {
     rejects: AtomicU64::new(0),
     response_rejects: AtomicU64::new(0),
     relookups: AtomicU64::new(0),
+    ipversion_filtered: AtomicU64::new(0),
 };
 
 extern "C" fn on_sighup(_sig: libc::c_int) {
@@ -2396,6 +2489,21 @@ fn set_suspend(ebpf: &mut Ebpf, on: bool) -> Result<(), Box<dyn std::error::Erro
 /// 重建域位图 → 记录结果；失败时保留旧规则（回滚等价于不切槽，reload_rules 内部先写非活跃槽）。
 /// `startup=true` = 启动期初始下发（P19：跳过订阅重拉，见下）。
 fn do_reload(args: &Args, ebpf: &mut Ebpf, startup: bool) -> ReloadOutcome {
+    // P23：reload 重置粘滞 IP 状态（对照 dae ResetGlobalProxyStateForReload：
+    // 新一代替换代际前不继承上一代可能已污染的代理 IP/失败状态）。
+    if !startup {
+        crate::sticky::reset();
+    }
+    // P23：bootstrap resolver 跟随配置热更新（组/上游重建前生效）。
+    if let Some(cfg_path) = &args.config {
+        if let Ok(cfg) = config::load(std::path::Path::new(cfg_path)) {
+            let boot = config::global_value(&cfg, "bootstrap_resolver");
+            if let Err(e) = bootstrap::configure(boot.as_deref()) {
+                log(&format!("bootstrap resolver 热更新失败（保留旧值）: {e}"));
+            }
+            apply_dns_options(Some(&cfg)); // P23：dns 段选项热更新
+        }
+    }
     if SUSPENDED.load(Ordering::SeqCst) {
         match set_suspend(ebpf, false) {
             Ok(()) => {
@@ -2930,6 +3038,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 log("sniff-punt: 嗅探命中域名后将在 relay 侧按规则重选出口（direct/block/组）");
             }
+        }
+        // P23：bootstrap resolver（解析 DNS 上游/订阅/节点域名；直连不经数据面）。
+        // 必须在 build_groups（解析节点链接）之前配置。
+        let mut boot = None;
+        if let Some(cfg_path) = &args.config {
+            if let Ok(cfg) = config::load(std::path::Path::new(cfg_path)) {
+                boot = config::global_value(&cfg, "bootstrap_resolver");
+                apply_dns_options(Some(&cfg)); // P23：dns 段选项
+            }
+        }
+        match bootstrap::configure(boot.as_deref()) {
+            Ok(()) => {
+                if bootstrap::enabled() {
+                    log(&format!(
+                        "bootstrap resolver: {}",
+                        boot.as_deref().unwrap_or("")
+                    ));
+                }
+            }
+            Err(e) => log(&format!("bootstrap resolver 配置失败（忽略）: {e}")),
         }
         if m != 0 {
             log(&format!(
@@ -3730,6 +3858,26 @@ fn resolve_dns(
     };
     // 2a) ECS 注入（mini 扩展；上游 URL `ecs=auto|<CIDR>`）：
     //     客户端自带 OPT 时不动（透传）；注入后缓存作用域加前缀（不同子网不串答）。
+    // P23：ipversion_prefer——若已知该域名有首选族（未过期缓存），
+    // 把非首选族查询回空 NOERROR（对照 dae 的 ipversion_prefer 过滤）。
+    if let Some(q) = &parsed {
+        let pref = dns_opts().ipversion_prefer;
+        let non_preferred = (pref == 4 && q.qtype == 28) || (pref == 6 && q.qtype == 1);
+        if non_preferred {
+            let preferred_type = if pref == 4 { 1u16 } else { 28u16 };
+            let fresh = DNS_CACHE
+                .lock()
+                .ok()
+                .is_some_and(|c| c.has_fresh(&q.qname, preferred_type, &scope, Instant::now()));
+            if fresh {
+                DNS_STATS.ipversion_filtered.fetch_add(1, Ordering::Relaxed);
+                let resp = dns::empty_noerror(query);
+                if !resp.is_empty() {
+                    return Some(serve_response(query, resp, proto));
+                }
+            }
+        }
+    }
     let ecs_prefix = match up.spec.ecs {
         Some(dnsup::EcsMode::Auto) => client.map(dns::ecs_auto_prefix),
         Some(dnsup::EcsMode::Prefix(ip, p)) => Some((ip, p)),
@@ -3812,8 +3960,14 @@ fn resolve_dns(
     DNS_STATS.responses.fetch_add(1, Ordering::Relaxed);
     if let Some(q) = &parsed {
         publish_live(q, &resp, tx, false);
+        // P23：fixed_domain_ttl——命中配置的域名用固定缓存寿命（0 = 立即过期，
+        // 配合 optimistic cache 可供 stale；对照 dae fixedTtlDeadlineFunc）。
+        let fixed = DNS_OPTS
+            .lock()
+            .ok()
+            .and_then(|g| g.fixed_domain_ttl.get(&dns_key(&q.qname)).copied());
         if let Ok(mut c) = DNS_CACHE.lock() {
-            c.insert_scoped(q, &edns, &scope, &resp, Instant::now());
+            c.insert_scoped_with_fixed(q, &edns, &scope, &resp, Instant::now(), fixed);
         }
     }
     Some(serve_response(query, resp, proto))
@@ -4811,9 +4965,19 @@ fn status_json(ebpf: &mut Ebpf) -> serde_json::Value {
     let (rebind_rejected, redirect_update_failed, offload_redirects, offload_verdicts) =
         read_stats(ebpf);
     let cache = match DNS_CACHE.lock() {
-        Ok(c) => (c.len(), c.hits, c.misses, c.inserts, c.evictions, c.expired),
-        Err(_) => (0, 0, 0, 0, 0, 0),
+        Ok(c) => (
+            c.len(),
+            c.hits,
+            c.misses,
+            c.inserts,
+            c.evictions,
+            c.expired,
+            c.stale_hits,
+            c.optimistic,
+        ),
+        Err(_) => (0, 0, 0, 0, 0, 0, 0, true),
     };
+    let dnso = dns_opts();
     let reload = LAST_RELOAD.lock().ok().and_then(|g| g.clone());
     let cfg_summary = cfg_state.as_ref().map(|(c, ex)| {
         json!({
@@ -4973,6 +5137,10 @@ fn status_json(ebpf: &mut Ebpf) -> serde_json::Value {
             "tcp_unsupported": DNS_STATS.tcp_unsupported.load(Ordering::Relaxed),
             "cache_entries": cache.0, "cache_hits": cache.1, "cache_misses": cache.2,
             "cache_inserts": cache.3, "cache_evictions": cache.4, "cache_expired": cache.5,
+            "optimistic_cache": cache.7, "stale_hits": cache.6,
+            "ipversion_prefer": dnso.ipversion_prefer,
+            "ipversion_filtered": DNS_STATS.ipversion_filtered.load(Ordering::Relaxed),
+            "fixed_domain_ttl": dnso.fixed_domain_ttl.len(),
             "domain_sets": DOMAIN_SETS.lock().map(|g| g.len()).unwrap_or(0),
         },
         "config": cfg_summary,

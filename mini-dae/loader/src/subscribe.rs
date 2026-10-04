@@ -48,7 +48,18 @@ fn fetch_once(url: &str, timeout: Duration) -> io::Result<Fetch> {
         return Ok(Fetch::Body(std::fs::read(url)?));
     }
     let (use_tls, host, port, path) = parse_http_url(url)?;
-    let addrs: Vec<std::net::SocketAddr> = (host.as_str(), port).to_socket_addrs()?.collect();
+    // P23：配置了 bootstrap resolver 时，订阅主机名也直连解析（对照 dae：
+    // 订阅/节点服务器主机名在内部 DNS 路由下走 bootstrap）。
+    let addrs: Vec<std::net::SocketAddr> =
+        if crate::bootstrap::enabled() && host.parse::<std::net::IpAddr>().is_err() {
+            crate::bootstrap::resolve_host(&host)
+                .map_err(|e| io::Error::other(format!("bootstrap 解析 {host} 失败: {e}")))?
+                .into_iter()
+                .map(|ip| std::net::SocketAddr::new(ip, port))
+                .collect()
+        } else {
+            (host.as_str(), port).to_socket_addrs()?.collect()
+        };
     let addr = addrs
         .iter()
         .find(|a| a.is_ipv4())

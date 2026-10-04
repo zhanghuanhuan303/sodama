@@ -28,6 +28,8 @@ use std::time::{Duration, Instant};
 use crate::outbound;
 use crate::tls;
 
+use crate::log;
+
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(5);
 /// 持久连接最大空闲时间（超过则新建）
@@ -208,11 +210,12 @@ fn truncated(msg: &[u8]) -> bool {
     msg.len() >= 4 && msg[2] & 0x02 != 0
 }
 
-/// 持久连接（DoT/DoH 共用）。
+/// 持久连接（DoT/DoH 共用）。DoH 若握手出 h2（ALPN）则 `h2` 有值。
 struct Persist {
     r: tls::TlsReader,
     w: tls::TlsWriter,
     born: Instant,
+    h2: Option<crate::h2client::H2Conn>,
 }
 
 /// DoQ 连接（quinn；连接复用，每查询一条双向流）。
@@ -229,16 +232,27 @@ pub struct Upstream {
     udp: Option<Mutex<UdpSocket>>,
     persist: Mutex<Option<Persist>>,
     quic: Mutex<Option<QuicConn>>,
+    /// P23：该上游 ALPN 选了 h2 但 h2 握手仍失败（后续直接用 HTTP/1.1）。
+    h2_broken: std::sync::atomic::AtomicBool,
 }
 
 impl Upstream {
     /// 解析 + 解析主机名（优先 IPv4）+ 建 UDP socket（如需）。
     pub fn new(raw: &str) -> Result<Arc<Self>, String> {
         let spec = parse(raw)?;
-        let addrs: Vec<SocketAddr> = (spec.host.as_str(), spec.port)
-            .to_socket_addrs()
-            .map_err(|e| format!("解析 DNS 上游 {}:{} 失败: {e}", spec.host, spec.port))?
-            .collect();
+        // P23：配置了 bootstrap resolver 时，用直连解析器解析上游主机名
+        // （对照 dae：dns.upstream 非 IP 字面量的主机名走 bootstrap）。
+        let addrs: Vec<SocketAddr> = if crate::bootstrap::enabled() {
+            crate::bootstrap::resolve_host(&spec.host)?
+                .into_iter()
+                .map(|ip| SocketAddr::new(ip, spec.port))
+                .collect()
+        } else {
+            (spec.host.as_str(), spec.port)
+                .to_socket_addrs()
+                .map_err(|e| format!("解析 DNS 上游 {}:{} 失败: {e}", spec.host, spec.port))?
+                .collect()
+        };
         let addr = addrs
             .iter()
             .find(|a| a.is_ipv4())
@@ -259,6 +273,7 @@ impl Upstream {
             udp,
             persist: Mutex::new(None),
             quic: Mutex::new(None),
+            h2_broken: std::sync::atomic::AtomicBool::new(false),
         }))
     }
 
@@ -323,8 +338,9 @@ impl Upstream {
         read_tcp_dns(&mut s)
     }
 
-    /// 取得（必要时新建）持久 TLS 连接；陈旧则重建。
-    fn persist_conn(&self, alpn: &[Vec<u8>]) -> Result<(), String> {
+    /// 取得（必要时新建）持久 TLS 连接；陈旧则重建。`want_h2=true` 时按 ALPN 结果
+    /// 决定是否发 HTTP/2 前言（协商不到 h2 就留在 HTTP/1.1，不浪费一次失败连接）。
+    fn persist_conn(&self, alpn: &[Vec<u8>], want_h2: bool) -> Result<(), String> {
         let mut g = self.persist.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(p) = g.as_ref() {
             if p.born.elapsed() < PERSIST_IDLE {
@@ -333,7 +349,7 @@ impl Upstream {
         }
         let tcp = outbound::marked_tcp_connect(self.addr, CONNECT_TIMEOUT)
             .map_err(|e| format!("连接上游失败: {e}"))?;
-        let (r, w) = tls::connect(
+        let ((r, w), negotiated) = tls::connect_alpn(
             tcp,
             &self.tls_sni(),
             self.spec.insecure,
@@ -341,18 +357,23 @@ impl Upstream {
             CONNECT_TIMEOUT,
         )
         .map_err(|e| format!("TLS 握手失败: {e}"))?;
-        *g = Some(Persist {
+        let mut p = Persist {
             r,
             w,
             born: Instant::now(),
-        });
+            h2: None,
+        };
+        if want_h2 && negotiated.as_deref() == Some(b"h2") {
+            p.h2 = Some(crate::h2client::H2Conn::handshake(&mut p.r, &mut p.w)?);
+        }
+        *g = Some(p);
         Ok(())
     }
 
     fn exchange_tls(&self, query: &[u8]) -> Result<Vec<u8>, String> {
         // 一次重连重试
         for attempt in 0..2 {
-            self.persist_conn(&[])?;
+            self.persist_conn(&[], false)?;
             let r = self.exchange_tls_once(query);
             if r.is_ok() {
                 return r;
@@ -380,38 +401,69 @@ impl Upstream {
         read_tcp_dns(&mut p.r)
     }
 
+    /// P23：DoH 优先 HTTP/2（RFC 8484 要求 h2/h3；按 TLS ALPN 协商结果决定），
+    /// 握手/复用失败则丢连接重试（必要时永久回退 HTTP/1.1）。
     fn exchange_https(&self, query: &[u8]) -> Result<Vec<u8>, String> {
-        for attempt in 0..2 {
-            self.persist_conn(&[b"http/1.1".to_vec()])?;
-            let r = self.exchange_https_once(query);
-            if r.is_ok() {
-                return r;
-            }
-            if attempt == 0 {
-                if let Ok(mut g) = self.persist.lock() {
-                    *g = None;
+        use std::sync::atomic::Ordering as AOrd;
+        let mut last = String::new();
+        for _attempt in 0..3 {
+            let need_new = match self.persist.lock() {
+                Ok(g) => g.is_none(),
+                Err(p) => p.into_inner().is_none(),
+            };
+            if need_new {
+                let try_h2 = !self.h2_broken.load(AOrd::Relaxed);
+                let alpn: Vec<Vec<u8>> = if try_h2 {
+                    vec![b"h2".to_vec(), b"http/1.1".to_vec()]
+                } else {
+                    vec![b"http/1.1".to_vec()]
+                };
+                match self.persist_conn(&alpn, try_h2) {
+                    Ok(()) => {}
+                    Err(e) if try_h2 => {
+                        self.h2_broken.store(true, AOrd::Relaxed);
+                        log(&format!("DoH h2 握手失败，回退 HTTP/1.1: {e}"));
+                        if let Ok(mut g) = self.persist.lock() {
+                            *g = None;
+                        }
+                        self.persist_conn(&[b"http/1.1".to_vec()], false)?;
+                    }
+                    Err(e) => return Err(e),
                 }
-            } else {
-                return r;
+            }
+            match self.exchange_https_once(query) {
+                Ok(v) => return Ok(v),
+                Err(e) => {
+                    last = e;
+                    if let Ok(mut g) = self.persist.lock() {
+                        *g = None; // 丢弃可能已损坏的连接后重试
+                    }
+                }
             }
         }
-        unreachable!()
+        Err(last)
     }
 
     fn exchange_https_once(&self, query: &[u8]) -> Result<Vec<u8>, String> {
         let mut g = self.persist.lock().unwrap_or_else(|e| e.into_inner());
         let p = g.as_mut().ok_or_else(|| "无持久连接".to_string())?;
-        let host_hdr = if self.spec.port == 443 {
+        let authority = if self.spec.port == 443 {
             self.spec.host.clone()
         } else {
             format!("{}:{}", self.spec.host, self.spec.port)
         };
+        p.r.set_read_timeout(Some(EXCHANGE_TIMEOUT)).ok();
+        if let Some(h2) = p.h2.as_mut() {
+            // 借用拆分：h2 不持有 r/w，分字段借用
+            let Persist { r, w, .. } = p;
+            return h2.post(r, w, &authority, &self.spec.path, query);
+        }
         let head = format!(
             "POST {} HTTP/1.1\r\nHost: {}\r\nAccept: application/dns-message\r\n\
              Content-Type: application/dns-message\r\nContent-Length: {}\r\n\
              Connection: keep-alive\r\n\r\n",
             self.spec.path,
-            host_hdr,
+            authority,
             query.len()
         );
         p.r.set_read_timeout(Some(EXCHANGE_TIMEOUT)).ok();

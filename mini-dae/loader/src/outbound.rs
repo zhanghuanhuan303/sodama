@@ -601,7 +601,29 @@ impl Outbound {
         )
     }
 
+    /// P23：代理服务器地址（粘滞 IP 拨号结果反馈用；direct/组/QUIC 系返回 None）。
+    pub fn server_addr(&self) -> Option<SocketAddr> {
+        match self {
+            Self::Socks5 { server }
+            | Self::Http { server, .. }
+            | Self::Shadowsocks { server, .. }
+            | Self::Trojan { server, .. }
+            | Self::Vless { server, .. }
+            | Self::Vmess { server, .. }
+            | Self::AnyTls { server, .. } => Some(*server),
+            _ => None,
+        }
+    }
+
     pub fn dial_tcp(&self, target: &Target, timeout: Duration) -> io::Result<DialedStream> {
+        let r = self.dial_tcp_inner(target, timeout);
+        if let Some(server) = self.server_addr() {
+            crate::sticky::note_dial(server, r.is_ok());
+        }
+        r
+    }
+
+    fn dial_tcp_inner(&self, target: &Target, timeout: Duration) -> io::Result<DialedStream> {
         match self {
             Self::Direct => {
                 let addr = target.resolve_local()?;
@@ -785,6 +807,18 @@ impl Outbound {
 
     /// UDP 出口；Ok(None) = 该协议不支持 UDP 代理（调用方决定直连回退）。
     pub fn dial_udp(&self, target: SocketAddr, timeout: Duration) -> io::Result<Option<UdpRelay>> {
+        let r = self.dial_udp_inner(target, timeout);
+        if let Some(server) = self.server_addr() {
+            crate::sticky::note_dial(server, r.is_ok());
+        }
+        r
+    }
+
+    fn dial_udp_inner(
+        &self,
+        target: SocketAddr,
+        timeout: Duration,
+    ) -> io::Result<Option<UdpRelay>> {
         match self {
             Self::Shadowsocks {
                 server,
@@ -950,20 +984,8 @@ pub fn parse(url: &str) -> Result<Outbound, String> {
 }
 
 fn resolve(hostport: &str) -> Result<SocketAddr, String> {
-    let mut addrs = hostport
-        .to_socket_addrs()
-        .map_err(|e| format!("解析 {hostport} 失败: {e}"))?;
-    let first = addrs
-        .next()
-        .ok_or_else(|| format!("解析 {hostport} 无结果"))?;
-    if first.is_ipv4() {
-        return Ok(first);
-    }
-    // 数据面协议只吃 IPv4：节点域名常同时有 AAAA（双栈 VPS），v6 优先会导致误拒。
-    match addrs.find(|a| a.is_ipv4()) {
-        Some(v4) => Ok(v4),
-        None => Ok(first), // v6-only：交给下游协议给出明确错误
-    }
+    // P23：域名地址走粘滞 IP 缓存（dae StickyIpDialer）：固定 IP + 失败阈值后重解析。
+    crate::sticky::resolve(hostport)
 }
 
 /// `anytls://password@host:port?sni=...&insecure=1`（anytls-go 协议，见 `anytls.rs`）。

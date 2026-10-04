@@ -59,6 +59,20 @@ TABLE = {
     "viacli.test": "10.9.10.49",
     # P18c+：ECS 注入 / 客户端网段路由夹具
     "rsip.test": "10.9.10.62",
+    # P23：DNS 选项夹具（fixed_domain_ttl / ipversion_prefer）
+    "stale.test": "10.9.10.71",
+    "pref.test": "10.9.10.72",
+}
+
+# P23：按名覆盖上游 TTL（默认 30）
+TTL_OVERRIDE = {
+    "stale.test": 30,  # fixed_domain_ttl=1 只影响缓存寿命；上游应答本身 TTL=30
+}
+
+# P23：AAAA 表（ipversion_prefer 用；v6only.test 只有 AAAA）
+AAAA = {
+    "pref.test": "2001:db8::72",
+    "v6only.test": "2001:db8::73",
 }
 
 # P3b-2a：大应答（60 条 A ≈ 990 字节 > 512，用于验证 UDP 截断/EDNS）
@@ -134,13 +148,21 @@ def respond(query, proto="UDP"):
     resp[2] |= 0x80
     resp[3] &= 0xF0  # rcode=0
     ip = TABLE.get(qname)
+    ttl = TTL_OVERRIDE.get(qname, 30)
     if ip and qtype == 1:
         resp[6:8] = struct.pack("!H", 1)  # ancount
         resp[8:10] = b"\x00\x00"
         resp[10:12] = b"\x00\x00"
         resp += b"\xc0\x0c"  # 指向 question 的 qname
-        resp += struct.pack("!HHI", 1, 1, 30)  # A IN TTL
+        resp += struct.pack("!HHI", 1, 1, ttl)  # A IN TTL
         resp += struct.pack("!H", 4) + socket.inet_aton(ip)
+    elif qtype == 28 and qname in AAAA:
+        resp[6:8] = struct.pack("!H", 1)
+        resp[8:10] = b"\x00\x00"
+        resp[10:12] = b"\x00\x00"
+        resp += b"\xc0\x0c"
+        resp += struct.pack("!HHI", 28, 1, ttl)  # AAAA IN TTL
+        resp += struct.pack("!H", 16) + socket.inet_pton(socket.AF_INET6, AAAA[qname])
     elif qname in BIG and qtype == 1:
         addrs = BIG[qname]
         resp[6:8] = struct.pack("!H", len(addrs))

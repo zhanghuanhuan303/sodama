@@ -1,0 +1,28 @@
+# P23：DNS 选项夹具——fixed_domain_ttl / optimistic_cache / ipversion_prefer。
+#
+# - fixed_domain_ttl: stale.test → 1s（只改缓存寿命；上游应答 TTL 仍为 30）
+# - optimistic_cache: true + optimistic_cache_ttl=60 + optimistic_stale_reply_ttl=7
+#   → 过期后 2s 的第二次查询仍可命中（stale，TTL 压到 7），且不再上行
+# - ipversion_prefer: 4 → 已知 A 的域名（pref.test）的 AAAA 查询回空 NOERROR
+
+global {
+    dial_mode: 'ip'
+}
+
+dns {
+    ipversion_prefer: 4
+    optimistic_cache: true
+    optimistic_cache_ttl: 60
+    optimistic_stale_reply_ttl: 7
+    fixed_domain_ttl {
+        stale.test: 1
+    }
+    upstream {
+        legacy: 'udp://127.0.0.1:5353'
+    }
+}
+
+routing {
+    dport(5353) -> direct(must)
+    fallback: direct
+}

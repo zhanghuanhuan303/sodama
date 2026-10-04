@@ -1362,6 +1362,26 @@ fn validate_dns(cfg: &Config, sec: &Section, out: &mut Vec<Diag>) {
                         }
                     }
                 }
+                // P23：fixed_domain_ttl { 域名: TTL 秒 }
+                "fixed_domain_ttl" => {
+                    for it in &s.items {
+                        match it {
+                            Item::Param(p) => match p.key.as_deref().zip(p.val.as_deref()) {
+                                Some((_, v)) if v.trim().parse::<u32>().is_ok() => {}
+                                _ => {
+                                    let mut d = p_loc(cfg, p);
+                                    d.msg = "dns.fixed_domain_ttl 需要 `域名: 秒数`".into();
+                                    out.push(d);
+                                }
+                            },
+                            other => out.push(err_at(
+                                cfg,
+                                &s.loc,
+                                format!("dns.fixed_domain_ttl 只接受 `域名: 秒数`：{other:?}"),
+                            )),
+                        }
+                    }
+                }
                 other => out.push(err_at(
                     cfg,
                     &s.loc,

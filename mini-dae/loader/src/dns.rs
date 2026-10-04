@@ -485,14 +485,39 @@ struct CacheEntry {
 }
 
 /// 上游应答缓存（对照 dae `dns_cache.go` 的最小语义：正/负缓存 + 命中时按剩余寿命递减 TTL）。
-#[derive(Default)]
+/// P23：新增 optimistic_cache（过期条目在窗口内继续以 stale TTL 供应）。
 pub struct DnsCache {
     map: HashMap<CacheKey, CacheEntry>,
+    /// optimistic cache（dae 默认 true）：过期后仍可供应（见 stale_reply_ttl）。
+    pub optimistic: bool,
+    /// 超过到期后仍可供应的窗口秒数（0 = 不限）。
+    pub optimistic_ttl: u32,
+    /// stale 应答中记录 TTL 的上限（对照 dae `optimistic_stale_reply_ttl`）。
+    pub stale_reply_ttl: u32,
     pub hits: u64,
     pub misses: u64,
     pub expired: u64,
     pub inserts: u64,
     pub evictions: u64,
+    /// P23：命中过期但被 optimistic 供应（stale）的次数。
+    pub stale_hits: u64,
+}
+
+impl Default for DnsCache {
+    fn default() -> Self {
+        Self {
+            map: HashMap::new(),
+            optimistic: true,
+            optimistic_ttl: 60,
+            stale_reply_ttl: 30,
+            hits: 0,
+            misses: 0,
+            expired: 0,
+            inserts: 0,
+            evictions: 0,
+            stale_hits: 0,
+        }
+    }
 }
 
 impl DnsCache {
@@ -539,6 +564,20 @@ impl DnsCache {
         };
         let elapsed = now.saturating_duration_since(e.stored).as_secs() as u32;
         if elapsed >= e.ttl {
+            // P23：optimistic cache——过期但在窗口内则继续供应（TTL 压到
+            // stale_reply_ttl 上限），并在后台/下次查询时刷新。
+            if self.optimistic
+                && (self.optimistic_ttl == 0 || elapsed < e.ttl.saturating_add(self.optimistic_ttl))
+            {
+                self.stale_hits += 1;
+                self.hits += 1;
+                return Some(prepare_cached_stale(
+                    &e.response,
+                    e.question_end,
+                    query,
+                    self.stale_reply_ttl,
+                ));
+            }
             self.map.remove(&key);
             self.expired += 1;
             self.misses += 1;
@@ -546,6 +585,30 @@ impl DnsCache {
         }
         self.hits += 1;
         Some(prepare_cached(&e.response, e.question_end, query, elapsed))
+    }
+
+    /// P23：作用域内某 (qname, qtype) 是否有未过期的缓存（ipversion_prefer 用）。
+    pub fn has_fresh(&self, qname: &str, qtype: u16, scope: &str, now: Instant) -> bool {
+        let qname = normalize(qname);
+        [false, true].iter().any(|do_bit| {
+            let key = CacheKey {
+                qname: qname.clone(),
+                qtype,
+                qclass: 1,
+                do_bit: *do_bit,
+                scope: scope.to_string(),
+            };
+            self.map
+                .get(&key)
+                .is_some_and(|e| (now.saturating_duration_since(e.stored).as_secs() as u32) < e.ttl)
+        })
+    }
+
+    /// P23：配置（启动/reload 时应用；对照 dae dns.optimistic_cache 系列）。
+    pub fn set_options(&mut self, optimistic: bool, optimistic_ttl: u32, stale_reply_ttl: u32) {
+        self.optimistic = optimistic;
+        self.optimistic_ttl = optimistic_ttl;
+        self.stale_reply_ttl = stale_reply_ttl;
     }
 
     /// 按语义入缓存；返回是否已缓存。带 EDNS options 的查询不入缓存。
@@ -563,12 +626,31 @@ impl DnsCache {
         response: &[u8],
         now: Instant,
     ) -> bool {
+        self.insert_scoped_with_fixed(q, edns, scope, response, now, None)
+    }
+
+    /// P23：带 fixed_domain_ttl 的插入。`fixed_ttl=Some(t)` 时缓存寿命固定为 t 秒
+    /// （0 = 立即过期；配合 optimistic 可供 stale），对照 dae `fixedTtlDeadlineFunc`。
+    pub fn insert_scoped_with_fixed(
+        &mut self,
+        q: &Question,
+        edns: &EdnsInfo,
+        scope: &str,
+        response: &[u8],
+        now: Instant,
+        fixed_ttl: Option<u32>,
+    ) -> bool {
         if edns.has_options {
             return false;
         }
-        let Some(entry) = build_entry(response, now) else {
+        let Some(mut entry) = build_entry(response, now, fixed_ttl.is_some()) else {
             return false;
         };
+        if let Some(t) = fixed_ttl {
+            entry.ttl = t.min(DNS_CACHE_MAX_TTL);
+        } else if entry.ttl == 0 {
+            return false;
+        }
         let key = CacheKey {
             qname: q.qname.clone(),
             qtype: q.qtype,
@@ -599,10 +681,16 @@ impl DnsCache {
     }
 
     fn sweep_expired(&mut self, now: Instant) {
+        let optimistic = self.optimistic;
+        let o_ttl = self.optimistic_ttl;
         let dead: Vec<CacheKey> = self
             .map
             .iter()
-            .filter(|(_, e)| now.saturating_duration_since(e.stored).as_secs() as u32 >= e.ttl)
+            .filter(|(_, e)| {
+                let elapsed = now.saturating_duration_since(e.stored).as_secs() as u32;
+                elapsed >= e.ttl
+                    && !(optimistic && (o_ttl == 0 || elapsed < e.ttl.saturating_add(o_ttl)))
+            })
             .map(|(k, _)| k.clone())
             .collect();
         for k in dead {
@@ -629,8 +717,9 @@ impl DnsCache {
     }
 }
 
-/// 判断一个应答能否入缓存，并计算缓存寿命。
-fn build_entry(response: &[u8], now: Instant) -> Option<CacheEntry> {
+/// 判断一个应答能否入缓存，并计算缓存寿命。`allow_zero_ttl` 供 fixed_domain_ttl=0
+/// 的“立即过期”条目使用（P23）。
+fn build_entry(response: &[u8], now: Instant, allow_zero_ttl: bool) -> Option<CacheEntry> {
     if response.len() < 12 || response[2] & 0x02 != 0 {
         return None; // 截断（TC）不入缓存
     }
@@ -649,7 +738,7 @@ fn build_entry(response: &[u8], now: Instant) -> Option<CacheEntry> {
             .map(|r| r.ttl)
             .min()?
     };
-    if ttl == 0 {
+    if ttl == 0 && !allow_zero_ttl {
         return None;
     }
     Some(CacheEntry {
@@ -706,6 +795,39 @@ fn prepare_cached(cached: &[u8], cached_qend: usize, query: &[u8], elapsed: u32)
                     let new = rr.ttl.saturating_sub(elapsed);
                     out[rr.ttl_off..rr.ttl_off + 4].copy_from_slice(&new.to_be_bytes());
                 }
+            }
+        }
+    }
+    out
+}
+
+/// P23：stale 应答（optimistic cache）——ID/question 回填同上，但记录 TTL 统一压到
+/// `stale_reply_ttl`（对照 dae `optimistic_stale_reply_ttl`）。
+fn prepare_cached_stale(
+    cached: &[u8],
+    cached_qend: usize,
+    query: &[u8],
+    stale_reply_ttl: u32,
+) -> Vec<u8> {
+    let mut out = cached.to_vec();
+    if query.len() >= 12 && out.len() >= 12 {
+        out[0..2].copy_from_slice(&query[0..2]);
+    }
+    if let Some(qend) = questions_end(query) {
+        let qlen = qend.saturating_sub(12);
+        let clen = cached_qend.saturating_sub(12);
+        if qlen > 0
+            && qlen == clen
+            && out.len() >= cached_qend
+            && query[12..qend].eq_ignore_ascii_case(&cached[12..cached_qend])
+        {
+            out[12..cached_qend].copy_from_slice(&query[12..qend]);
+        }
+    }
+    if let Some(rrs) = parse_rrs(&out) {
+        for rr in rrs {
+            if rr.rtype != RR_OPT {
+                out[rr.ttl_off..rr.ttl_off + 4].copy_from_slice(&stale_reply_ttl.to_be_bytes());
             }
         }
     }
@@ -1022,6 +1144,7 @@ mod tests {
         let resp = build_a_response(&q, &[[1, 2, 3, 4]], 10).unwrap();
         let t0 = Instant::now();
         let mut c = DnsCache::default();
+        c.set_options(false, 60, 30); // P23：本用例验证非 optimistic 的过期行为
         assert!(c.insert(&parse_query(&q).unwrap(), &no_edns(), &resp, t0));
         assert!(c
             .answer_from_cache(
@@ -1034,6 +1157,104 @@ mod tests {
         assert_eq!(c.expired, 1);
         assert_eq!(c.misses, 1);
         assert_eq!(c.len(), 0);
+    }
+
+    // ---- P23：optimistic cache / fixed_domain_ttl / has_fresh ----
+
+    #[test]
+    fn optimistic_serves_stale_with_bounded_ttl() {
+        let q = query("stale.test", 1);
+        let resp = build_a_response(&q, &[[10, 9, 10, 71]], 10).unwrap();
+        let t0 = Instant::now();
+        let mut c = DnsCache::default(); // optimistic=true / ttl=60 / stale=30
+        assert!(c.insert(&parse_query(&q).unwrap(), &no_edns(), &resp, t0));
+        let hit = c
+            .answer_from_cache_scoped(
+                &q,
+                &parse_query(&q).unwrap(),
+                &no_edns(),
+                "",
+                t0 + Duration::from_secs(15),
+            )
+            .unwrap();
+        let a = parse_rrs(&hit)
+            .unwrap()
+            .into_iter()
+            .find(|r| r.section == SEC_ANSWER && r.rtype == 1)
+            .unwrap();
+        assert_eq!(a.ttl, 30); // 过期应答的 TTL 上限 = optimistic_stale_reply_ttl
+        assert_eq!(c.stale_hits, 1);
+        assert_eq!(c.expired, 0);
+        // 超出 optimistic 窗口（10 + 60）→ miss 并清出
+        assert!(c
+            .answer_from_cache_scoped(
+                &q,
+                &parse_query(&q).unwrap(),
+                &no_edns(),
+                "",
+                t0 + Duration::from_secs(75),
+            )
+            .is_none());
+        assert_eq!(c.expired, 1);
+    }
+
+    #[test]
+    fn fixed_domain_ttl_zero_expires_immediately_but_serves_stale() {
+        let q = query("fixed.test", 1);
+        let resp = build_a_response(&q, &[[1, 2, 3, 4]], 300).unwrap();
+        let t0 = Instant::now();
+        let mut c = DnsCache::default();
+        assert!(c.insert_scoped_with_fixed(
+            &parse_query(&q).unwrap(),
+            &no_edns(),
+            "",
+            &resp,
+            t0,
+            Some(0)
+        ));
+        // 立即过期，但 optimistic 窗口内仍可供应（dae：fixed 0 + optimistic 默认开）
+        assert!(c
+            .answer_from_cache_scoped(
+                &q,
+                &parse_query(&q).unwrap(),
+                &no_edns(),
+                "",
+                t0 + Duration::from_secs(1),
+            )
+            .is_some());
+        assert_eq!(c.stale_hits, 1);
+        // 关 optimistic → 立即 miss
+        let mut c2 = DnsCache::default();
+        c2.set_options(false, 60, 30);
+        assert!(c2.insert_scoped_with_fixed(
+            &parse_query(&q).unwrap(),
+            &no_edns(),
+            "",
+            &resp,
+            t0,
+            Some(0)
+        ));
+        assert!(c2
+            .answer_from_cache_scoped(
+                &q,
+                &parse_query(&q).unwrap(),
+                &no_edns(),
+                "",
+                t0 + Duration::from_secs(1),
+            )
+            .is_none());
+    }
+
+    #[test]
+    fn has_fresh_tracks_expiry_and_type() {
+        let q = query("fresh.test", 1);
+        let resp = build_a_response(&q, &[[1, 2, 3, 4]], 10).unwrap();
+        let t0 = Instant::now();
+        let mut c = DnsCache::default();
+        assert!(c.insert(&parse_query(&q).unwrap(), &no_edns(), &resp, t0));
+        assert!(c.has_fresh("fresh.test", 1, "", t0 + Duration::from_secs(5)));
+        assert!(!c.has_fresh("fresh.test", 1, "", t0 + Duration::from_secs(11)));
+        assert!(!c.has_fresh("fresh.test", 28, "", t0 + Duration::from_secs(5)));
     }
 
     #[test]
@@ -1063,6 +1284,7 @@ mod tests {
         assert_eq!(soa_min_ttl(&resp, &parse_rrs(&resp).unwrap()), Some(20));
         let t0 = Instant::now();
         let mut c = DnsCache::default();
+        c.set_options(false, 60, 30); // P23：验证非 optimistic 的过期语义
         assert!(c.insert(&parse_query(&q).unwrap(), &no_edns(), &resp, t0));
         let hit = c
             .answer_from_cache(

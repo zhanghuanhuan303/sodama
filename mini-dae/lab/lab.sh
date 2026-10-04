@@ -205,6 +205,10 @@ DOT_PID_FILE=/tmp/mini-dae-dot.pid
 DOH_PORT=8953
 DOH_LOG=/tmp/mini-dae-doh.txt
 DOH_PID_FILE=/tmp/mini-dae-doh.pid
+# P23：DoH over HTTP/2 参考服务端（Go 标准库）
+DOH_H2_PORT=8954
+DOH_H2_LOG=/tmp/mini-dae-doh-h2.txt
+DOH_H2_PID_FILE=/tmp/mini-dae-doh-h2.pid
 # P18b：DoQ 参考服务端（Go/quic-go，需先构建；转发到假 UDP DNS）
 DOQ_PORT=9053
 DOQ_LOG=/tmp/mini-dae-doq.txt
@@ -320,6 +324,10 @@ cleanup() {
   if [ -f "$DOH_PID_FILE" ]; then
     kill "$(cat "$DOH_PID_FILE")" 2>/dev/null || true
     rm -f "$DOH_PID_FILE"
+  fi
+  if [ -f "$DOH_H2_PID_FILE" ]; then
+    kill "$(cat "$DOH_H2_PID_FILE")" 2>/dev/null || true
+    rm -f "$DOH_H2_PID_FILE"
   fi
   if [ -f "$DOQ_PID_FILE" ]; then
     kill "$(cat "$DOQ_PID_FILE")" 2>/dev/null || true
@@ -646,6 +654,21 @@ up() {
     fi
   fi
 
+  # P23：DoH over HTTP/2 参考服务端（Go 标准库；仅收 h2）
+  if [ -n "${USE_DNS_H2:-}" ]; then
+    [ -x "$HERE/proto-check/bin/doh-h2-server" ] \
+      || die "缺 DoH h2 参考服务端：先运行 lab/proto-check/build-doh-h2-server.sh"
+    [ -f "$CERTS_DIR/cert.pem" ] && [ -f "$CERTS_DIR/key.pem" ] \
+      || die "缺自签证书：先运行 lab/gen-certs.sh"
+    rm -f "$DOH_H2_LOG"
+    "$HERE/proto-check/bin/doh-h2-server" -port "$DOH_H2_PORT" -cert "$CERTS_DIR/cert.pem" \
+      -key "$CERTS_DIR/key.pem" -upstream "127.0.0.1:$FAKE_DNS_PORT" -log "$DOH_H2_LOG" \
+      >/tmp/mini-dae-doh-h2.stdout 2>&1 &
+    echo $! >"$DOH_H2_PID_FILE"
+    sleep 0.3
+    kill -0 "$(cat "$DOH_H2_PID_FILE")" 2>/dev/null || { cat /tmp/mini-dae-doh-h2.stdout; die "DoH h2 服务端启动失败"; }
+  fi
+
   # P18b：DoQ 参考服务端（Go/quic-go，需先构建）
   if [ "${USE_DNS_TRANSPORT:-}" = doq ]; then
     [ -x "$HERE/proto-check/bin/doq-server" ] \
@@ -712,6 +735,13 @@ up() {
     cat "$LOG"
     die "启动失败"
   fi
+  # P23：就绪等待——状态面 socket 出现 = 初始 reload 完成（DNS/relay 线程随后启动），
+  # 避免“进程活着但数据面尚未就绪”的用例竞态。
+  local _i
+  for _i in $(seq 1 80); do
+    [ -S "$STATUS_SOCK" ] && break
+    sleep 0.25
+  done
   echo "== mini-dae 运行中 (pid $(cat "$PID_FILE"))，日志：$LOG =="
   cat "$LOG"
 }
@@ -1460,6 +1490,27 @@ PY
   echo "PASS: DoH 上游（2 次查询复用 1 条 keep-alive 连接）"
 }
 
+# P23：DoH over HTTP/2（H1 回退不触发；Go 标准库服务端仅收 h2）。
+test_doh_h2() {
+  require_root
+  echo "== P23：DoH over HTTP/2 =="
+  [ -f "$DOH_H2_PID_FILE" ] && kill -0 "$(cat "$DOH_H2_PID_FILE")" 2>/dev/null \
+    || die "DoH h2 服务端未运行（先用 doh-h2-up 会话启动）"
+  local out before after
+  before="$(grep -c 'proto=HTTP/2.0 alpn="h2"' "$DOH_H2_LOG" || true)"
+  out="$(ip netns exec "$CLIENT_NS" timeout 8 python3 "$HERE/dns_probe.py" 9.9.9.9 doh.test 2>&1 || true)"
+  echo "$out"
+  printf '%s\n' "$out" | grep -q '^answer=10.9.10.33' || { echo "FAIL: DoH h2 未解析 doh.test"; exit 1; }
+  out="$(ip netns exec "$CLIENT_NS" timeout 8 python3 "$HERE/dns_probe.py" 9.9.9.9 doh2.test 2>&1 || true)"
+  echo "$out"
+  printf '%s\n' "$out" | grep -q '^answer=10.9.10.34' || { echo "FAIL: DoH h2 第二次查询失败（连接复用/流）"; exit 1; }
+  after="$(grep -c 'proto=HTTP/2.0 alpn="h2"' "$DOH_H2_LOG" || true)"
+  [ "$((after - before))" = "2" ] \
+    || { echo "FAIL: 参考服务端未收到恰好 2 次 h2 请求（增量 $((after - before))）"; tail -5 "$DOH_H2_LOG"; exit 1; }
+  if grep -q 'DoH h2 握手失败' "$LOG"; then echo "FAIL: loader 出现 h2 握手回退"; grep 'DoH h2' "$LOG"; exit 1; fi
+  echo "PASS: DoH 走 HTTP/2（Go 标准库服务端 ALPN=h2，两次查询复用一条连接）"
+}
+
 # P18b：DoQ 上游（quic://，RFC 9250：ALPN doq、每查询一条流、连接复用）
 test_doq() {
   require_root
@@ -1813,6 +1864,50 @@ print("punt: attempts=%d direct=%d block=%d group=%d keep=%d" % (
     s["punt_group"], s["punt_keep"]))
 PY
   echo "PASS: sniff-punt（direct / block / 组重选 三条路径）"
+}
+
+# P23：DNS 选项（fixed_domain_ttl / optimistic cache / ipversion_prefer）。
+test_dns_options() {
+  require_root
+  echo "== P23：DNS 选项（fixed_domain_ttl / optimistic / ipversion_prefer）=="
+  rm -f "$FAKE_DNS_LOG"
+  local out
+  # 1) fixed_domain_ttl=1：首查（上游 TTL=30）→ 应答 TTL 为上游值（fixed 只改缓存寿命）
+  out="$(ip netns exec "$CLIENT_NS" timeout 8 python3 "$HERE/dns_probe.py" 9.9.9.9 stale.test 2>&1 || true)"
+  echo "$out"
+  printf '%s\n' "$out" | grep -q '^answer=10.9.10.71' || { echo "FAIL: stale.test 未解析"; exit 1; }
+  # 2) 睡 2s（> fixed 1s，< optimistic 60s）：第二次查询命中 stale，TTL 压到 7，且不再上行
+  sleep 2
+  out="$(ip netns exec "$CLIENT_NS" timeout 8 python3 "$HERE/dns_probe.py" 9.9.9.9 stale.test 2>&1 || true)"
+  echo "$out"
+  printf '%s\n' "$out" | grep -q '^answer=10.9.10.71' || { echo "FAIL: stale.test 第二次未解析（optimistic 未生效）"; exit 1; }
+  printf '%s\n' "$out" | grep -q '^ttl=7' || { echo "FAIL: stale 应答 TTL 未压到 optimistic_stale_reply_ttl=7"; exit 1; }
+  [ "$(grep -c '^QUERY stale.test ' "$FAKE_DNS_LOG" || true)" = "1" ] \
+    || { echo "FAIL: optimistic 命中后仍重查了上游（fixed_ttl 未生效？）"; cat "$FAKE_DNS_LOG"; exit 1; }
+  # 3) ipversion_prefer=4：先 A（入缓存），AAAA 查询应得到空 NOERROR（ancount=0）
+  out="$(ip netns exec "$CLIENT_NS" timeout 8 python3 "$HERE/dns_probe.py" 9.9.9.9 pref.test 2>&1 || true)"
+  printf '%s\n' "$out" | grep -q '^answer=10.9.10.72' || { echo "FAIL: pref.test A 未解析"; exit 1; }
+  out="$(ip netns exec "$CLIENT_NS" timeout 8 python3 "$HERE/dns_probe.py" 9.9.9.9 pref.test 28 2>&1 || true)"
+  echo "$out"
+  printf '%s\n' "$out" | grep -q '^ancount=0' || { echo "FAIL: ipversion_prefer=4 未过滤 AAAA（应有 A 已知）"; exit 1; }
+  # 4) 仅 AAAA 的域名不受影响
+  out="$(ip netns exec "$CLIENT_NS" timeout 8 python3 "$HERE/dns_probe.py" 9.9.9.9 v6only.test 28 2>&1 || true)"
+  echo "$out"
+  printf '%s\n' "$out" | grep -q '^answer6=2001:db8::73' || { echo "FAIL: 仅 AAAA 域名被误过滤"; exit 1; }
+  # 5) 状态面
+  "$LOADER" status --socket "$STATUS_SOCK" --json >/tmp/mini-dae-status.json
+  python3 - /tmp/mini-dae-status.json <<'PY'
+import json, sys
+v = json.load(open(sys.argv[1]))
+d = v["dns"]
+assert d.get("ipversion_prefer") == 4, d
+assert d.get("fixed_domain_ttl") == 1, d
+assert d.get("stale_hits", 0) >= 1, d
+assert d.get("ipversion_filtered", 0) >= 1, d
+print("dns opts: stale_hits=%d ipversion_filtered=%d fixed=%d" % (
+    d["stale_hits"], d["ipversion_filtered"], d["fixed_domain_ttl"]))
+PY
+  echo "PASS: fixed_domain_ttl / optimistic cache（stale TTL 上限）/ ipversion_prefer"
 }
 
 # P4b：UDP NAT 会话 janitor（会话用 --udp-idle-timeout 2 启动）。
@@ -2956,6 +3051,9 @@ case "${1:-}" in
   doh-up) USE_RULES="$HERE/rules.dns.dae" USE_FAKE_DNS=1 USE_DNS_TRANSPORT=https \
     USE_DNS_UPSTREAM="https://127.0.0.1:$DOH_PORT/dns-query?sni=localhost&insecure=1" up ;;
   test-doh) test_doh ;;
+  doh-h2-up) USE_RULES="$HERE/rules.dns.dae" USE_FAKE_DNS=1 USE_DNS_H2=1 \
+    USE_DNS_UPSTREAM="https://127.0.0.1:$DOH_H2_PORT/dns-query?sni=localhost&insecure=1" up ;;  # P23
+  test-doh-h2) test_doh_h2 ;;  # P23：DoH over HTTP/2
   doq-up) USE_RULES="$HERE/rules.dns.dae" USE_FAKE_DNS=1 USE_DNS_TRANSPORT=doq \
     USE_DNS_UPSTREAM="quic://127.0.0.1:$DOQ_PORT?sni=localhost&insecure=1" up ;;
   test-doq) test_doq ;;
@@ -2963,9 +3061,11 @@ case "${1:-}" in
     chmod 640 /tmp/mini-dae-dnsroute.dae; cp "$HERE/blocklist.test.txt" /tmp/blocklist.test.txt; \
     USE_CONFIG=/tmp/mini-dae-dnsroute.dae \
     USE_FAKE_DNS=1 USE_FAKE_DNS_B=1 up ;;
-  dns-udp-up) USE_RULES="$HERE/rules.dns.dae" USE_FAKE_DNS=1 \
+  dnsopts-up) chmod 640 "$HERE/dnsopts.dae"; USE_CONFIG="$HERE/dnsopts.dae" USE_FAKE_DNS=1 up ;;  # P23
+dns-udp-up) USE_RULES="$HERE/rules.dns.dae" USE_FAKE_DNS=1 \
     USE_DNS_UPSTREAM="udp://127.0.0.1:$FAKE_DNS_PORT" up ;;
-  test-dns-udp) test_dns_udp ;;  # 显式 udp:// 上游（仅 UDP）
+  test-dns-options) test_dns_options ;;  # P23：fixed ttl / optimistic / ipversion_prefer
+test-dns-udp) test_dns_udp ;;  # 显式 udp:// 上游（仅 UDP）
   dns-tcpup-up) USE_RULES="$HERE/rules.dns.dae" USE_FAKE_DNS=1 \
     USE_DNS_UPSTREAM="tcp://127.0.0.1:$FAKE_DNS_PORT" up ;;
   test-dns-tcpup) test_dns_tcpup ;;  # 显式 tcp:// 上游（仅 TCP，服务端同端口的 TCP 面）
@@ -3068,5 +3168,5 @@ case "${1:-}" in
   status) status ;;
   trace) trace ;;
   down) down ;;
-  *) echo "usage: $0 {build|up|dual-up|config-up|forward-up|dns-up|dot-up|doh-up|doq-up|dnsroute-up|dns-udp-up|dns-tcpup-up|geo-up|pname-up|regex-up|relay-up|offload-up|udp-up|ss-up|ss2022-up|http-up|groups-up|ss-udp-up|trojan-up|vless-up|vless-tls-up|vless-udp-up|vmess-up|vmess-tls-up|vmess-udp-up|tuic-up|tuic-udp-up|hy2-up|hy2-udp-up|hy2-obfs-up|hy2-obfs-udp-up|hy2-brutal-up|hy2-hop-up|ops-up|ops-reload-up|bench-up|test-proxy|test-direct|test-block|test-host-proxy|test-reload|test-rebind|test-status|test-config|test-forward|test-domain|test-dns-cache|test-dns-tcp|test-dns-reload|test-domain-regex|test-dns-edns|test-dot|test-doh|test-doq|test-dnsroute|test-dns-udp|test-dns-tcpup|test-geo|test-pname|test-v6|test-relay|test-relay-idle|test-relay-offload|test-offload-lifecycle|test-udp-relay|test-quic-sniff|test-udp-idle|test-ss|test-ss2022|test-http|test-groups|test-trojan|test-ss-udp|test-vless|test-vless-udp|test-vmess|test-vmess-udp|test-tuic|test-tuic-udp|test-hy2|test-hy2-udp|test-hy2-obfs|test-hy2-obfs-udp|test-hy2-brutal|test-hy2-hop|test-ops|test-config-reload|test-fault-reload|test-fault-kill|reload|verify|status|trace|down|sniff-punt-up|test-sniff-punt}"; exit 2 ;;
+  *) echo "usage: $0 {build|up|dual-up|config-up|forward-up|dns-up|dot-up|doh-up|doh-h2-up|doq-up|dnsroute-up|dnsopts-up|dns-udp-up|dns-tcpup-up|geo-up|pname-up|regex-up|relay-up|offload-up|udp-up|ss-up|ss2022-up|http-up|groups-up|ss-udp-up|trojan-up|vless-up|vless-tls-up|vless-udp-up|vmess-up|vmess-tls-up|vmess-udp-up|tuic-up|tuic-udp-up|hy2-up|hy2-udp-up|hy2-obfs-up|hy2-obfs-udp-up|hy2-brutal-up|hy2-hop-up|ops-up|ops-reload-up|bench-up|test-proxy|test-direct|test-block|test-host-proxy|test-reload|test-rebind|test-status|test-config|test-forward|test-domain|test-dns-cache|test-dns-tcp|test-dns-reload|test-domain-regex|test-dns-edns|test-dot|test-doh|test-doh-h2|test-doq|test-dnsroute|test-dns-options|test-dns-udp|test-dns-tcpup|test-geo|test-pname|test-v6|test-relay|test-relay-idle|test-relay-offload|test-offload-lifecycle|test-udp-relay|test-quic-sniff|test-udp-idle|test-ss|test-ss2022|test-http|test-groups|test-trojan|test-ss-udp|test-vless|test-vless-udp|test-vmess|test-vmess-udp|test-tuic|test-tuic-udp|test-hy2|test-hy2-udp|test-hy2-obfs|test-hy2-obfs-udp|test-hy2-brutal|test-hy2-hop|test-ops|test-config-reload|test-fault-reload|test-fault-kill|reload|verify|status|trace|down|sniff-punt-up|test-sniff-punt}"; exit 2 ;;
 esac

@@ -237,6 +237,19 @@ pub fn connect(
     alpn: &[Vec<u8>],
     timeout: Duration,
 ) -> io::Result<(TlsReader, TlsWriter)> {
+    let ((r, w), _) = connect_alpn(tcp, sni, insecure, alpn, timeout)?;
+    Ok((r, w))
+}
+
+/// P23：同 `connect`，并返回协商出的 ALPN（DoH 据此判断是否走 h2，
+/// 避免对 HTTP/1.1 服务端白白发一次 HTTP/2 前言）。
+pub fn connect_alpn(
+    tcp: TcpStream,
+    sni: &str,
+    insecure: bool,
+    alpn: &[Vec<u8>],
+    timeout: Duration,
+) -> io::Result<((TlsReader, TlsWriter), Option<Vec<u8>>)> {
     tcp.set_read_timeout(Some(timeout))?;
     tcp.set_write_timeout(Some(timeout))?;
     let name = ServerName::try_from(sni.to_string())
@@ -254,17 +267,21 @@ pub fn connect(
     // 恢复阻塞语义（超时只用于握手期）
     tcp.set_read_timeout(None)?;
     tcp.set_write_timeout(None)?;
+    let negotiated = conn.alpn_protocol().map(|p| p.to_vec());
     let conn = Arc::new(Mutex::new(conn));
     Ok((
-        TlsReader {
-            conn: conn.clone(),
-            sock: tcp.try_clone()?,
-            eof: false,
-            pending: Vec::new(),
-        },
-        TlsWriter {
-            conn,
-            sock: tcp.try_clone()?,
-        },
+        (
+            TlsReader {
+                conn: conn.clone(),
+                sock: tcp.try_clone()?,
+                eof: false,
+                pending: Vec::new(),
+            },
+            TlsWriter {
+                conn,
+                sock: tcp.try_clone()?,
+            },
+        ),
+        negotiated,
     ))
 }
