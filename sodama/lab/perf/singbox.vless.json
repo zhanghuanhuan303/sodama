@@ -1,0 +1,28 @@
+{
+  "log": { "level": "warn" },
+  "inbounds": [
+    {
+      "type": "tproxy",
+      "tag": "tproxy-in",
+      "listen": "0.0.0.0",
+      "listen_port": 7895,
+      "sniff": false
+    }
+  ],
+  "outbounds": [
+    { "type": "direct", "tag": "direct" },
+    {
+      "type": "vless",
+      "tag": "vless",
+      "server": "10.9.9.2",
+      "server_port": 8543,
+      "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811"
+    }
+  ],
+  "route": {
+    "rules": [
+      { "ip_cidr": ["10.9.9.0/24"], "outbound": "direct" }
+    ],
+    "final": "vless"
+  }
+}

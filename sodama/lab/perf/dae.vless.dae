@@ -1,0 +1,32 @@
+# dae v2.1.1 性能对比配置（VLESS 明文 TCP 变体；与 rules.perf.dae 对齐）：
+#   - 10.9.9.0/24 → direct（内核基线路径）
+#   - 1.1.1.1:8080 → group:proxy（节点 = WAN ns 里的 sing-box vless 服务端 :8543）
+# 用法：sudo dae run --config lab/perf/dae.vless.dae
+global {
+    wan_interface: wan
+    lan_interface: landae
+    tproxy_port: 12345
+    log_level: warn
+    auto_config_kernel_parameter: true
+    # 节点存活检查：WAN ns 里的 python http.server（HEAD 200）
+    tcp_check_url: 'http://10.9.9.2:8390'
+    tcp_check_http_method: HEAD
+    check_interval: 30s
+}
+
+node {
+    v1: 'vless://b831381d-6324-4d53-ad4f-8cda48b30811@10.9.9.2:8543?type=tcp&security=none'
+}
+
+group {
+    proxy {
+        policy: min_moving_avg
+        filter: name(v1)
+    }
+}
+
+routing {
+    dip(10.9.9.0/24) -> direct
+    dip(1.1.1.1/32) && dport(8080) -> proxy
+    fallback: block
+}

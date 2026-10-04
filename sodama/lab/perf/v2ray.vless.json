@@ -1,0 +1,38 @@
+{
+  "log": { "loglevel": "warning" },
+  "inbounds": [
+    {
+      "tag": "tproxy-in",
+      "listen": "0.0.0.0",
+      "port": 7896,
+      "protocol": "dokodemo-door",
+      "settings": { "network": "tcp", "followRedirect": true },
+      "streamSettings": { "sockopt": { "tproxy": "tproxy" } }
+    }
+  ],
+  "outbounds": [
+    {
+      "tag": "vless",
+      "protocol": "vless",
+      "settings": {
+        "vnext": [
+          {
+            "address": "10.9.9.2",
+            "port": 8543,
+            "users": [
+              {
+                "id": "b831381d-6324-4d53-ad4f-8cda48b30811",
+                "encryption": "none"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    { "tag": "direct", "protocol": "freedom", "settings": {} }
+  ],
+  "routing": {
+    "domainStrategy": "AsIs",
+    "rules": [{ "type": "field", "ip": ["10.9.9.0/24"], "outboundTag": "direct" }]
+  }
+}

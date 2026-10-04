@@ -14,7 +14,8 @@
 # 环境变量：
 #   DAE_BIN=/tmp/perf/usr/bin/dae   SINGBOX_BIN=sing-box   V2RAY_BIN=v2ray
 #   BENCH_MB=48（每流）BENCH_STREAMS=4 ROUNDS=3 WARMUP=1 BENCH_LAT=500
-#   SS_UPSTREAM=python|ssserver   # 默认 python；性能测量用 ssserver（shadowsocks-rust）
+#   SS_UPSTREAM=python|ssserver   # ss 上游选择（默认 python；性能测量用 ssserver）
+#   PROXY_PROTO=ss|vless|vless-tls # 代理路径协议（默认 ss；vless 上游 = sing-box 服务端）
 #   BENCH_RING_MB=128             # 全双工 echo 夹具 ring 容量
 set -euo pipefail
 
@@ -31,6 +32,17 @@ CLIENT_NS=sodama_client
 WAN_NS=sodama_wan
 SS_PORT=8388
 HTTP_PORT=8390
+VLESS_PORT=8543
+VLESS_TLS_PORT=8544
+VLESS_UUID=b831381d-6324-4d53-ad4f-8cda48b30811
+# 代理路径协议：ss（shadowsocks 上游）| vless（sing-box vless 服务端明文）| vless-tls（自签 TLS）
+PROXY_PROTO="${PROXY_PROTO:-ss}"
+case "$PROXY_PROTO" in
+  ss) UPSTREAM_PORT="$SS_PORT" ;;
+  vless) UPSTREAM_PORT="$VLESS_PORT" ;;
+  vless-tls) UPSTREAM_PORT="$VLESS_TLS_PORT" ;;
+  *) echo "!! PROXY_PROTO=$PROXY_PROTO 未知（ss|vless|vless-tls）" >&2; exit 1 ;;
+esac
 IMPL_PID_FILE=/tmp/perf-impl.pid
 RESULTS="${RESULTS:-/tmp/perf-results.tsv}"
 
@@ -57,7 +69,7 @@ build() {
 # ---------------------------------------------------------------- 拓扑与 WAN 侧服务
 
 stop_wan_servers() {
-  for f in /tmp/perf-bench.pid /tmp/perf-http.pid /tmp/perf-ss.pid; do
+  for f in /tmp/perf-bench.pid /tmp/perf-http.pid /tmp/perf-ss.pid /tmp/perf-vless.pid; do
     if [ -f "$f" ]; then
       kill "$(cat "$f")" 2>/dev/null || true
       rm -f "$f"
@@ -76,23 +88,32 @@ prepare() {
   ip netns exec "$WAN_NS" python3 -m http.server "$HTTP_PORT" --bind 10.9.9.2 \
     >/tmp/perf-http.log 2>&1 &
   echo $! >/tmp/perf-http.pid
-  if [ "${SS_UPSTREAM:-python}" = ssserver ]; then
-    # 高速上游（shadowsocks-rust；性能测量用，python 上游有 GIL 〜2.4Gbps 上限）
-    command -v ssserver >/dev/null || die "SS_UPSTREAM=ssserver 但未安装 ssserver"
-    ip netns exec "$WAN_NS" ssserver -s "10.9.9.2:$SS_PORT" \
-      -k testpass -m chacha20-ietf-poly1305 --tcp-no-delay \
-      >/tmp/perf-ss.stdout 2>&1 &
-    echo $! >/tmp/perf-ss.pid
+  if [ "$PROXY_PROTO" = ss ]; then
+    if [ "${SS_UPSTREAM:-python}" = ssserver ]; then
+      # 高速上游（shadowsocks-rust；性能测量用，python 上游有 GIL 〜2.4Gbps 上限）
+      command -v ssserver >/dev/null || die "SS_UPSTREAM=ssserver 但未安装 ssserver"
+      ip netns exec "$WAN_NS" ssserver -s "10.9.9.2:$SS_PORT" \
+        -k testpass -m chacha20-ietf-poly1305 --tcp-no-delay \
+        >/tmp/perf-ss.stdout 2>&1 &
+      echo $! >/tmp/perf-ss.pid
+    else
+      ip netns exec "$WAN_NS" python3 "$ROOT/lab/ss_server.py" /tmp/perf-ss.log \
+        chacha20-ietf-poly1305 testpass "$SS_PORT" 10.9.9.2 >/tmp/perf-ss.stdout 2>&1 &
+      echo $! >/tmp/perf-ss.pid
+    fi
   else
-    ip netns exec "$WAN_NS" python3 "$ROOT/lab/ss_server.py" /tmp/perf-ss.log \
-      chacha20-ietf-poly1305 testpass "$SS_PORT" 10.9.9.2 >/tmp/perf-ss.stdout 2>&1 &
-    echo $! >/tmp/perf-ss.pid
+    # VLESS 上游：sing-box 服务端（同进程同时监听 8543 明文 / 8544 自签 TLS）。
+    # 证书相对路径以 $ROOT 为工作目录（env -C）解析。
+    command -v "$SINGBOX_BIN" >/dev/null || die "PROXY_PROTO=$PROXY_PROTO 但未安装 sing-box"
+    ip netns exec "$WAN_NS" env -C "$ROOT" "$SINGBOX_BIN" run -c "$HERE/singbox.vless-server.json" \
+      >/tmp/perf-vless-server.log 2>&1 &
+    echo $! >/tmp/perf-vless.pid
   fi
   sleep 0.6
-  # ss 上游就绪探测（从 host ns）
-  timeout 3 bash -c ": >/dev/tcp/10.9.9.2/$SS_PORT" 2>/dev/null \
-    || die "WAN ns ss 上游未就绪（见 /tmp/perf-ss.stdout）"
-  echo "== 拓扑 + WAN 侧服务（bench_io:8080,9999 / http:$HTTP_PORT / ss:$SS_PORT）就绪 =="
+  # 上游就绪探测（从 host ns）
+  timeout 3 bash -c ": >/dev/tcp/10.9.9.2/$UPSTREAM_PORT" 2>/dev/null \
+    || die "WAN ns $PROXY_PROTO 上游(:$UPSTREAM_PORT) 未就绪（见 /tmp/perf-ss.stdout 或 /tmp/perf-vless-server.log）"
+  echo "== 拓扑 + WAN 侧服务（bench_io:8080,9999 / http:$HTTP_PORT / $PROXY_PROTO:$UPSTREAM_PORT）就绪 =="
 }
 
 # ---------------------------------------------------------------- tproxy（sing-box/v2ray）
@@ -125,31 +146,44 @@ impl_env_cleanup() {
 start_impl() {
   local impl="$1"
   local pid
+  # 代理协议 → 各实现的拨号参数/配置选择
+  local sodama_dialer dae_cfg singbox_cfg v2ray_cfg
+  case "$PROXY_PROTO" in
+    ss)
+      sodama_dialer='ss://chacha20-ietf-poly1305:testpass@10.9.9.2:8388'
+      dae_cfg="$HERE/dae.dae"; singbox_cfg="$HERE/singbox.json"; v2ray_cfg="$HERE/v2ray.json" ;;
+    vless)
+      sodama_dialer="vless://$VLESS_UUID@10.9.9.2:$VLESS_PORT?type=tcp&security=none"
+      dae_cfg="$HERE/dae.vless.dae"; singbox_cfg="$HERE/singbox.vless.json"; v2ray_cfg="$HERE/v2ray.vless.json" ;;
+    vless-tls)
+      sodama_dialer="vless://$VLESS_UUID@10.9.9.2:$VLESS_TLS_PORT?type=tcp&security=tls&sni=localhost&allowinsecure=1"
+      dae_cfg="$HERE/dae.vless-tls.dae"; singbox_cfg="$HERE/singbox.vless-tls.json"; v2ray_cfg="$HERE/v2ray.vless-tls.json" ;;
+  esac
   case "$impl" in
     sodama)
       [ -x "$LOADER" ] && [ -f "$OBJ" ] || die "先构建 sodama（lab.sh build + cargo build --release）"
       "$LOADER" --ebpf "$OBJ" --lan landae --wan wan \
         --dae0 dae0 --dae0peer dae0peer --daens sodamans \
         --rules "$HERE/rules.perf.dae" \
-        --dialer 'ss://chacha20-ietf-poly1305:testpass@10.9.9.2:8388' \
+        --dialer "$sodama_dialer" \
         --status-socket /tmp/sodama-status.sock >/tmp/perf-sodama.log 2>&1 &
       pid=$!
       ;;
     dae)
       [ -x "$DAE_BIN" ] || die "缺 dae 二进制（DAE_BIN=$DAE_BIN）"
       # dae 要求配置不可被 group/other 读写
-      chmod 640 "$HERE/dae.dae" 2>/dev/null || true
-      "$DAE_BIN" run --config "$HERE/dae.dae" --disable-pidfile >/tmp/perf-dae.log 2>&1 &
+      chmod 640 "$dae_cfg" 2>/dev/null || true
+      "$DAE_BIN" run --config "$dae_cfg" --disable-pidfile >/tmp/perf-dae.log 2>&1 &
       pid=$!
       ;;
     singbox)
       nft_add 7895
-      "$SINGBOX_BIN" run -c "$HERE/singbox.json" >/tmp/perf-singbox.log 2>&1 &
+      "$SINGBOX_BIN" run -c "$singbox_cfg" >/tmp/perf-singbox.log 2>&1 &
       pid=$!
       ;;
     v2ray)
       nft_add 7896
-      "$V2RAY_BIN" run -c "$HERE/v2ray.json" >/tmp/perf-v2ray.log 2>&1 &
+      "$V2RAY_BIN" run -c "$v2ray_cfg" >/tmp/perf-v2ray.log 2>&1 &
       pid=$!
       ;;
     *) die "未知实现：$impl" ;;
@@ -200,7 +234,7 @@ bench_impl() {
   local impl="$1"
   require_root
   # ss 上游若不在（例如上一轮被异常流量打挂），自动重建拓扑与服务。
-  if ! timeout 3 bash -c ": >/dev/tcp/10.9.9.2/$SS_PORT" 2>/dev/null; then
+  if ! timeout 3 bash -c ": >/dev/tcp/10.9.9.2/$UPSTREAM_PORT" 2>/dev/null; then
     prepare
   fi
   start_impl "$impl"
@@ -212,7 +246,7 @@ bench_impl() {
   done
   for i in $(seq 1 "$ROUNDS"); do
     run_one "$impl" direct 10.9.9.2 9999 || return 1
-    run_one "$impl" ss 1.1.1.1 8080 || return 1
+    run_one "$impl" "$PROXY_PROTO" 1.1.1.1 8080 || return 1
   done
   stop_impl
   echo "== $impl 完成 =="

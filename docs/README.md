@@ -10,6 +10,7 @@ docs/
 ├── architecture-decision.html    # 决策档案（主文档，自包含可离线打开）
 ├── parity-status.md              # 对标进度：dae（Go）↔ sodama（全 Rust）分域覆盖度
 ├── perf-report.md                # 性能对比报告（四方对拍 / 并发扩展 / perf 剖面 / 夹具校准）
+├── vless-proposal.html           # VLESS 性能实测与优化提案（自包含 HTML，可离线打开）
 ├── optimization-roadmap.md       # 优化方向（数据驱动，O1–O8 优先级与验收）
 ├── adr/                          # 已采纳决策记录（ADR-0001..0031）
 ├── modules/                      # 模块级规格（tuic-v5-client-spec.md / hysteria2-client-spec.md，由源码研究产出）
@@ -22,6 +23,7 @@ docs/
 |---|---|---|
 | 决策记录（ADR） | `adr/` | 已采纳决策的背景/选项/后果/验证方式，共 30 条（D1–D8；0007 被 0009 取代，0010–0015 记录 K2/K3/P3/P4 口径，0016 = P5-G1，0017 = P5-G2，0018 = P5-G3a，0019 = P5-G3b，0020 = P5-G3b+，0021 = P6，0022 = P7，0023 = P8，0024 = P9，0025 = 移除 C 数据面，**0026 = P10 vless-ws，0027 = P11 anytls，0028 = P12 socks 入口，0029 = P13 真网关模式，0030 = P14 嗅探 + dial_mode，0031 = P15 订阅/节点组/健康检查**） |
 | 对标进度 | `parity-status.md` | dae（Go）↔ sodama（全 Rust）分域覆盖度对照（15 域 + 汇总 + Top 缺口 + 优势项，附证据锚点） |
+| VLESS 提案 | `vless-proposal.html` | VLESS（明文/TLS）四方实测 + perf 剖面 + 分阶段优化提案（自包含，可离线打开） |
 | 数据面核心笔记 | `sodama/NOTES.md` | eBPF 分流/tproxy/回程机制的源码级笔记（带行号） |
 | 实验手册 | `sodama/README.md` | sodama 的构建、拓扑、测试与实测输出 |
 | 上游文档 | `dae/docs/{en,zh}/` | dae 官方文档（how-it-works、配置、内核参数） |

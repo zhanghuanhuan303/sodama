@@ -1,0 +1,25 @@
+{
+  "log": { "level": "warn" },
+  "inbounds": [
+    {
+      "type": "vless",
+      "tag": "vless-plain",
+      "listen": "10.9.9.2",
+      "listen_port": 8543,
+      "users": [{ "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811" }]
+    },
+    {
+      "type": "vless",
+      "tag": "vless-tls",
+      "listen": "10.9.9.2",
+      "listen_port": 8544,
+      "users": [{ "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811" }],
+      "tls": {
+        "enabled": true,
+        "certificate_path": "lab/certs/cert.pem",
+        "key_path": "lab/certs/key.pem"
+      }
+    }
+  ],
+  "outbounds": [{ "type": "direct", "tag": "direct" }]
+}

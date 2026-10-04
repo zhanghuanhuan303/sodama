@@ -95,6 +95,24 @@ dae/sing-box 高 18–28%，是当前最大短板——根因见 §perf 剖面�
 - 线程数由「每连接 1–2 个 OS 线程 + 看门狗」模型决定——连接规模上量时是
   首要风险（见优化方向 P2）。
 
+## 结果 D：VLESS（明文 / TLS，四方对比 · 2026-10-04 加测）
+
+上游为 WAN ns 内同一 sing-box VLESS 服务端（:8543 明文 / :8544 自签 TLS），
+与 ss 同口径（48MB×4、5 轮中位；脚本 `PROXY_PROTO=vless|vless-tls run.sh all`）。
+完整实测、perf 剖面与优化提案见 **[`vless-proposal.html`](./vless-proposal.html)**。
+
+| 实现 | vless 明文 | p50 | CPU | vless-tls | p50 | CPU | RSS | 线程 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| **sodama** | 12 225 Mbps | **40 µs** | 380 ms | 11 624 Mbps | **46 µs** | **420 ms** | **29.8 MB** | **11** |
+| dae v2.1.1 | **12 689** | 42 µs | 410 ms | 11 453 | 55 µs | 450 ms | 59.5 MB | 20 |
+| sing-box 1.14.2 | **16 588** | 42 µs | **80 ms** | **12 003** | 53 µs | 450 ms | 69.3 MB | 18 |
+| v2ray 5.52.0 | 10 739 | 52 µs | 710 ms | 7 529 | 58 µs | 800 ms | 74.3 MB | 25 |
+
+要点：① VLESS+TLS 下 sodama 综合第一梯队（吞吐 ≈ sing-box 的 97%、CPU/延迟/内存最优）；
+② 明文路径落后 sing-box 是**零拷贝（splice）差距**（其 CPU 80ms vs 380ms；perf：
+`rep_movs` 46.8% + 建页 18.8%）；③ **TLS（AES-NI GCM）比 ss 的 chacha20-poly1305 更快
+更省**（11.6G/420ms vs 9.5G/590ms）；④ Vision-over-TLS 为待补的主流组合缺口。
+
 ## perf 热点剖面（8×64MB，`perf record -g`）
 
 **ss 路径（9.5 Gbps，sodama 进程 CPU 1690ms/512MB）**：

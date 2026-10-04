@@ -1,0 +1,397 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>sodama · VLESS 性能实测与优化提案</title>
+<style>
+  :root{
+    --bg:#0f1115; --card:#171a21; --card2:#1d212b; --fg:#e6e9ef; --muted:#9aa3b2;
+    --line:#2a2f3a; --accent:#5ee0a0; --accent2:#7cc4ff; --warn:#ffcc66; --bad:#ff7b72;
+    --ok:#5ee0a0; --shadow:0 8px 28px rgba(0,0,0,.35); --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+    --sans:-apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans CJK SC","PingFang SC","Microsoft YaHei",sans-serif;
+  }
+  @media (prefers-color-scheme: light){
+    :root{ --bg:#f6f7fa; --card:#ffffff; --card2:#f0f2f6; --fg:#1c2028; --muted:#5b6472; --line:#e2e6ee;
+           --shadow:0 6px 20px rgba(20,30,60,.08); }
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.65 var(--sans);}
+  .wrap{max-width:1080px;margin:0 auto;padding:32px 20px 80px}
+  header.top{border-bottom:1px solid var(--line);padding-bottom:18px;margin-bottom:26px}
+  h1{font-size:26px;margin:0 0 6px;letter-spacing:.2px}
+  h2{font-size:20px;margin:38px 0 12px;padding-top:10px;border-top:1px solid var(--line)}
+  h3{font-size:16px;margin:24px 0 8px}
+  p{margin:8px 0}
+  .sub{color:var(--muted);font-size:13.5px}
+  .chips{display:flex;flex-wrap:wrap;gap:8px;margin:12px 0 0}
+  .chip{background:var(--card2);border:1px solid var(--line);border-radius:999px;padding:3px 11px;font-size:12.5px;color:var(--muted)}
+  .chip b{color:var(--fg);font-weight:600}
+  .grid{display:grid;gap:14px;grid-template-columns:repeat(auto-fit,minmax(230px,1fr))}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:16px 16px 14px;box-shadow:var(--shadow)}
+  .kpi{font-size:26px;font-weight:700;letter-spacing:.3px}
+  .kpi small{font-size:12.5px;color:var(--muted);font-weight:500;margin-left:4px}
+  .tag{display:inline-block;font-size:11.5px;padding:2px 8px;border-radius:6px;border:1px solid var(--line);color:var(--muted);margin-right:6px}
+  .tag.ok{color:var(--ok);border-color:rgba(94,224,160,.35)}
+  .tag.warn{color:var(--warn);border-color:rgba(255,204,102,.35)}
+  .tag.bad{color:var(--bad);border-color:rgba(255,123,114,.35)}
+  table{width:100%;border-collapse:collapse;margin:12px 0;font-size:14px}
+  th,td{border:1px solid var(--line);padding:7px 9px;text-align:right}
+  th:first-child,td:first-child{text-align:left}
+  thead th{background:var(--card2);color:var(--muted);font-weight:600;font-size:12.5px}
+  td.n{font-family:var(--mono)}
+  .best{color:var(--accent);font-weight:700}
+  .worst{color:var(--bad)}
+  .bar{height:10px;border-radius:5px;background:linear-gradient(90deg,var(--accent2),var(--accent));min-width:2px;display:inline-block;vertical-align:middle}
+  .bar.alt{background:linear-gradient(90deg,#8f9bb3,#c2cbd9)}
+  .bars{display:grid;grid-template-columns:120px 1fr 84px;gap:6px 10px;align-items:center;margin:10px 0}
+  .bars .lbl{color:var(--muted);font-size:13px;text-align:left}
+  .bars .val{font-family:var(--mono);font-size:13px;text-align:right}
+  .note{background:var(--card2);border-left:3px solid var(--accent2);border-radius:8px;padding:10px 12px;margin:12px 0;color:var(--muted);font-size:13.5px}
+  .note b{color:var(--fg)}
+  code,pre{font-family:var(--mono)}
+  pre{background:var(--card2);border:1px solid var(--line);border-radius:10px;padding:12px;overflow:auto;font-size:12.5px;line-height:1.5}
+  .ok{color:var(--ok)} .warnc{color:var(--warn)} .badc{color:var(--bad)} .muted{color:var(--muted)}
+  .prio{display:grid;grid-template-columns:64px 1fr;gap:10px 14px;margin:10px 0 4px}
+  .prio .p{font-weight:700}
+  .p0{color:#ff8a65}.p1{color:#ffcc66}.p2{color:#7cc4ff}.p3{color:#9aa3b2}
+  .foot{margin-top:46px;border-top:1px solid var(--line);padding-top:14px;color:var(--muted);font-size:12.5px}
+  .two{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+  @media (max-width:760px){ .two{grid-template-columns:1fr} }
+  .legend{font-size:12.5px;color:var(--muted);margin-top:4px}
+  .legend i{display:inline-block;width:10px;height:10px;border-radius:3px;margin:0 6px 0 12px;vertical-align:middle}
+  .svgi{width:100%;height:auto;background:var(--card2);border:1px solid var(--line);border-radius:12px;margin-top:8px}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header class="top">
+  <h1>sodama · VLESS 性能实测与优化提案</h1>
+  <div class="sub">同机四方对拍（sodama / dae v2.1.1 / sing-box 1.14.2 / v2ray 5.52.0）· 明文与 TLS 两种 VLESS 形态 · 5 轮中位数 · 2026-10-04</div>
+  <div class="chips">
+    <span class="chip">数据口径 <b>5 轮中位</b></span>
+    <span class="chip">夹具 <b>全双工 echo · 环回上限 ≈25 Gbps</b></span>
+    <span class="chip">上游 <b>sing-box VLESS server（四方共用）</b></span>
+    <span class="chip">路径 <b>client ns → 网关 → WAN ns</b></span>
+    <span class="chip">perf <b>-g 采样热点</b></span>
+    <span class="chip">结论 <b>VLESS+TLS 综合第一梯队</b></span>
+  </div>
+</header>
+
+<section>
+<h2>01 · 摘要（TL;DR）</h2>
+<div class="grid">
+  <div class="card">
+    <div class="sub">VLESS + TLS（主流形态）</div>
+    <div class="kpi">11 624 <small>Mbps</small></div>
+    <div class="sub">全场最低 p50：<b class="ok">46 µs</b> · CPU 420 ms · RSS 29.8 MB</div>
+  </div>
+  <div class="card">
+    <div class="sub">VLESS 明文（无 TLS）</div>
+    <div class="kpi">12 225 <small>Mbps</small></div>
+    <div class="sub">p50 <b>40 µs</b> · CPU 380 ms · 输 sing-box 是 <b>splice 差距</b>（16.6 G / 80 ms）</div>
+  </div>
+  <div class="card">
+    <div class="sub">关键洞察：TLS 比 ss 加密更快</div>
+    <div class="kpi">+22% <small>吞吐 / −29% CPU</small></div>
+    <div class="sub">VLESS+TLS 11.6 G / 420 ms vs ss 9.5 G / 590 ms（同机同口径）</div>
+  </div>
+  <div class="card">
+    <div class="sub">主要缺口</div>
+    <div class="kpi" style="font-size:19px;line-height:1.4">Vision-over-TLS <span class="tag bad">未实现</span></div>
+    <div class="sub">sodama 的 xtls-rprx-vision 目前仅随 REALITY 生效；主流「VLESS+TLS+Vision」组合缺位</div>
+  </div>
+</div>
+
+<div class="note">
+<b>三句话结论：</b>① VLESS+TLS 形态下 sodama 已进入第一梯队（吞吐 ≈ sing-box 的 97%、CPU 更低、延迟最低、内存只有对手 40–50%）；
+② VLESS 明文的差距（12.2 G vs sing-box 16.6 G、380 ms vs 80 ms）几乎全部来自 <b>零拷贝缺失</b>——数据面 65% 的 CPU 花在 <code>rep_movs</code> + 建页；
+③ 提案按「先零拷贝、再 TLS 降本、后规模与生态」推进：第一阶段完成后预计明文 ≥16 G / CPU ≤150 ms，TLS ≥13 G，同时补上 Vision-over-TLS 以对齐主流节点。
+</div>
+</section>
+
+<section>
+<h2>02 · 方法与环境</h2>
+<p class="sub">同一台机器、不同 netns；四方共用同一个 WAN ns 内 sing-box VLESS 服务端（明文 :8543 / 自签 TLS :8544），目标 <code>1.1.1.1:8080</code> 由服务端本地拨达。负载：每轮 <b>48 MB × 4 流</b>全双工回显 + 500 次 RTT；预热 1 轮、取 <b>5 轮中位数</b>；吞吐对比关闭半关闭（语义差异另有专项）。</p>
+<pre>sodama_client ns ──landae── [网关: eBPF / tproxy] ──wan── sodama_wan ns
+                                       ├─ bench_io :9999  (direct 目标)
+                                       ├─ bench_io :8080  (代理目标)
+                                       └─ sing-box :8543  (VLESS 明文) / :8544 (VLESS+TLS)</pre>
+<ul class="sub">
+  <li>夹具为全双工 ring echo（<code>BENCH_RING_MB=128</code>）；4×48 MB 环回上限 ≈ <b>24.5–25.7 Gbps</b>，因此 <b>direct 行是夹具受限的下界</b>，不用于比较实现上限；</li>
+  <li>CPU = 网关进程 <code>utime+stime</code> 增量（不含上游与夹具进程）；RSS/线程取负载期样本；</li>
+  <li>sodama：eBPF 重定向 + 用户态 relay；dae：eBPF；sing-box/v2ray：nftables tproxy（各官方推荐部署）；</li>
+  <li>版本：sodama <code>f10298c+</code>（含 P33.2 性能线）· dae v2.1.1 官方 release · sing-box 1.14.2（pacman）· v2ray 5.52.0（pacman）。</li>
+</ul>
+<p class="sub">复现：<code>sudo PROXY_PROTO=vless ROUNDS=5 lab/perf/run.sh all</code>（TLS 用 <code>PROXY_PROTO=vless-tls</code>）；并发扩展 <code>lab/perf/scaling.sh</code>。</p>
+</section>
+
+<section>
+<h2>03 · 结果 A：VLESS（明文 TCP）四方对比</h2>
+<table>
+  <thead><tr><th>实现</th><th>direct 吞吐<br><span class="sub">Mbps（夹具受限）</span></th><th>direct p50<br>µs</th><th>direct CPU<br>ms</th><th>vless 吞吐<br>Mbps</th><th>vless p50<br>µs</th><th>vless CPU<br>ms</th><th>RSS<br>MB</th><th>线程</th></tr></thead>
+  <tbody>
+    <tr><td><b>sodama</b></td><td class="n">25 569</td><td class="n">16</td><td class="n">≈0</td><td class="n">12 225</td><td class="n best">40</td><td class="n">380</td><td class="n best">27.1</td><td class="n best">11</td></tr>
+    <tr><td>dae v2.1.1</td><td class="n">25 006</td><td class="n">15</td><td class="n">≈0</td><td class="n best">12 689</td><td class="n">42</td><td class="n">410</td><td class="n">52.4</td><td class="n">21</td></tr>
+    <tr><td>sing-box 1.14.2</td><td class="n">21 143</td><td class="n">26</td><td class="n">80</td><td class="n best">16 588</td><td class="n">42</td><td class="n best">80</td><td class="n">65.8</td><td class="n">20</td></tr>
+    <tr><td>v2ray 5.52.0</td><td class="n">13 578</td><td class="n">33</td><td class="n">620</td><td class="n">10 739</td><td class="n">52</td><td class="n worst">710</td><td class="n">70.8</td><td class="n">26</td></tr>
+  </tbody>
+</table>
+<div class="bars">
+  <div class="lbl">sodama</div><div><span class="bar" style="width:73.7%"></span></div><div class="val">12 225</div>
+  <div class="lbl">dae</div><div><span class="bar" style="width:76.5%"></span></div><div class="val">12 689</div>
+  <div class="lbl">sing-box</div><div><span class="bar" style="width:100%"></span></div><div class="val">16 588</div>
+  <div class="lbl">v2ray</div><div><span class="bar alt" style="width:64.7%"></span></div><div class="val">10 739</div>
+</div>
+<p class="sub">sing-box 的领先是<b>零拷贝（splice）</b>的胜利：其 CPU 仅 80 ms，约为 sodama/dae 的 1/5；sodama 与 dae 同为「用户态拷贝泵」，吞吐/CPU 几乎持平（12.2/380 vs 12.7/410），延迟 sodama 最优。</p>
+</section>
+
+<section>
+<h2>04 · 结果 B：VLESS + TLS（自签证书）四方对比</h2>
+<table>
+  <thead><tr><th>实现</th><th>direct 吞吐<br>Mbps</th><th>direct p50<br>µs</th><th>direct CPU<br>ms</th><th>vless-tls 吞吐<br>Mbps</th><th>vless-tls p50<br>µs</th><th>vless-tls CPU<br>ms</th><th>RSS<br>MB</th><th>线程</th></tr></thead>
+  <tbody>
+    <tr><td><b>sodama</b></td><td class="n">24 970</td><td class="n">16</td><td class="n">≈0</td><td class="n">11 624</td><td class="n best">46</td><td class="n best">420</td><td class="n best">29.8</td><td class="n best">11</td></tr>
+    <tr><td>dae v2.1.1</td><td class="n">24 226</td><td class="n">15</td><td class="n">≈0</td><td class="n">11 453</td><td class="n">55</td><td class="n">450</td><td class="n">59.5</td><td class="n">20</td></tr>
+    <tr><td>sing-box 1.14.2</td><td class="n">22 283</td><td class="n">34</td><td class="n">80</td><td class="n best">12 003</td><td class="n">53</td><td class="n">450</td><td class="n">69.3</td><td class="n">18</td></tr>
+    <tr><td>v2ray 5.52.0</td><td class="n">13 510</td><td class="n">32</td><td class="n">650</td><td class="n">7 529</td><td class="n">58</td><td class="n worst">800</td><td class="n">74.3</td><td class="n">25</td></tr>
+  </tbody>
+</table>
+<div class="bars">
+  <div class="lbl">sodama</div><div><span class="bar" style="width:96.8%"></span></div><div class="val">11 624</div>
+  <div class="lbl">dae</div><div><span class="bar" style="width:95.4%"></span></div><div class="val">11 453</div>
+  <div class="lbl">sing-box</div><div><span class="bar" style="width:100%"></span></div><div class="val">12 003</div>
+  <div class="lbl">v2ray</div><div><span class="bar alt" style="width:62.7%"></span></div><div class="val">7 529</div>
+</div>
+<div class="note">
+<b>TLS 是「均衡器」：</b>加上 TLS 后 sing-box 的 splice 优势被加密开销抵消，四家吞吐差距压缩到 11.5–12.0 G（v2ray 除外）；
+sodama 以 <b>最低 CPU（420 ms）与最低延迟（46 µs）</b> 拿下 TLS 形态的综合第一，且 RSS 只有对手的 40–50%。
+</div>
+</section>
+
+<section>
+<h2>05 · 与 ss 路径的对照：为什么建议把 VLESS+TLS 作为主推</h2>
+<table>
+  <thead><tr><th>路径（sodama，8×64 MB / 4×48 MB 中位）</th><th>吞吐 Mbps</th><th>p50 µs</th><th>CPU ms</th><th>瓶颈构成（perf）</th></tr></thead>
+  <tbody>
+    <tr><td>VLESS + TLS（AES-GCM / AES-NI）</td><td class="n best">11 624</td><td class="n">46</td><td class="n">420</td><td class="sub">拷贝 27.5% + AES-NI 14.9% + 建页 9.7% + libc memcpy 7.6%</td></tr>
+    <tr><td>VLESS 明文</td><td class="n">12 225</td><td class="n best">40</td><td class="n">380</td><td class="sub">rep_movs 46.8% + 建页 18.8%（无用户态热点）</td></tr>
+    <tr><td>ss（chacha20-poly1305）</td><td class="n">9 487</td><td class="n">46</td><td class="n worst">590</td><td class="sub">AEAD 41%（chacha 21.3 + poly 12.5）+ 拷贝 18% + 逐块分配/syscall</td></tr>
+    <tr><td>direct（eBPF，夹具受限）</td><td class="n">24 319</td><td class="n">16</td><td class="n">≈0</td><td class="sub">内核旁路，零用户态</td></tr>
+  </tbody>
+</table>
+<p class="sub">
+① <b>TLS（AES-256-GCM + AES-NI）比 ss 的 chacha20-poly1305 AVX2 更快也更省 CPU</b>——这是本轮最重要的swap 洞察：别再把 ss 当默认主链路；
+② VLESS 明文没有加密负担，瓶颈 100% 是拷贝，正好对应提案 <b>P0 零拷贝</b>；
+③ ss 路径的多块帧让每 16 KB 至少 3 次 syscall、逐块分配，CPU 效率最差，仅建议作为兼容后备。
+</p>
+</section>
+
+<section>
+<h2>06 · 结果 C：sodama 并发扩展（64 MB 单流 ~ 1/2/4/8 流 + 64×1 MB）</h2>
+<div class="two">
+  <div>
+    <h3>VLESS 明文</h3>
+    <table>
+      <thead><tr><th>流数</th><th>吞吐 Mbps</th><th>p50 µs</th><th>CPU ms</th><th>RSS MB</th></tr></thead>
+      <tbody>
+        <tr><td>1</td><td class="n">8 904</td><td class="n">36</td><td class="n">40</td><td class="n">28.0</td></tr>
+        <tr><td>2</td><td class="n">14 468</td><td class="n">41</td><td class="n">100</td><td class="n">28.2</td></tr>
+        <tr><td>4</td><td class="n">12 427</td><td class="n">38</td><td class="n">530</td><td class="n">28.5</td></tr>
+        <tr><td>8</td><td class="n">11 678</td><td class="n">41</td><td class="n">1 100</td><td class="n">29.3</td></tr>
+        <tr><td>64×1 MB</td><td class="n best">16 836</td><td class="n">43</td><td class="n">120</td><td class="n">32.4</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div>
+    <h3>VLESS + TLS</h3>
+    <table>
+      <thead><tr><th>流数</th><th>吞吐 Mbps</th><th>p50 µs</th><th>CPU ms</th><th>RSS MB</th></tr></thead>
+      <tbody>
+        <tr><td>1</td><td class="n">5 664</td><td class="n">40</td><td class="n">80</td><td class="n">28.0</td></tr>
+        <tr><td>2</td><td class="n">8 366</td><td class="n">41</td><td class="n">210</td><td class="n">28.4</td></tr>
+        <tr><td>4</td><td class="n">11 313</td><td class="n">50</td><td class="n">590</td><td class="n">28.8</td></tr>
+        <tr><td>8</td><td class="n">11 253</td><td class="n">47</td><td class="n">1 450</td><td class="n">30.4</td></tr>
+        <tr><td>64×1 MB</td><td class="n">11 182</td><td class="n">46</td><td class="n">180</td><td class="n">34.6</td></tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+<p class="sub">
+- 明文：1 流 8.9 G 已很高效（40 ms CPU），4–8 流受「拷贝 + 建页」CPU 限制饱和在 ~12 G；<b>64×1 MB 反而到 16.8 G</b>（小连接摊薄了每连接的拷贝放大）。
+- TLS：8 流饱和 ~11.3 G、CPU 1 450 ms（≈129 ms·Gbps⁻¹）；4 流即达 11.3 G——<b>TLS 把成本从「纯搬运」转成了「密码学 + 拷贝」的混合体</b>。
+- RSS 全档 28–35 MB；稳态线程恒 11。</p>
+</section>
+
+<section>
+<h2>07 · 结果 D：64 并发连接资源占用（VLESS+TLS）</h2>
+<div class="grid">
+  <div class="card"><div class="sub">峰值线程</div><div class="kpi">123 <small>（空闲 11）</small></div><div class="sub">≈1.75 线程/连接（每连接 1–2 个泵线程 + 看门狗）</div></div>
+  <div class="card"><div class="sub">峰值 RSS</div><div class="kpi">39.6 <small>MB</small></div><div class="sub">≈ +175 KB/连接（线程栈 + 64 KB 泵缓冲）</div></div>
+  <div class="card"><div class="sub">该负载吞吐</div><div class="kpi">10 711 <small>Mbps</small></div><div class="sub">4 MB × 64 流，尾延迟稳定</div></div>
+  <div class="card"><div class="sub">空闲基线</div><div class="kpi">≈27.3 <small>MB / 11 线程</small></div><div class="sub">含全部 eBPF/DNS/状态面</div></div>
+</div>
+<p class="sub">连接规模上量时，「每连接 OS 线程」是内存与调度成本的主要项 → 提案 <b>P2 worker 池</b>。</p>
+</section>
+
+<section>
+<h2>08 · perf 热点剖面（8×64 MB，sodama 进程采样）</h2>
+<h3>VLESS 明文（11.3 G）：纯搬运，无用户态热点</h3>
+<div class="bars">
+  <div class="lbl">内核 socket 拷贝</div><div><span class="bar" style="width:46.8%"></span></div><div class="val">46.8%</div>
+  <div class="lbl">skb 建页/分配</div><div><span class="bar" style="width:18.8%"></span></div><div class="val">18.8%</div>
+  <div class="lbl">其余（TCP/BPF/调度）</div><div><span class="bar alt" style="width:34.4%"></span></div><div class="val">34.4%</div>
+</div>
+<h3>VLESS + TLS（11.0 G）</h3>
+<div class="bars">
+  <div class="lbl">内核 socket 拷贝</div><div><span class="bar" style="width:27.5%"></span></div><div class="val">27.5%</div>
+  <div class="lbl">AES-GCM（AES-NI）</div><div><span class="bar" style="width:14.9%"></span></div><div class="val">14.9%</div>
+  <div class="lbl">skb 建页/分配</div><div><span class="bar" style="width:9.7%"></span></div><div class="val">9.7%</div>
+  <div class="lbl">libc memcpy</div><div><span class="bar" style="width:7.6%"></span></div><div class="val">7.6%</div>
+  <div class="lbl">其余（含 bpf_printk 0.5）</div><div><span class="bar alt" style="width:40.3%"></span></div><div class="val">40.3%</div>
+</div>
+<p class="sub">对照：ss 路径 AEAD（chacha+poly）≈41%、relay 路径 rep_movs 49.4% + 建页 18.5%。<b>VLESS 明文与 relay 同构（拷贝主导）；TLS 形态把 ~23% 的 CPU 换成了 AES-NI 与额外一次 memcpy。</b></p>
+</section>
+
+<section>
+<h2>09 · 分析</h2>
+<ol>
+  <li><b>VLESS+TLS 是 sodama 当前最强的代理形态</b>：11.6 G / 46 µs / 420 ms / 29.8 MB，综合优于 dae 与 sing-box，且延迟、内存、线程全面领先；</li>
+  <li><b>与 sing-box 的明文差距 = 零拷贝差距</b>：sing-box 80 ms 的 CPU 说明它走的是 splice 类零拷贝；sodama 46.8% + 18.8% 的搬运/建页成本与之对应。计划用 <code>splice()</code>（socket↔socket 经 pipe）把该成本清零；</li>
+  <li><b>TLS 形态的下一档收益来自「少一次拷贝」</b>：libc memcpy 7.6% + 建页 9.7% 是 rustls 记录层与内核 skb 的搬运开销；缓冲池化 + 记录层就地读写可省一半，kTLS 是后续的激进选项；</li>
+  <li><b>加密算法选择重排</b>：本机 AES-NI 下 AES-256-GCM ≫ chacha20-poly1305 AVX2（14.9% vs 41%）；ss 节点允许时优先协商 aes-256-gcm，或直接以 VLESS+TLS 为主链路；</li>
+  <li><b>规模模型是长板中的短板</b>：122 线程/64 连接、175 KB/连接、连接建立依赖线程 spawn；事件驱动/worker 池是万级连接的前提；</li>
+  <li><b>生态缺口</b>：主流「VLESS+TLS+Vision」组合中 sodama 的 vision 仅在 REALITY 路径实现；不补齐会在真实节点上退化为「VLESS+TLS 无 vision」，流量特征与性能均非最优。</li>
+</ol>
+</section>
+
+<section>
+<h2>10 · 优化提案（按数据排序）</h2>
+
+<div class="prio">
+  <div class="p p0">P0</div><div><b>零拷贝数据面（splice socket↔socket）</b> — 对应 VLESS 明文/relay 路径的头号成本</div>
+</div>
+<table>
+  <tbody>
+    <tr><td style="width:88px">现状</td><td>拷贝 46.8% + 建页 18.8% ≈ 65% CPU；明文 12.2 G / 380 ms，落后 sing-box 26%（16.6 G / 80 ms）</td></tr>
+    <tr><td>目标</td><td>明文 ≥16 Gbps、CPU ≤150 ms（对齐 sing-box 档位）；relay 路径同步受益（15→22 G）</td></tr>
+    <tr><td>做法</td><td>每方向 <code>splice(client→pipe)</code> + <code>splice(pipe→upstream)</code>，非阻塞 + epoll；<code>F_SETPIPE_SZ</code> 调大；不可 splice 时回退现泵；保留计数与降级路径</td></tr>
+    <tr><td>验证</td><td><code>scaling.sh</code> vless 8×64 MB：吞吐/CPU 曲线；perf 中 <code>rep_movs</code>/<code>clear_page</code> 占比应下降 ≥40%</td></tr>
+  </tbody>
+</table>
+
+<div class="prio">
+  <div class="p p0">P0</div><div><b>VLESS+TLS 降本：记录层少拷贝 + 缓冲池化</b></div>
+</div>
+<table>
+  <tbody>
+    <tr><td style="width:88px">现状</td><td>拷贝 27.5% + AES-NI 14.9% + libc memcpy 7.6% + 建页 9.7%；8 流饱和 11.3 G / CPU 1 450 ms（129 ms·Gbps⁻¹）</td></tr>
+    <tr><td>目标</td><td>TLS 8 流 ≥13 G、CPU ≤1 000 ms；4 流 ≥12.5 G</td></tr>
+    <tr><td>做法</td><td>① 泵缓冲/记录层缓冲每连接复用（零热路径分配）；② rustls 读写走 <code>ReadBuf</code>/vectored，减少一次明文↔记录拷贝；③ 评估 kTLS（rustls 导出流量密钥 + <code>setsockopt(TLS_TX/RX)</code>）把 AES-GCM 与拷贝一并下沉内核；④ TLS 会话/票据复用降低每连接握手成本</td></tr>
+    <tr><td>验证</td><td>perf 热点搬家（libc memcpy ≤3%）；<code>scaling.sh</code> TLS 曲线；与 P0 的 kTLS 对照</td></tr>
+  </tbody>
+</table>
+
+<div class="prio">
+  <div class="p p0">P0</div><div><b>Vision-over-TLS（对齐主流组合）+ ws/wss 变体</b></div>
+</div>
+<table>
+  <tbody>
+    <tr><td style="width:88px">现状</td><td><code>xtls-rprx-vision</code> 仅在 REALITY 分支生效；真实订阅中「VLESS+TLS+Vision」占主流</td></tr>
+    <tr><td>目标</td><td><code>vless://…?security=tls&flow=xtls-rprx-vision</code> 可用；与 sing-box/xray 节点 e2e 通过</td></tr>
+    <tr><td>做法</td><td>把 vision 读写半（VisionReader/Writer）接到 tls 分支；补齐 padding/长度语义与半关闭；lab 用 sing-box 服务端 vision flow 对拍 + 真机订阅验证</td></tr>
+    <tr><td>验证</td><td>lab 四路（sodama/dae/sing-box/xray）512 KB 逐字节；真实节点 66/66</td></tr>
+  </tbody>
+</table>
+
+<div class="prio">
+  <div class="p p1">P1</div><div><b>连接规模：worker 池替代每连接线程</b></div>
+</div>
+<table>
+  <tbody>
+    <tr><td style="width:88px">现状</td><td>64 并发 = 123 线程 / +11 MB；每连接 spawn/join 成本计入 RTT 与内存</td></tr>
+    <tr><td>目标</td><td>线程数 O(核数)；4096→10000 连接吞吐/内存平稳；小包 p99 改善</td></tr>
+    <tr><td>做法</td><td>epoll 事件循环 + 连接状态表（含半关闭/janitor/offload 看门狗统一计时）；保持 eBPF accept 语义不变</td></tr>
+    <tr><td>验证</td><td>新增连接压力基准（新建/s、512/4096 并发 RSS/吞吐）</td></tr>
+  </tbody>
+</table>
+
+<div class="prio">
+  <div class="p p1">P1</div><div><b>加密策略重排：AES-GCM 优先 & ss 路径零分配</b></div>
+</div>
+<table>
+  <tbody>
+    <tr><td style="width:88px">现状</td><td>ss 路径 chacha+poly 占 41% CPU；同机 AES-NI GCM 仅 14.9%</td></tr>
+    <tr><td>目标</td><td>ss 节点支持时优先 aes-256-gcm；ss writer/reader 去逐块 Vec 分配与多余 syscall（lb+payload 合并写、预读解析）</td></tr>
+    <tr><td>验证</td><td>ss 8 流 CPU ≤460 ms（对齐 dae）；方法对照表</td></tr>
+  </tbody>
+</table>
+
+<div class="prio">
+  <div class="p p2">P2</div><div><b>零散纯开销清理（低成本、确定收益）</b></div>
+</div>
+<ul class="sub">
+  <li><code>bpf_printk</code> 热路径门控（当前 0.3–0.5%，高 PPS 放大；改 debug map 开关）；</li>
+  <li>UDP 批量 <code>recvmmsg/sendmmsg</code> + per-CPU 会话表（G1 缺口，需补同口径对拍）；</li>
+  <li>半关闭/关闭路径的统一收敛（SIGTERM 1–3 s → ≤500 ms）。</li>
+</ul>
+
+<h3>分阶段里程碑</h3>
+<table>
+  <thead><tr><th>阶段</th><th>内容</th><th>验收（同机同口径）</th></tr></thead>
+  <tbody>
+    <tr><td>M1（1–2 周）</td><td>P0 零拷贝（明文/relay）+ bpf_printk 门控</td><td>vless 明文 8×64 ≥16 Gbps；CPU ≤150 ms；relay ≥22 Gbps</td></tr>
+    <tr><td>M2（2–3 周）</td><td>P0 TLS 降本 + 缓冲池</td><td>TLS 8 流 ≥13 Gbps；CPU ≤1 000 ms；libc memcpy ≤3%</td></tr>
+    <tr><td>M3（2 周）</td><td>P0 Vision-over-TLS + ws 变体</td><td>lab 四方逐字节 + 真实订阅节点 e2e</td></tr>
+    <tr><td>M4（3–4 周）</td><td>P1 worker 池 + ss 清理 + UDP 批量</td><td>10k 连接基准；ss CPU ≤460 ms；UDP 四方对拍</td></tr>
+  </tbody>
+</table>
+</section>
+
+<section>
+<h2>11 · 风险与边界</h2>
+<ul class="sub">
+  <li><b>夹具边界</b>：direct 行受环回 ≈25 Gbps 限制（客户端 pattern 校验 CPU），不代表 eBPF 上限（64×1 MB 口径 35.2 G 为参考）；绝对吞吐不能外推到真实公网；</li>
+  <li><b>上游同源</b>：四方共用 sing-box VLESS 服务端，与 ss 轮的 ssserver 一样，高并发下可能成为共同天花板；横向对比成立；</li>
+  <li><b>splice 与 tproxy 的兼容性</b>：目标 socket 为 tproxy 绑定的本地 socket，splice 对 socket↔socket 经 pipe 可行，但需实测穿越 eBPF 重定向后的语义（半关闭、RST、sockmap offload 的优先级）；</li>
+  <li><b>kTLS</b>：需要从 rustls 导出流量密钥，rustls 未公开该接口，属于「需要自实现 TLS 或切换后端」的激进选项，先做评估 spike；</li>
+  <li><b>Vision 语义</b>：需与 sing-box/xray 行为对拍（padding、块大小、直通标记），否则可能被服务端判为异常流；</li>
+  <li><b>测量噪声</b>：同机 16 线程、veth 环境，round-to-round ±5–10%；本提案所有结论基于 5 轮中位数与跨路径一致性。</li>
+</ul>
+</section>
+
+<section>
+<h2>12 · 附录</h2>
+<h3>配置与脚本（已入库）</h3>
+<pre>lab/perf/singbox.vless-server.json     # WAN ns：VLESS 服务端（:8543 明文 / :8544 自签 TLS）
+lab/perf/singbox.vless.json            # sing-box 客户端（明文）
+lab/perf/singbox.vless-tls.json        # sing-box 客户端（TLS，insecure）
+lab/perf/v2ray.vless{,-tls}.json       # v2ray 客户端
+lab/perf/dae.vless{,-tls}.dae          # dae 客户端（TLS 用 global.allow_insecure）
+lab/perf/run.sh                        # PROXY_PROTO=ss|vless|vless-tls 四实现对拍
+lab/perf/scaling.sh                    # 并发扩展（PROXY_PROTO 同步支持）</pre>
+<h3>复现命令</h3>
+<pre>lab/perf/run.sh build
+sudo PROXY_PROTO=vless      ROUNDS=5 lab/perf/run.sh all   # 结果：/tmp/perf-vless.tsv
+sudo PROXY_PROTO=vless-tls  ROUNDS=5 lab/perf/run.sh all   # 结果：/tmp/perf-vless-tls.tsv
+sudo PROXY_PROTO=vless      lab/perf/scaling.sh all        # 结果：/tmp/scaling-vless.tsv
+sudo PROXY_PROTO=vless-tls  lab/perf/scaling.sh all        # 结果：/tmp/scaling-vless-tls.tsv
+perf record -F 1499 -g -p &lt;sodama-pid&gt; -- sleep 12         # 热点复现</pre>
+<h3>原始数据（本机 /tmp）</h3>
+<pre>/tmp/perf-run-vless.log        /tmp/perf-vless.tsv         # 明文四方（5 轮）
+/tmp/perf-run-vless-tls.log    /tmp/perf-vless-tls.tsv     # TLS 四方（5 轮）
+/tmp/scaling-vless.tsv         /tmp/scaling-vless-tls.tsv  # 并发扩展
+/tmp/perf-vless.data           /tmp/perf-vless-tls.data    # perf 采样</pre>
+<p class="sub">历史对照（同等口径）：ss 四方（<code>docs/perf-report.md</code> P33.2）· 夹具修复与全双工说明同见该文。</p>
+</section>
+
+<div class="foot">
+  sodama · VLESS 性能实测与优化提案 · v1.0 · 2026-10-04 · 生成环境 Arch / 6.18.54-lts / i9-9900KF ·
+  数据为同机 lab 口径，按 5 轮中位数与 perf 剖面如实呈现；优化路线与验收目标均为可复测的可验证项。
+</div>
+
+</div>
+</body>
+</html>

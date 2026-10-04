@@ -1,0 +1,33 @@
+# dae v2.1.1 性能对比配置（VLESS + TLS 变体；自签证书，allowInsecure）：
+#   - 10.9.9.0/24 → direct（内核基线路径）
+#   - 1.1.1.1:8080 → group:proxy（节点 = WAN ns 里的 sing-box vless+tls 服务端 :8544）
+# 用法：sudo dae run --config lab/perf/dae.vless-tls.dae
+global {
+    wan_interface: wan
+    lan_interface: landae
+    tproxy_port: 12345
+    log_level: warn
+    auto_config_kernel_parameter: true
+    # 自签证书 lab：daed 的 vless 链解析不接受 allowInsecure 参数，用全局开关
+    allow_insecure: true
+    tcp_check_url: 'http://10.9.9.2:8390'
+    tcp_check_http_method: HEAD
+    check_interval: 30s
+}
+
+node {
+    v1: 'vless://b831381d-6324-4d53-ad4f-8cda48b30811@10.9.9.2:8544?type=tcp&security=tls&sni=localhost'
+}
+
+group {
+    proxy {
+        policy: min_moving_avg
+        filter: name(v1)
+    }
+}
+
+routing {
+    dip(10.9.9.0/24) -> direct
+    dip(1.1.1.1/32) && dport(8080) -> proxy
+    fallback: block
+}

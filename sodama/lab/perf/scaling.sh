@@ -67,16 +67,26 @@ measure() { # <path> <dialer> <host> <port>
   stop_loader
 }
 
+# 代理路径拨号器（PROXY_PROTO 选择，与 run.sh 对齐；先跑 run.sh prepare 建拓扑）
+VLESS_UUID=b831381d-6324-4d53-ad4f-8cda48b30811
+PROXY_PROTO="${PROXY_PROTO:-ss}"
+case "$PROXY_PROTO" in
+  ss) PROXY_DIALER='ss://chacha20-ietf-poly1305:testpass@10.9.9.2:8388' ;;
+  vless) PROXY_DIALER="vless://$VLESS_UUID@10.9.9.2:8543?type=tcp&security=none" ;;
+  vless-tls) PROXY_DIALER="vless://$VLESS_UUID@10.9.9.2:8544?type=tcp&security=tls&sni=localhost&allowinsecure=1" ;;
+  *) echo "!! PROXY_PROTO=$PROXY_PROTO 未知（ss|vless|vless-tls）" >&2; exit 1 ;;
+esac
+
 case "${1:-all}" in
-  direct) measure direct 'ss://chacha20-ietf-poly1305:testpass@10.9.9.2:8388' 10.9.9.2 9999 ;;
-  ss) measure ss 'ss://chacha20-ietf-poly1305:testpass@10.9.9.2:8388' 1.1.1.1 8080 ;;
+  direct) measure direct "$PROXY_DIALER" 10.9.9.2 9999 ;;
+  ss | vless | vless-tls) measure "$PROXY_PROTO" "$PROXY_DIALER" 1.1.1.1 8080 ;;
   relay) measure relay direct 1.1.1.1 8080 ;;
   all)
     : >"$OUT"
-    measure direct 'ss://chacha20-ietf-poly1305:testpass@10.9.9.2:8388' 10.9.9.2 9999
-    measure ss 'ss://chacha20-ietf-poly1305:testpass@10.9.9.2:8388' 1.1.1.1 8080
+    measure direct "$PROXY_DIALER" 10.9.9.2 9999
+    measure "$PROXY_PROTO" "$PROXY_DIALER" 1.1.1.1 8080
     measure relay direct 1.1.1.1 8080
     ;;
-  *) die "usage: $0 [direct|ss|relay|all]" ;;
+  *) die "usage: $0 [direct|ss|vless|vless-tls|relay|all]" ;;
 esac
 echo "== 写入 $OUT =="
