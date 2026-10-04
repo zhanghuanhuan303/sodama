@@ -28,5 +28,6 @@ group {
 routing {
     dip(10.9.9.0/24) -> direct
     dip(1.1.1.1/32) && dport(8080) -> proxy
+    dip(1.1.1.1/32) && dport(9998) -> proxy
     fallback: block
 }

@@ -13,7 +13,8 @@
  *   bench_io client <host> <port> <mb_per_stream> <streams>   # echo 回显校验
  *   bench_io lat <host> <port> <count>                        # 小包 ping-pong RTT
  *   bench_io udpclient <host> <port> <count> <size>           # 逐包 echo RTT
- *   bench_io udpblast <host> <port> <count> <size>            # 单向洪峰 + 回包计数
+ *   bench_io udpblast <host> <port> <count> <size> [pps]  # 单向洪峰/限速 + 回包计数
+ *       pps>0 时按固定速率发送（可持续 PPS 对拍）；缺省 0 = 不限速突发
  *
  * 输出（stdout 单行，供 bench.sh 解析）：
  *   tcp-ok streams=4 mb_sent=128 mb_recv=128 wall_s=1.234 oneway_mbps=829.8 verify=ok
@@ -24,6 +25,7 @@
 #define _GNU_SOURCE
 #include <arpa/inet.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <pthread.h>
@@ -274,6 +276,9 @@ static void *udp_echo(void *arg) {
         close(fd);
         return NULL;
     }
+    int sb = 8 << 20;
+    setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &sb, sizeof sb);
+    setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sb, sizeof sb);
     unsigned char buf[65536];
     for (;;) {
         struct sockaddr_in peer;
@@ -545,13 +550,14 @@ static int cmd_udpclient(int argc, char **argv) {
 
 static int cmd_udpblast(int argc, char **argv) {
     if (argc < 4) {
-        fprintf(stderr, "用法: bench_io udpblast <host> <port> <count> <size>\n");
+        fprintf(stderr, "用法: bench_io udpblast <host> <port> <count> <size> [pps]\n");
         return 2;
     }
     const char *host = argv[0];
     int port = atoi(argv[1]);
     int count = atoi(argv[2]);
     int size = atoi(argv[3]);
+    double pps = argc >= 5 ? atof(argv[4]) : 0;
     if (size < 8 || size > 60000) return 2;
     int fd = socket(AF_INET, SOCK_DGRAM, 0);
     struct sockaddr_in sa;
@@ -565,23 +571,48 @@ static int cmd_udpblast(int argc, char **argv) {
 
     unsigned char *pkt = malloc((size_t)size);
     unsigned char in[65536];
+    double interval = pps > 0 ? 1.0 / pps : 0;
+    int fl = fcntl(fd, F_GETFL, 0);
+    fcntl(fd, F_SETFL, fl | O_NONBLOCK); // 发送期边发边收，避免回包挤爆 rcvbuf
+    struct timespec next;
+    clock_gettime(CLOCK_MONOTONIC, &next);
     double t0 = now_s();
     int sent = 0;
+    int recv_n = 0;
+    double t_last = 0;
     for (int i = 0; i < count; i++) {
         uint32_t seq = (uint32_t)htonl((uint32_t)i);
         memcpy(pkt, &seq, 4);
+        if (interval > 0) {
+            next.tv_nsec += (long)(interval * 1e9);
+            while (next.tv_nsec >= 1000000000L) {
+                next.tv_nsec -= 1000000000L;
+                next.tv_sec++;
+            }
+            clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next, NULL);
+        }
         if (sendto(fd, pkt, (size_t)size, 0, (struct sockaddr *)&sa, sizeof sa) < 0) break;
         sent++;
+        if ((i & 31) == 31) {
+            ssize_t n;
+            while ((n = recv(fd, in, sizeof in, 0)) > 0) {
+                recv_n++;
+                t_last = now_s();
+            }
+        }
     }
+    fcntl(fd, F_SETFL, fl & ~O_NONBLOCK);
     struct timeval tv = {1, 0};
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
-    int recv_n = 0;
     for (;;) {
         ssize_t n = recv(fd, in, sizeof in, 0);
         if (n <= 0) break;
         recv_n++;
+        t_last = now_s();
     }
-    double wall = now_s() - t0;
+    // 主动期 = 首包到最后一个回包（不含末尾等超时），限速模式下才是真实 PPS。
+    double t_end = t_last > 0 ? t_last : now_s();
+    double wall = t_end - t0;
     double mbps = wall > 0 ? (double)recv_n * (double)size * 8.0 / wall / 1e6 : 0;
     printf("udpblast-ok sent=%d recv=%d loss=%d wall_s=%.3f mbps=%.1f\n", sent, recv_n,
            sent - recv_n, wall, mbps);

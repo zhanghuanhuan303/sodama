@@ -78,11 +78,15 @@ impl VmessSecurity {
         }
     }
 
-    /// 链接里的 `scy`：auto→aes-128-gcm；none/zero/未知 → None（显式拒绝）。
+    /// 链接里的 `scy`：auto/未填 = chacha20-poly1305；none/zero/未知 → None（显式拒绝）。
+    ///
+    /// O6 实测：本客户端用 RustCrypto AEAD，16KB 块 chacha 1.73 GB/s vs aes-256-gcm
+    /// 1.57 GB/s（AES-GCM 受 GHASH ~2.3 GB/s 串行限制），因此 auto 默认选 chacha。
+    /// 服务端两种都支持（VMess 由客户端定 scy），互操作不受影响。
     pub fn from_scy(s: &str) -> Option<Self> {
         match s.to_ascii_lowercase().as_str() {
-            "" | "auto" | "aes-128-gcm" | "aes128gcm" => Some(Self::Aes128Gcm),
-            "chacha20-poly1305" | "chacha20poly1305" => Some(Self::Chacha20Poly1305),
+            "" | "auto" | "chacha20-poly1305" | "chacha20poly1305" => Some(Self::Chacha20Poly1305),
+            "aes-128-gcm" | "aes128gcm" => Some(Self::Aes128Gcm),
             _ => None,
         }
     }

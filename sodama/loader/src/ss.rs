@@ -118,6 +118,14 @@ impl SsMethod {
     pub const fn is_2022_aes(&self) -> bool {
         matches!(self, Self::Ss2022Aes128Gcm | Self::Ss2022Aes256Gcm)
     }
+
+    /// O6：AES-GCM 类方法（本平台有 AES-NI：用户态 ~6.6 GB/s vs chacha ~2.9 GB/s）。
+    pub const fn is_aes(&self) -> bool {
+        matches!(
+            self,
+            Self::Aes256Gcm | Self::Ss2022Aes128Gcm | Self::Ss2022Aes256Gcm
+        )
+    }
 }
 
 /// OpenSSL `EVP_BytesToKey(cipher, MD5, salt=NULL, data=password, count=1)`。
@@ -1408,6 +1416,63 @@ mod tests {
         assert!(Ss2022UdpSession::new(SsMethod::Aes256Gcm, &[0u8; 32]).is_err());
         assert!(Ss2022UdpSession::new(M_128, &[0u8; 32]).is_err());
         assert!(Ss2022UdpSession::new(M_128, &[0u8; 16]).is_ok());
+    }
+
+    /// O6 微基准（默认忽略）：本机 AEAD 本体吞吐，chacha vs aes-gcm。
+    /// cargo test --release --bin sodama cipher_microbench -- --ignored --nocapture
+    #[test]
+    #[ignore = "微基准（手动运行）"]
+    fn cipher_microbench() {
+        use std::time::Instant;
+        // 纯 AES-NI 检查（AES-128 ECB，无每块 key schedule）。
+        {
+            println!(
+                "cpu: aes={} pclmulqdq={} avx2={}",
+                std::arch::is_x86_feature_detected!("aes"),
+                std::arch::is_x86_feature_detected!("pclmulqdq"),
+                std::arch::is_x86_feature_detected!("avx2")
+            );
+            let cipher = Aes128::new_from_slice(&[0u8; 16]).unwrap();
+            let mut b = aes::Block::clone_from_slice(&[0u8; 16]);
+            let iters = 16_000_000usize;
+            let t = Instant::now();
+            for _ in 0..iters {
+                cipher.encrypt_block(&mut b);
+            }
+            let s = t.elapsed().as_secs_f64();
+            println!(
+                "aes128-ecb(no key sched): {:.2} GB/s",
+                iters as f64 * 16.0 / s / 1e9
+            );
+        }
+        let total = 512usize << 20; // 512 MiB
+        let pt = vec![0x5Au8; 16384];
+        for (name, method) in [
+            ("aes-256-gcm", SsMethod::Aes256Gcm),
+            ("chacha20-ietf-poly1305", SsMethod::Chacha20IetfPoly1305),
+        ] {
+            let key = vec![0x11u8; method.key_len()];
+            let t0 = Instant::now();
+            let mut n = 0usize;
+            while n < total {
+                let _ = seal(method, &key, &nonce_of(7), &pt);
+                n += pt.len();
+            }
+            let seal_s = t0.elapsed().as_secs_f64();
+            let ct = seal(method, &key, &nonce_of(7), &pt);
+            let t1 = Instant::now();
+            n = 0;
+            while n < total {
+                let _ = open(method, &key, &nonce_of(7), &ct).unwrap();
+                n += pt.len();
+            }
+            let open_s = t1.elapsed().as_secs_f64();
+            println!(
+                "{name}: seal {:.2} GB/s  open {:.2} GB/s（含每块 Vec 分配）",
+                total as f64 / seal_s / 1e9,
+                total as f64 / open_s / 1e9
+            );
+        }
     }
 
     // ------------------------------------------------ stage 2：WouldBlock 可重入

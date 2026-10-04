@@ -81,7 +81,7 @@
 
 | # | 事项 | 现状 | 验收标准 |
 |---|---|---|---|
-| G1 | 与 Go 版**同机对拍**（六路径基准） | **大部分完成**：P33.2 四方对比（direct/ss，ssserver 上游 + 全双工夹具 + 5 次中位数；并发扩展/内存/线程/perf 剖面齐备；`docs/perf-report.md`）——sodama 与 dae 同机同拓扑；余 relay/offload/UDP 同机对拍 | 补齐 relay/offload/UDP 路径对拍 + 误差说明 |
+| G1 | 与 Go 版**同机对拍**（六路径基准） | **已完成**：P33.2 四方对比（direct/ss，ssserver 上游 + 全双工夹具 + 5 次中位数；并发扩展/内存/线程/perf 剖面齐备；`docs/perf-report.md`）——sodama 与 dae 同机同拓扑；UDP 四方对拍补齐（`lab/perf/udp.sh`：20k pps 0 丢包，sodama CPU 630 ms/40k 包 vs dae 2140 / sing-box 1580 / v2ray 1780；O7）；ss 方法 A/B（chacha vs aes-256-gcm）已做（O6） | 余：TLS 目标服务端异机口径、公网口径 |
 | G2 | 生产级优化（THP/连接池/看门狗内存上限） | **M1+M2+M4（stage 1+2 全部）已交付**：splice 零拷贝（Direct/VLESS 明文/kTLS 成功的 TLS，`--no-splice` 可关；vless 12.2→16.9 Gbps / CPU 380→60 ms；relay 8 流 15→21.6 Gbps） + eBPF printk 门控 + **kTLS 内核 TLS 实验（`--ktls`：TLS 48MB×4 11.67→12.32 Gbps、memcpy 29.4%→1.6%、TX+RX+splice 全链路，默认关）** + **M4 epoll worker 池：10k 连接 28 线程 / 32.1 MB、fail=0、风暴 25 606/s；stage 2 codec 全协议面（VLESS 全组合含 reality/vision/ws、Trojan、vmess、ss/ssr/anytls）vless-tls 2 000 连接 27 线程 / 61 MB（线程模型 4 011 / 222 MB）；offload 看门狗单线程化（每 offload 连接 0 线程）；io_uring A/B 结论不引入；`SODAMA_NO_REACTOR=1` / `SODAMA_REACTOR_CODEC=0` 可关（ADR-0058）**；方向与待办（服务端异机复测、UDP 批量化）在 `docs/optimization-roadmap.md`（O1–O9） | 各优化项有开关与压测数据；M2 对账：memcpy ✓；≥13 Gbps/≤1000 ms 受本机夹具（≈12.5 Gbps 封顶）与内核密码引擎速度限制，待异机口径重测；M4：✅ 10k 连接 28 线程 / 32.1 MB、fail=0；stage 2 验收：ss/ssr/ss2022/anytls 均逐连接确认 codec 投递、offload 200 条 0 线程回收全过 |
 | G3 | fuzz（`.dae` 解析 / DNS 报文 / CH 解析） | 未做 | 至少 3 个 fuzz target 跑通 |
 | G4 | 特权内核加载类 CI | CI 只编译+单测 | self-hosted runner 或 QEMU 中跑 verify 子集 |

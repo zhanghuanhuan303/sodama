@@ -37,6 +37,8 @@ VLESS_TLS_PORT=8544
 VLESS_UUID=b831381d-6324-4d53-ad4f-8cda48b30811
 # 代理路径协议（默认 vless——VLESS 为主测/优化方向；ss 为兼容对照）
 PROXY_PROTO="${PROXY_PROTO:-vless}"
+# O6：ss 方法可参数化（AES-GCM 对比 chacha；四方使用同一方法）。
+SS_METHOD="${SS_METHOD:-chacha20-ietf-poly1305}"
 case "$PROXY_PROTO" in
   ss) UPSTREAM_PORT="$SS_PORT" ;;
   vless) UPSTREAM_PORT="$VLESS_PORT" ;;
@@ -93,12 +95,12 @@ prepare() {
       # 高速上游（shadowsocks-rust；性能测量用，python 上游有 GIL 〜2.4Gbps 上限）
       command -v ssserver >/dev/null || die "SS_UPSTREAM=ssserver 但未安装 ssserver"
       ip netns exec "$WAN_NS" ssserver -s "10.9.9.2:$SS_PORT" \
-        -k testpass -m chacha20-ietf-poly1305 --tcp-no-delay \
+        -k testpass -m "$SS_METHOD" --tcp-no-delay \
         >/tmp/perf-ss.stdout 2>&1 &
       echo $! >/tmp/perf-ss.pid
     else
       ip netns exec "$WAN_NS" python3 "$ROOT/lab/ss_server.py" /tmp/perf-ss.log \
-        chacha20-ietf-poly1305 testpass "$SS_PORT" 10.9.9.2 >/tmp/perf-ss.stdout 2>&1 &
+        "$SS_METHOD" testpass "$SS_PORT" 10.9.9.2 >/tmp/perf-ss.stdout 2>&1 &
       echo $! >/tmp/perf-ss.pid
     fi
   else
@@ -150,8 +152,16 @@ start_impl() {
   local sodama_dialer dae_cfg singbox_cfg v2ray_cfg
   case "$PROXY_PROTO" in
     ss)
-      sodama_dialer='ss://chacha20-ietf-poly1305:testpass@10.9.9.2:8388'
-      dae_cfg="$HERE/dae.dae"; singbox_cfg="$HERE/singbox.json"; v2ray_cfg="$HERE/v2ray.json" ;;
+      sodama_dialer="ss://$SS_METHOD:testpass@10.9.9.2:8388"
+      dae_cfg="$HERE/dae.dae"; singbox_cfg="$HERE/singbox.json"; v2ray_cfg="$HERE/v2ray.json"
+      # O6：非默认方法时把四份配置模板替换到 /tmp（四方同方法对拍）。
+      if [ "$SS_METHOD" != "chacha20-ietf-poly1305" ]; then
+        sed "s/chacha20-ietf-poly1305/$SS_METHOD/g" "$HERE/dae.dae" >/tmp/perf-dae.dae
+        sed "s/chacha20-ietf-poly1305/$SS_METHOD/g" "$HERE/singbox.json" >/tmp/perf-singbox.json
+        sed "s/chacha20-ietf-poly1305/$SS_METHOD/g" "$HERE/v2ray.json" >/tmp/perf-v2ray.json
+        dae_cfg=/tmp/perf-dae.dae; singbox_cfg=/tmp/perf-singbox.json; v2ray_cfg=/tmp/perf-v2ray.json
+      fi
+      ;;
     vless)
       sodama_dialer="vless://$VLESS_UUID@10.9.9.2:$VLESS_PORT?type=tcp&security=none"
       dae_cfg="$HERE/dae.vless.dae"; singbox_cfg="$HERE/singbox.vless.json"; v2ray_cfg="$HERE/v2ray.vless.json" ;;

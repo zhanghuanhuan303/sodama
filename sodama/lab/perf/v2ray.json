@@ -6,7 +6,7 @@
       "listen": "0.0.0.0",
       "port": 7896,
       "protocol": "dokodemo-door",
-      "settings": { "network": "tcp", "followRedirect": true },
+      "settings": { "network": "tcp,udp", "followRedirect": true },
       "streamSettings": { "sockopt": { "tproxy": "tproxy" } }
     }
   ],

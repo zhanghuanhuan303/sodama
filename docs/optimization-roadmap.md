@@ -59,15 +59,32 @@
 - **验证**：`perf` 中 syscall/`__check_object_size`/`rep_movs` 占比下降；
   `strace -c -p` syscall 次数对照。
 
-### O6 · AES-GCM 方法优先（可选，视节点能力）
+### O6 · AEAD 方法实测与选择（已完成：结论为保留 chacha）
 
-- **现状**：chacha20-poly1305 AVX2 在本平台约 1.5–2.9 GB/s/core（M2 实测：用户态 2.87 GB/s、内核 1.76 GB/s）。
-- **实测（M2 复测）**：AES-128-GCM 本机用户态 **6.57 GB/s**、内核 2.89 GB/s（均 = chacha 的 2.3×/1.6×）；
-  ss/vless 节点支持时应优先协商 aes-*-gcm（含 kTLS 路径）。
-- **做法**：配置/订阅侧对节点方法排序；`ss.rs` 已有 aes-gcm 支持（验证其批处理
-  路径是否走 AES-NI）；给出「方法 → 预期 CPU」对照表。
-- **预期收益**：ss CPU -30~50%（受节点方法约束）。
-- **验证**：同一四方对比改用 aes-256-gcm 方法复测（python/ssserver 均支持）。
+- **实测（2026-10-05，本机 RustCrypto AEAD，`ss::tests::cipher_microbench`）：**
+
+  | 口径 | aes-256-gcm | chacha20-poly1305 | 说明 |
+  |---|---|---|---|
+  | AEAD 16KB 块（本项目 `seal()` 口径） | **1.57 GB/s** | **1.73 GB/s** | 含每块 Vec 分配 |
+  | AEAD 64KB 块 | 1.59 GB/s | 1.89 GB/s | |
+  | GHASH / POLYVAL 单独 | GHASH 2.30 / POLYVAL 2.38 GB/s | — | CLMUL 已启用（cpuid pclmulqdq=true） |
+  | 纯 AES 块加密（AES-128 ECB，无 key schedule） | **~6.0 GB/s** | — | AES-NI 已生效（目标文件含 `aesenc`） |
+  | 端到端 ss TCP（同二进制，ssserver AES 同方法） | 4.4–8.0 Gbps / CPU 660–720 ms | 5.8–9.7 Gbps / CPU 500–570 ms | 4×48MB，同机轮间噪声 ±30% |
+
+- **结论：不做 AES 优先。** AES-NI 对 AES **块加密**有效（~6 GB/s），但 RustCrypto
+  的 GCM 构造受 GHASH（~2.3 GB/s）串行依赖限制，端到端 1.57 GB/s，
+  反而不如 chacha（1.73 GB/s）；ss TCP 实测也是 chacha 吞吐更高、CPU 更低。
+  M2 文档中「AES-GCM 用户态 6.57 GB/s」更接近 AES 块加密口径（~6.0–6.6 GB/s 实测），
+  AEAD 口径下不成立，已在 O6 表中更正。
+- **已交付的实现：**
+  1. `vmess` 的 `scy=auto/未填` 默认改为 **chacha20-poly1305**（由客户端定，服务端两种都收，互操作不变）；
+  2. 组内排序新增 AEAD 方法破紧张：同健康/同延迟时**优先 chacha**（`Outbound::crypto_pref`，
+     Min/MinMovingAvg/MinAvg10/Fixed 均适用；Random 保持随机语义）；
+  3. `ss::tests::cipher_microbench`（`--ignored` 手动跑）留档，随时可复测。
+- **验证：** `SS_METHOD` 参数化后四方对拍可用同一方法复测（`lab/perf/run.sh` 把四份配置
+  sed 到 /tmp）；ss TCP A/B 与微基准数据见上表。
+- **后续（未做）：** 若要复活 AES 优势，需把 ss/vmess 的 AEAD 换成 **ring/aws-lc** 后端
+  （其 AES-GCM 为 AES-NI+PCLMUL 汇编，预期 4–6 GB/s；rustls 已用 ring），属独立优化项。
 
 ---
 
@@ -183,8 +200,14 @@
 
 ## P4 · 协议面（后续迭代）
 
-- **O7 · UDP**：`recvmmsg/sendmmsg` 批量收发 + per-CPU 会话表；同口径四方对拍
-  （backlog G1 缺口）。
+- **O7 · UDP（✅ 2026-10-05 完成）**：`recvmmsg/sendmmsg` 批量收发（Plain/Ss；栈上中转、
+  `SODAMA_UDP_BATCH=0` A/B）+ 会话表 16 分片（FNV-1a）+ 转发 socket 4–8 MB 缓冲；
+  同口径四方对拍工具 `lab/perf/udp.sh`（含限速 `udpblast`）。
+  **实测（20k pps、256B、0 丢包）：** sodama CPU 630 ms/40k 包 ≪ dae 2 140 / sing-box 1 580 /
+  v2ray 1 780；RSS 28.6 MB 也最小；逐包 ≈15.8 µs（一核 30%）。**批量的边界：** 限速下
+  `recvmmsg` 平均每批 ~1 包（strace：recvmmsg 119 728 次 vs sendmmsg 134 次），perf 显示
+  63% 在 syscall entry/exit —— UDP 路径不是 syscall 数量问题；顺发/100k pps 下批量小幅领先
+  （+0.9%，噪声内），保留但不宣称大幅提升。详细数据与结论见 O7 节。
 - **DNS**：命中缓存路径的 syscall 数、并发上限；已独立线程，当前不是瓶颈
   （idle 11 线程、27MB）。
 - **半关闭/关闭语义**：splice 链路的 EOF→`SHUT_WR` 已随 O4 stage 1 状态机落地；

@@ -297,9 +297,53 @@ struct UdpSession {
     alive: AtomicBool,
 }
 
-static UDP_NAT: std::sync::LazyLock<
-    Mutex<std::collections::HashMap<(SocketAddr, SocketAddr), Arc<UdpSession>>>,
-> = std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+static UDP_NAT: std::sync::LazyLock<Vec<UdpNatShard>> = std::sync::LazyLock::new(|| {
+    (0..UDP_NAT_SHARDS)
+        .map(|_| Mutex::new(std::collections::HashMap::new()))
+        .collect()
+});
+type UdpNatShard = Mutex<std::collections::HashMap<(SocketAddr, SocketAddr), Arc<UdpSession>>>;
+
+/// O7：会话表分片数（单锁在包速率下会成为竞争点；按 key hash 选片）。
+const UDP_NAT_SHARDS: usize = 16;
+/// O7：监听/回程一次 recvmmsg 最多收包数。
+const UDP_RECV_BATCH: usize = 32;
+
+/// O7：批量路径开关（`SODAMA_UDP_BATCH=0` 回退逐包，供 A/B）。
+static UDP_BATCH_ON: OnceLock<bool> = OnceLock::new();
+fn udp_batch_on() -> bool {
+    *UDP_BATCH_ON.get_or_init(|| std::env::var("SODAMA_UDP_BATCH").map_or(true, |v| v != "0"))
+}
+
+fn fnv_step(h: &mut u64, b: u8) {
+    *h ^= b as u64;
+    *h = h.wrapping_mul(0x0000_0100_0000_01b3);
+}
+
+/// 轻量会话 hash（FNV-1a；避免 SipHash 每包开销）。
+fn udp_nat_shard(key: &(SocketAddr, SocketAddr)) -> &'static UdpNatShard {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for ip in [key.0.ip(), key.1.ip()] {
+        match ip {
+            std::net::IpAddr::V4(v4) => {
+                for b in v4.octets() {
+                    fnv_step(&mut h, b);
+                }
+            }
+            std::net::IpAddr::V6(v6) => {
+                for b in v6.octets() {
+                    fnv_step(&mut h, b);
+                }
+            }
+        }
+    }
+    for p in [key.0.port(), key.1.port()] {
+        for b in p.to_be_bytes() {
+            fnv_step(&mut h, b);
+        }
+    }
+    &UDP_NAT[(h as usize) % UDP_NAT_SHARDS]
+}
 
 /// relay 活跃连接注册表（janitor 据此空闲回收）。
 struct RelayHandle {
@@ -4036,6 +4080,9 @@ fn new_udp_socket(family: libc::c_int) -> std::io::Result<OwnedFd> {
         set_int_opt(fd.as_raw_fd(), libc::IPPROTO_IP, IP_TRANSPARENT_OPT, 1)?;
     }
     set_int_opt(fd.as_raw_fd(), libc::SOL_SOCKET, libc::SO_REUSEADDR, 1)?;
+    // O7：UDP 突发/高 PPS 下默认收发缓冲（~212KB）会先丢包；失败不致命（内核会按 rmem_max 截断）。
+    let _ = set_int_opt(fd.as_raw_fd(), libc::SOL_SOCKET, libc::SO_RCVBUF, 8 << 20);
+    let _ = set_int_opt(fd.as_raw_fd(), libc::SOL_SOCKET, libc::SO_SNDBUF, 8 << 20);
     Ok(fd)
 }
 
@@ -4116,7 +4163,59 @@ fn send_to_udp(fd: RawFd, to: SocketAddr, data: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
+/// O7：同一客户端地址批量回包（sendmmsg；回复 socket 绑定原始目的地址、不 connect）。
+fn send_batch_to_udp(fd: RawFd, to: SocketAddr, datas: &[&[u8]]) -> std::io::Result<()> {
+    if datas.is_empty() {
+        return Ok(());
+    }
+    if datas.len() == 1 {
+        return send_to_udp(fd, to, datas[0]);
+    }
+    const MAX: usize = 64;
+    let n = datas.len().min(MAX);
+    let (st, name_len) = sockaddr_any_of(to);
+    let mut iovecs: [libc::iovec; MAX] = unsafe { std::mem::zeroed() };
+    let mut names: [libc::sockaddr_storage; MAX] = unsafe { std::mem::zeroed() };
+    let mut msgs: [libc::mmsghdr; MAX] = unsafe { std::mem::zeroed() };
+    for i in 0..n {
+        names[i] = st;
+        iovecs[i] = libc::iovec {
+            iov_base: datas[i].as_ptr() as *mut libc::c_void,
+            iov_len: datas[i].len(),
+        };
+        msgs[i].msg_hdr.msg_name = &mut names[i] as *mut _ as *mut libc::c_void;
+        msgs[i].msg_hdr.msg_namelen = name_len;
+        msgs[i].msg_hdr.msg_iov = &mut iovecs[i];
+        msgs[i].msg_hdr.msg_iovlen = 1;
+    }
+    let mut done = 0usize;
+    while done < n {
+        let rc = unsafe {
+            libc::sendmmsg(
+                fd,
+                msgs.as_mut_ptr().add(done),
+                (n - done) as libc::c_uint,
+                0,
+            )
+        };
+        if rc < 0 {
+            let e = std::io::Error::last_os_error();
+            match e.raw_os_error() {
+                Some(libc::EINTR) => continue,
+                Some(libc::EAGAIN) => break,
+                _ => return Err(e),
+            }
+        }
+        if rc == 0 {
+            break;
+        }
+        done += rc as usize;
+    }
+    Ok(())
+}
+
 /// 收一个 UDP 报文，返回 (长度, 客户端地址, 原始目的地址)。
+#[allow(dead_code)] // A/B 与降级路径保留
 fn recv_with_orig_dst(
     fd: RawFd,
     buf: &mut [u8],
@@ -4140,9 +4239,15 @@ fn recv_with_orig_dst(
         return Err(std::io::Error::last_os_error());
     }
     let client = sockaddr_to_std(&name).ok_or_else(|| std::io::Error::other("bad peer addr"))?;
+    let orig = orig_dst_from_cmsgs(&msg)?;
+    Ok((n as usize, client, orig))
+}
+
+/// 从 msghdr 的 cmsg 链里取原始目的地址（v4 IP_ORIGDSTADDR / v6 IPV6_ORIGDSTADDR）。
+fn orig_dst_from_cmsgs(msg: &libc::msghdr) -> std::io::Result<SocketAddr> {
     let mut orig: Option<SocketAddr> = None;
     unsafe {
-        let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
+        let mut cmsg = libc::CMSG_FIRSTHDR(msg);
         while !cmsg.is_null() {
             let c = &*cmsg;
             if c.cmsg_level == libc::IPPROTO_IP && c.cmsg_type == IP_ORIGDSTADDR_OPT {
@@ -4163,12 +4268,110 @@ fn recv_with_orig_dst(
                     a6.sin6_scope_id,
                 )));
             }
-            cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
+            cmsg = libc::CMSG_NXTHDR(msg, cmsg);
         }
     }
-    let orig =
-        orig.ok_or_else(|| std::io::Error::other("缺少 IP_ORIGDSTADDR（setsockopt 未生效？）"))?;
-    Ok((n as usize, client, orig))
+    orig.ok_or_else(|| std::io::Error::other("缺少 IP_ORIGDSTADDR（setsockopt 未生效？）"))
+}
+
+/// O7：UDP 监听批量收（recvmmsg + IP_ORIGDSTADDR）。
+/// 首包阻塞，`MSG_WAITFORONE` 之后非阻塞排空——与逐包语义一致，只是每次 syscall 多收。
+struct UdpRecvBatch {
+    slots: Vec<Vec<u8>>,
+    names: Vec<libc::sockaddr_storage>,
+    ctrls: Vec<[u8; 128]>,
+    iovecs: Vec<libc::iovec>,
+    msgs: Vec<libc::mmsghdr>,
+    max: usize,
+}
+
+impl UdpRecvBatch {
+    fn new(max: usize) -> Self {
+        let max = max.max(1);
+        let mut slots: Vec<Vec<u8>> = (0..max).map(|_| vec![0u8; 65536]).collect();
+        let mut names: Vec<libc::sockaddr_storage> = vec![unsafe { std::mem::zeroed() }; max];
+        let mut ctrls: Vec<[u8; 128]> = vec![[0u8; 128]; max];
+        // 预先取堆指针（Vec 移动不改变堆地址），后续不再 realloc。
+        let names_ptr = names.as_mut_ptr();
+        let ctrls_ptr = ctrls.as_mut_ptr();
+        let mut iovecs: Vec<libc::iovec> = Vec::with_capacity(max);
+        for s in slots.iter_mut() {
+            iovecs.push(libc::iovec {
+                iov_base: s.as_mut_ptr() as *mut libc::c_void,
+                iov_len: s.len(),
+            });
+        }
+        let iovecs_ptr = iovecs.as_mut_ptr();
+        let mut msgs: Vec<libc::mmsghdr> = Vec::with_capacity(max);
+        for i in 0..max {
+            let mut m: libc::mmsghdr = unsafe { std::mem::zeroed() };
+            // SAFETY：names/ctrls/iovecs 容量固定且不再扩容，指针在结构生命周期内有效。
+            m.msg_hdr.msg_name = unsafe { names_ptr.add(i) as *mut libc::c_void };
+            m.msg_hdr.msg_namelen =
+                std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+            m.msg_hdr.msg_iov = unsafe { iovecs_ptr.add(i) };
+            m.msg_hdr.msg_iovlen = 1;
+            m.msg_hdr.msg_control = unsafe { ctrls_ptr.add(i) as *mut libc::c_void };
+            m.msg_hdr.msg_controllen = ctrls[i].len() as _;
+            msgs.push(m);
+        }
+        UdpRecvBatch {
+            slots,
+            names,
+            ctrls,
+            iovecs,
+            msgs,
+            max,
+        }
+    }
+
+    fn max_recv(&self) -> usize {
+        if udp_batch_on() {
+            self.max
+        } else {
+            1
+        }
+    }
+
+    /// 返回本批收包数。`WouldBlock`/超时由调用方处理（沿用阻塞监听无超时的语义）。
+    fn recv(&mut self, fd: RawFd) -> std::io::Result<usize> {
+        let n = self.max_recv().min(self.max);
+        loop {
+            for i in 0..n {
+                self.msgs[i].msg_hdr.msg_namelen =
+                    std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+                self.msgs[i].msg_hdr.msg_controllen = self.ctrls[i].len() as _;
+                self.msgs[i].msg_len = 0;
+            }
+            let rc = unsafe {
+                libc::recvmmsg(
+                    fd,
+                    self.msgs.as_mut_ptr(),
+                    n as libc::c_uint,
+                    libc::MSG_WAITFORONE,
+                    std::ptr::null_mut(),
+                )
+            };
+            if rc < 0 {
+                let e = std::io::Error::last_os_error();
+                if e.raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                return Err(e);
+            }
+            return Ok(rc as usize);
+        }
+    }
+
+    /// 第 i 包：(data, client, orig_dst)。
+    fn datagram(&self, i: usize) -> std::io::Result<(&[u8], SocketAddr, SocketAddr)> {
+        let m = &self.msgs[i];
+        let len = (m.msg_len as usize).min(self.slots[i].len());
+        let client = sockaddr_to_std(&self.names[i])
+            .ok_or_else(|| std::io::Error::other("bad peer addr"))?;
+        let orig = orig_dst_from_cmsgs(&m.msg_hdr)?;
+        Ok((&self.slots[i][..len], client, orig))
+    }
 }
 
 // ---------------------------------------------------------------- P3b-1：缓存 + TCP
@@ -4600,50 +4803,65 @@ fn maybe_spawn_optimistic_refresh(
 /// DNS（orig_dst port=53，解析/缓存/位图）与普通 UDP NAT（其他目的端口）。
 fn dns_loop(listener: OwnedFd, tx: std::sync::mpsc::Sender<status::MainMsg>) {
     let fd = listener.as_raw_fd();
-    let mut buf = vec![0u8; 2048];
+    // O7：批量收（recvmmsg）；DNS 与普通 UDP NAT 共用同一入口，按 orig_dst 分流。
+    let mut batch = UdpRecvBatch::new(UDP_RECV_BATCH);
     let mut reply_sockets: std::collections::HashMap<SocketAddr, Arc<OwnedFd>> =
         std::collections::HashMap::new();
     loop {
-        let (n, client, orig_dst) = match recv_with_orig_dst(fd, &mut buf) {
-            Ok(v) => v,
+        let got = match batch.recv(fd) {
+            Ok(n) => n,
             Err(e) => {
                 log(&format!("udp recv: {e}"));
                 continue;
             }
         };
-        if orig_dst.port() != 53 {
-            // P4b：普通 UDP 代理流量 → NAT 会话表
-            udp_nat_handle(&buf[..n], client, orig_dst, &mut reply_sockets);
-            continue;
-        }
-        DNS_STATS.queries.fetch_add(1, Ordering::Relaxed);
-        // P18c+：发送方进程名（WAN egress 新 UDP DNS 流由 eBPF 写入）
-        let dns_pname = lookup_dns_pname(Some(client.ip()), client.port());
-        // panic 隔离：单次查询（含第三方 QUIC 栈）出 panic 不应杀死整个 DNS 线程
-        let resolved = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            resolve_dns(
-                &buf[..n],
-                ClientProto::Udp,
-                Some(client.ip()),
-                dns_pname.as_deref(),
-                Some(orig_dst),
-                &tx,
-            )
-        }));
-        let resp = match resolved {
-            Ok(Some(r)) => r,
-            Ok(None) => continue,
-            Err(_) => {
-                DNS_STATS.upstream_errors.fetch_add(1, Ordering::Relaxed);
-                log("dns 查询处理 panic（已隔离，连续出现请查日志）");
+        // NAT 条目先收集，批内按会话聚合后 sendmmsg。
+        let mut nat_entries: Vec<(&[u8], SocketAddr, SocketAddr)> = Vec::new();
+        for i in 0..got {
+            let (data, client, orig_dst) = match batch.datagram(i) {
+                Ok(v) => v,
+                Err(e) => {
+                    log(&format!("udp recv: {e}"));
+                    continue;
+                }
+            };
+            if orig_dst.port() != 53 {
+                // P4b：普通 UDP 代理流量 → NAT 会话表
+                nat_entries.push((data, client, orig_dst));
                 continue;
             }
-        };
-        let Some(s) = reply_socket_for(&mut reply_sockets, orig_dst) else {
-            continue;
-        };
-        if let Err(e) = send_to_udp(s.as_raw_fd(), client, &resp) {
-            log(&format!("dns 回包 {client}: {e}"));
+            DNS_STATS.queries.fetch_add(1, Ordering::Relaxed);
+            // P18c+：发送方进程名（WAN egress 新 UDP DNS 流由 eBPF 写入）
+            let dns_pname = lookup_dns_pname(Some(client.ip()), client.port());
+            // panic 隔离：单次查询（含第三方 QUIC 栈）出 panic 不应杀死整个 DNS 线程
+            let resolved = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                resolve_dns(
+                    data,
+                    ClientProto::Udp,
+                    Some(client.ip()),
+                    dns_pname.as_deref(),
+                    Some(orig_dst),
+                    &tx,
+                )
+            }));
+            let resp = match resolved {
+                Ok(Some(r)) => r,
+                Ok(None) => continue,
+                Err(_) => {
+                    DNS_STATS.upstream_errors.fetch_add(1, Ordering::Relaxed);
+                    log("dns 查询处理 panic（已隔离，连续出现请查日志）");
+                    continue;
+                }
+            };
+            let Some(s) = reply_socket_for(&mut reply_sockets, orig_dst) else {
+                continue;
+            };
+            if let Err(e) = send_to_udp(s.as_raw_fd(), client, &resp) {
+                log(&format!("dns 回包 {client}: {e}"));
+            }
+        }
+        if !nat_entries.is_empty() {
+            udp_nat_handle_batch(&nat_entries, &mut reply_sockets);
         }
     }
 }
@@ -4785,24 +5003,16 @@ fn clear_domain_slot(ebpf: &mut Ebpf, slot: u32) -> Result<(), Box<dyn std::erro
 
 // ---------------------------------------------------------------- P4b：UDP NAT
 
-/// 上游回包 → 客户端（每会话一个 reader 线程）。
+/// 上游回包 → 客户端（每会话一个 reader 线程；O7：recvmmsg 批量收 + sendmmsg 批量回）。
 fn udp_session_reader(sess: Arc<UdpSession>) {
-    let mut buf = vec![0u8; 65536];
+    let mut slots: Vec<Vec<u8>> = Vec::new();
     loop {
         if !sess.alive.load(Ordering::Relaxed) {
             break;
         }
-        match sess.relay.recv_payload(&mut buf) {
-            Ok(payload) => {
-                sess.last_ns.store(monotonic_now_ns(), Ordering::Relaxed);
-                UDP_NAT_STATS
-                    .bytes_down
-                    .fetch_add(payload.len() as u64, Ordering::Relaxed);
-                if let Err(e) = send_to_udp(sess.reply.as_raw_fd(), sess.client, &payload) {
-                    UDP_NAT_STATS.errors.fetch_add(1, Ordering::Relaxed);
-                    log(&format!("udp nat: 回包 {} 失败: {e}", sess.client));
-                }
-            }
+        let got = match sess.relay.recv_batch(&mut slots, UDP_RECV_BATCH) {
+            Ok(0) => continue,
+            Ok(n) => n,
             Err(e)
                 if matches!(
                     e.kind(),
@@ -4817,6 +5027,16 @@ fn udp_session_reader(sess: Arc<UdpSession>) {
                 log(&format!("udp nat: 会话读结束（{e}）"));
                 break;
             }
+        };
+        sess.last_ns.store(monotonic_now_ns(), Ordering::Relaxed);
+        let datas: Vec<&[u8]> = slots.iter().take(got).map(|v| v.as_slice()).collect();
+        let total: usize = datas.iter().map(|d| d.len()).sum();
+        UDP_NAT_STATS
+            .bytes_down
+            .fetch_add(total as u64, Ordering::Relaxed);
+        if let Err(e) = send_batch_to_udp(sess.reply.as_raw_fd(), sess.client, &datas) {
+            UDP_NAT_STATS.errors.fetch_add(1, Ordering::Relaxed);
+            log(&format!("udp nat: 回包 {} 失败: {e}", sess.client));
         }
     }
 }
@@ -4842,118 +5062,164 @@ fn reply_socket_for(
     }
 }
 
-/// 一条客户端 UDP 报文：按 (client, orig_dst) 复用/创建会话并上行。
-fn udp_nat_handle(
-    data: &[u8],
+/// 取（或创建）一条 (client, orig_dst) 会话；创建路径含 QUIC 嗅探与拨号（不持锁）。
+fn udp_nat_session(
     client: SocketAddr,
     orig_dst: SocketAddr,
+    probe: &[u8],
     reply_sockets: &mut std::collections::HashMap<SocketAddr, Arc<OwnedFd>>,
-) {
+) -> Option<Arc<UdpSession>> {
     let key = (client, orig_dst);
     // 快路径：已有会话（只持锁查表）
-    let existing = UDP_NAT.lock().ok().and_then(|t| t.get(&key).cloned());
-    let sess = match existing {
-        Some(s) => s,
+    if let Some(s) = udp_nat_shard(&key)
+        .lock()
+        .ok()
+        .and_then(|t| t.get(&key).cloned())
+    {
+        return Some(s);
+    }
+    // P20：QUIC Initial 识别 + SNI 嗅探（解 Initial 加密；失败仅计识别数）。
+    if probe.len() >= 1200 && probe[0] & 0xC0 == 0xC0 {
+        SNIFF_STATS.quic_initial.fetch_add(1, Ordering::Relaxed);
+        if let quicsniff::QuicSniff::Found(name) = quicsniff::sniff(probe) {
+            SNIFF_STATS.quic_sni.fetch_add(1, Ordering::Relaxed);
+            log(&format!(
+                "quic sniff {client} → {name}（SNI，Initial 解密）"
+            ));
+        }
+    }
+    // 慢路径：先拨号（不持锁——TLS/协议拨号可能耗一个 RTT）
+    let reply = match reply_socket_for(reply_sockets, orig_dst) {
+        Some(r) => r,
         None => {
-            // P20：QUIC Initial 识别 + SNI 嗅探（解 Initial 加密；失败仅计识别数）。
-            if data.len() >= 1200 && data[0] & 0xC0 == 0xC0 {
-                SNIFF_STATS.quic_initial.fetch_add(1, Ordering::Relaxed);
-                if let quicsniff::QuicSniff::Found(name) = quicsniff::sniff(data) {
-                    SNIFF_STATS.quic_sni.fetch_add(1, Ordering::Relaxed);
-                    log(&format!(
-                        "quic sniff {client} → {name}（SNI，Initial 解密）"
-                    ));
-                }
-            }
-            // 慢路径：先拨号（不持锁——TLS/协议拨号可能耗一个 RTT）
-            let Some(reply) = reply_socket_for(reply_sockets, orig_dst) else {
-                UDP_NAT_STATS.errors.fetch_add(1, Ordering::Relaxed);
-                return;
-            };
-            // P5/P19：按规则选中的组分派（conn_state 回读；回退默认组）
-            let resolved = resolve_group_dialer(client, orig_dst, 17);
-            let relay = match resolved.as_ref().or(OUTBOUND.get()) {
-                Some(o) if o.supports_udp() => match o.dial_udp(
-                    orig_dst,
-                    Duration::from_millis(RELAY_DIAL_TIMEOUT_MS.load(Ordering::Relaxed)),
-                ) {
-                    Ok(Some(r)) => {
-                        UDP_NAT_STATS
-                            .sessions_proxied
-                            .fetch_add(1, Ordering::Relaxed);
-                        r
-                    }
-                    Ok(None) => match outbound::Outbound::direct_udp(orig_dst) {
-                        Ok(r) => r,
-                        Err(e) => {
-                            UDP_NAT_STATS.errors.fetch_add(1, Ordering::Relaxed);
-                            log(&format!("udp nat: 建出口失败: {e}"));
-                            return;
-                        }
-                    },
-                    Err(e) => {
-                        UDP_NAT_STATS.errors.fetch_add(1, Ordering::Relaxed);
-                        log(&format!("udp nat: dial_udp {orig_dst} 失败: {e}"));
-                        return;
-                    }
-                },
-                Some(_) => {
-                    UDP_NAT_STATS
-                        .direct_fallback
-                        .fetch_add(1, Ordering::Relaxed);
-                    match outbound::Outbound::direct_udp(orig_dst) {
-                        Ok(r) => r,
-                        Err(e) => {
-                            UDP_NAT_STATS.errors.fetch_add(1, Ordering::Relaxed);
-                            log(&format!("udp nat: 建直连出口失败: {e}"));
-                            return;
-                        }
-                    }
-                }
-                None => match outbound::Outbound::direct_udp(orig_dst) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        UDP_NAT_STATS.errors.fetch_add(1, Ordering::Relaxed);
-                        log(&format!("udp nat: 建直连出口失败: {e}"));
-                        return;
-                    }
-                },
-            };
-            let _ = relay.set_read_timeout(Some(Duration::from_secs(2)));
-            let s = Arc::new(UdpSession {
-                client,
-                relay,
-                reply,
-                last_ns: AtomicU64::new(monotonic_now_ns()),
-                alive: AtomicBool::new(true),
-            });
-            // 插入可能与其他线程竞争（当前只有 dns_loop 调用，但保持防御性）：
-            // 已有则用已有的，新建的会话随 drop 关闭。
-            match UDP_NAT.lock() {
-                Ok(mut table) => match table.get(&key) {
-                    Some(prev) => prev.clone(),
-                    None => {
-                        table.insert(key, s.clone());
-                        UDP_NAT_STATS.sessions_total.fetch_add(1, Ordering::Relaxed);
-                        let r = s.clone();
-                        std::thread::spawn(move || udp_session_reader(r));
-                        s
-                    }
-                },
-                Err(_) => return,
-            }
+            UDP_NAT_STATS.errors.fetch_add(1, Ordering::Relaxed);
+            return None;
         }
     };
-    sess.last_ns.store(monotonic_now_ns(), Ordering::Relaxed);
-    match sess.relay.send_payload(data) {
-        Ok(n) => {
+    // P5/P19：按规则选中的组分派（conn_state 回读；回退默认组）
+    let resolved = resolve_group_dialer(client, orig_dst, 17);
+    let relay = match resolved.as_ref().or(OUTBOUND.get()) {
+        Some(o) if o.supports_udp() => match o.dial_udp(
+            orig_dst,
+            Duration::from_millis(RELAY_DIAL_TIMEOUT_MS.load(Ordering::Relaxed)),
+        ) {
+            Ok(Some(r)) => {
+                UDP_NAT_STATS
+                    .sessions_proxied
+                    .fetch_add(1, Ordering::Relaxed);
+                r
+            }
+            Ok(None) => match outbound::Outbound::direct_udp(orig_dst) {
+                Ok(r) => r,
+                Err(e) => {
+                    UDP_NAT_STATS.errors.fetch_add(1, Ordering::Relaxed);
+                    log(&format!("udp nat: 建出口失败: {e}"));
+                    return None;
+                }
+            },
+            Err(e) => {
+                UDP_NAT_STATS.errors.fetch_add(1, Ordering::Relaxed);
+                log(&format!("udp nat: dial_udp {orig_dst} 失败: {e}"));
+                return None;
+            }
+        },
+        Some(_) => {
             UDP_NAT_STATS
-                .bytes_up
-                .fetch_add(n as u64, Ordering::Relaxed);
+                .direct_fallback
+                .fetch_add(1, Ordering::Relaxed);
+            match outbound::Outbound::direct_udp(orig_dst) {
+                Ok(r) => r,
+                Err(e) => {
+                    UDP_NAT_STATS.errors.fetch_add(1, Ordering::Relaxed);
+                    log(&format!("udp nat: 建直连出口失败: {e}"));
+                    return None;
+                }
+            }
         }
-        Err(e) => {
-            UDP_NAT_STATS.errors.fetch_add(1, Ordering::Relaxed);
-            log(&format!("udp nat: 上行 {orig_dst} 失败: {e}"));
+        None => match outbound::Outbound::direct_udp(orig_dst) {
+            Ok(r) => r,
+            Err(e) => {
+                UDP_NAT_STATS.errors.fetch_add(1, Ordering::Relaxed);
+                log(&format!("udp nat: 建直连出口失败: {e}"));
+                return None;
+            }
+        },
+    };
+    let _ = relay.set_read_timeout(Some(Duration::from_secs(2)));
+    let s = Arc::new(UdpSession {
+        client,
+        relay,
+        reply,
+        last_ns: AtomicU64::new(monotonic_now_ns()),
+        alive: AtomicBool::new(true),
+    });
+    // 插入可能与其他线程竞争（当前只有 dns_loop 调用，但保持防御性）：
+    // 已有则用已有的，新建的会话随 drop 关闭。
+    match udp_nat_shard(&key).lock() {
+        Ok(mut table) => match table.get(&key) {
+            Some(prev) => Some(prev.clone()),
+            None => {
+                table.insert(key, s.clone());
+                UDP_NAT_STATS.sessions_total.fetch_add(1, Ordering::Relaxed);
+                let r = s.clone();
+                std::thread::spawn(move || udp_session_reader(r));
+                Some(s)
+            }
+        },
+        Err(_) => None,
+    }
+}
+
+/// O7：一批客户端报文——按会话聚合后批量上行（同会话顺序保持；跨会话重排不影响 UDP）。
+fn udp_nat_handle_batch(
+    entries: &[(&[u8], SocketAddr, SocketAddr)],
+    reply_sockets: &mut std::collections::HashMap<SocketAddr, Arc<OwnedFd>>,
+) {
+    if entries.is_empty() {
+        return;
+    }
+    if entries.len() == 1 {
+        let &(data, client, orig_dst) = &entries[0];
+        if let Some(sess) = udp_nat_session(client, orig_dst, data, reply_sockets) {
+            sess.last_ns.store(monotonic_now_ns(), Ordering::Relaxed);
+            match sess.relay.send_payload(data) {
+                Ok(n) => {
+                    UDP_NAT_STATS
+                        .bytes_up
+                        .fetch_add(n as u64, Ordering::Relaxed);
+                }
+                Err(e) => {
+                    UDP_NAT_STATS.errors.fetch_add(1, Ordering::Relaxed);
+                    log(&format!("udp nat: 上行 {orig_dst} 失败: {e}"));
+                }
+            }
+        }
+        return;
+    }
+    let mut per_sess: Vec<(Arc<UdpSession>, Vec<&[u8]>)> = Vec::new();
+    for &(data, client, orig_dst) in entries {
+        let Some(sess) = udp_nat_session(client, orig_dst, data, reply_sockets) else {
+            continue;
+        };
+        sess.last_ns.store(monotonic_now_ns(), Ordering::Relaxed);
+        if let Some((_, v)) = per_sess.iter_mut().find(|(s, _)| Arc::ptr_eq(s, &sess)) {
+            v.push(data);
+        } else {
+            per_sess.push((sess, vec![data]));
+        }
+    }
+    for (sess, datas) in per_sess {
+        let orig = sess.relay.target();
+        match sess.relay.send_batch(&datas) {
+            Ok(n) => {
+                UDP_NAT_STATS
+                    .bytes_up
+                    .fetch_add(n as u64, Ordering::Relaxed);
+            }
+            Err(e) => {
+                UDP_NAT_STATS.errors.fetch_add(1, Ordering::Relaxed);
+                log(&format!("udp nat: 上行 {orig} 失败: {e}"));
+            }
         }
     }
 }
@@ -4967,18 +5233,22 @@ fn udp_nat_janitor_loop() {
             .load(Ordering::Relaxed)
             .saturating_mul(1_000_000_000);
         let now = monotonic_now_ns();
-        let dead: Vec<((SocketAddr, SocketAddr), Arc<UdpSession>)> = match UDP_NAT.lock() {
-            Ok(t) => t
-                .iter()
-                .filter(|(_, s)| now.saturating_sub(s.last_ns.load(Ordering::Relaxed)) > idle_ns)
-                .map(|(k, s)| (*k, s.clone()))
-                .collect(),
-            Err(_) => continue,
-        };
+        let mut dead: Vec<((SocketAddr, SocketAddr), Arc<UdpSession>)> = Vec::new();
+        for shard in UDP_NAT.iter() {
+            if let Ok(t) = shard.lock() {
+                dead.extend(
+                    t.iter()
+                        .filter(|(_, s)| {
+                            now.saturating_sub(s.last_ns.load(Ordering::Relaxed)) > idle_ns
+                        })
+                        .map(|(k, s)| (*k, s.clone())),
+                );
+            }
+        }
         for (k, s) in dead {
             s.alive.store(false, Ordering::Relaxed);
             UDP_NAT_STATS.evicted.fetch_add(1, Ordering::Relaxed);
-            if let Ok(mut t) = UDP_NAT.lock() {
+            if let Ok(mut t) = udp_nat_shard(&k).lock() {
                 t.remove(&k);
             }
         }
@@ -5688,7 +5958,10 @@ fn status_json(ebpf: &mut Ebpf) -> serde_json::Value {
         "group": default_group_json,
         "groups": groups_json,
         "udp_nat": {
-            "sessions_active": UDP_NAT.lock().map(|t| t.len()).unwrap_or(0),
+            "sessions_active": UDP_NAT
+                .iter()
+                .map(|s| s.lock().map(|t| t.len()).unwrap_or(0))
+                .sum::<usize>(),
             "sessions_total": UDP_NAT_STATS.sessions_total.load(Ordering::Relaxed),
             "sessions_proxied": UDP_NAT_STATS.sessions_proxied.load(Ordering::Relaxed),
             "direct_fallback": UDP_NAT_STATS.direct_fallback.load(Ordering::Relaxed),
@@ -6140,6 +6413,25 @@ fn handle_status_query(cmd: &str, ebpf: &mut Ebpf, args: &Args) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// O7：会话表分片——同 key 始终同片，不同 key 能铺开（避免单锁竞争）。
+    #[test]
+    fn udp_nat_shard_stable_and_spread() {
+        let k = (
+            "10.0.0.1:1000".parse().unwrap(),
+            "1.1.1.1:53".parse().unwrap(),
+        );
+        assert!(std::ptr::eq(udp_nat_shard(&k), udp_nat_shard(&k)));
+        let mut set = std::collections::HashSet::new();
+        for i in 0..64u16 {
+            let kk = (
+                SocketAddr::from(([10, 0, 0, 1], 1000 + i)),
+                SocketAddr::from(([1, 1, 1, 1], 53)),
+            );
+            set.insert(udp_nat_shard(&kk) as *const _ as usize);
+        }
+        assert!(set.len() > 4, "分片过少：{}", set.len());
+    }
 
     /// P19：单个上游构造失败（如非法 URL）应被跳过，其余照常生效——
     /// 不再让一个坏条目把整个上游集（进而全机 DNS）拖垮。

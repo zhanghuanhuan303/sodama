@@ -70,7 +70,7 @@
 
 <header class="top">
   <h1>sodama · VLESS 性能实测与优化提案 <span class="tag ok">M1–M4 已落地</span></h1>
-  <div class="sub">同机四方对拍（sodama / dae v2.1.1 / sing-box 1.14.2 / v2ray 5.52.0）· VLESS 明文/TLS/Vision/规模 · 5 轮中位数 · 2026-10-05 · v1.7（M3：Vision-over-TLS 四模式逐字节 + 真订阅 e2e；M4：epoll worker 池——10k 连接 28 线程/32.1 MB、风暴 25 606 conn/s；stage 2 全部：codec 全协议面（VLESS 全组合含 reality/vision/ws、Trojan、vmess、ss/ssr/anytls）——2 000 连接 27 线程/61 MB（线程模型 4 011/222 MB）、吞吐 +5~25%；offload 看门狗单线程化——每 offload 连接 0 线程；io_uring A/B 结论不引入；<code>SODAMA_REACTOR_CODEC=0</code> 可关）</div>
+  <div class="sub">同机四方对拍（sodama / dae v2.1.1 / sing-box 1.14.2 / v2ray 5.52.0）· VLESS 明文/TLS/Vision/规模 · 5 轮中位数 · 2026-10-05 · v1.8（M1–M4 全部落地；O6：AEAD 实测定调——保留 chacha（16KB 块 1.73 vs aes-gcm 1.57 GB/s），vmess auto→chacha；O7：UDP 批量+分片会话表+大缓冲，20k pps 0 丢包 CPU 630ms/40k 包（dae 2140/sing-box 1580/v2ray 1780）；offload 看门狗单线程化（每连接 0 线程）；io_uring 结论不引入）</div>
   <div class="chips">
     <span class="chip">数据口径 <b>5 轮中位</b></span>
     <span class="chip">夹具 <b>全双工 echo · 环回上限 ≈25 Gbps</b></span>
@@ -587,8 +587,8 @@ status --cmd status --json | jq .relay.splice_total        # 命中/回退计数
 </section>
 
 <div class="foot">
-  sodama · VLESS 性能实测与优化提案 · v1.7（M1–M4 全部落地 + stage 2 全协议面版）· 2026-10-05 · Arch / 6.18.54-lts / i9-9900KF ·
-  数据为同机 lab 口径，5 轮中位数与 perf 剖面如实呈现；M2 验收对账（内存达标、吞吐/CPU 受夹具与硬件限制）见 05 节，M4 规模/风暴/codec A-B/offload 线程数/io_uring 结论见 06b 节与 ADR-0058。
+  sodama · VLESS 性能实测与优化提案 · v1.8（M1–M4 + O6/O7 版）· 2026-10-05 · Arch / 6.18.54-lts / i9-9900KF ·
+  数据为同机 lab 口径，5 轮中位数与 perf 剖面如实呈现；M2 验收对账（内存达标、吞吐/CPU 受夹具与硬件限制）见 05 节，M4 规模/风暴/codec A-B/offload 线程数/io_uring 结论见 06b 节与 ADR-0058；O6/O7 见 `docs/optimization-roadmap.md`。
 </div>
 
 </div>
