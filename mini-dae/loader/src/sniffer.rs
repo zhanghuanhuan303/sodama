@@ -289,6 +289,12 @@ fn parse_tls(buf: &[u8]) -> Sniff {
         return Sniff::NeedMore;
     }
     let hs = &rec[4..4 + hs_len];
+    parse_client_hello_body(hs)
+}
+
+/// ClientHello 主体解析（无类型/长度头）：取首个 SNI 扩展——TLS record 与 QUIC CRYPTO
+/// 两条路径共用。输入不足时返回 NeedMore（调用方可回退/继续等）。
+pub fn parse_client_hello_body(hs: &[u8]) -> Sniff {
     // client_version(2) + random(32) + session_id(1+n) + cipher_suites(2+n)
     // + compression(1+n) + extensions(2+n)
     let mut off = 34usize;

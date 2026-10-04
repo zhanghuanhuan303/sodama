@@ -53,6 +53,7 @@ mod hpack;
 mod huffman_table;
 mod hysteria2;
 mod outbound;
+mod quicsniff;
 mod quicsock;
 mod reality;
 mod rules;
@@ -168,8 +169,10 @@ struct SniffStats {
     attempts: AtomicU64,
     hits: AtomicU64,
     misses: AtomicU64,
-    /// P18e：识别到的 QUIC Initial 包（仅统计，SNI 需解 Initial 加密）。
+    /// P18e：识别到的 QUIC Initial 包（长头 + ≥1200B；仅识别，不含解密结果）。
     quic_initial: AtomicU64,
+    /// P20：Initial 解密后成功解出 SNI 的计数。
+    quic_sni: AtomicU64,
 }
 impl SniffStats {
     const fn new() -> Self {
@@ -178,6 +181,7 @@ impl SniffStats {
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
             quic_initial: AtomicU64::new(0),
+            quic_sni: AtomicU64::new(0),
         }
     }
 }
@@ -3867,9 +3871,15 @@ fn udp_nat_handle(
     let sess = match existing {
         Some(s) => s,
         None => {
-            // P18e：QUIC Initial 识别（长头 + ≥1200B）；仅统计，不做 SNI 解析。
+            // P20：QUIC Initial 识别 + SNI 嗅探（解 Initial 加密；失败仅计识别数）。
             if data.len() >= 1200 && data[0] & 0xC0 == 0xC0 {
                 SNIFF_STATS.quic_initial.fetch_add(1, Ordering::Relaxed);
+                if let quicsniff::QuicSniff::Found(name) = quicsniff::sniff(data) {
+                    SNIFF_STATS.quic_sni.fetch_add(1, Ordering::Relaxed);
+                    log(&format!(
+                        "quic sniff {client} → {name}（SNI，Initial 解密）"
+                    ));
+                }
             }
             // 慢路径：先拨号（不持锁——TLS/协议拨号可能耗一个 RTT）
             let Some(reply) = reply_socket_for(reply_sockets, orig_dst) else {
@@ -4662,6 +4672,7 @@ fn status_json(ebpf: &mut Ebpf) -> serde_json::Value {
             "hits": SNIFF_STATS.hits.load(Ordering::Relaxed),
             "misses": SNIFF_STATS.misses.load(Ordering::Relaxed),
             "quic_initial": SNIFF_STATS.quic_initial.load(Ordering::Relaxed),
+            "quic_sni": SNIFF_STATS.quic_sni.load(Ordering::Relaxed),
         },
         // P17b：pname 采集面（cgroup2 钩子 + cookie→pname map）
         "pname": {

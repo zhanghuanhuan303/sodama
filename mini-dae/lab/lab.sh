@@ -1724,24 +1724,50 @@ test_udp_relay() {
   require_root
   echo "== 测试 UDP NAT（转发 + 会话复用）=="
   local out
+  # P20：用前后增量断言（3 报文恰好新增 1 会话 = 复用），不依赖前序用例留下的会话。
+  "$LOADER" status --socket "$STATUS_SOCK" --json >/tmp/mini-dae-status-before.json
   out="$(ip netns exec "$CLIENT_NS" timeout 10 python3 "$HERE/udp_probe.py" 2.2.2.2 9998 3 0.2 2>&1 || true)"
   echo "$out"
   echo "$out" | grep -q "reply=udp-echo-ok data=ping0 from=2.2.2.2:9998" || { echo "FAIL: UDP 未转发到真实目标/回包源地址不对"; exit 1; }
   echo "$out" | grep -q "^summary=3/3" || { echo "FAIL: UDP 报文丢失"; exit 1; }
   sleep 0.3
   "$LOADER" status --socket "$STATUS_SOCK" --json >/tmp/mini-dae-status.json
+  python3 - /tmp/mini-dae-status-before.json /tmp/mini-dae-status.json <<'PY'
+import json, sys
+b = json.load(open(sys.argv[1]))["udp_nat"]
+a = json.load(open(sys.argv[2]))["udp_nat"]
+assert a["sessions_total"] == b["sessions_total"] + 1, (b, a)  # 3 报文复用出 1 个新会话
+assert a["bytes_up"] >= b["bytes_up"] + 15, (b, a)
+assert a["bytes_down"] >= b["bytes_down"] + 45, (b, a)
+assert a["errors"] == b["errors"], (b, a)
+print("udp nat: +1 session bytes_up=%d bytes_down=%d" % (
+    a["bytes_up"] - b["bytes_up"], a["bytes_down"] - b["bytes_down"]))
+PY
+  echo "PASS: UDP NAT（真实转发、3 报文复用 1 会话、回包源地址正确）"
+}
+
+# P20：QUIC Initial SNI 嗅探（跨实现：Python 按 RFC 9001 独立造包）。
+test_quic_sniff() {
+  require_root
+  echo "== P20：QUIC Initial SNI 嗅探 =="
+  local out
+  out="$(ip netns exec "$CLIENT_NS" timeout 8 python3 "$HERE/quic_probe.py" 2.2.2.2 9998 www.example.com 2>&1 || true)"
+  echo "$out"
+  echo "$out" | grep -q "quic-sniff-sent sni=www.example.com" \
+    || { echo "FAIL: 探针未发送"; exit 1; }
+  sleep 0.3
+  grep -q "quic sniff .* → www.example.com" "$LOG" \
+    || { echo "FAIL: 日志无 QUIC SNI 记录（先 udp-up）"; tail -5 "$LOG"; exit 1; }
+  "$LOADER" status --socket "$STATUS_SOCK" --json >/tmp/mini-dae-status.json
   python3 - /tmp/mini-dae-status.json <<'PY'
 import json, sys
 v = json.load(open(sys.argv[1]))
-u = v["udp_nat"]
-assert u["sessions_active"] == 1, u
-assert u["sessions_total"] == 1, u
-assert u["bytes_up"] >= 15 and u["bytes_down"] >= 45, u
-assert u["errors"] == 0, u
-print("udp nat: sessions=%d/%d bytes_up=%d bytes_down=%d" % (
-    u["sessions_active"], u["sessions_total"], u["bytes_up"], u["bytes_down"]))
+s = v["sniffing"]
+assert s.get("quic_initial", 0) >= 1, s
+assert s.get("quic_sni", 0) >= 1, s
+print("quic sniff: initial=%d sni=%d" % (s["quic_initial"], s["quic_sni"]))
 PY
-  echo "PASS: UDP NAT（真实转发、3 报文复用 1 会话、回包源地址正确）"
+  echo "PASS: QUIC Initial SNI 嗅探（Initial 解密 + sni=www.example.com）"
 }
 
 # P4b：UDP NAT 会话 janitor（会话用 --udp-idle-timeout 2 启动）。
@@ -2944,6 +2970,7 @@ case "${1:-}" in
   test-relay) test_relay ;;
   test-relay-idle) test_relay_idle ;;
   test-udp-relay) test_udp_relay ;;
+  test-quic-sniff) test_quic_sniff ;;  # P20：QUIC Initial SNI 嗅探
   test-udp-idle) test_udp_idle ;;
   test-relay-offload) test_relay_offload ;;
   test-offload-lifecycle) test_offload_lifecycle ;;
@@ -2973,5 +3000,5 @@ case "${1:-}" in
   status) status ;;
   trace) trace ;;
   down) down ;;
-  *) echo "usage: $0 {build|up|dual-up|config-up|forward-up|dns-up|dot-up|doh-up|doq-up|dnsroute-up|dns-udp-up|dns-tcpup-up|geo-up|pname-up|regex-up|relay-up|offload-up|udp-up|ss-up|ss2022-up|http-up|groups-up|ss-udp-up|trojan-up|vless-up|vless-tls-up|vless-udp-up|vmess-up|vmess-tls-up|vmess-udp-up|tuic-up|tuic-udp-up|hy2-up|hy2-udp-up|hy2-obfs-up|hy2-obfs-udp-up|hy2-brutal-up|hy2-hop-up|ops-up|ops-reload-up|bench-up|test-proxy|test-direct|test-block|test-host-proxy|test-reload|test-rebind|test-status|test-config|test-forward|test-domain|test-dns-cache|test-dns-tcp|test-dns-reload|test-domain-regex|test-dns-edns|test-dot|test-doh|test-doq|test-dnsroute|test-dns-udp|test-dns-tcpup|test-geo|test-pname|test-v6|test-relay|test-relay-idle|test-relay-offload|test-offload-lifecycle|test-udp-relay|test-udp-idle|test-ss|test-ss2022|test-http|test-groups|test-trojan|test-ss-udp|test-vless|test-vless-udp|test-vmess|test-vmess-udp|test-tuic|test-tuic-udp|test-hy2|test-hy2-udp|test-hy2-obfs|test-hy2-obfs-udp|test-hy2-brutal|test-hy2-hop|test-ops|test-config-reload|test-fault-reload|test-fault-kill|reload|verify|status|trace|down}"; exit 2 ;;
+  *) echo "usage: $0 {build|up|dual-up|config-up|forward-up|dns-up|dot-up|doh-up|doq-up|dnsroute-up|dns-udp-up|dns-tcpup-up|geo-up|pname-up|regex-up|relay-up|offload-up|udp-up|ss-up|ss2022-up|http-up|groups-up|ss-udp-up|trojan-up|vless-up|vless-tls-up|vless-udp-up|vmess-up|vmess-tls-up|vmess-udp-up|tuic-up|tuic-udp-up|hy2-up|hy2-udp-up|hy2-obfs-up|hy2-obfs-udp-up|hy2-brutal-up|hy2-hop-up|ops-up|ops-reload-up|bench-up|test-proxy|test-direct|test-block|test-host-proxy|test-reload|test-rebind|test-status|test-config|test-forward|test-domain|test-dns-cache|test-dns-tcp|test-dns-reload|test-domain-regex|test-dns-edns|test-dot|test-doh|test-doq|test-dnsroute|test-dns-udp|test-dns-tcpup|test-geo|test-pname|test-v6|test-relay|test-relay-idle|test-relay-offload|test-offload-lifecycle|test-udp-relay|test-quic-sniff|test-udp-idle|test-ss|test-ss2022|test-http|test-groups|test-trojan|test-ss-udp|test-vless|test-vless-udp|test-vmess|test-vmess-udp|test-tuic|test-tuic-udp|test-hy2|test-hy2-udp|test-hy2-obfs|test-hy2-obfs-udp|test-hy2-brutal|test-hy2-hop|test-ops|test-config-reload|test-fault-reload|test-fault-kill|reload|verify|status|trace|down}"; exit 2 ;;
 esac
