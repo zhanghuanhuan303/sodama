@@ -150,6 +150,14 @@ SUB_PORT=18530
 SUB_PID_FILE=/tmp/mini-dae-sub.pid
 SUB_BODY=/tmp/mini-dae-sub-body.txt
 SUB_CONFIG=/tmp/mini-dae-subscribe.dae
+# P18e：SS2022（shadowsocks-rust ssserver 参考对端；PSK 为 16 字节 "0123456789abcdef" 的 base64）
+SS2022_PSK=MDEyMzQ1Njc4OWFiY2RlZg==
+SS2022_METHOD=2022-blake3-aes-128-gcm
+SS2022_PID_FILE=/tmp/mini-dae-ss2022.pid
+# P18e：HTTP CONNECT 出站夹具
+HTTP_PROXY_PORT=18390
+HTTP_PROXY_LOG=/tmp/mini-dae-http-proxy.log
+HTTP_PROXY_PID_FILE=/tmp/mini-dae-http-proxy.pid
 TROJAN_PORT=8443
 TROJAN_LOG=/tmp/mini-dae-trojan-target.txt
 TROJAN_PID_FILE=/tmp/mini-dae-trojan.pid
@@ -268,6 +276,14 @@ cleanup() {
   if [ -f "$SUB_PID_FILE" ]; then
     kill "$(cat "$SUB_PID_FILE")" 2>/dev/null || true
     rm -f "$SUB_PID_FILE"
+  fi
+  if [ -f "$SS2022_PID_FILE" ]; then
+    kill "$(cat "$SS2022_PID_FILE")" 2>/dev/null || true
+    rm -f "$SS2022_PID_FILE"
+  fi
+  if [ -f "$HTTP_PROXY_PID_FILE" ]; then
+    kill "$(cat "$HTTP_PROXY_PID_FILE")" 2>/dev/null || true
+    rm -f "$HTTP_PROXY_PID_FILE"
   fi
   if [ -f "$TROJAN_PID_FILE" ]; then
     kill "$(cat "$TROJAN_PID_FILE")" 2>/dev/null || true
@@ -487,6 +503,27 @@ up() {
     echo $! >"$SUB_PID_FILE"
     sleep 0.3
     kill -0 "$(cat "$SUB_PID_FILE")" 2>/dev/null || { cat /tmp/mini-dae-sub.log; die "订阅服务器启动失败"; }
+  fi
+  # P18e：SS2022 参考对端（shadowsocks-rust ssserver，需系统安装）
+  if [ -n "${USE_SS_2022:-}" ]; then
+    command -v ssserver >/dev/null 2>&1 || die "需要 shadowsocks-rust（ssserver）：pacman -S shadowsocks-rust"
+    rm -f "$SS_LOG.2022"
+    ssserver -s "127.0.0.1:$SS_PORT" -m "$SS2022_METHOD" -k "$SS2022_PSK" \
+      --outbound-fwmark 563 \
+      >/tmp/mini-dae-ss2022.log 2>&1 &
+    echo $! >"$SS2022_PID_FILE"
+    sleep 0.3
+    kill -0 "$(cat "$SS2022_PID_FILE")" 2>/dev/null || { cat /tmp/mini-dae-ss2022.log; die "ssserver（SS2022）启动失败"; }
+  fi
+  # P18e：HTTP CONNECT 出站夹具（可选 Basic 认证：USE_HTTP_PROXY_AUTH=user:pass）
+  if [ -n "${USE_HTTP_PROXY:-}" ]; then
+    rm -f "$HTTP_PROXY_LOG"
+    python3 -u "$HERE/http_connect_server.py" "$HTTP_PROXY_LOG" "$HTTP_PROXY_PORT" \
+      ${USE_HTTP_PROXY_AUTH:+"$USE_HTTP_PROXY_AUTH"} \
+      >/tmp/mini-dae-http-proxy.log 2>&1 &
+    echo $! >"$HTTP_PROXY_PID_FILE"
+    sleep 0.3
+    kill -0 "$(cat "$HTTP_PROXY_PID_FILE")" 2>/dev/null || { cat /tmp/mini-dae-http-proxy.log; die "HTTP CONNECT 代理启动失败"; }
   fi
   if [ -n "${USE_TROJAN:-}" ]; then
     [ -f "$CERTS_DIR/cert.pem" ] && [ -f "$CERTS_DIR/key.pem" ] \
@@ -1906,6 +1943,118 @@ print("alive=%d dead=%s" % (g["alive"], dead))
   echo "PASS: failover 后经节点 B 拨号成功（组 select/failover 计数见状态面）"
 }
 
+# P18e：SS2022——跨实现验证（shadowsocks-rust ssserver，SIP022）。
+ss2022_up() {
+  require_root
+  [ -f "$OBJ" ] && [ -x "$LOADER" ] || die "先运行 $0 build"
+  cleanup
+  local creds="$SS2022_METHOD:$SS2022_PSK"
+  local b64
+  b64="$(printf '%s' "$creds" | base64 -w0 | tr '+/' '-_' | tr -d '=')"
+  USE_RULES="$HERE/rules.dae" USE_SS_2022=1 USE_OFFLOAD=1 \
+    USE_DIALER="ss://$b64@127.0.0.1:$SS_PORT#ss2022" \
+    USE_RELAY_IDLE=600 up
+}
+
+test_ss2022() {
+  require_root
+  echo "== P18e：Shadowsocks 2022（跨实现 shadowsocks-rust ssserver）=="
+  local out
+  out="$(ip netns exec "$CLIENT_NS" timeout 8 python3 "$HERE/client_probe.py" "$PROXY_DST" 8080 2>&1 || true)"
+  echo "$out"
+  echo "$out" | grep -q "wan-echo-ok data=ping" \
+    || { echo "FAIL: ss2022 链路未把流量转发到真实目标"; exit 1; }
+  kill -0 "$(cat "$SS2022_PID_FILE")" 2>/dev/null \
+    || { echo "FAIL: ssserver 进程已退出"; cat /tmp/mini-dae-ss2022.log; exit 1; }
+  out="$(ip netns exec "$CLIENT_NS" timeout 30 python3 "$HERE/stream_probe.py" "$PROXY_DST" 8080 512 2>&1 || true)"
+  echo "$out"
+  echo "$out" | grep -q "^stream-ok bytes=524288" || { echo "FAIL: ss2022 大流量回显不一致"; exit 1; }
+  "$LOADER" status --socket "$STATUS_SOCK" --json >/tmp/mini-dae-status.json
+  python3 - /tmp/mini-dae-status.json <<'PY'
+import json, sys
+v = json.load(open(sys.argv[1]))
+assert v["dialer"].startswith("ss://2022-blake3-aes-128-gcm@"), v["dialer"]
+r = v["relay"]
+assert r["conns_total"] >= 2, r
+assert r["dial_errors"] == 0, r
+assert r["offload_enabled"] and r["offloaded_total"] == 0, r  # 协议互斥
+assert r["bytes_up"] >= 512 * 1024 and r["bytes_down"] >= 512 * 1024, r
+print("ss2022: conns=%d bytes_up=%d bytes_down=%d" % (r["conns_total"], r["bytes_up"], r["bytes_down"]))
+PY
+  echo "PASS: shadowsocks 2022（SIP022 跨实现 + 512KB 回显一致）"
+}
+
+# P18e：HTTP CONNECT 出站（独立 Python 代理夹具）。
+http_up() {
+  require_root
+  [ -f "$OBJ" ] && [ -x "$LOADER" ] || die "先运行 $0 build"
+  cleanup
+  USE_RULES="$HERE/rules.dae" USE_HTTP_PROXY=1 USE_OFFLOAD=1 \
+    USE_DIALER="http://127.0.0.1:$HTTP_PROXY_PORT" \
+    USE_RELAY_IDLE=600 up
+}
+
+test_http_out() {
+  require_root
+  echo "== P18e：HTTP CONNECT 出站（Python 代理夹具）=="
+  local out
+  out="$(ip netns exec "$CLIENT_NS" timeout 8 python3 "$HERE/client_probe.py" "$PROXY_DST" 8080 2>&1 || true)"
+  echo "$out"
+  echo "$out" | grep -q "wan-echo-ok data=ping" \
+    || { echo "FAIL: http 出站未把流量转发到真实目标"; exit 1; }
+  grep -q "CONNECT $PROXY_DST:8080" "$HTTP_PROXY_LOG" \
+    || { echo "FAIL: 代理夹具没看到 CONNECT（跨实现失败）"; cat "$HTTP_PROXY_LOG" 2>/dev/null; exit 1; }
+  out="$(ip netns exec "$CLIENT_NS" timeout 30 python3 "$HERE/stream_probe.py" "$PROXY_DST" 8080 512 2>&1 || true)"
+  echo "$out"
+  echo "$out" | grep -q "^stream-ok bytes=524288" || { echo "FAIL: http 大流量回显不一致"; exit 1; }
+  "$LOADER" status --socket "$STATUS_SOCK" --json >/tmp/mini-dae-status.json
+  python3 - /tmp/mini-dae-status.json <<'PY'
+import json, sys
+v = json.load(open(sys.argv[1]))
+assert v["dialer"].startswith("http://"), v["dialer"]
+r = v["relay"]
+assert r["conns_total"] >= 2, r
+assert r["dial_errors"] == 0, r
+assert r["offload_enabled"] and r["offloaded_total"] == 0, r
+print("http CONNECT: conns=%d bytes_up=%d bytes_down=%d" % (r["conns_total"], r["bytes_up"], r["bytes_down"]))
+PY
+  echo "PASS: HTTP CONNECT 出站（CONNECT 隧道 + 512KB 回显一致）"
+}
+
+# P18e：SIGHUP 订阅热更新（重拉订阅 → 整体替换成员 + 健康继承）。
+# 用法：sub-reload-up 后执行；本测试会改写 $SUB_BODY 并 SIGHUP。
+test_sub_reload() {
+  require_root
+  echo "== P18e：SIGHUP 订阅热更新（2 节点 → 1 节点）=="
+  grep -q "订阅 lab: 拉取成功，2 个节点" "$LOG" \
+    || { echo "FAIL: 初始订阅应为 2 节点（先 sub-reload-up）"; tail -5 "$LOG"; exit 1; }
+  local out
+  out="$(ip netns exec "$CLIENT_NS" timeout 8 python3 "$HERE/client_probe.py" "$PROXY_DST" 8080 2>&1 || true)"
+  echo "$out" | grep -q "wan-echo-ok" || { echo "FAIL: 初始经组拨号失败"; echo "$out"; exit 1; }
+  # 改订阅：去掉 node-b（与 subscribe_up 相同的链接格式）
+  {
+    echo "ss://chacha20-ietf-poly1305:testpass@127.0.0.1:$SS_PORT#node-a"
+  } | base64 -w0 >"$SUB_BODY"
+  echo >>"$SUB_BODY"
+  kill -HUP "$(cat "$PID_FILE")"
+  sleep 3
+  grep -q "订阅热更新：1 成员（继承 1 健康），组 proxy" "$LOG" \
+    || { echo "FAIL: 日志无订阅热更新或健康继承计数"; tail -8 "$LOG"; exit 1; }
+  "$LOADER" status --socket "$STATUS_SOCK" --json >/tmp/mini-dae-status.json
+  python3 - /tmp/mini-dae-status.json <<'PY'
+import json, sys
+v = json.load(open(sys.argv[1]))
+g = v.get("group") or {}
+assert g.get("members") == 1, g
+assert g.get("nodes")[0]["name"] == "node-a", g
+assert g.get("nodes")[0]["alive"], g
+print("hot reload: members=%d node=%s alive=%s" % (g["members"], g["nodes"][0]["name"], g["nodes"][0]["alive"]))
+PY
+  out="$(ip netns exec "$CLIENT_NS" timeout 8 python3 "$HERE/client_probe.py" "$PROXY_DST" 8080 2>&1 || true)"
+  echo "$out" | grep -q "wan-echo-ok" || { echo "FAIL: 热更新后拨号失败"; echo "$out"; exit 1; }
+  echo "PASS: 订阅热更新（成员 2→1，node-a 继承健康，拨号正常）"
+}
+
 # P4c：TCP offload——同一 512KB 流量下，用户态字节数远小于总传输（内核拼接证据）。
 test_relay_offload() {
   require_root
@@ -2611,6 +2760,8 @@ case "${1:-}" in
     # P17a：配置里有 dip(geoip: cn)（编译期展开），用小型夹具提供 geodata 文件。
     USE_CONFIG="$HERE/real-user.dae" USE_GEODATA_DIR=/tmp/mini-dae-geodata up ;;
   subscribe-up) subscribe_up ;;
+  sub-reload-up) subscribe_up ;;  # P18e：热更新测试的前置（与 subscribe-up 相同）
+  test-sub-reload) test_sub_reload ;;
   test-subscribe) test_subscribe ;;
   v6-up) USE_RULES="$HERE/rules.v6.dae" USE_SS=1 USE_SS_METHOD=chacha20-ietf-poly1305 \
     USE_SS_PASSWORD=testpass USE_DIALER="ss://chacha20-ietf-poly1305:testpass@127.0.0.1:$SS_PORT" \
@@ -2648,6 +2799,8 @@ case "${1:-}" in
   udp-up) USE_RULES="$HERE/rules.udp.dae" USE_UDP_IDLE=2 up ;;
   ss-up) USE_RULES="$HERE/rules.dae" USE_SS=1 USE_SS_METHOD=chacha20-ietf-poly1305 USE_SS_PASSWORD=testpass \
     USE_DIALER="ss://chacha20-ietf-poly1305:testpass@127.0.0.1:$SS_PORT" USE_OFFLOAD=1 USE_RELAY_IDLE=600 up ;;
+  ss2022-up) ss2022_up ;;  # P18e：SS2022（shadowsocks-rust ssserver 参考对端）
+  http-up) http_up ;;      # P18e：HTTP CONNECT 出站（Python 夹具）
   ss-udp-up) USE_RULES="$HERE/rules.udp.dae" USE_SS=1 USE_SS_METHOD=chacha20-ietf-poly1305 USE_SS_PASSWORD=testpass \
     USE_DIALER="ss://chacha20-ietf-poly1305:testpass@127.0.0.1:$SS_PORT" up ;;
   trojan-up) USE_RULES="$HERE/rules.dae" USE_TROJAN=1 USE_TROJAN_PASSWORD=testpass \
@@ -2706,6 +2859,8 @@ case "${1:-}" in
   test-relay-offload) test_relay_offload ;;
   test-offload-lifecycle) test_offload_lifecycle ;;
   test-ss) test_ss ;;
+  test-ss2022) test_ss2022 ;;  # P18e
+  test-http) test_http_out ;;   # P18e
   test-trojan) test_trojan ;;
   test-ss-udp) test_ss_udp ;;
   test-vless) test_vless ;;
@@ -2729,5 +2884,5 @@ case "${1:-}" in
   status) status ;;
   trace) trace ;;
   down) down ;;
-  *) echo "usage: $0 {build|up|dual-up|config-up|forward-up|dns-up|dot-up|doh-up|doq-up|dnsroute-up|dns-udp-up|dns-tcpup-up|geo-up|pname-up|regex-up|relay-up|offload-up|udp-up|ss-up|ss-udp-up|trojan-up|vless-up|vless-tls-up|vless-udp-up|vmess-up|vmess-tls-up|vmess-udp-up|tuic-up|tuic-udp-up|hy2-up|hy2-udp-up|hy2-obfs-up|hy2-obfs-udp-up|hy2-brutal-up|hy2-hop-up|ops-up|ops-reload-up|bench-up|test-proxy|test-direct|test-block|test-host-proxy|test-reload|test-rebind|test-status|test-config|test-forward|test-domain|test-dns-cache|test-dns-tcp|test-dns-reload|test-domain-regex|test-dns-edns|test-dot|test-doh|test-doq|test-dnsroute|test-dns-udp|test-dns-tcpup|test-geo|test-pname|test-v6|test-relay|test-relay-idle|test-relay-offload|test-offload-lifecycle|test-udp-relay|test-udp-idle|test-ss|test-trojan|test-ss-udp|test-vless|test-vless-udp|test-vmess|test-vmess-udp|test-tuic|test-tuic-udp|test-hy2|test-hy2-udp|test-hy2-obfs|test-hy2-obfs-udp|test-hy2-brutal|test-hy2-hop|test-ops|test-config-reload|test-fault-reload|test-fault-kill|reload|verify|status|trace|down}"; exit 2 ;;
+  *) echo "usage: $0 {build|up|dual-up|config-up|forward-up|dns-up|dot-up|doh-up|doq-up|dnsroute-up|dns-udp-up|dns-tcpup-up|geo-up|pname-up|regex-up|relay-up|offload-up|udp-up|ss-up|ss2022-up|http-up|ss-udp-up|trojan-up|vless-up|vless-tls-up|vless-udp-up|vmess-up|vmess-tls-up|vmess-udp-up|tuic-up|tuic-udp-up|hy2-up|hy2-udp-up|hy2-obfs-up|hy2-obfs-udp-up|hy2-brutal-up|hy2-hop-up|ops-up|ops-reload-up|bench-up|test-proxy|test-direct|test-block|test-host-proxy|test-reload|test-rebind|test-status|test-config|test-forward|test-domain|test-dns-cache|test-dns-tcp|test-dns-reload|test-domain-regex|test-dns-edns|test-dot|test-doh|test-doq|test-dnsroute|test-dns-udp|test-dns-tcpup|test-geo|test-pname|test-v6|test-relay|test-relay-idle|test-relay-offload|test-offload-lifecycle|test-udp-relay|test-udp-idle|test-ss|test-ss2022|test-http|test-trojan|test-ss-udp|test-vless|test-vless-udp|test-vmess|test-vmess-udp|test-tuic|test-tuic-udp|test-hy2|test-hy2-udp|test-hy2-obfs|test-hy2-obfs-udp|test-hy2-brutal|test-hy2-hop|test-ops|test-config-reload|test-fault-reload|test-fault-kill|reload|verify|status|trace|down}"; exit 2 ;;
 esac

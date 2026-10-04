@@ -161,12 +161,20 @@ pub struct GroupStats {
 pub struct GroupRuntime {
     pub name: String,
     pub policy: Policy,
-    pub members: Vec<Member>,
-    health: Mutex<Vec<Health>>,
+    /// P18e：成员集可热替换（订阅热更新）；Arc 快照读，拨号不持锁。
+    inner: std::sync::RwLock<std::sync::Arc<GroupInner>>,
     pub check_targets: Vec<(String, u16)>,
+    /// P18e：UDP 健康检查目标（解析后的 IP:port）；None = 不启用。
+    pub udp_check_dns: Option<(String, u16)>,
     pub check_interval_secs: u64,
     pub check_tolerance: u32,
     pub stats: GroupStats,
+}
+
+/// 成员 + 健康（整体替换以实现“生成代”隔离）。
+struct GroupInner {
+    members: Vec<Member>,
+    health: Mutex<Vec<Health>>,
 }
 
 impl std::fmt::Debug for GroupRuntime {
@@ -176,7 +184,7 @@ impl std::fmt::Debug for GroupRuntime {
             "GroupRuntime({}, {:?}, {} members)",
             self.name,
             self.policy,
-            self.members.len()
+            self.member_count()
         )
     }
 }
@@ -189,22 +197,74 @@ impl GroupRuntime {
         check_targets: Vec<(String, u16)>,
         check_interval_secs: u64,
         check_tolerance: u32,
+        udp_check_dns: Option<(String, u16)>,
     ) -> Arc<Self> {
         let n = members.len();
         Arc::new(Self {
             name,
             policy,
-            members,
-            health: Mutex::new(vec![Health::default(); n]),
+            inner: std::sync::RwLock::new(std::sync::Arc::new(GroupInner {
+                members,
+                health: Mutex::new(vec![Health::default(); n]),
+            })),
             check_targets,
+            udp_check_dns,
             check_interval_secs,
             check_tolerance,
             stats: GroupStats::default(),
         })
     }
 
-    fn health_lock(&self) -> std::sync::MutexGuard<'_, Vec<Health>> {
-        match self.health.lock() {
+    fn inner(&self) -> std::sync::Arc<GroupInner> {
+        match self.inner.read() {
+            Ok(g) => g.clone(),
+            Err(p) => p.into_inner().clone(),
+        }
+    }
+
+    pub fn member_count(&self) -> usize {
+        self.inner().members.len()
+    }
+
+    /// P18e：订阅热更新——整体替换成员（同 name+tag 的成员继承健康/延迟）。
+    /// 返回（新成员数, 继承数）。
+    pub fn replace_members(&self, members: Vec<Member>) -> (usize, usize) {
+        let old = self.inner();
+        let old_hs = match old.health.lock() {
+            Ok(g) => g.clone(),
+            Err(p) => p.into_inner().clone(),
+        };
+        let mut health = Vec::with_capacity(members.len());
+        let mut inherited = 0usize;
+        for m in &members {
+            let mut h = Health::default();
+            if let Some((i, _)) = old
+                .members
+                .iter()
+                .enumerate()
+                .find(|(_, o)| o.name == m.name && o.tag == m.tag)
+            {
+                if let Some(oh) = old_hs.get(i) {
+                    h = oh.clone();
+                    inherited += 1;
+                }
+            }
+            health.push(h);
+        }
+        let n = members.len();
+        let new_inner = std::sync::Arc::new(GroupInner {
+            members,
+            health: Mutex::new(health),
+        });
+        match self.inner.write() {
+            Ok(mut g) => *g = new_inner,
+            Err(p) => *p.into_inner() = new_inner,
+        }
+        (n, inherited)
+    }
+
+    fn health_lock(inner: &GroupInner) -> std::sync::MutexGuard<'_, Vec<Health>> {
+        match inner.health.lock() {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         }
@@ -227,8 +287,9 @@ impl GroupRuntime {
 
     /// 按 policy + 健康状态给出尝试顺序（alive/已知延迟优先，其后未探测，最后 dead）。
     pub fn select_order(&self) -> Vec<usize> {
-        let hs = self.health_lock();
-        let n = self.members.len();
+        let inner = self.inner();
+        let hs = Self::health_lock(&inner);
+        let n = inner.members.len();
         match self.policy {
             Policy::Random => {
                 let mut idx: Vec<usize> = (0..n).collect();
@@ -286,9 +347,8 @@ impl GroupRuntime {
         }
     }
 
-    fn note_dial(&self, i: usize, ok: bool) {
-        let tolerance = self.check_tolerance;
-        let mut hs = self.health_lock();
+    fn note_dial(inner: &GroupInner, i: usize, ok: bool, tolerance: u32) {
+        let mut hs = Self::health_lock(inner);
         if let Some(h) = hs.get_mut(i) {
             if ok {
                 h.fails = 0;
@@ -305,17 +365,19 @@ impl GroupRuntime {
     /// 拨号：按顺序最多尝试 3 个成员；失败自动切换下一个。
     pub fn dial_tcp(&self, target: &Target, timeout: Duration) -> std::io::Result<DialedStream> {
         let order = self.select_order();
+        let inner = self.inner();
+        let tol = self.check_tolerance;
         let mut last_err: Option<std::io::Error> = None;
         let mut tried = 0usize;
         for &i in order.iter().take(3.max(1)) {
             self.stats.dials.fetch_add(1, Ordering::Relaxed);
-            match self.members[i].outbound.dial_tcp(target, timeout) {
+            match inner.members[i].outbound.dial_tcp(target, timeout) {
                 Ok(d) => {
-                    self.note_dial(i, true);
+                    Self::note_dial(&inner, i, true, tol);
                     return Ok(d);
                 }
                 Err(e) => {
-                    self.note_dial(i, false);
+                    Self::note_dial(&inner, i, false, tol);
                     if tried > 0 {
                         self.stats.failovers.fetch_add(1, Ordering::Relaxed);
                     }
@@ -334,20 +396,22 @@ impl GroupRuntime {
         timeout: Duration,
     ) -> std::io::Result<Option<outbound::UdpRelay>> {
         let order = self.select_order();
+        let inner = self.inner();
+        let tol = self.check_tolerance;
         let mut last_err: Option<std::io::Error> = None;
         let mut tried = 0usize;
         for &i in order.iter().take(3.max(1)) {
-            if !self.members[i].outbound.supports_udp() {
+            if !inner.members[i].outbound.supports_udp() {
                 continue;
             }
-            match self.members[i].outbound.dial_udp(target, timeout) {
+            match inner.members[i].outbound.dial_udp(target, timeout) {
                 Ok(Some(r)) => {
-                    self.note_dial(i, true);
+                    Self::note_dial(&inner, i, true, tol);
                     return Ok(Some(r));
                 }
                 Ok(None) => continue,
                 Err(e) => {
-                    self.note_dial(i, false);
+                    Self::note_dial(&inner, i, false, tol);
                     if tried > 0 {
                         self.stats.failovers.fetch_add(1, Ordering::Relaxed);
                     }
@@ -363,13 +427,18 @@ impl GroupRuntime {
     }
 
     pub fn supports_udp(&self) -> bool {
-        self.members.iter().any(|m| m.outbound.supports_udp())
+        self.inner()
+            .members
+            .iter()
+            .any(|m| m.outbound.supports_udp())
     }
 
     /// 健康快照（状态面用）。
     pub fn snapshot(&self) -> Vec<(String, String, bool, Option<u64>, Option<f64>)> {
-        let hs = self.health_lock();
-        self.members
+        let inner = self.inner();
+        let hs = Self::health_lock(&inner);
+        inner
+            .members
             .iter()
             .zip(hs.iter())
             .map(|(m, h)| (m.name.clone(), m.tag.clone(), h.alive, h.last_ms, h.ema_ms))
@@ -378,12 +447,14 @@ impl GroupRuntime {
 
     /// 启动健康探测线程：周期性经每个成员连接 check 目标，成功即更新延迟/存活。
     pub fn spawn_health_loop(self: &Arc<Self>) {
-        if self.check_targets.is_empty() || self.members.is_empty() {
+        if (self.check_targets.is_empty() && self.udp_check_dns.is_none())
+            || self.member_count() == 0
+        {
             return;
         }
         let g = self.clone();
         std::thread::spawn(move || loop {
-            let n = g.members.len();
+            let n = g.member_count();
             let mut i = 0;
             while i < n {
                 let end = (i + 8).min(n);
@@ -401,24 +472,65 @@ impl GroupRuntime {
         });
     }
 
+    /// 记录一次探测结果（UDP/TCP 共用）。
+    fn record_probe(&self, inner: &GroupInner, i: usize, ok: bool, ms: u64) {
+        let tol = self.check_tolerance;
+        if ok {
+            self.stats.probes_ok.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.stats.probes_fail.fetch_add(1, Ordering::Relaxed);
+        }
+        if let Some(h) = Self::health_lock(inner).get_mut(i) {
+            h.note_probe(ok, ms, tol);
+        }
+    }
+
+    /// UDP DNS 探测：经该节点向 udp_check_dns 发一条最小 DNS 查询并等应答。
+    /// （dae `udp_check_dns` 语义；目标需在构建时解析为 IP:port。）
+    fn udp_probe(out: &outbound::Outbound, dns: &(String, u16)) -> std::io::Result<()> {
+        let target: std::net::SocketAddr = format!("{}:{}", dns.0, dns.1)
+            .parse()
+            .map_err(|e| std::io::Error::other(format!("udp_check_dns 目标非法: {e}")))?;
+        let relay = out
+            .dial_udp(target, Duration::from_secs(5))?
+            .ok_or_else(|| std::io::Error::other("outbound 不支持 UDP"))?;
+        relay.set_read_timeout(Some(Duration::from_secs(3)))?;
+        relay.send_payload(&dns_query())?;
+        let mut buf = [0u8; 512];
+        let r = relay.recv_payload(&mut buf)?;
+        if r.is_empty() {
+            return Err(std::io::Error::other("UDP check 空响应"));
+        }
+        Ok(())
+    }
+
     fn probe(&self, i: usize) -> std::io::Result<()> {
+        let inner = self.inner();
+        let Some(member) = inner.members.get(i) else {
+            return Ok(());
+        };
+        let t0 = Instant::now();
+        // P18e：配置 udp_check_dns 且成员支持 UDP 时，优先 UDP DNS 探测；
+        // 失败回退 TCP（dae health check：UDP 能力节点以 UDP 检查为主）。
+        if let Some(dns) = self.udp_check_dns.as_ref() {
+            if member.outbound.supports_udp() {
+                if let Ok(()) = Self::udp_probe(&member.outbound, dns) {
+                    self.record_probe(&inner, i, true, t0.elapsed().as_millis() as u64);
+                    return Ok(());
+                }
+            }
+        }
         let Some((host, port)) = self.check_targets.first().cloned() else {
             return Ok(());
         };
         let target: Target = format!("{host}:{port}")
             .parse()
             .map_err(|e| std::io::Error::other(format!("check 目标非法: {e}")))?;
-        let t0 = Instant::now();
-        let d = match self.members[i]
-            .outbound
-            .dial_tcp(&target, Duration::from_secs(5))
-        {
+        let d = match member.outbound.dial_tcp(&target, Duration::from_secs(5)) {
             Ok(d) => d,
             Err(e) => {
                 // 拨号失败必须计入健康状态（否则死节点永远不会被标死）
-                self.stats.probes_fail.fetch_add(1, Ordering::Relaxed);
-                let tol = self.check_tolerance;
-                self.health_lock()[i].note_probe(false, 0, tol);
+                self.record_probe(&inner, i, false, 0);
                 return Err(e);
             }
         };
@@ -435,18 +547,32 @@ impl GroupRuntime {
             ok = ok_write && read_ok;
         }
         let ms = t0.elapsed().as_millis() as u64;
+        self.record_probe(&inner, i, ok, ms);
         if ok {
-            self.stats.probes_ok.fetch_add(1, Ordering::Relaxed);
-            let tol = self.check_tolerance;
-            self.health_lock()[i].note_probe(true, ms, tol);
             Ok(())
         } else {
-            self.stats.probes_fail.fetch_add(1, Ordering::Relaxed);
-            let tol = self.check_tolerance;
-            self.health_lock()[i].note_probe(false, 0, tol);
             Err(std::io::Error::other("check 无响应"))
         }
     }
+}
+
+/// 最小 DNS A 查询（ID 固定；健康探测只需任意应答）。
+fn dns_query() -> Vec<u8> {
+    let mut q = Vec::with_capacity(29);
+    q.extend_from_slice(&0x1234u16.to_be_bytes());
+    q.extend_from_slice(&0x0100u16.to_be_bytes()); // RD
+    q.extend_from_slice(&1u16.to_be_bytes()); // QDCOUNT
+    q.extend_from_slice(&0u16.to_be_bytes()); // ANCOUNT
+    q.extend_from_slice(&0u16.to_be_bytes()); // NSCOUNT
+    q.extend_from_slice(&0u16.to_be_bytes()); // ARCOUNT
+    for label in [b"a" as &[u8], b"com"] {
+        q.push(label.len() as u8);
+        q.extend_from_slice(label);
+    }
+    q.push(0);
+    q.extend_from_slice(&1u16.to_be_bytes()); // QTYPE A
+    q.extend_from_slice(&1u16.to_be_bytes()); // QCLASS IN
+    q
 }
 
 /// 从已解析节点 + 组配置构建成员（filter 命中；空 filter = 全部）。
@@ -529,6 +655,44 @@ mod tests {
     }
 
     #[test]
+    fn replace_members_inherits_health_by_name_tag() {
+        // P18e：订阅热更新——同名+tag 成员继承健康/延迟，新成员默认健康。
+        let dummy = crate::outbound::Outbound::Direct;
+        let mk = |name: &str| Member {
+            name: name.into(),
+            tag: "t".into(),
+            outbound: dummy.clone(),
+        };
+        let g = GroupRuntime::new(
+            "g".into(),
+            Policy::Min,
+            vec![mk("a"), mk("b")],
+            vec![],
+            30,
+            1,
+            None,
+        );
+        {
+            let inner = g.inner();
+            let mut hs = GroupRuntime::health_lock(&inner);
+            hs[0].note_probe(true, 33, 0);
+            hs[1].alive = false;
+        }
+        let (n, inherited) = g.replace_members(vec![mk("a"), mk("c")]);
+        assert_eq!(n, 2);
+        assert_eq!(inherited, 1, "a 应继承");
+        let snap = g.snapshot();
+        assert_eq!(snap.len(), 2);
+        assert_eq!(snap[0].0, "a");
+        assert!(snap[0].2, "a 继承 alive");
+        assert_eq!(snap[0].3, Some(33), "a 继承 last_ms");
+        assert_eq!(snap[1].0, "c");
+        assert!(snap[1].2, "新成员默认 alive");
+        assert_eq!(snap[1].3, None);
+        assert_eq!(g.member_count(), 2);
+    }
+
+    #[test]
     fn policy_parse() {
         assert_eq!(parse_policy(Some("random")), Policy::Random);
         assert_eq!(parse_policy(Some("min")), Policy::Min);
@@ -558,9 +722,10 @@ mod tests {
                 outbound: dummy,
             },
         ];
-        let g = GroupRuntime::new("g".into(), Policy::Min, members, vec![], 30, 1);
+        let g = GroupRuntime::new("g".into(), Policy::Min, members, vec![], 30, 1, None);
         {
-            let mut hs = g.health_lock();
+            let inner = g.inner();
+            let mut hs = GroupRuntime::health_lock(&inner);
             hs[0].note_probe(true, 200, 1);
             hs[1].note_probe(true, 20, 1);
             hs[2].alive = false;
@@ -584,6 +749,7 @@ mod tests {
             vec![("127.0.0.1".into(), 1)],
             1,
             0,
+            None,
         );
         assert!(g.probe(0).is_err());
         assert_eq!(g.stats.probes_fail.load(Ordering::Relaxed), 1);

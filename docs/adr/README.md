@@ -66,6 +66,7 @@
 | [0039](./ADR-0039-dns-response-sip-bench.md) | 应答侧 `sip(...)`（按客户端来源过滤应答）+ `dns-bench` 子命令（用户态、marked socket、同域名跨上游 min/avg/p50/TTL 对比）；真机 router↔DoH↔DoH+ECS A/B | 已采纳 | —（P18c 实用化扩展三） |
 | [0040](./ADR-0040-dns-pname-bench-concurrency.md) | DNS `pname()`（mini 扩展：WAN egress 按 DNS 流写入 `dns_sender_pname_map`，控制面 raw lookup 反查；请求/应答双侧过滤；陈旧条目 GC）+ `dns-bench` 并发/多轮 p95；真机 python3/getent/TCP 三态验证 | 已采纳 | —（P18c 实用化扩展四） |
 | [0041](./ADR-0041-reality-vision.md) | REALITY + Vision（自实现 TLS 1.3 客户端）：Chrome 形状 CH + X25519MLKEM768（ml-kem）+ session_id AES-GCM 密封 + 证书 HMAC-SHA512/ed25519 绑定；Vision 帧层（UUID/cmd/len/pad、长填充、下行 splice 裸读）；订阅#2 48 条 REALITY 入组（对标表缺口 #6 首段） | 已采纳 | —（P18d 执行；缺口 #6 首段） |
+| [0042](./ADR-0042-p18e-batch.md) | P18e 批量收尾：SS2022（SIP022 三方法）+ HTTP CONNECT 出站；SIGHUP 订阅热更新（成员热替换 + 健康继承）；`--max-conns` 并发上限；`udp_check_dns` 组 UDP 检查；eBPF 分片处理；geodata XDG；嗅探 h2c（最小 HPACK）+ QUIC Initial 识别；CI/systemd/install.sh/deploy.md | 已采纳 | —（P18e 执行；缺口 #1/#3/#6/#7/#8/#9/#11/#13 批量） |
 
 ## 新增一条 ADR
 

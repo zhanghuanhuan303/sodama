@@ -132,6 +132,8 @@ struct SniffStats {
     attempts: AtomicU64,
     hits: AtomicU64,
     misses: AtomicU64,
+    /// P18e：识别到的 QUIC Initial 包（仅统计，SNI 需解 Initial 加密）。
+    quic_initial: AtomicU64,
 }
 impl SniffStats {
     const fn new() -> Self {
@@ -139,6 +141,7 @@ impl SniffStats {
             attempts: AtomicU64::new(0),
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
+            quic_initial: AtomicU64::new(0),
         }
     }
 }
@@ -162,6 +165,8 @@ struct RelayStats {
     evicted: AtomicU64,
     offloaded_total: AtomicU64,
     offload_failures: AtomicU64,
+    /// P18e：并发上限拒绝数（--max-conns）。
+    limit_rejected: AtomicU64,
 }
 static RELAY_STATS: RelayStats = RelayStats {
     conns_total: AtomicU64::new(0),
@@ -172,7 +177,11 @@ static RELAY_STATS: RelayStats = RelayStats {
     evicted: AtomicU64::new(0),
     offloaded_total: AtomicU64::new(0),
     offload_failures: AtomicU64::new(0),
+    limit_rejected: AtomicU64::new(0),
 };
+
+/// P18e：relay 并发上限（0 = 不限；对照 dae relay 的并发上限）。
+static RELAY_MAX_CONNS: AtomicU64 = AtomicU64::new(0);
 
 /// P4c：offload 用的 fast_sock SOCKHASH（从 Ebpf 中取出后由 relay 线程共享写入）。
 static RELAY_OFFLOAD: OnceLock<Mutex<SockHash<MapData, MiniTuple>>> = OnceLock::new();
@@ -655,6 +664,8 @@ struct Args {
     dialer: Option<String>,
     /// P4：relay 空闲回收秒数（默认 300）
     relay_idle_timeout: Option<u64>,
+    /// P18e：relay 并发上限（0/未设 = 不限）
+    max_conns: Option<u64>,
     /// P11：relay 拨号超时秒数（默认 5；真实节点慢首连可调大）
     dial_timeout: Option<u64>,
     /// P14：拨号模式 ip|domain|domain+（缺省 ip；config global.dial_mode 可提供）
@@ -762,6 +773,7 @@ fn usage() -> ! {
            --udp-idle-timeout <s>   P4：UDP NAT 会话空闲秒数（默认 60）\n\
            --forward <url>       旧写法：等价于 --dialer socks5://host:port\n\
            --offload             P4c：启用 TCP relay offload（内核对拼，需 --dialer）\n\
+           --max-conns <N>       P18e：relay 并发上限（0=不限；超限直接关闭并计数）\n\
            --dns-upstream <url>  P3a：DNS 上游（host:port 或 udp://host:port）\n\
            --dump                打印编译出的 match_set / LPM 内容\n\
            --compile-dump <path> 只编译规则并按对拍格式打印（不加载 eBPF，不需要 root）\n\
@@ -801,6 +813,7 @@ fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
         status_socket: None,
         dialer: None,
         relay_idle_timeout: None,
+        max_conns: None,
         dial_timeout: None,
         dial_mode: None,
         sniffing_timeout_ms: None,
@@ -859,6 +872,7 @@ fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
             "--udp-idle-timeout" => args.udp_idle_timeout = Some(next()?.parse()?),
             "--forward" => args.forward = Some(next()?),
             "--offload" => args.offload = true,
+            "--max-conns" => args.max_conns = Some(next()?.parse()?),
             "--dns-upstream" => args.dns_upstream = Some(next()?),
             "--dump" => args.dump = true,
             "--compile-dump" => args.compile_dump = Some(next()?),
@@ -1691,6 +1705,14 @@ fn handle_socks_conn(mut client: TcpStream) {
 
 /// relay 一条连接：按 dialer 拨号到 orig_dst，双向转发（含半关闭）。
 fn handle_relay_conn(mut client: TcpStream) {
+    // P18e：并发上限（--max-conns；0=不限）。超限直接关闭并计数（对照 dae 并发限制）。
+    let max = RELAY_MAX_CONNS.load(Ordering::Relaxed);
+    if max != 0 && RELAY_STATS.conns_active.load(Ordering::Relaxed) >= max {
+        RELAY_STATS.limit_rejected.fetch_add(1, Ordering::Relaxed);
+        log(&format!("relay 并发上限 {max} 已满，拒绝新连接"));
+        let _ = client.shutdown(std::net::Shutdown::Both);
+        return;
+    }
     let Ok(orig) = client.local_addr() else {
         return;
     };
@@ -2203,6 +2225,8 @@ fn do_reload(args: &Args, ebpf: &mut Ebpf) -> ReloadOutcome {
             }
             // 对照 dae reconcileCurrentBpfProjections：新槽需要重建域位图。
             reconcile_domain_bits(ebpf);
+            // P18e：订阅热更新（重拉订阅 → 整体替换活动组成员）。
+            reload_group_members(args);
             log(&format!("热重载完成（{n} 条 match_set）"));
             ReloadOutcome {
                 ok: true,
@@ -2290,51 +2314,20 @@ fn build_group_outbound(args: &Args) -> Option<outbound::Outbound> {
             })
             .ok()
     });
-    let sub_specs = cfg.as_ref().map(config::subscriptions).unwrap_or_default();
-    let node_specs = cfg.as_ref().map(config::inline_nodes).unwrap_or_default();
     let group_specs = cfg.as_ref().map(config::groups).unwrap_or_default();
-    if sub_specs.is_empty() && args.subscribe.is_empty() && node_specs.is_empty() {
+    let has_subs = cfg
+        .as_ref()
+        .map(|c| !config::subscriptions(c).is_empty())
+        .unwrap_or(false);
+    let has_nodes = cfg
+        .as_ref()
+        .map(|c| !config::inline_nodes(c).is_empty())
+        .unwrap_or(false);
+    if !has_subs && !has_nodes && args.subscribe.is_empty() {
         return None;
     }
 
-    let mut nodes: Vec<subscribe::ParsedNode> = Vec::new();
-    for n in &node_specs {
-        match outbound::parse(&n.link) {
-            Ok(o) => nodes.push(subscribe::ParsedNode {
-                name: n.name.clone(),
-                tag: "node".into(),
-                outbound: o,
-            }),
-            Err(e) => log(&format!("节点 {} 不支持: {e}", n.name)),
-        }
-    }
-    let timeout = Duration::from_secs(15);
-    let cli_subs: Vec<(String, String)> = args
-        .subscribe
-        .iter()
-        .enumerate()
-        .map(|(i, u)| (format!("cli{}", i + 1), u.clone()))
-        .collect();
-    for (tag, url) in sub_specs
-        .iter()
-        .map(|s| (s.tag.clone(), s.url.clone()))
-        .chain(cli_subs)
-    {
-        match subscribe::fetch(&url, timeout).and_then(|b| subscribe::decode_body(&b)) {
-            Ok(text) => {
-                let (mut ns, errs) = subscribe::parse_subscription(&text, &tag);
-                for e in errs.iter().take(3) {
-                    log(&format!("订阅 {tag}: {e}"));
-                }
-                if errs.len() > 3 {
-                    log(&format!("订阅 {tag}: 另有 {} 行不支持", errs.len() - 3));
-                }
-                log(&format!("订阅 {tag}: 拉取成功，{} 个节点", ns.len()));
-                nodes.append(&mut ns);
-            }
-            Err(e) => log(&format!("订阅 {tag} 拉取失败: {e}")),
-        }
-    }
+    let nodes = fetch_nodes(cfg.as_ref(), args);
     if nodes.is_empty() {
         log("未获得任何可用节点，组不启用");
         return None;
@@ -2391,6 +2384,26 @@ fn build_group_outbound(args: &Args) -> Option<outbound::Outbound> {
         .or_else(|| global_str("check_tolerance"))
         .and_then(|v| parse_duration_secs(&v))
         .unwrap_or(1) as u32;
+    // P18e：udp_check_dns（组级 > 全局；取第一个，域名在此解析一次，失败则禁用）。
+    let udp_check_dns = spec
+        .and_then(|g| g.udp_check_dns.clone())
+        .or_else(|| global_str("udp_check_dns"))
+        .and_then(|s| {
+            use std::net::ToSocketAddrs as _;
+            let first = s.split(',').next().unwrap_or("").trim().to_string();
+            if first.is_empty() {
+                return None;
+            }
+            match first.to_socket_addrs() {
+                Ok(mut it) => it.next().map(|a| (a.ip().to_string(), a.port())),
+                Err(e) => {
+                    log(&format!(
+                        "组 {gname}: udp_check_dns '{first}' 解析失败（{e}），UDP 检查禁用"
+                    ));
+                    None
+                }
+            }
+        });
 
     let rt = group::GroupRuntime::new(
         gname.clone(),
@@ -2399,14 +2412,100 @@ fn build_group_outbound(args: &Args) -> Option<outbound::Outbound> {
         targets.clone(),
         interval,
         tolerance,
+        udp_check_dns.clone(),
     );
     log(&format!(
-        "节点组 {gname}: {} 个成员, policy={policy:?}, check={targets:?} 每 {interval}s, 容忍 {tolerance} 次失败",
-        rt.members.len()
+        "节点组 {gname}: {} 个成员, policy={policy:?}, check={targets:?} 每 {interval}s, 容忍 {tolerance} 次失败, udp_check={udp_check_dns:?}",
+        rt.member_count()
     ));
     rt.spawn_health_loop();
     let _ = ACTIVE_GROUP.set(rt.clone());
     Some(outbound::Outbound::Group(rt))
+}
+
+/// 拉取内联节点 + 全部订阅（config subscription 与 CLI `--subscribe`）——
+/// 组构建与 SIGHUP 订阅热更新共用。
+fn fetch_nodes(cfg: Option<&config::Config>, args: &Args) -> Vec<subscribe::ParsedNode> {
+    let node_specs = cfg.map(config::inline_nodes).unwrap_or_default();
+    let sub_specs = cfg.map(config::subscriptions).unwrap_or_default();
+    let mut nodes: Vec<subscribe::ParsedNode> = Vec::new();
+    for n in &node_specs {
+        match outbound::parse(&n.link) {
+            Ok(o) => nodes.push(subscribe::ParsedNode {
+                name: n.name.clone(),
+                tag: "node".into(),
+                outbound: o,
+            }),
+            Err(e) => log(&format!("节点 {} 不支持: {e}", n.name)),
+        }
+    }
+    let timeout = Duration::from_secs(15);
+    let cli_subs: Vec<(String, String)> = args
+        .subscribe
+        .iter()
+        .enumerate()
+        .map(|(i, u)| (format!("cli{}", i + 1), u.clone()))
+        .collect();
+    for (tag, url) in sub_specs
+        .iter()
+        .map(|s| (s.tag.clone(), s.url.clone()))
+        .chain(cli_subs)
+    {
+        match subscribe::fetch(&url, timeout).and_then(|b| subscribe::decode_body(&b)) {
+            Ok(text) => {
+                let (mut ns, errs) = subscribe::parse_subscription(&text, &tag);
+                for e in errs.iter().take(3) {
+                    log(&format!("订阅 {tag}: {e}"));
+                }
+                if errs.len() > 3 {
+                    log(&format!("订阅 {tag}: 另有 {} 行不支持", errs.len() - 3));
+                }
+                log(&format!("订阅 {tag}: 拉取成功，{} 个节点", ns.len()));
+                nodes.append(&mut ns);
+            }
+            Err(e) => log(&format!("订阅 {tag} 拉取失败: {e}")),
+        }
+    }
+    nodes
+}
+
+/// P18e：SIGHUP 订阅热更新——重拉订阅并整体替换活动组成员
+/// （同 name+tag 成员继承健康/延迟）；失败（无节点/filter 后为空）保留旧成员。
+fn reload_group_members(args: &Args) {
+    let Some(g) = ACTIVE_GROUP.get() else {
+        return;
+    };
+    let cfg = args.config.as_ref().and_then(|p| {
+        config::load(std::path::Path::new(p))
+            .map_err(|d| {
+                log(&format!("订阅热更新：配置解析失败（{} 条诊断）", d.len()));
+            })
+            .ok()
+    });
+    let nodes = fetch_nodes(cfg.as_ref(), args);
+    if nodes.is_empty() {
+        log("订阅热更新：未获得任何节点，保留旧成员");
+        return;
+    }
+    // 按当前活动组名回查 filter（非 config 组时为空 = 全收，与初次构建一致）。
+    let filters = cfg
+        .as_ref()
+        .map(config::groups)
+        .unwrap_or_default()
+        .into_iter()
+        .find(|s| s.name == g.name)
+        .map(|s| s.filters)
+        .unwrap_or_default();
+    let members = group::build_members(&nodes, &filters);
+    if members.is_empty() {
+        log("订阅热更新：filter 后无成员，保留旧成员");
+        return;
+    }
+    let (n, inherited) = g.replace_members(members);
+    log(&format!(
+        "订阅热更新：{n} 成员（继承 {inherited} 健康），组 {}",
+        g.name
+    ));
 }
 
 fn parse_check_target(u: &str) -> Option<(String, u16)> {
@@ -2474,6 +2573,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if let Some(s) = args.relay_idle_timeout {
         RELAY_IDLE_SECS.store(s, Ordering::SeqCst);
+    }
+    if let Some(n) = args.max_conns {
+        RELAY_MAX_CONNS.store(n, Ordering::SeqCst);
     }
     if let Some(s) = args.dial_timeout {
         RELAY_DIAL_TIMEOUT_MS.store(s.saturating_mul(1000), Ordering::SeqCst);
@@ -3544,6 +3646,10 @@ fn udp_nat_handle(
     let sess = match existing {
         Some(s) => s,
         None => {
+            // P18e：QUIC Initial 识别（长头 + ≥1200B）；仅统计，不做 SNI 解析。
+            if data.len() >= 1200 && data[0] & 0xC0 == 0xC0 {
+                SNIFF_STATS.quic_initial.fetch_add(1, Ordering::Relaxed);
+            }
             // 慢路径：先拨号（不持锁——TLS/协议拨号可能耗一个 RTT）
             let Some(reply) = reply_socket_for(reply_sockets, orig_dst) else {
                 UDP_NAT_STATS.errors.fetch_add(1, Ordering::Relaxed);
@@ -4280,6 +4386,8 @@ fn status_json(ebpf: &mut Ebpf) -> serde_json::Value {
             "offload_enabled": RELAY_OFFLOAD.get().is_some(),
             "offloaded_total": RELAY_STATS.offloaded_total.load(Ordering::Relaxed),
             "offload_failures": RELAY_STATS.offload_failures.load(Ordering::Relaxed),
+            "max_conns": RELAY_MAX_CONNS.load(Ordering::Relaxed),
+            "limit_rejected": RELAY_STATS.limit_rejected.load(Ordering::Relaxed),
         },
         "sniffing": {
             "dial_mode": dial_mode_name(DIAL_MODE.load(Ordering::Relaxed)),
@@ -4287,6 +4395,7 @@ fn status_json(ebpf: &mut Ebpf) -> serde_json::Value {
             "attempts": SNIFF_STATS.attempts.load(Ordering::Relaxed),
             "hits": SNIFF_STATS.hits.load(Ordering::Relaxed),
             "misses": SNIFF_STATS.misses.load(Ordering::Relaxed),
+            "quic_initial": SNIFF_STATS.quic_initial.load(Ordering::Relaxed),
         },
         // P17b：pname 采集面（cgroup2 钩子 + cookie→pname map）
         "pname": {
@@ -4302,7 +4411,7 @@ fn status_json(ebpf: &mut Ebpf) -> serde_json::Value {
                 json!({
                     "name": g.name,
                     "policy": format!("{:?}", g.policy),
-                    "members": g.members.len(),
+                    "members": g.member_count(),
                     "alive": snap.iter().filter(|x| x.2).count(),
                     "dials": g.stats.dials.load(Ordering::Relaxed),
                     "failovers": g.stats.failovers.load(Ordering::Relaxed),
@@ -4488,6 +4597,12 @@ fn metrics_text(v: &serde_json::Value) -> String {
         "counter",
         "mini_dae_offload_failures",
         get(v, &["relay", "offload_failures"]),
+    );
+    emit(
+        &mut s,
+        "counter",
+        "mini_dae_relay_limit_rejected",
+        get(v, &["relay", "limit_rejected"]),
     );
     emit(
         &mut s,

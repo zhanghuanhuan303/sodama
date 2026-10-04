@@ -18,6 +18,10 @@ pub fn parse_v4(ctx: &TcContext) -> Option<MiniParseResult> {
     if ihl < 20 {
         return None;
     }
+    // 分片：非首片（offset != 0）没有完整 L4 头，交内核原路径（对照 dae tproxy.c:1131）。
+    if (u16::from_be(iph.frag_off) & 0x1fff) != 0 {
+        return None;
+    }
 
     let mut out = MiniParseResult::default();
     out.tuples.sip = v4_mapped_bytes(iph.saddr);
@@ -59,6 +63,16 @@ pub fn parse_v6(ctx: &TcContext) -> Option<MiniParseResult> {
         off += hdr_len;
         next = ext_next;
         hops += 1;
+    }
+    // 分片头（44）：非首片交内核；首片跳过 8B 继续解 L4（对照 dae tproxy.c:1214）。
+    if next == 0x2c {
+        let frag_next: u8 = ctx.load(off as usize).ok()?;
+        let frag_word: u16 = ctx.load(off as usize + 2).ok()?;
+        if (u16::from_be(frag_word) & 0xfff8) != 0 {
+            return None;
+        }
+        off += 8;
+        next = frag_next;
     }
 
     let mut out = MiniParseResult::default();

@@ -5,7 +5,7 @@ netns 实验环境。**K0–K3、P3a（DNS 接管/域位图）、P3b-1（缓存/
 （domain(regex:)/EDNS）、P4（TCP relay / UDP NAT / TCP offload）、P5-G1（shadowsocks +
 trojan）、P5-G2（vless + vmess AEAD）、P5-G3a（tuic v5 / QUIC）、P5-G3b（hysteria2 /
 QUIC + 最小 HTTP/3 认证）、P5-G3b+（salamander 混淆 / Brutal 近似 / udphop）、
-P18a–d（DoT/DoH、DoQ、`dns.routing`、ECS/sip、pname、REALITY+Vision）与
+P18a–e（DoT/DoH、DoQ、`dns.routing`、ECS/sip、pname、REALITY+Vision、SS2022/http、热更新、CI/systemd）与
 P6（suspend/reload/metrics/sysdump/日志轮转/整配置热重载）已完成**；P9+ 已删除 C 数据面，
 `ebpf-rs` 的 Rust 对象是**唯一数据面**（ADR-0025）。
 
@@ -123,6 +123,15 @@ P6（suspend/reload/metrics/sysdump/日志轮转/整配置热重载）已完成*
   证书 HMAC-SHA512+ed25519 绑定）、`vision.rs`（帧层 + 下行 splice）；
   `vless://…security=reality…flow=xtls-rprx-vision` 直接解析入组；
   订阅#2 66/66 节点入组，真机 HTTP/HTTPS 实测（ADR-0041、NOTES §11.32）
+- **P18e 批量收尾（协议/组/数据面/工程化）**：SS2022（SIP022 三方法，BLAKE3
+  子密钥，跨实现 shadowsocks-rust）+ HTTP CONNECT 出站；**SIGHUP 订阅热更新**
+  （重拉订阅 → 成员整体替换 + 同名继承健康，失败保留旧成员）；`--max-conns`
+  并发上限 + `limit_rejected`；组 `udp_check_dns`（UDP DNS 探测优先、失败回退 TCP）；
+  eBPF **分片处理**（v4 非首片跳过 / v6 分片头）；geodata **XDG** 搜索目录；
+  嗅探 **h2c**（preface + 最小 HPACK `:authority`）+ QUIC Initial 识别统计；
+  **GitHub Actions CI**（loader 构建/单测/eBPF 对象，固定 nightly + bpf-linker）+
+  **systemd unit + install.sh（--dry-run/--uninstall）+ `docs/deploy.md`**；
+  lab 新增 `ss2022-up`/`http-up`/`sub-reload-up` 三用例（ADR-0042、NOTES §11.33）
 - **P5-G3a QUIC（tuic v5）**：惰性 tokio 运行时 + quinn（阻塞 relay 用 block_on 桥接）；
   认证 token = TLS exporter（label=uuid 裸字节、context=password）；TCP 每条中继一条 QUIC
   双向流，UDP 走 QUIC DATAGRAM（含分片/重组）；上游 socket 用自建 `Endpoint` 打 `SO_MARK`；
@@ -170,17 +179,17 @@ loader/src/main.rs   Rust + aya：加载、挂钩子、setns、tproxy/UDP socket
                      relay/Dialer、UDP NAT、offload 注册、janitor、只读状态面、DNS 线程
 loader/src/rules.rs  迷你规则解析 + 编译（match_set 编码 + LPM trie + regex 编译 + dump/对拍）
 loader/src/target.rs P14：拨号目标类型（IPv4/IPv6/域名）+ 逐协议编码（vless/vmess/tuic/RFC1928/字符串；v6 形式见 P16）
-loader/src/sniffer.rs P14：TLS SNI / HTTP Host 嗅探（纯解析函数 + MSG_PEEK 采集循环）
+loader/src/sniffer.rs P14/P18e：TLS SNI / HTTP Host / h2c（preface + 最小 HPACK :authority）嗅探（纯解析函数 + MSG_PEEK 采集循环）
 loader/src/subscribe.rs P15：订阅拉取（HTTP(S)/file、重定向/chunked/base64）+ 链接解析
-loader/src/group.rs   P15：节点组 filter/policy/健康探测/失败切换（GroupRuntime）
-loader/src/geodata.rs P17a：v2ray .dat 读取（手写 protobuf）+ geoip/geosite 展开/搜索目录/缓存
+loader/src/group.rs   P15/P18e：节点组 filter/policy/健康探测/失败切换（GroupRuntime）；P18e 成员热替换（replace_members 健康继承）+ udp_check_dns
+loader/src/geodata.rs P17a：v2ray .dat 读取（手写 protobuf）+ geoip/geosite 展开/搜索目录（含 XDG）/缓存
 loader/src/config.rs 全量 .dae 解析（词法/语法、include 合并、schema 校验、deferred 提取）
 loader/src/status.rs 状态面（Unix socket：status/rules/config/maps/metrics + reload/suspend/resume 控制命令）
 loader/src/socks5.rs 最小 SOCKS5 客户端（relay 的一种 dialer，握手 + CONNECT）
-loader/src/outbound.rs 拨号器梯度：direct / socks5 / shadowsocks / trojan / vless / vmess / tuic /
-                     hysteria2；URL 解析、标记 socket、ReadHalf/WriteHalf、UDP relay、offload/UDP 能力判定
-loader/src/ss.rs    shadowsocks classic AEAD（SIP004：evp_bytes_to_key + HKDF-SHA1，
-                   TCP 分块 / UDP 包，读写两半）
+loader/src/outbound.rs 拨号器梯度：direct / socks5 / shadowsocks(含 2022) / trojan / vless / vmess / tuic /
+                     hysteria2 / http(CONNECT)；URL 解析、标记 socket、ReadHalf/WriteHalf、UDP relay、offload/UDP 能力判定
+loader/src/ss.rs    shadowsocks classic AEAD（SIP004）+ SS2022（SIP022：BLAKE3 子密钥,
+                   TCP 随机 salt / UDP session+packet id；读写两半）
 loader/src/tls.rs   共享 TLS 层（rustls：握手 + 读路径 pending/抽干不变量，ALPN）
 loader/src/trojan.rs trojan（TLS + CONNECT 头；仅 TCP；无 close_notify 半关闭）
 loader/src/vless.rs vless（TCP/UDP，tls/none/reality，tcp/ws 传输，addons flow=xtls-rprx-vision，响应头惰性解析）
@@ -231,7 +240,8 @@ lab/rules.regex.dae  P3b-2a regex 域分流规则（api[0-9]+.regex.test 命中�
 lab/rules.udp.dae    P4b UDP NAT 规则（所有 UDP:9998 判 proxy，验证 mark 防自环）
 lab/lab.sh           建/拆 netns 拓扑（标准 + 单臂）、跑测试、热重载、故障注入
 lab/gateway.sh       P13：真网关模式一键脚本（up/down/status/test/--dry-run；宿主流量透明接管；P15 支持 --subscribe/--group；P18c 支持 --config/--dns/--geodata-dir）
-lab/sub_server.py    P15：订阅服务器夹具（GET /sub 返回指定文件内容）
+lab/sub_server.py    P15：订阅服务器夹具（GET /sub 返回指定文件内容；P18e 起按请求重读）
+lab/http_connect_server.py P18e：独立实现的 HTTP CONNECT 代理（可选 Basic；ss/代理跨实现验证用）
 lab/rules.gateway.dae P13：网关模式规则（DNS must 置顶、无私网 sip、QUIC block、fallback proxy）
 lab/gateway.dae      P18c：网关模式配置（同规则的 routing + DNS 进控制面 → 国内走本地明文/其余 DoH + 广告拦截）
 lab/blocklist.txt    P18c：自定义 DNS 拦截名单（qname(file:) 读取；默认全部注释）
@@ -258,6 +268,16 @@ lab/matrix/SUMMARY.md 矩阵执行结果与未覆盖项
 - QUIC 交叉验证（P5-G3a/G3b）：Go 工具链 + module 缓存
 - （可选）sing-box：anytls 跨实现测试靶子（`cargo test` 缺失时自动跳过）
   （`lab/proto-check/build-tuic-server.sh` / `build-hy2-server.sh`）
+- （可选）shadowsocks-rust（`ssserver`，P18e ss2022 跨实现对端，`pacman -S shadowsocks-rust`）
+
+## 部署（P18e）
+
+系统级安装：`install/install.sh`（二进制 → `/usr/local/bin`、unit → 系统 unit 目录、
+配置与 geodata 示例；支持 `--dry-run` 与 `--uninstall`）；unit 文件
+`install/dae-mini.service`（capability 最小集、SIGHUP `ExecReload`）——详细步骤与
+真网关模式配合见 [`docs/deploy.md`](../docs/deploy.md)。CI（GitHub Actions）覆盖
+loader 构建、`cargo test --release` 与 eBPF 对象构建（`.github/workflows/ci.yml`，
+固定 nightly-2026-09-29 + bpf-linker 0.11.1；fmt/clippy 刻意不入 CI，见文件内注释）。
 
 ## 快速开始
 

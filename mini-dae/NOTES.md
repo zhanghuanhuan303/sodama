@@ -1184,6 +1184,45 @@ addons flow。）
   **66/66 入组** + `gateway.sh test` PASS + curl http/https 正常；lab verify
   9/9 无回归。
 
+### 11.33 P18e 批量收尾（SS2022/http/热更新/并发上限/分片/XDG/嗅探/CI，ADR-0042）
+
+（实现：`loader/src/ss.rs`、`outbound.rs`、`group.rs`、`sniffer.rs`、`geodata.rs`、
+`main.rs`；`ebpf-rs/src/parse.rs`；`.github/workflows/ci.yml`、`install/`、`docs/deploy.md`；
+lab 夹具 `http_connect_server.py` + `sub_server.py` 每次重读。）
+
+- **SS2022（SIP022）**：`2022-blake3-aes-128-gcm/-aes-256-gcm/-chacha20-poly1305`；
+  URI 的 password 是 PSK 标准 base64（**严禁** EVP_BytesToKey，长度硬校验）；
+  子密钥 `BLAKE3 derive_key("shadowsocks 2022 session subkey", PSK||salt)`；
+  TCP 随机 salt + 长度域独立 AEAD 块 + 首块 timestamp（容差 30s）；UDP
+  `session_id(8B)+packet_id(8B)`、每会话重放窗口上限 32；跨实现对端：
+  **shadowsocks-rust ssserver**（pacman 安装，`--outbound-fwmark 563` 防自环）。
+- **HTTP CONNECT 出站**：`http://[user:pass@]host:port`；读响应头到 `\r\n\r\n`、
+  非 200 报错、Basic 认证；`supports_udp()==false`（UDP 调用方直连回退）。
+- **订阅热更新**：`GroupRuntime.inner: RwLock<Arc<GroupInner>>`（成员+健康同锁）；
+  `replace_members` 按 **name+tag** 继承 health（alive/last/EMA/hist），
+  返回（新成员数, 继承数）；拨号/探测持 Arc 快照零锁竞争；
+  `do_reload` 成功路径调 `reload_group_members`（重拉订阅→按活动组名回查 filter→替换）；
+  无节点/替换后为空 → 保留旧成员。日志：`订阅热更新：N 成员（继承 M 健康），组 X`。
+- **并发上限**：`--max-conns N`（0=不限）+ `limit_rejected`（状态面 + Prometheus
+  `mini_dae_relay_limit_rejected`）；超限即关连接。
+- **udp_check_dns**：组级 > 全局，取第一个、构建期解析（失败禁用并告警）；
+  支持 UDP 的成员优先 UDP DNS 探测（最小 A 查询，等应答；3s 读/5s 拨号），
+  失败回退 TCP；探测记账统一 `record_probe`。
+- **eBPF 分片**（对照 `tproxy.c:1131/1214`）：v4 `frag_off & 0x1fff != 0` 跳过；
+  v6 分片扩展头（0x2c）非首片跳过、首片 +8B 继续。**改完已重建对象**（build-ebpf-rs.sh）。
+- **h2c**：`PRI * HTTP/2.0` preface + 跳 SETTINGS，首个 HEADERS 帧走最小 HPACK
+  （61 项静态表、前缀整数、Huffman 复用 `hpack.rs`）取 `:authority`；
+  动态表引用/CONTINUATION/无 END_HEADERS → No（回退 IP）。
+- **QUIC**：仅 Initial 识别统计（新 UDP 会话首包长头 && ≥1200B）→ `sniffing.quic_initial`；
+  SNI 需解 Initial 加密，本阶段不做（如实）。
+- **geodata XDG**：搜索目录加 `$XDG_DATA_HOME/dae` / `~/.local/share/dae` /
+  `$XDG_DATA_DIRS/*/dae`（config 目录之后、系统目录之前）。
+- **工程化**：GitHub Actions（固定 nightly-2026-09-29 + bpf-linker 0.11.1 + LLVM23；
+  loader 构建/单测/eBPF 对象校验；fmt/clippy 刻意不入 CI）、`install/dae-mini.service`（capability 最小集 + `ExecReload`
+  SIGHUP）、`install/install.sh`（`--dry-run`/`--uninstall`）、`docs/deploy.md`。
+- lab 新命令：`ss2022-up`/`test-ss2022`、`http-up`/`test-http`、`sub-reload-up`/`test-sub-reload`；
+  `sub_server.py` 改为按请求重读文件。
+
 ## 12. 用 Rust 重写这套东西的可行性
 
 已验证（本仓库 mini-dae，实测跑通）：

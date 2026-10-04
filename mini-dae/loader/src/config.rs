@@ -1915,6 +1915,8 @@ pub struct GroupSpec {
     pub tcp_check_urls: Vec<String>,
     pub check_interval: Option<String>,
     pub check_tolerance: Option<String>,
+    /// P18e：UDP 健康检查目标（`udp_check_dns: 'dns.google:53'`）；空 = 不做 UDP 检查。
+    pub udp_check_dns: Option<String>,
 }
 
 pub fn subscriptions(cfg: &Config) -> Vec<SubSpec> {
@@ -1971,6 +1973,7 @@ pub fn groups(cfg: &Config) -> Vec<GroupSpec> {
                 tcp_check_urls: Vec::new(),
                 check_interval: None,
                 check_tolerance: None,
+                udp_check_dns: None,
             };
             for it in &g.items {
                 let Item::Param(p) = it else { continue };
@@ -1992,6 +1995,7 @@ pub fn groups(cfg: &Config) -> Vec<GroupSpec> {
                     }
                     Some("check_interval") => spec.check_interval = p.val.clone(),
                     Some("check_tolerance") => spec.check_tolerance = p.val.clone(),
+                    Some("udp_check_dns") => spec.udp_check_dns = p.val.clone(),
                     _ => {}
                 }
             }
@@ -2119,6 +2123,28 @@ routing {
         assert!(parse("global {").is_err());
         assert!(parse("global { x: 'oops }").is_err());
         assert!(parse("/* never ends").is_err());
+    }
+
+    #[test]
+    fn group_spec_parses_udp_check_and_check_params() {
+        let secs = parse(
+            "routing { fallback: proxy }\ngroup { proxy { filter: subtag(x)\nudp_check_dns: 'dns.google:53, 8.8.8.8:53'\ncheck_interval: 15\ncheck_tolerance: 2 } }\n",
+        )
+        .unwrap();
+        let cfg = Config {
+            entry: PathBuf::from("t.dae"),
+            files: vec![],
+            sections: secs,
+        };
+        let gs = groups(&cfg);
+        assert_eq!(gs.len(), 1);
+        assert_eq!(gs[0].name, "proxy");
+        assert_eq!(
+            gs[0].udp_check_dns.as_deref(),
+            Some("dns.google:53, 8.8.8.8:53")
+        );
+        assert_eq!(gs[0].check_interval.as_deref(), Some("15"));
+        assert_eq!(gs[0].check_tolerance.as_deref(), Some("2"));
     }
 
     #[test]

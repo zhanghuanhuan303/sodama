@@ -1,5 +1,5 @@
 //! P14：用户态嗅探（TLS ClientHello SNI / HTTP Host）——为 `dial_mode: domain`
-//! 提供远端解析目标。
+//! 提供远端解析目标。P18e 追加 h2c（明文 HTTP/2 preface + HPACK `:authority`）。
 //!
 //! 对照 dae：dae 的嗅探在内核侧做（`sniffing_timeout`，默认 30ms，读客户端
 //! 首个 TCP 载荷的头部）；本实现把嗅探放在 relay accept 之后、拨号之前，
@@ -7,8 +7,10 @@
 //! `--sniffing-timeout-ms`（默认 100ms）约束。
 //!
 //! 边界（如实）：
-//! - 只识别 TLS（SNI）与 HTTP/1.x（Host / CONNECT）；HTTP/2 前言、QUIC、其他
-//!   二进制协议一律回退按 IP 拨号；
+//! - 识别 TLS（SNI）、HTTP/1.x（Host / CONNECT）与 h2c（HTTP/2 明文）：
+//!   h2c 解析 preface 后的首个 HEADERS 帧，支持静态表索引/字面量与 Huffman；
+//!   引用动态表或 CONTINUATION 时回退按 IP 拨号；
+//! - QUIC 不在本模块（UDP 数据面只做 Initial 识别统计，见 main.rs）；
 //! - ClientHello 跨多条 TLS record 到达属极端场景，本解析只看第一条 record
 //!   （超时后按 IP 回退，不阻塞）；
 //! - 不做 dae 的「域名单词表/后台探测门槛」：命中即用域名（等价 dae 的
@@ -39,10 +41,228 @@ pub fn sniff(buf: &[u8]) -> Sniff {
     if buf.is_empty() {
         return Sniff::NeedMore;
     }
+    if buf[0] == b'P' {
+        if buf.starts_with(H2_PREFACE) {
+            return parse_h2c(buf);
+        }
+        if H2_PREFACE.starts_with(buf) {
+            return Sniff::NeedMore;
+        }
+    }
     if buf[0] == 0x16 || buf[0] == 0x14 || buf[0] == 0x15 || buf[0] == 0x17 {
         return parse_tls(buf);
     }
     parse_http(buf)
+}
+
+/// HTTP/2 明文（h2c）连接前言（RFC 9113 §3.4）。
+const H2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+
+/// h2c：解析 preface 之后的首个 HEADERS 帧，取 HPACK `:authority`。
+/// 只为嗅探服务：假设单帧 header block（END_HEADERS）、不使用动态表；
+/// 遇到无法理解的结构返回 No（回退 IP）。
+fn parse_h2c(buf: &[u8]) -> Sniff {
+    let mut off = H2_PREFACE.len();
+    loop {
+        if buf.len() < off + 9 {
+            return if buf.len() >= MAX_PEEK {
+                Sniff::No
+            } else {
+                Sniff::NeedMore
+            };
+        }
+        let len =
+            ((buf[off] as usize) << 16) | ((buf[off + 1] as usize) << 8) | buf[off + 2] as usize;
+        let ftype = buf[off + 3];
+        let flags = buf[off + 4];
+        if len > 16384 {
+            return Sniff::No;
+        }
+        if buf.len() < off + 9 + len {
+            return Sniff::NeedMore;
+        }
+        let payload = &buf[off + 9..off + 9 + len];
+        if ftype == 0x01 {
+            // HEADERS
+            if flags & 0x04 == 0 {
+                return Sniff::No; // 需要 CONTINUATION，放弃
+            }
+            let mut p = payload;
+            if flags & 0x08 != 0 {
+                // PADDED：1 字节 pad 长度 + 尾部 pad
+                let Some(&padb) = p.first() else {
+                    return Sniff::No;
+                };
+                let pad = padb as usize;
+                if p.len() < 1 + pad {
+                    return Sniff::No;
+                }
+                p = &p[1..p.len() - pad];
+            }
+            if flags & 0x20 != 0 {
+                // PRIORITY：5 字节
+                if p.len() < 5 {
+                    return Sniff::No;
+                }
+                p = &p[5..];
+            }
+            return match hpack_authority(p) {
+                Some(a) => Sniff::Found(a),
+                None => Sniff::No,
+            };
+        }
+        off += 9 + len;
+        if off > MAX_PEEK {
+            return Sniff::No;
+        }
+    }
+}
+
+/// HPACK 静态表（RFC 7541 附录 A，1-based 索引）。
+const HPACK_STATIC: [(&str, &str); 61] = [
+    (":authority", ""),
+    (":method", "GET"),
+    (":method", "POST"),
+    (":path", "/"),
+    (":path", "/index.html"),
+    (":scheme", "http"),
+    (":scheme", "https"),
+    (":status", "200"),
+    (":status", "204"),
+    (":status", "206"),
+    (":status", "304"),
+    (":status", "400"),
+    (":status", "404"),
+    (":status", "500"),
+    ("accept-charset", ""),
+    ("accept-encoding", "gzip, deflate"),
+    ("accept-language", ""),
+    ("accept-ranges", ""),
+    ("accept", ""),
+    ("access-control-allow-origin", ""),
+    ("age", ""),
+    ("allow", ""),
+    ("authorization", ""),
+    ("cache-control", ""),
+    ("content-disposition", ""),
+    ("content-encoding", ""),
+    ("content-language", ""),
+    ("content-length", ""),
+    ("content-location", ""),
+    ("content-range", ""),
+    ("content-type", ""),
+    ("cookie", ""),
+    ("date", ""),
+    ("etag", ""),
+    ("expect", ""),
+    ("expires", ""),
+    ("from", ""),
+    ("host", ""),
+    ("if-match", ""),
+    ("if-modified-since", ""),
+    ("if-none-match", ""),
+    ("if-range", ""),
+    ("if-unmodified-since", ""),
+    ("last-modified", ""),
+    ("link", ""),
+    ("location", ""),
+    ("max-forwards", ""),
+    ("proxy-authenticate", ""),
+    ("proxy-authorization", ""),
+    ("range", ""),
+    ("referer", ""),
+    ("refresh", ""),
+    ("retry-after", ""),
+    ("server", ""),
+    ("set-cookie", ""),
+    ("strict-transport-security", ""),
+    ("transfer-encoding", ""),
+    ("user-agent", ""),
+    ("vary", ""),
+    ("via", ""),
+    ("www-authenticate", ""),
+];
+
+/// HPACK 前 n 位前缀整数（RFC 7541 §5.1）。
+fn hpack_int(buf: &[u8], pos: &mut usize, prefix_bits: u8) -> Option<u64> {
+    let first = *buf.get(*pos)?;
+    let mask = (1u16 << prefix_bits) - 1;
+    let mut val = (first as u16 & mask) as u64;
+    *pos += 1;
+    if val == mask as u64 {
+        let mut shift = 0u32;
+        loop {
+            let b = *buf.get(*pos)?;
+            *pos += 1;
+            val += ((b & 0x7f) as u64) << shift;
+            shift += 7;
+            if b & 0x80 == 0 {
+                break;
+            }
+            if shift > 28 {
+                return None;
+            }
+        }
+    }
+    Some(val)
+}
+
+/// HPACK 字符串（H 位 + 7 位长度；Huffman 复用 QUIC 侧解码器）。
+fn hpack_str(buf: &[u8], pos: &mut usize) -> Option<Vec<u8>> {
+    let huff = *buf.get(*pos)? & 0x80 != 0;
+    let len = hpack_int(buf, pos, 7)? as usize;
+    let s = buf.get(*pos..*pos + len)?;
+    *pos += len;
+    if huff {
+        crate::hpack::huffman_decode(s).ok()
+    } else {
+        Some(s.to_vec())
+    }
+}
+
+/// 在 HPACK 块中找 `:authority`（动态表引用/表大小更新以外的形态均支持）。
+fn hpack_authority(block: &[u8]) -> Option<String> {
+    let mut pos = 0usize;
+    while pos < block.len() {
+        let b = block[pos];
+        let name: Vec<u8> = if b & 0x80 != 0 {
+            // 索引字段（静态表）
+            let idx = hpack_int(block, &mut pos, 7)? as usize;
+            if idx == 0 || idx > 61 {
+                return None;
+            }
+            let (n, v) = HPACK_STATIC[idx - 1];
+            if n == ":authority" {
+                return (!v.is_empty()).then(|| v.to_string());
+            }
+            continue;
+        } else if b & 0x40 != 0 {
+            // 字面量，带增量索引
+            hpack_name(block, &mut pos, 6)?
+        } else if b & 0x20 != 0 {
+            // 动态表大小更新
+            let _ = hpack_int(block, &mut pos, 5)?;
+            continue;
+        } else {
+            // 无索引 / 从不索引
+            hpack_name(block, &mut pos, 4)?
+        };
+        let val = hpack_str(block, &mut pos)?;
+        if name == b":authority" {
+            return String::from_utf8(val).ok();
+        }
+    }
+    None
+}
+
+/// 读字面量的 name：索引 0 为字符串，否则静态表查找（动态表不支持）。
+fn hpack_name(block: &[u8], pos: &mut usize, prefix_bits: u8) -> Option<Vec<u8>> {
+    let idx = hpack_int(block, pos, prefix_bits)? as usize;
+    if idx == 0 {
+        return hpack_str(block, pos);
+    }
+    let (n, _) = HPACK_STATIC.get(idx - 1)?;
+    Some(n.as_bytes().to_vec())
 }
 
 fn parse_tls(buf: &[u8]) -> Sniff {
@@ -369,5 +589,73 @@ mod tests {
     fn binary_is_no() {
         assert_eq!(sniff(&[0x00, 0x01, 0x02, 0x03]), Sniff::No);
         assert_eq!(sniff(b"SSH-2.0-OpenSSH_9.0\r\n"), Sniff::No);
+    }
+
+    /// 构造 h2c 请求：preface + SETTINGS + HEADERS。
+    fn h2c(authority_hpack: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(H2_PREFACE);
+        out.extend_from_slice(&[0, 0, 0, 0x04, 0, 0, 0, 0, 0]); // SETTINGS 空帧
+        let mut block = vec![0x82, 0x86, 0x84]; // :method GET / :scheme http / :path /
+        block.extend_from_slice(authority_hpack);
+        let l = block.len();
+        out.extend_from_slice(&[
+            ((l >> 16) & 0xff) as u8,
+            ((l >> 8) & 0xff) as u8,
+            (l & 0xff) as u8,
+            0x01, // HEADERS
+            0x04, // END_HEADERS
+            0,
+            0,
+            0,
+            1,
+        ]);
+        out.extend_from_slice(&block);
+        out
+    }
+
+    #[test]
+    fn h2c_authority_found() {
+        // 字面量带增量索引，name 指静态表 1（:authority），值非 Huffman
+        let mut lit = vec![0x41, 11];
+        lit.extend_from_slice(b"example.com");
+        let buf = h2c(&lit);
+        assert_eq!(sniff(&buf), Sniff::Found("example.com".into()));
+    }
+
+    #[test]
+    fn h2c_authority_huffman() {
+        // RFC 7541 C.4 "www.example.com" 的 Huffman 向量
+        let mut lit = vec![0x41, 0x8c];
+        lit.extend_from_slice(&[
+            0xf1, 0xe3, 0xc2, 0xe5, 0xf2, 0x3a, 0x6b, 0xa0, 0xab, 0x90, 0xf4, 0xff,
+        ]);
+        let buf = h2c(&lit);
+        assert_eq!(sniff(&buf), Sniff::Found("www.example.com".into()));
+    }
+
+    #[test]
+    fn h2c_need_more_until_complete() {
+        let mut lit = vec![0x41, 11];
+        lit.extend_from_slice(b"example.com");
+        let buf = h2c(&lit);
+        for cut in [
+            1usize,
+            10,
+            H2_PREFACE.len(),
+            H2_PREFACE.len() + 5,
+            buf.len() - 1,
+        ] {
+            assert_eq!(sniff(&buf[..cut]), Sniff::NeedMore, "cut={cut}");
+        }
+        assert_eq!(sniff(&buf), Sniff::Found("example.com".into()));
+    }
+
+    #[test]
+    fn h2c_dynamic_table_ref_is_no() {
+        // 索引字段指向动态表（>61）——放弃（回退 IP）
+        let lit = vec![0x80 | 62];
+        let buf = h2c(&lit);
+        assert_eq!(sniff(&buf), Sniff::No);
     }
 }

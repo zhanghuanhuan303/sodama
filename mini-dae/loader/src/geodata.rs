@@ -503,6 +503,21 @@ pub fn search_dirs(cli_dirs: &[PathBuf], config_path: Option<&Path>) -> Vec<Path
             push(parent.to_path_buf(), &mut dirs);
         }
     }
+    // XDG 数据目录（$XDG_DATA_HOME/dae + $XDG_DATA_DIRS/*/dae，含 ~/.local/share/dae）。
+    if let Ok(home) = std::env::var("XDG_DATA_HOME") {
+        if !home.is_empty() {
+            push(PathBuf::from(home).join("dae"), &mut dirs);
+        }
+    } else if let Ok(h) = std::env::var("HOME") {
+        if !h.is_empty() {
+            push(PathBuf::from(h).join(".local/share/dae"), &mut dirs);
+        }
+    }
+    let data_dirs = std::env::var("XDG_DATA_DIRS")
+        .unwrap_or_else(|_| "/usr/local/share:/usr/share".to_string());
+    for d in data_dirs.split(':').filter(|s| !s.is_empty()) {
+        push(PathBuf::from(d).join("dae"), &mut dirs);
+    }
     for d in ["/etc/dae", "/usr/local/share/dae", "/usr/share/dae"] {
         push(PathBuf::from(d), &mut dirs);
     }
