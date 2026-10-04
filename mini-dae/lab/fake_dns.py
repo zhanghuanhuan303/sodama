@@ -45,6 +45,9 @@ TABLE = {
     # P18b：DoQ 夹具（doq-server 转发到本服务）
     "doq.test": "10.9.10.37",
     "doq2.test": "10.9.10.38",
+    # P26：DoH over HTTP/3 夹具（doh-h3-server 转发到本服务）
+    "doh3.test": "10.9.10.39",
+    "doh4.test": "10.9.10.40",
     # P18c：dns.routing 夹具
     "blocked.test": "10.9.10.43",
     "via2.test": "10.9.10.42",

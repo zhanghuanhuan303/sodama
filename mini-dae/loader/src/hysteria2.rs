@@ -34,6 +34,7 @@ use tokio::runtime::Runtime;
 use crate::brutal::{self, RateTarget};
 use crate::hpack::{qpack_decode, qpack_encode};
 use crate::quicsock::{HopSocket, ObfsSocket, PlainUdpSocket};
+use crate::quicvarint::{read_varint, read_varint_async, varint_len, write_varint};
 
 const FRAME_HEADERS: u64 = 0x01;
 const FRAME_DATA: u64 = 0x00;
@@ -87,55 +88,6 @@ impl std::fmt::Debug for Hy2Dialer {
 
 fn map_err<E: std::fmt::Display>(what: &'static str, e: E) -> io::Error {
     io::Error::new(ErrorKind::Other, format!("hy2: {what}: {e}"))
-}
-
-// ---------------------------------------------------------------- QUIC varint
-
-pub fn varint_len(v: u64) -> usize {
-    if v < 64 {
-        1
-    } else if v < 16384 {
-        2
-    } else if v < (1 << 30) {
-        4
-    } else {
-        8
-    }
-}
-
-pub fn write_varint(dst: &mut Vec<u8>, v: u64) {
-    match varint_len(v) {
-        1 => dst.push(v as u8),
-        2 => {
-            let b = (v as u16 | 0x4000).to_be_bytes();
-            dst.extend_from_slice(&b);
-        }
-        4 => {
-            let b = (v as u32 | 0x8000_0000).to_be_bytes();
-            dst.extend_from_slice(&b);
-        }
-        _ => {
-            let b = (v | 0xC000_0000_0000_0000).to_be_bytes();
-            dst.extend_from_slice(&b);
-        }
-    }
-}
-
-pub fn read_varint(buf: &[u8], pos: &mut usize) -> Option<u64> {
-    if *pos >= buf.len() {
-        return None;
-    }
-    let first = buf[*pos];
-    let len = 1usize << (first >> 6);
-    if *pos + len > buf.len() {
-        return None;
-    }
-    let mut v = (first & 0x3f) as u64;
-    for &b in &buf[*pos + 1..*pos + len] {
-        v = (v << 8) | b as u64;
-    }
-    *pos += len;
-    Some(v)
 }
 
 fn random_pad(rng: &mut impl Rng, min: usize, max: usize) -> Vec<u8> {
@@ -508,25 +460,6 @@ fn min_bandwidth(server_rx: u64, client_tx: u64) -> u64 {
         tx = client_tx;
     }
     tx
-}
-
-async fn read_varint_async(recv: &mut quinn::RecvStream) -> io::Result<u64> {
-    let mut first = [0u8; 1];
-    recv.read_exact(&mut first)
-        .await
-        .map_err(|e| map_err("varint 读", e))?;
-    let len = 1usize << (first[0] >> 6);
-    let mut v = (first[0] & 0x3f) as u64;
-    if len > 1 {
-        let mut rest = [0u8; 7];
-        recv.read_exact(&mut rest[..len - 1])
-            .await
-            .map_err(|e| map_err("varint 读", e))?;
-        for &b in &rest[..len - 1] {
-            v = (v << 8) | b as u64;
-        }
-    }
-    Ok(v)
 }
 
 // ---------------------------------------------------------------- TCP 读写半

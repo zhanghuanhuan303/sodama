@@ -12,7 +12,7 @@
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use base64::Engine as _;
@@ -245,6 +245,12 @@ impl WriteHalf for tls13::Tls13Writer {
 impl WriteHalf for crate::h2client::TunnelWriter {
     fn shutdown_write(&self) -> io::Result<()> {
         crate::h2client::TunnelWriter::end_stream(self)
+    }
+}
+
+impl WriteHalf for crate::h3client::H3TunnelWriter {
+    fn shutdown_write(&self) -> io::Result<()> {
+        crate::h3client::H3TunnelWriter::end_stream(self)
     }
 }
 
@@ -534,13 +540,15 @@ pub enum Outbound {
         sni: String,
         insecure: bool,
     },
-    /// P25：naive（HTTP/2 CONNECT，Basic 认证；TLS 固定开启、仅 h2，无 QUIC/H3）。
+    /// P25/P26：naive（CONNECT + Basic）；`h3=false` 走 HTTP/2（`naive+https://`），
+    /// `h3=true` 走 HTTP/3（`naive+quic://`，QUIC 无底层 TcpStream）。
     Naive {
         server: SocketAddr,
         user: String,
         pass: String,
         sni: String,
         insecure: bool,
+        h3: bool,
     },
     /// P15：节点组（订阅/内联节点池）+ policy + 健康检查；拨号层选择与失败切换。
     Group(std::sync::Arc<GroupRuntime>),
@@ -590,6 +598,9 @@ impl Outbound {
             Self::Tuic { dialer } => dialer.name(),
             Self::Hysteria2 { dialer } => dialer.name(),
             Self::AnyTls { server, sni, .. } => format!("anytls://{server}?sni={sni}"),
+            Self::Naive {
+                server, h3: true, ..
+            } => format!("naive+quic://{server}"),
             Self::Naive { server, .. } => format!("naive+https://{server}"),
             Self::Group(g) => format!("group:{}（{} 节点）", g.name, g.member_count()),
         }
@@ -789,8 +800,64 @@ impl Outbound {
                 pass,
                 sni,
                 insecure,
+                h3,
             } => {
                 use base64::Engine as _;
+                let auth = format!(
+                    "Basic {}",
+                    base64::engine::general_purpose::STANDARD.encode(format!("{user}:{pass}"))
+                );
+                if *h3 {
+                    // P26：naive+quic（HTTP/3 CONNECT）——QUIC 无底层 TcpStream（socket=None，
+                    // 与 tuic/hy2 一样不与 offload 搭配）。
+                    let rustls_cfg = tls::build_rustls_config(*insecure, &[b"h3".to_vec()]);
+                    let quic_crypto = quinn::crypto::rustls::QuicClientConfig::try_from(rustls_cfg)
+                        .map_err(|e| io::Error::other(format!("naive h3 TLS 配置: {e}")))?;
+                    let mut transport = quinn::TransportConfig::default();
+                    transport.keep_alive_interval(Some(Duration::from_secs(5)));
+                    transport.max_idle_timeout(Some(
+                        quinn::IdleTimeout::try_from(Duration::from_secs(60))
+                            .map_err(|e| io::Error::other(format!("naive h3 idle: {e}")))?,
+                    ));
+                    let mut client_cfg = quinn::ClientConfig::new(Arc::new(quic_crypto));
+                    client_cfg.transport_config(Arc::new(transport));
+                    let sock = new_marked_udp()?;
+                    let rt = crate::tuic::runtime();
+                    let mut endpoint = rt.block_on(async {
+                        quinn::Endpoint::new(
+                            quinn::EndpointConfig::default(),
+                            None,
+                            sock,
+                            Arc::new(quinn::TokioRuntime),
+                        )
+                        .map_err(|e| io::Error::other(format!("naive h3 endpoint: {e}")))
+                    })?;
+                    endpoint.set_default_client_config(client_cfg);
+                    let conn = rt.block_on(async {
+                        let connecting = endpoint
+                            .connect(*server, sni)
+                            .map_err(|e| io::Error::other(format!("naive h3 connect: {e}")))?;
+                        match tokio::time::timeout(timeout, connecting).await {
+                            Ok(Ok(c)) => Ok(c),
+                            Ok(Err(e)) => Err(io::Error::other(format!("naive h3 握手失败: {e}"))),
+                            Err(_) => Err(io::Error::other("naive h3 连接超时")),
+                        }
+                    })?;
+                    let h3conn =
+                        crate::h3client::H3Conn::new(conn, endpoint).map_err(io::Error::other)?;
+                    let (tr, tw) = h3conn
+                        .connect_tunnel(
+                            &target.to_string(),
+                            &[("proxy-authorization", auth.as_str())],
+                            timeout,
+                        )
+                        .map_err(io::Error::other)?;
+                    return Ok(DialedStream {
+                        from_remote: Box::new(tr),
+                        to_remote: Box::new(tw),
+                        socket: None,
+                    });
+                }
                 let sock = marked_tcp_connect(*server, timeout)?;
                 let kill = sock.try_clone()?;
                 let ((mut r, mut w), alpn) =
@@ -798,15 +865,11 @@ impl Outbound {
                 if alpn.as_deref() != Some(b"h2") {
                     return Err(io::Error::new(
                         std::io::ErrorKind::InvalidData,
-                        "naive: 服务端未协商 ALPN=h2（naive+quic/H3 未实现）",
+                        "naive: 服务端未协商 ALPN=h2（naive+quic 用于 HTTP/3）",
                     ));
                 }
                 let mut h2 =
                     crate::h2client::H2Conn::handshake(&mut r, &mut w).map_err(io::Error::other)?;
-                let auth = format!(
-                    "Basic {}",
-                    base64::engine::general_purpose::STANDARD.encode(format!("{user}:{pass}"))
-                );
                 let (tr, tw) = h2
                     .connect_tunnel(
                         r,
@@ -1027,15 +1090,15 @@ pub fn parse(url: &str) -> Result<Outbound, String> {
     if let Some(rest) = url.strip_prefix("anytls://") {
         return parse_anytls(rest);
     }
-    // P25：naive（HTTP/2 CONNECT）；naive+quic（H3）显式未实现
+    // P25/P26：naive（h2 = naive+https/naive；h3 = naive+quic）
     if let Some(rest) = url.strip_prefix("naive+https://") {
-        return parse_naive(rest);
+        return parse_naive(rest, false);
+    }
+    if let Some(rest) = url.strip_prefix("naive+quic://") {
+        return parse_naive(rest, true);
     }
     if let Some(rest) = url.strip_prefix("naive://") {
-        return parse_naive(rest);
-    }
-    if url.starts_with("naive+quic://") {
-        return Err("naive+quic（HTTP/3）未实现；可用 naive+https://（h2）".into());
+        return parse_naive(rest, false);
     }
     if url.starts_with("socks5://") || url.contains(':') {
         return Ok(Outbound::Socks5 {
@@ -1044,7 +1107,7 @@ pub fn parse(url: &str) -> Result<Outbound, String> {
     }
     Err(format!(
         "--dialer 不支持 {url}（direct / socks5:// / http:// / ss:// / trojan:// / vless:// / \
-         vmess:// / tuic:// / hysteria2:// / hy2://）"
+         vmess:// / tuic:// / hysteria2:// / hy2:// / anytls:// / naive+https:// / naive+quic://）"
     ))
 }
 
@@ -1095,10 +1158,9 @@ fn parse_anytls(rest: &str) -> Result<Outbound, String> {
     })
 }
 
-/// `naive+https://user:pass@host:port?sni=…&insecure=1`（naiveproxy，HTTP/2 CONNECT）。
-///
-/// 仅 h2（ALPN 协商不到即报错）；`naive+quic://`（H3）未实现。
-fn parse_naive(rest: &str) -> Result<Outbound, String> {
+/// `naive+https://user:pass@host:port?sni=…&insecure=1`（naiveproxy；`h3=false` 走
+/// HTTP/2 CONNECT，`h3=true`（`naive+quic://`）走 HTTP/3 CONNECT）。
+fn parse_naive(rest: &str, h3: bool) -> Result<Outbound, String> {
     let rest = rest.split('#').next().unwrap_or(rest);
     let (main, query) = match rest.split_once('?') {
         Some((m, q)) => (m, q),
@@ -1120,7 +1182,7 @@ fn parse_naive(rest: &str) -> Result<Outbound, String> {
             "insecure" | "allowinsecure" | "allow_insecure" | "skipverify" => {
                 insecure = matches!(v, "1" | "true" | "TRUE" | "True")
             }
-            "alpn" => { /* naive+https 固定 h2，忽略 */ }
+            "alpn" => { /* naive 固定传输（h2/h3 由 scheme 决定），忽略 */ }
             _ => {}
         }
     }
@@ -1141,6 +1203,7 @@ fn parse_naive(rest: &str) -> Result<Outbound, String> {
         pass,
         sni: sni.unwrap_or(default_sni),
         insecure,
+        h3,
     })
 }
 
@@ -1973,12 +2036,30 @@ mod tests {
             }
             other => panic!("应为 Naive: {other:?}"),
         }
-        // H3 显式未实现
-        assert!(parse("naive+quic://u:p@h:443")
-            .unwrap_err()
-            .contains("naive+quic"));
+        // P26：naive+quic（HTTP/3）解析（真实拨号在 lab/真机验证）
+        match parse("naive+quic://carol:pw@1.2.3.4:443?sni=quic.example").unwrap() {
+            Outbound::Naive {
+                user,
+                pass,
+                sni,
+                h3,
+                ..
+            } => {
+                assert_eq!(user, "carol");
+                assert_eq!(pass, "pw");
+                assert_eq!(sni, "quic.example");
+                assert!(h3, "naive+quic 应标记 h3");
+            }
+            other => panic!("应为 Naive: {other:?}"),
+        }
+        // naive+https 保持 h2
+        match parse("naive+https://u:p@1.2.3.4:8443").unwrap() {
+            Outbound::Naive { h3, .. } => assert!(!h3),
+            other => panic!("应为 Naive: {other:?}"),
+        }
         // 缺少 userinfo 报错
         assert!(parse("naive+https://127.0.0.1:8443").is_err());
+        assert!(parse("naive+quic://127.0.0.1:443").is_err());
     }
 
     #[test]

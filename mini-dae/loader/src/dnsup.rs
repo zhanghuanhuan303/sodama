@@ -11,14 +11,16 @@
 //!   或 h2 握手失败时同连接/重连回退 HTTP/1.1（keep-alive + Content-Length/chunked）；
 //! - `quic://`（DoQ，默认 853）：RFC 9250——线上 DNS ID 必须置 0（应答恢复客户端
 //!   ID）、每查询一条双向流、**查询写完 FIN 后才读应答**、连接复用（错流/过期重建）；
-//! - `h3://`（DoH over HTTP/3）未实现（显式报错）。
+//! - `h3://`（DoH over HTTP/3，默认 443/path=/dns-query）：QUIC + ALPN=h3 + 最小
+//!   HTTP/3（`h3client`）POST `application/dns-message`，**连接复用**（失败重建重试）。
 //!
 //! URL 查询参数（mini 扩展，与其它协议一致）：`sni=` 覆盖 TLS SNI、
 //! `insecure=1|allowInsecure=1` 跳过证书校验（lab 自签用）。
 //!
-//! 与 dae 的差异（如实）：DoH 已优先 h2（RFC 8484），H3 未做；h2 客户端为最小实现
-//! （无服务端推送/动态表解码）；上游主机名解析默认系统解析，配置 `global.bootstrap_resolver`
-//! 后改为直连自举（对照 dae：dae 未配置时也有 119.29/223.5 回退，mini 不回退、保持系统解析）。
+//! 与 dae 的差异（如实）：DoH 按 ALPN 优先 h2、可用 `h3://` 显式走 HTTP/3；
+//! h2/h3 客户端均为最小实现（无服务端推送/动态表解码）；上游主机名解析默认系统解析，
+//! 配置 `global.bootstrap_resolver` 后改为直连自举（对照 dae：dae 未配置时也有
+//! 119.29/223.5 回退，mini 不回退、保持系统解析）。
 
 use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs, UdpSocket};
@@ -46,6 +48,7 @@ pub enum Scheme {
     TcpUdp,
     Tls,
     Https,
+    H3,
     Quic,
 }
 
@@ -57,6 +60,7 @@ impl Scheme {
             Scheme::TcpUdp => "tcp+udp",
             Scheme::Tls => "tls",
             Scheme::Https => "https",
+            Scheme::H3 => "h3",
             Scheme::Quic => "quic",
         }
     }
@@ -100,12 +104,8 @@ pub fn parse(raw: &str) -> Result<UpstreamSpec, String> {
         "tcp+udp" | "udp+tcp" => Scheme::TcpUdp,
         "tls" => Scheme::Tls,
         "https" => Scheme::Https,
+        "h3" | "http3" => Scheme::H3,
         "quic" => Scheme::Quic,
-        "h3" | "http3" => {
-            return Err(
-                "DNS 上游 h3://（DoH over HTTP/3）尚未实现；可用 https:// 或 quic://".into(),
-            )
-        }
         other => return Err(format!("DNS 上游 scheme 不支持: {other}")),
     };
     // 拆 query（?sni=…&insecure=1）
@@ -113,8 +113,8 @@ pub fn parse(raw: &str) -> Result<UpstreamSpec, String> {
         Some((h, q)) => (h, q),
         None => (rest, ""),
     };
-    // https 先切出 path（其余 scheme 无 path）
-    let (hostport, path) = if scheme == Scheme::Https {
+    // https/h3 先切出 path（其余 scheme 无 path）
+    let (hostport, path) = if matches!(scheme, Scheme::Https | Scheme::H3) {
         match hostpart.split_once('/') {
             Some((h, p)) => (h, format!("/{}", p.trim_start_matches('/'))),
             None => (hostpart, "/dns-query".to_string()),
@@ -124,7 +124,7 @@ pub fn parse(raw: &str) -> Result<UpstreamSpec, String> {
     };
     let default_port = match scheme {
         Scheme::Tls | Scheme::Quic => 853,
-        Scheme::Https => 443,
+        Scheme::Https | Scheme::H3 => 443,
         _ => 53,
     };
     // host[:port]，支持 [v6]
@@ -224,6 +224,12 @@ struct QuicConn {
     born: Instant,
 }
 
+/// DoH over H3 连接（quinn + 最小 HTTP/3；连接复用，请求串行）。
+struct H3DoH {
+    h3: crate::h3client::H3Conn,
+    born: Instant,
+}
+
 pub struct Upstream {
     pub spec: UpstreamSpec,
     pub url: String,
@@ -232,6 +238,7 @@ pub struct Upstream {
     udp: Option<Mutex<UdpSocket>>,
     persist: Mutex<Option<Persist>>,
     quic: Mutex<Option<QuicConn>>,
+    h3: Mutex<Option<H3DoH>>,
     /// P23：该上游 ALPN 选了 h2 但 h2 握手仍失败（后续直接用 HTTP/1.1）。
     h2_broken: std::sync::atomic::AtomicBool,
 }
@@ -273,6 +280,7 @@ impl Upstream {
             udp,
             persist: Mutex::new(None),
             quic: Mutex::new(None),
+            h3: Mutex::new(None),
             h2_broken: std::sync::atomic::AtomicBool::new(false),
         }))
     }
@@ -302,6 +310,7 @@ impl Upstream {
             }
             Scheme::Tls => self.exchange_tls(query),
             Scheme::Https => self.exchange_https(query),
+            Scheme::H3 => self.exchange_h3(query),
             Scheme::Quic => self.exchange_quic(query),
         }
     }
@@ -590,6 +599,107 @@ impl Upstream {
         restore_dns_id(&mut resp, query);
         Ok(resp)
     }
+
+    /// 取得（必要时新建/重建）DoH H3 连接（ALPN=h3）。
+    fn h3_conn(&self) -> Result<(), String> {
+        let mut g = self.h3.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(h) = g.as_ref() {
+            if h.born.elapsed() < QUIC_IDLE && h.h3.connection().close_reason().is_none() {
+                return Ok(());
+            }
+        }
+        let rustls_cfg = tls::build_rustls_config(self.spec.insecure, &[b"h3".to_vec()]);
+        let quic_crypto = quinn::crypto::rustls::QuicClientConfig::try_from(rustls_cfg)
+            .map_err(|e| format!("DoH h3 TLS 配置: {e}"))?;
+        let mut transport = quinn::TransportConfig::default();
+        transport.keep_alive_interval(Some(Duration::from_secs(5)));
+        transport.max_idle_timeout(Some(
+            quinn::IdleTimeout::try_from(QUIC_IDLE).map_err(|e| format!("idle timeout: {e}"))?,
+        ));
+        let mut client_cfg = quinn::ClientConfig::new(Arc::new(quic_crypto));
+        client_cfg.transport_config(Arc::new(transport));
+        let sock =
+            outbound::new_marked_udp().map_err(|e| format!("DoH h3 建 UDP socket 失败: {e}"))?;
+        let mut endpoint = crate::tuic::runtime().block_on(async {
+            quinn::Endpoint::new(
+                quinn::EndpointConfig::default(),
+                None,
+                sock,
+                Arc::new(quinn::TokioRuntime),
+            )
+            .map_err(|e| format!("DoH h3 endpoint: {e}"))
+        })?;
+        endpoint.set_default_client_config(client_cfg);
+        let sni = self.tls_sni();
+        let conn = crate::tuic::runtime().block_on(async {
+            let connecting = endpoint
+                .connect(self.addr, &sni)
+                .map_err(|e| format!("DoH h3 connect: {e}"))?;
+            match tokio::time::timeout(CONNECT_TIMEOUT, connecting).await {
+                Ok(Ok(c)) => Ok(c),
+                Ok(Err(e)) => Err(format!("DoH h3 握手失败: {e}")),
+                Err(_) => Err("DoH h3 连接超时".to_string()),
+            }
+        })?;
+        // H3Conn::new 自己会 block_on（不能在 block_on 内嵌套调用）
+        let h3 = crate::h3client::H3Conn::new(conn, endpoint)
+            .map_err(|e| format!("DoH h3 初始化: {e}"))?;
+        *g = Some(H3DoH {
+            h3,
+            born: Instant::now(),
+        });
+        Ok(())
+    }
+
+    /// DoH over H3：一次重建重试（连接被打断/流被拒时换连接）。
+    fn exchange_h3(&self, query: &[u8]) -> Result<Vec<u8>, String> {
+        for attempt in 0..2 {
+            self.h3_conn()?;
+            match self.exchange_h3_once(query) {
+                Ok(r) => return Ok(r),
+                Err(e) => {
+                    if attempt == 0 {
+                        if let Ok(mut g) = self.h3.lock() {
+                            *g = None;
+                        }
+                    } else {
+                        return Err(e);
+                    }
+                }
+            }
+        }
+        unreachable!()
+    }
+
+    fn exchange_h3_once(&self, query: &[u8]) -> Result<Vec<u8>, String> {
+        let g = self.h3.lock().unwrap_or_else(|e| e.into_inner());
+        let h = g.as_ref().ok_or_else(|| "无 DoH h3 连接".to_string())?;
+        let authority = if self.spec.port == 443 {
+            self.spec.host.clone()
+        } else {
+            format!("{}:{}", self.spec.host, self.spec.port)
+        };
+        let len = query.len().to_string();
+        let (status, _fields, body) =
+            h.h3.request(
+                "POST",
+                "https",
+                &authority,
+                &self.spec.path,
+                &[
+                    ("accept", "application/dns-message"),
+                    ("content-type", "application/dns-message"),
+                    ("content-length", len.as_str()),
+                ],
+                query,
+                EXCHANGE_TIMEOUT,
+            )
+            .map_err(|e| format!("DoH h3 请求: {e}"))?;
+        if status != 200 {
+            return Err(format!("DoH h3 响应状态 {status}"));
+        }
+        Ok(body)
+    }
 }
 
 fn write_tcp_dns<W: Write>(w: &mut W, query: &[u8]) -> Result<(), String> {
@@ -749,6 +859,17 @@ mod tests {
         let s = parse("quic://dns.adguard-dns.com:8853").unwrap();
         assert_eq!(s.scheme, Scheme::Quic);
         assert_eq!(s.port, 8853);
+        // P26：h3://（DoH over HTTP/3）
+        let s = parse("h3://dns.google").unwrap();
+        assert_eq!(s.scheme, Scheme::H3);
+        assert_eq!(s.port, 443);
+        assert_eq!(s.path, "/dns-query");
+        let s = parse("h3://dns.example:8443/custom?insecure=1").unwrap();
+        assert_eq!(
+            (s.host.as_str(), s.port, s.path.as_str()),
+            ("dns.example", 8443, "/custom")
+        );
+        assert!(s.insecure);
         // sni / insecure
         let s = parse("tls://10.0.0.1:853?sni=dns.test&insecure=1").unwrap();
         assert_eq!(s.sni.as_deref(), Some("dns.test"));
@@ -768,7 +889,6 @@ mod tests {
         assert_eq!(s.host, "2001:db8::1");
         assert_eq!(s.port, 853);
         // 错误
-        assert!(parse("h3://dns.google").is_err());
         assert!(parse("ftp://x").is_err());
         assert!(parse("").is_err());
     }
