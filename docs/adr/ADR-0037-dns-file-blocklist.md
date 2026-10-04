@@ -1,4 +1,4 @@
-# ADR-0037：`qname(file:)` 自定义域名名单（mini 扩展）+ 分流命中观测
+# ADR-0037：`qname(file:)` 自定义域名名单（sodama 扩展）+ 分流命中观测
 
 - **状态**：已采纳（2026-10-04）
 - **对应**：P18c 的实用化扩展（真网关默认配置：国内域走本地明文 / 其余走 DoH / 名单拦截）
@@ -15,7 +15,7 @@
 
 ## 决策
 
-1. **新键 `file:`**（`qname` 请求/应答两侧都可用，mini 扩展）：
+1. **新键 `file:`**（`qname` 请求/应答两侧都可用，sodama 扩展）：
    `qname(file: 'blocklist.txt') -> reject`。
    - 文件格式：每行一条；空行/`#` 注释忽略，支持行尾注释；
    - 默认 suffix 语义（`example.com` 匹配自身与子域）；行首可用
@@ -51,7 +51,7 @@
 ## 与 dae 的差异（如实）
 
 - dae 没有 `qname(file:)`；等价能力需要自建 geosite `.dat` 或把域名写进配置。
-  本键是**纯 mini 扩展**，只影响 mini 的配置方言；dae 原版配置不受影响
+  本键是**纯 sodama 扩展**，只影响 sodama 的配置方言；dae 原版配置不受影响
   （含 `file:` 的配置在 dae 上会报不认识的 key）。
 - `upstream_hits` 为状态面扩展（dae 无对应字段）。
 
@@ -79,7 +79,7 @@
    `qname_file_missing_is_error`）。
 2. lab：`sudo lab/lab.sh dnsroute-up && sudo lab/lab.sh test-dnsroute`。
 3. 真机：`sudo lab/gateway.sh up --config lab/gateway.dae --geodata-dir /usr/share/v2ray
-   --subscribe /tmp/mini-dae-sub.url`；`status` 看 `upstream_hits`；
+   --subscribe /tmp/sodama-sub.url`；`status` 看 `upstream_hits`；
    临时往 `lab/blocklist.txt` 加一行 + `reload` 验证拦截与恢复。
 
 ## 修订条件

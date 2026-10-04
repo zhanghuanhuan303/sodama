@@ -29,8 +29,8 @@ DoH/DoQ、TCP DNS、`geosite` 数据、`regex:` 域匹配、sniffing punt（`ROU
      **位下标 = 该 domain 参数在数组中的位置**（对照 dae `addDomain`，
      `control/routing_matcher_builder.go:375`）；
    - 数据面 `domain_routing_map`（key = `{slot, ipv4-mapped addr}`，value = 位图
-     `[MINI_MAX_MATCH_SET_LEN/32]`）对照 `tproxy.c:388`；匹配函数
-     `mini_route_match_domain_set` 对照 `tproxy.c:1673-1706` 的 word 缓存实现；
+     `[SODAMA_MAX_MATCH_SET_LEN/32]`）对照 `tproxy.c:388`；匹配函数
+     `sodama_route_match_domain_set` 对照 `tproxy.c:1673-1706` 的 word 缓存实现；
    - 用户态解析 DNS 应答的 A 记录，对每条 domain 规则做 suffix（**点边界**，
      即 `a.example.com` 命中 `example.com` 而 `notexample.com` 不命中）/full/keyword
      匹配，算出位图，经 mpsc 交主循环写 map（服务线程不碰 map）。
@@ -42,7 +42,7 @@ DoH/DoQ、TCP DNS、`geosite` 数据、`regex:` 域匹配、sniffing punt（`ROU
    - 无 DNS 缓存、无 `dns.routing` 请求/应答分流、无 DoH/DoQ、无 `geosite`；
    - `domain(regex:)` 由「整条规则 deferred」改为显式 deferred，原因标注 regex
      未实现（规则级原子原则不变：绝不部分编译）。
-6. **验收口径**：`proxy.test` 与 `direct.test` 两条域规则，DNS 经 mini-dae 转发到
+6. **验收口径**：`proxy.test` 与 `direct.test` 两条域规则，DNS 经 sodama 转发到
    假上游后，前者 IP 命中 domain 规则走 tproxy、后者直转；状态面可见
    `dns.queries / published_ips / maps.domain_routing`。
 
@@ -75,8 +75,8 @@ DoH/DoQ、TCP DNS、`geosite` 数据、`regex:` 域匹配、sniffing punt（`ROU
   及位图计算。
 - `lab.sh dns-up && lab.sh test-domain`：
   ```
-  answer=10.9.10.3 / answer=10.9.10.4         # DNS 经 mini-dae 转发到假上游
-  mini-dae tproxy: orig_dst=10.9.10.3:9999    # proxy.test 的 IP → domain 规则命中
+  answer=10.9.10.3 / answer=10.9.10.4         # DNS 经 sodama 转发到假上游
+  sodama tproxy: orig_dst=10.9.10.3:9999    # proxy.test 的 IP → domain 规则命中
   wan-echo-ok data=ping                       # direct.test 的 IP → 内核直转
   dns: queries=2 published_ips=2 domain_routing_entries=2
   PASS: 域位图端到端（DNS 接管 → 位图 → domain 规则分流）

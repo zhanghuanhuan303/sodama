@@ -10,7 +10,7 @@ dae 的运维面由 cmd 子命令 + 信号组成：`dae reload [pid]`（SIGHUP +
 `cmd/reload.go`）、`dae suspend [pid]`（SIGUSR2 → no-load，`dae reload` 恢复，`cmd/suspend.go`）、
 `dae sysdump`（系统网络信息归档，`cmd/sysdump.go`）、`dae trace`（运行时跟踪）、`dae validate` 等；
 监控侧 daed 提供 GraphQL，**dae 本体没有 Prometheus 导出**（源码实测：无 metrics 目录/prometheus 依赖）。
-mini-dae 的 K3 状态面此前是**只读**的（status/rules/config/maps），没有控制路径、没有日志文件、
+sodama 的 K3 状态面此前是**只读**的（status/rules/config/maps），没有控制路径、没有日志文件、
 没有统计导出格式；SIGHUP 只重编译规则文本，`--config` 模式不重读 dns 段。
 
 ## 决策
@@ -25,11 +25,11 @@ mini-dae 的 K3 状态面此前是**只读**的（status/rules/config/maps），
    - 控制命令与 DNS 的 `DnsPublish` 一样经 mpsc 交**主循环串行执行**（唯一持有 `Ebpf` 的地方），
      因此不引入并发写 map 的问题；
    - 响应协议从「单行」改为「读到 EOF」（metrics 是多行文本）。
-3. **CLI 子命令**（`mini-dae …`）：`reload`（等价 SIGHUP，同步等结果，失败退出码非零）、
+3. **CLI 子命令**（`sodama …`）：`reload`（等价 SIGHUP，同步等结果，失败退出码非零）、
    `suspend`/`resume`、`metrics`、`sysdump`（状态+规则+配置+maps+系统网络信息 → JSON）、
-   `trace --seconds N`（过滤 mini-dae 的 ftrace `trace_pipe`）。
-4. **指标导出（Prometheus 文本）**：`metrics` 命令把 status JSON 扁平化为 `mini_dae_*` 序列
-   （relay/udp_nat/dns/maps/stats/uptime/suspended/reload_success + `mini_dae_info{dialer=…}`）；
+   `trace --seconds N`（过滤 sodama 的 ftrace `trace_pipe`）。
+4. **指标导出（Prometheus 文本）**：`metrics` 命令把 status JSON 扁平化为 `sodama_*` 序列
+   （relay/udp_nat/dns/maps/stats/uptime/suspended/reload_success + `sodama_info{dialer=…}`）；
    dae 本体无 Prometheus，daed GraphQL **不做**（边界，见第 7 条）。
 5. **日志**：新增 `--log-file <path>`（默认 stdout），所有日志经同一 sink；
    SIGHUP 时 reopen（不经 systemd 的 logrotate 友好形态）；不实现日志分级（dae 有 log_level，
@@ -44,13 +44,13 @@ mini-dae 的 K3 状态面此前是**只读**的（status/rules/config/maps），
 
 ## 理由
 
-- dae 的 reload/suspend 本质是「信号 + 数据面状态位」：mini 沿用同一形态（SIGHUP/SIGUSR2 +
+- dae 的 reload/suspend 本质是「信号 + 数据面状态位」：sodama 沿用同一形态（SIGHUP/SIGUSR2 +
   eBPF 控制位），并把同一动作暴露到状态面/CLI，便于测试与编排（dae 靠 pid 文件与 progress 文件，
-  mini 不需要进程间文件协议）；
+  sodama 不需要进程间文件协议）；
 - suspend 用 eBPF 标志位而不是摘钩子：摘/挂 TCX 钩子有窗口期与失败面，标志位是一个原子 map 写入，
   语义是「全部流量直线放行」，与 dae 的 no-load 等价且可被 reload 瞬间恢复；
 - 指标选择 Prometheus 文本是因为它是运维事实标准，且实现只依赖已有状态数据（无新依赖）；
-  daed 的 GraphQL 是另一套（鉴权/订阅/写接口），在 mini 范围外，如实标注；
+  daed 的 GraphQL 是另一套（鉴权/订阅/写接口），在 sodama 范围外，如实标注；
 - 整配置热重载以「编译失败不切槽」实现回滚：与现有双 epoch 机制天然一致（非活跃槽写坏也不影响
   活跃槽），无需额外快照。
 
@@ -68,7 +68,7 @@ mini-dae 的 K3 状态面此前是**只读**的（status/rules/config/maps），
 
 - lab `test-ops`（`ops-up` 会话）：suspend 后客户端探测从 tproxy 变为内核直转（fail-open）、
   状态面 `suspended=true`；`reload` 后恢复 tproxy、`active_slot` 切槽、`suspended=false`、
-  `reload.ok=true`；`metrics` 输出 42 行 `mini_dae_*`；`sysdump` 六键 JSON 可解析；
+  `reload.ok=true`；`metrics` 输出 42 行 `sodama_*`；`sysdump` 六键 JSON 可解析；
   `--log-file` 经 `mv + SIGHUP` 后新文件重建且含重载记录。
 - lab `test-config-reload`（`ops-reload-up` 会话，/tmp 配置副本）：改 routing 后 reload 生效
   （8080 由 proxy 变 direct）；写坏配置 reload 失败且**旧规则保留**；`dns.upstream` 5353→59999

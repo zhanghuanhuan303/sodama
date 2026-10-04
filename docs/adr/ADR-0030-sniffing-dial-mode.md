@@ -9,7 +9,7 @@
 - 对标清点中「嗅探 + dial_mode」被列为第一缺口：dae 在内核侧做 TCP 嗅探
   （`sniffing_timeout` 默认 30ms，读首载荷判 TLS/HTTP），`dial_mode: domain/domain+`
   把**嗅探到的域名**而不是 IP 交给代理节点远端解析——这是绕开本地 DNS 污染的关键。
-- mini-dae 此前 target 一律 IPv4（`SocketAddr`），浏览器走真网关时若本地 DNS 被污染，
+- sodama 此前 target 一律 IPv4（`SocketAddr`），浏览器走真网关时若本地 DNS 被污染，
   TLS 会连到错误 IP，只能靠浏览器 Secure DNS/DoH 规避。
 
 ## 决策

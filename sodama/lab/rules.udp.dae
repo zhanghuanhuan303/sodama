@@ -1,0 +1,7 @@
+# P4b：UDP NAT 端到端（只代理 UDP:9998，其余直连）。
+#
+# 说明：
+# - 上游发往 2.2.2.2:9998 的 socket 必须打 SO_MARK，否则会被本规则再抓一次成环；
+#   该用例同时验证数据面的 mark 跳过（sodama_wan_egress）。
+l4proto(udp) && dport(9998) -> proxy
+fallback -> direct

@@ -4,7 +4,7 @@
 - **对应**：P18c 实用化扩展（二）：国内域走 DoH 时的 CDN 精度、按客户端来源分流
 - **相关**：ADR-0036（`dns.routing`）、ADR-0037（`qname(file:)`）、NOTES §11.29；
   上游对照：dae 只透传客户端自带 EDNS（`control/dns_control_optimistic.go:57`
-  注释），DNS 请求路由函数仅 qname/qtype——本 ADR 两项均为 **mini 扩展**
+  注释），DNS 请求路由函数仅 qname/qtype——本 ADR 两项均为 **sodama 扩展**
 
 ## 背景
 
@@ -13,7 +13,7 @@
   对国内小运营商出口可能偏。ECS（RFC 7871）能把**客户端子网**随查询带给上游，
   让权威侧按真实位置作答。
 - 另一个需求是**按客户端网段分流**：不同来源（如访客网段/本机）走不同上游。
-  dae 的 DNS 请求函数没有 `sip` 之类来源匹配（只有主路由有），故为 mini 扩展。
+  dae 的 DNS 请求函数没有 `sip` 之类来源匹配（只有主路由有），故为 sodama 扩展。
 
 ## 决策
 
@@ -45,7 +45,7 @@
 
 ## 与 dae 的差异（如实）
 
-- dae 不主动注入 ECS；`sip` 不存在于其 DNS 请求路由。两项均为 mini 方言扩展
+- dae 不主动注入 ECS；`sip` 不存在于其 DNS 请求路由。两项均为 sodama 方言扩展
   （dae 原版配置不受影响）。
 - ECS 仅在查询**无 OPT** 时注入；客户端自带 OPT（含 ECS）时保持透传——
   与 dae 的透传语义一致，也避免同一报文出现两个 ECS 选项。
@@ -71,7 +71,7 @@
    dnsup 的 `ecs=` 解析、`request_sip_client_subnet`）。
 2. lab：`sudo lab/lab.sh dnsroute-up && sudo lab/lab.sh test-dnsroute`。
 3. 真机：`sudo lab/gateway.sh up --config lab/gateway.dae --geodata-dir /usr/share/v2ray
-   --subscribe /tmp/mini-dae-sub.url`；`status .dns.routing.upstream_hits`。
+   --subscribe /tmp/sodama-sub.url`；`status .dns.routing.upstream_hits`。
 
 ## 修订条件
 

@@ -60,4 +60,4 @@
   `test-udp-relay` 改为前后增量断言（3 报文恰好 +1 会话），与 P20 用例可任意顺序串联。
 - 回归：`verify` 9/9；`test-udp-relay`/`test-udp-idle` 全过。
 - 文档：本 ADR + `docs/parity-status.md` v2.1 + `architecture-decision.html` v2.29 +
-  `mini-dae/NOTES.md` §11.35。
+  `sodama/NOTES.md` §11.35。

@@ -1,0 +1,11 @@
+# P17a 会话：geoip（LPM 展开）+ geosite（域位图展开）
+# 夹具由 lab/gen-geo-dat.py 生成（geo-up 自动放进 /tmp/sodama-geodata 并传 --geodata-dir）。
+
+# 1) geoip：目的属于 CN 集合的 9999 直连（10.9.10.0/24 由 WAN echo 服务）
+dip(geoip: cn) && dport(9999) -> direct
+
+# 2) geosite：域名属于 CN 集合（suffix/full/keyword/regex）走代理
+domain(geosite: cn) -> proxy
+
+# 3) 其余（含 10.9.9.2、未命中的域名）走代理，作为 geoip 未展开时的可观测回退
+fallback -> proxy

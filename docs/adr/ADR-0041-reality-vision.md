@@ -78,7 +78,7 @@
 3. `compress_certificate` 用 Chrome 实际值 `[02 00 02]`（仅 brotli）；
 4. REALITY 的 session_id **只密封前 16 字节**（GCM 输出 32B = 16 密文 + 16 tag）；
    AD 为「session_id 置零」的完整 ClientHello；
-5. `MiniTuple.sport` 为网络序原始 u16（见 ADR-0040 第 3 条教训）。
+5. `SodaTuple.sport` 为网络序原始 u16（见 ADR-0040 第 3 条教训）。
 
 ## 后果
 
@@ -89,7 +89,7 @@
       参考服务端）→ 本实现拨号 echo，小数据+128KB 往返逐字节一致；
     - `tls13_real_server_handshake`：本 TLS13 客户端直接握手
       www.microsoft.com:443（严格栈）+ 本机 openssl s_server，多次重跑稳定；
-    - `MINI_DAE_E2E_URL` 旁路：真实订阅节点 HTTP 200、HTTPS（内层 TLS 1.3，
+    - `SODAMA_DAE_E2E_URL` 旁路：真实订阅节点 HTTP 200、HTTPS（内层 TLS 1.3，
       触发服务端下行 splice）成功；
   - 真机：loader `--listen-socks`（SO_MARK 生效）经真实 REALITY 节点
     `example.com` 200 / 0.64s；网关模式订阅#2：**66/66 节点入组**，
@@ -104,8 +104,8 @@
 1. 单测：`cargo test --release`；密码学锚点：HKDF RFC 5869 向量、
    记录层加解密/KeyUpdate 往返、ClientHello 布局断言。
 2. 参考实现对拍：`cargo test --release -- --ignored`（sing-box 服务端 e2e；
-   `MINI_DAE_E2E_URL`/`MINI_DAE_E2E_TARGET`/`MINI_DAE_E2E_HTTPS` 可指向真实节点）。
-3. 真机：`mini-dae --listen-socks 127.0.0.1:1083 --dialer '<reality url>'`
+   `SODAMA_DAE_E2E_URL`/`SODAMA_DAE_E2E_TARGET`/`SODAMA_DAE_E2E_HTTPS` 可指向真实节点）。
+3. 真机：`sodama --listen-socks 127.0.0.1:1083 --dialer '<reality url>'`
    + `curl -x socks5h://…`；网关订阅#2 + `gateway.sh test`。
 
 ## 修订条件

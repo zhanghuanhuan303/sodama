@@ -51,7 +51,7 @@ P18d 后剩余缺口多、单项都不大，但彼此独立，适合一次性批
 ### 3. relay 并发上限 + udp_check_dns（缺口 #7/#8）
 
 - `--max-conns N`（0=不限，`RELAY_MAX_CONNS`）：`handle_relay_conn` 入口超出即关闭 +
-  `limit_rejected` 计数（状态面与 Prometheus `mini_dae_relay_limit_rejected`）；
+  `limit_rejected` 计数（状态面与 Prometheus `sodama_relay_limit_rejected`）；
   对照 dae relay 的并发限制语义（dae 是每出站最大连接数，这里先做全局上限）。
 - 组参数 `udp_check_dns: 'dns.google:53[, ...]'`（组级 > 全局 `global.udp_check_dns`，
   取第一个；域名在构建时解析一次，失败禁用并告警）：
@@ -81,7 +81,7 @@ P18d 后剩余缺口多、单项都不大，但彼此独立，适合一次性批
   + LLVM 23；本机验证过的组合）跑 loader `cargo build --release --locked`、
   `cargo test --release --locked`、eBPF 对象构建（build-std=core）与产物校验；
   fmt/clippy **刻意不入 CI**（生成件 `huffman_table.rs` 非 rustfmt-clean，容器内保证全绿优先）；
-- **systemd/安装**：`install/dae-mini.service`（capability 最小集、`AmbientCapabilities`、
+- **systemd/安装**：`install/sodama.service`（capability 最小集、`AmbientCapabilities`、
   SIGHUP `ExecReload`）+ `install/install.sh`（`--dry-run`/`--uninstall`，
   二进制/unit/配置/geodata 就位）+ `docs/deploy.md`。
 
@@ -117,4 +117,4 @@ P18d 后剩余缺口多、单项都不大，但彼此独立，适合一次性批
   既有 `verify` 9/9 与协议梯无回归；
 - 真机：订阅#2 网关 SIGHUP 热更新、`gateway.sh test`、HTTP/HTTPS 实测、0 panic；
 - 文档：本 ADR + `docs/parity-status.md` v1.9 + `architecture-decision.html` v2.27 +
-  `mini-dae/NOTES.md` §11.33。
+  `sodama/NOTES.md` §11.33。

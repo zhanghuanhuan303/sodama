@@ -61,9 +61,9 @@ K3 要求「全量 `.dae` 解析 + 只读状态面 +（可选）Go 后端过渡�
 
 ## 验证方式（实测）
 
-- `mini-dae validate lab/real-user.dae`：6 个 section 全解析、schema 通过；
+- `sodama validate lab/real-user.dae`：6 个 section 全解析、schema 通过；
   routing 7 条规则 → 5 条可编译、2 条 deferred（domain/geoip，带行号与原因）。
-- `mini-dae validate`（dae 官方 `example.dae`，chmod 640）：schema 通过；
+- `sodama validate`（dae 官方 `example.dae`，chmod 640）：schema 通过；
   6 条规则 → 1 条可编译、5 条 deferred（pname / 含 IPv6 的 dip / geoip×2 / domain）。
 - `lab.sh config-up && test-config && test-status`：配置驱动 proxy 生效；
   状态面返回 rules=11、conn_state≥1、hooks=5、deferred=2、fallback=proxy；

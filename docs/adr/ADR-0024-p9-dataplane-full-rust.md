@@ -58,11 +58,11 @@ ADR-0023 打通了工具链并完成 offload 垂直切片（双对象共存）�
 - **性能（单次取数，量级对比）**：direct 30.4Gbps/10µs（C 31.1/10µs）；relay 20.4Gbps/18µs
   （C 24.7/17µs）；offload 11.9Gbps/21µs（C）vs offload-rs 10.8Gbps/19µs（Rust 全对象）；
   ping-pong 微秒级对齐。
-- **默认切换**：默认会话加载 `mini-dae-ebpf`（日志 `loading .../mini-dae-ebpf`）且 `test-proxy` 通过；
-  `USE_EBPF_C=1` 回退加载 `mini_dae.o` 同样通过。
+- **默认切换**：默认会话加载 `sodama-ebpf`（日志 `loading .../sodama-ebpf`）且 `test-proxy` 通过；
+  `USE_EBPF_C=1` 回退加载 `sodama.o` 同样通过。
 
 ## 修订条件
 
 若 aya-obj 支持 `BPF_PSEUDO_FUNC` 且规则规模需要 `bpf_loop`，另写 ADR 换回；
-若移除 C 对象（删 `ebpf/mini_dae.c` 与 `USE_EBPF_C` 回退），另写 ADR 记录；
+若移除 C 对象（删 `ebpf/sodama.c` 与 `USE_EBPF_C` 回退），另写 ADR 记录；
 规则上限提升（>64）时必须重评有界循环的 verifier 成本。

@@ -34,7 +34,7 @@ P5-G2 的 vless 只做 `type=tcp`（ADR-0017 边界）。拿真实订阅（50 �
 
 ## 后果
 
-- 正面：mini-dae 可消费真实 vless-ws 订阅并端到端出网（204 实测）；协议栈首次接入
+- 正面：sodama 可消费真实 vless-ws 订阅并端到端出网（204 实测）；协议栈首次接入
   商用节点生态；UDP-over-ws 同样可用。
 - 负面/代价：无 uTLS 指纹（对强指纹校验的 CDN 可能受限）；不做 permessage-deflate；
   pong 仅在写路径顺带发出（只读流量下 ping 应答延迟——实测 CF 节点不主动 ping）；
@@ -50,7 +50,7 @@ P5-G2 的 vless 只做 `type=tcp`（ADR-0017 边界）。拿真实订阅（50 �
   - 网关 e2e `lab/real-node-e2e.sh`：client ns → tproxy → vless-ws → 真实节点 →
     `www.gstatic.com/generate_204` **204**；relay 计数 up 1981B / down 4713B、dial_errors=0；
   - 参照对拍（同一节点，v2ray 5.52）：gstatic/ipify 可用；`1.1.1.1`、`1.0.0.1`、
-    `www.cloudflare.com` 被节点侧黑洞——mini-dae 逐目标与参照一致（同失败模式）。
+    `www.cloudflare.com` 被节点侧黑洞——sodama 逐目标与参照一致（同失败模式）。
 - 回归：标准 verify 9/9；vless tcp/tls/udp 专项全过（ws 改动未影响既有路径）。
 
 ## 修订条件

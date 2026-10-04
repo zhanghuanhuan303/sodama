@@ -160,7 +160,7 @@ key = BLAKE2b-256(PSK || salt)       32B，keystream 以 32B 循环
   - Brutal 语义：固定目标速率、窗口 ≈ 2×BDP、丢包不降速（`protocol/tuic/congestion`）。
 - 线上没有 CC 协商字段；`Hysteria-CC-RX` 只上报客户端下行带宽声明。
 
-## 8. 本仓库（mini-dae / Rust）的对应实现与边界
+## 8. 本仓库（sodama / Rust）的对应实现与边界
 
 | 项 | Rust 实现 | 与 Go 的差异（如实） |
 |---|---|---|

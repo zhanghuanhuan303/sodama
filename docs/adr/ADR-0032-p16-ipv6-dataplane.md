@@ -15,7 +15,7 @@
 
 ## 决策
 
-1. **五元组统一 16 字节**（`ebpf-rs/common.rs` + loader 镜像 `MiniTuple`）：
+1. **五元组统一 16 字节**（`ebpf-rs/common.rs` + loader 镜像 `SodaTuple`）：
    `sip[16] / dip[16] / sport / dport / l4proto / is_v6 / pad`。IPv4 以
    **v4-mapped**（`::ffff:a.b.c.d`，与上游 `redirect_tuple` 的注释一致）存入，
    v6 存原始 16 字节。`conn_state_map` / `redirect_track` / `fast_sock` 的 key
@@ -24,7 +24,7 @@
    dest-opts(60)（最多 4 个）；**分片(44)不处理**（返回 None 交内核原路径）；
    统一入口 `parse_ip`。v4/v6/`parse_ip`/`load_l4` 必须 `#[inline(always)]`
    （verifier：嵌套调用返回大结构体会报 `cannot return stack pointer to the caller`）。
-   `MiniParseResult.is_v4` 驱动 `ipversion` 规则与 sockmap key。
+   `SodaParseResult.is_v4` 驱动 `ipversion` 规则与 sockmap key。
 3. **交付路径**：`flow.rs` 在 cb 里带 `is_v6`（cb[3]）；`progs.rs` 的
    `dae0peer_ingress` 用 `key = tcp?0:1 + (v6?2:0)` 选择 listener
    （0/1=TCP/UDP v4，2=TCP v6，3=UDP v6 预留未注册）；loader 侧新增
@@ -41,7 +41,7 @@
      `dae0peer_ingress` 的「cb[0] != TPROXY_MARK → SHOT」丢掉（与上游 C 相同），
      邻居永远 INCOMPLETE，tproxy 的 SYN-ACK 发不出去。上游同样写静态邻居，照搬。
 5. **规则**：LPM 键 16 字节（v4 前缀前缀长度 +96），`dip/sip` 接受 v4/v6 CIDR；
-   手写 mini 规则里 v6 前缀含 `:` 必须加引号（`dip('fe80::/10')`），`.dae` 提取器自动加。
+   手写 sodama 规则里 v6 前缀含 `:` 必须加引号（`dip('fe80::/10')`），`.dae` 提取器自动加。
 6. **协议目标**：`Target::Ip(IpAddr)`；RFC1928 风格 0x04（ss/trojan/anytls/socks5）、
    vless/vmess 0x03、tuic 0x02、hysteria2 用 `[v6]:port` 字符串；`marked_tcp_connect`
    支持 v6 sockaddr（`[u8;128]` 栈缓冲 + `copy_nonoverlapping`）；SOCKS5 入口接受 ATYP=6。
@@ -63,7 +63,7 @@
 
 - **UDP v6 未做**：sockmap key 3 预留但未注册（透明 UDP6 socket）；IPv6 的 UDP
   流量（含 DNS over UDP6）不会进控制面；UDP relay 的目标仍是 `SocketAddr`（v4）。
-- **ICMPv6 / 分片未处理**：按原路径放行（与 mini 的 v4 ICMP 边界一致，上游有 ICMP 回包改写）。
+- **ICMPv6 / 分片未处理**：按原路径放行（与 sodama 的 v4 ICMP 边界一致，上游有 ICMP 回包改写）。
 - 解析跳过扩展头但不做分片重组，超范围直接放行（非 tproxy 语义）。
 - 控制对用 veth（上游新版用 netkit），静态邻居/路由配方等价。
 
@@ -84,13 +84,13 @@
 
 ## 验证方式（实测）
 
-1. 单测：`MiniTuple` v4-mapped 生成、`encode_socks_addr`/`encode_v2ray_addr`/
+1. 单测：`SodaTuple` v4-mapped 生成、`encode_socks_addr`/`encode_v2ray_addr`/
    `encode_tuic_addr` 的 v6 形式、`Target` 解析 `[v6]:port`、SOCKS5 入口 ATYP=6。
    规则对拍：`lab/parity.sh`（含 `rules.v6.dae`）与 dae Go 编译器逐字节一致。
 2. lab：`sudo lab/lab.sh v6-up && sudo lab/lab.sh test-v6`（3 断言，独立 Python
    ss 服务端走 ATYP=4；v6 目的由 `wan_echo.py` 双栈监听）。
 3. 回归（P16 后全量复跑）：`verify` 9/9、`dns-up` 系 6/6、`subscribe-up` 组 3/3。
-4. 真机：`gateway.sh up --subscribe /tmp/mini-dae-sub.url` 后浏览器/curl 实测
+4. 真机：`gateway.sh up --subscribe /tmp/sodama-sub.url` 后浏览器/curl 实测
    （v6 域名嗅探链路 + v6 字面量链路，见「正面」）。
 
 ## 修订条件

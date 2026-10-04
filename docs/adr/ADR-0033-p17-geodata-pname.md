@@ -9,7 +9,7 @@
 ## 背景
 
 - 对标表缺口 #4：dae 支持 `dip(geoip:cn)`、`domain(geosite:cn[@attr])`、`ext:file:code`、
-  `pname(curl)`；mini 此前把带 key 参数与 `pname()` 整条列入 deferred（覆盖度规则引擎 ≈75%）。
+  `pname(curl)`；sodama 此前把带 key 参数与 `pname()` 整条列入 deferred（覆盖度规则引擎 ≈75%）。
 - 上游机制（研究结论，见 NOTES §11.24 证据行）：
   - geodata 是 v2ray protobuf `.dat`（`GeoIPList/GeoSiteList`），由
     `DatReaderOptimizer` 在规则归一化链中展开；`geoip:cn` ≈15,357 CIDR（v4+v6）、
@@ -30,7 +30,7 @@
    `GeoIPList/GeoSiteList` 整文件遍历、按 code 命中即返回；code 大小写不敏感；
    `geosite:code@attr` 按 `Domain.attribute.key` 大小写不敏感过滤；`ext:<file>[:<code>]`
    （文件名缺 `.dat` 自动补）；`inverse_match` 硬错误（与 dae 一致）。
-   搜索目录：`--geodata-dir`（mini 扩展）> `$DAE_LOCATION_ASSET` > 配置文件目录 >
+   搜索目录：`--geodata-dir`（sodama 扩展）> `$DAE_LOCATION_ASSET` > 配置文件目录 >
    `/etc/dae` > `/usr/local/share/dae` > `/usr/share/dae`。文件/展开结果按
    (dir, code) 进程内缓存，懒加载（无 geo 规则不碰磁盘）。
 2. **编译期展开**（`rules.rs`）：`dip/sip` 的 `geoip:`/`ext:` 参数展开为裸前缀
@@ -54,7 +54,7 @@
 7. **eBPF**（`ebpf-rs/src/cgroup.rs`）：6 个 cgroup 程序（section `cgroup/sock_create`、
    `sock_release`、`connect4/6`、`sendmsg4/6`），全部返回 1（放行，绝不阻断业务）；
    按 `bpf_get_socket_cookie(ctx)` 写/刷新/删除 `cookie_pid_map`
-   （`MiniPidPname{pname[16],pid,last_seen}`；HASH + `BPF_F_NO_PREALLOC` + 65536，dae 同）。
+   （`SodaPidPname{pname[16],pid,last_seen}`；HASH + `BPF_F_NO_PREALLOC` + 65536，dae 同）。
    **pname 取 `bpf_get_current_comm`**（≤15 字节）；dae 优先读 argv[0] basename
    （CO-RE + `bpf_loop`）——见差异。
 8. **TC 侧**（`flow.rs` + `route.rs`）：仅在 `is_wan && new_flow` 时反查 cookie →
@@ -65,7 +65,7 @@
    装载时挂 cgroup2 钩子（第一个 cgroup2 挂载点；`CgroupAttachMode::Single`），
    任何失败只告警继续（规则不命中，dae 同）；状态面新增
    `pname{driver,enabled,hooks,map_entries,hits}`，metrics 加
-   `mini_dae_pname_{hooks,map_entries,hits}`；命中计数在规则 VM（`MINI_STAT_PNAME_HITS=4`）。
+   `sodama_pname_{hooks,map_entries,hits}`；命中计数在规则 VM（`SODAMA_STAT_PNAME_HITS=4`）。
 10. **对拍**：harness 增加 `ProcessName` 分支（16B NUL 截断渲染）与
     `rules.pname.dae`（单值/多值排序/NOT）。
 
@@ -84,8 +84,8 @@
   可绕过 setuid/线程改 comm 的场景）。常见进程（curl/python3/docker-proxy）一致；
   对 comm 被改写或多名字进程（如 chrome 子进程）可能不同。需要时按修订条件扩展。
 - **geodata 解析**：整文件遍历（有 256MiB 级内存保护的必要性低；单 entry 解析后即丢弃），
-  dae 为按 code 流式 seek；无 XDG 搜索目录；`--geodata-dir` 为 mini 扩展。
-- **domain 组顺序**：dae 对 domain 参数按 (key,val) 排序，mini 按「首次出现顺序」分组。
+  dae 为按 code 流式 seek；无 XDG 搜索目录；`--geodata-dir` 为 sodama 扩展。
+- **domain 组顺序**：dae 对 domain 参数按 (key,val) 排序，sodama 按「首次出现顺序」分组。
   位下标在两边各自自洽（域位图与规则 VM 同源），端到端语义一致；仅内部下标不同
   （对拍不比较 domain 负载）。
 - **geosite 未纳入逐字节对拍**（对拍格式只覆盖 LPM/pname 等负载；域集合由单测 +

@@ -55,14 +55,14 @@
 
 ## 与 dae 的差异（如实）
 
-- **无 `sub/node/subnode`**：mini 没有「daemon 自身订阅/节点域名查询」这条内部路径；
+- **无 `sub/node/subnode`**：sodama 没有「daemon 自身订阅/节点域名查询」这条内部路径；
   含这些函数的规则被跳过并记 note（dae 中它们对普通客户端查询同样不命中，效果等价）。
 - **`upstream(...)` 按名字比较**：dae 用数值 index（`Reject`/`AsIs` 的常量值与
-  response 出口常量复用，导致 `upstream(reject)` 数值上等价于命中 asis）；mini 不
+  response 出口常量复用，导致 `upstream(reject)` 数值上等价于命中 asis）；sodama 不
   复刻这种数值巧合，`upstream(asis)`/`upstream(reject)`/`upstream(tag)` 语义直白。
 - **`ip(geoip:…)` 运行时线性前缀匹配**：应答 IP 数少（个位数），每应答 × 前缀数
   的按位比较；dae 用 128 位 trie。语义一致，规模敏感度不同。
-- **无该段时的默认**：dae 默认 `asis`；mini 保留 legacy 单上游（`--dns-upstream` 或
+- **无该段时的默认**：dae 默认 `asis`；sodama 保留 legacy 单上游（`--dns-upstream` 或
   `dns.upstream` 首项），以保持既有网关/脚本行为不变（写 `dns.routing` 即显式启用）。
 - 未做（同表列明）：DoH h2/h3、ECS 透传、optimistic cache、`fixed_domain_ttl`、
   `ipversion_prefer`、`bootstrap_resolver`、sniff-punt。
@@ -85,7 +85,7 @@
 - **负面/代价**：`dnsroute` 为独立解释器（每次查询线性扫规则行；规则数通常个位，
   开销可忽略）；缓存键变长（作用域字符串）。
 - **风险**：应答重查成环由深度上限兜底（≥3 放弃 + 日志 + `upstream_errors`），
-  与 dae 同；`asis` 指向 mini 自身:53 的配置会自环（dae 文档同样警告），属配置错误。
+  与 dae 同；`asis` 指向 sodama 自身:53 的配置会自环（dae 文档同样警告），属配置错误。
 
 ## 验证方式（实测）
 
@@ -97,6 +97,6 @@
 ## 修订条件
 
 - DoH h2/h3、ECS、optimistic cache/fixed_domain_ttl/ipversion_prefer 落地时；
-- 需要 dae 的 `sub/node/subnode` 内部查询语义（mini 引入订阅拉取/节点域名走 DNS
+- 需要 dae 的 `sub/node/subnode` 内部查询语义（sodama 引入订阅拉取/节点域名走 DNS
   路由时）时；
 - `ip(geoip:…)` 需要 trie 或大规则集时；或 `dns.upstream` 需要按 tag 保序选择策略时。

@@ -2,26 +2,26 @@
 
 - **状态**：已采纳（2026-10-04）
 - **对应**：ADR-0002「先 C 后迁」的收尾；P9（ADR-0024）默认切换后的必然清理
-- **相关**：ADR-0002、ADR-0023、ADR-0024；NOTES §11.13/§11.14/§12；mini-dae/README.md
+- **相关**：ADR-0002、ADR-0023、ADR-0024；NOTES §11.13/§11.14/§12；sodama/README.md
 
 ## 背景
 
 ADR-0022/0023/0024 之后，数据面存在两个对象：Rust 全量对象（默认加载）与 C 对象
-`build/mini_dae.o`（`USE_EBPF_C=1` 回退、offload 对照）。双份实现需要同步（任一侧改动都要
+`build/sodama.o`（`USE_EBPF_C=1` 回退、offload 对照）。双份实现需要同步（任一侧改动都要
 维持布局与语义一致），且 C 回退只在"Rust 出问题时"才被使用——而全量回归已在 Rust 对象上
 9/9 + 各专项通过。继续保留回退的成本（双份构建、双份维护、脚本分支、混淆默认值）高于收益。
 
 ## 决策
 
-1. **删除 C 数据面**：移除 `ebpf/mini_dae.c`（整个 `ebpf/` 目录）与 `build/mini_dae.o`；
+1. **删除 C 数据面**：移除 `ebpf/sodama.c`（整个 `ebpf/` 目录）与 `build/sodama.o`；
    `lab/lab.sh build` 只构建 Rust 对象（`lab/build-ebpf-rs.sh`，失败即失败，不再"跳过"）。
 2. **单一对象**：lab 的 `up()`/`dual_up()` 直接加载
-   `ebpf-rs/target/bpfel-unknown-none/release/mini-dae-ebpf`；删除 `USE_EBPF_RS`/`USE_EBPF_C`/
+   `ebpf-rs/target/bpfel-unknown-none/release/sodama-ebpf`；删除 `USE_EBPF_RS`/`USE_EBPF_C`/
    `USE_OFFLOAD_RS` 分支，删除 `offload-rs-up`/`rs-up`/`rs-dual-up` 会话（`offload-up` 即
    Rust offload）。
 3. **loader 去掉 offload 双对象**：删除 `--ebpf-offload`、`static OFFLOAD_EBPF` 与
    "从 offload 对象读 verdict/redirect 计数"的回退分支；offload 计数与数据面同属
-   `mini_stats_map`（索引 2/3）。`--ebpf` 默认值指向 Rust 对象。
+   `sodama_stats_map`（索引 2/3）。`--ebpf` 默认值指向 Rust 对象。
 4. **bench/soak 同步**：bench 删除 `offload-rs` 路径（`offload` 保留）；bench/soak 的对象
    存在性检查改为 Rust 对象路径。`bench_io.c` 是压测服务端夹具，不属于数据面，保留。
 5. **回退方式**：不再保留二进制回退。需要 C 对照时从只读上游 clone `dae/`
@@ -50,7 +50,7 @@ ADR-0022/0023/0024 之后，数据面存在两个对象：Rust 全量对象（�
 ## 验证方式（实测）
 
 - 构建：`lab/lab.sh build` 全绿（loader 零 warning；Rust 对象 274KB，含 `.BTF`）。
-- 残余检查：`grep -rn "mini_dae\.c\|mini_dae\.o\|USE_EBPF\|USE_OFFLOAD_RS\|offload-rs\|ebpf-offload"`
+- 残余检查：`grep -rn "sodama\.c\|sodama\.o\|USE_EBPF\|USE_OFFLOAD_RS\|offload-rs\|ebpf-offload"`
   在 `lab/`、`loader/src/`、`ebpf-rs/src/` 零命中；`lab/lab.sh rs-up`/`offload-rs-up` 退出码 2（usage）。
 - 回归（唯一 Rust 对象）：
   - 标准拓扑 verify **9/9**；单臂 `dual-up` verify **9/9**（本次串行执行无 flake）；
@@ -68,7 +68,7 @@ ADR-0022/0023/0024 之后，数据面存在两个对象：Rust 全量对象（�
     Rust 侧 TLS 由 lab e2e 覆盖并通过）；soak tcp60/ss30/udp30 无泄漏；内核矩阵
     双内核 9/9（宿主 6.18.54-2-lts 与 QEMU 7.2.8-arch1-2，MATRIX-RESULT verify=PASS）；
     详见 NOTES §11.16 与 `lab/matrix/SUMMARY.md`。
-- 环境清洁：无遗留 mini-dae 进程与 netns；`dae/` clone `git status --porcelain` 为空。
+- 环境清洁：无遗留 sodama 进程与 netns；`dae/` clone `git status --porcelain` 为空。
 
 ## 修订条件
 

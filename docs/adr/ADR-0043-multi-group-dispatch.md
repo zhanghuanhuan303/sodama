@@ -10,7 +10,7 @@
 1. **单代理槽**：K3 起 `-> <组名>` 全部编译为 `OUTBOUND_PROXY=0x02`，组只在**拨号层**
    选择；规则无法把不同流量分给不同组（`group.rs` 头部边界、ADR-0031 遗留项）。
 2. **数据面已具备条件**：规则 VM 把 outbound u8（`match_set.outbound`）写入
-   `conn_state_map`（`MiniConnState.outbound`），用户态可用 raw lookup 回读——
+   `conn_state_map`（`SodaConnState.outbound`），用户态可用 raw lookup 回读——
    本阶段**eBPF 零改动**。
 3. **真机启动断网（排查所得）**：重启后网关 `up` 必现全机断网。根因链：
    - 启动期 `do_reload`（initial）在 **eBPF 钩子已挂、DNS 监听线程尚未 spawn** 时
@@ -87,4 +87,4 @@
 - 真机：启动自检通过（~20s）、`gateway.sh test` PASS（204 / 出口 IP / DNS ok）、
   SIGHUP「组 proxy 66 成员（继承 44 健康）」、66/66 alive、0 panic。
 - 文档：本 ADR + `docs/parity-status.md` v2.0 + `architecture-decision.html` v2.28 +
-  `mini-dae/NOTES.md` §11.34。
+  `sodama/NOTES.md` §11.34。

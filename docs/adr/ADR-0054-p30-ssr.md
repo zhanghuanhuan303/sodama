@@ -9,7 +9,7 @@
 ## 背景
 
 - dae 出站 12 家族（ss/ssr/trojan/vmess/vless/tuic/hysteria2/juicity/naive/http/socks5/anytls）
-  中，mini-dae 此前已完成 11 个，**SSR 是最后一个未覆盖家族**。
+  中，sodama 此前已完成 11 个，**SSR 是最后一个未覆盖家族**。
 - SSR 的复杂度与 SS classic 不同：链接格式为
   `ssr://base64(server:port:proto:method:obfs:urlbase64(password)/?params)`；
   协议层分 proto（`origin` / 各 `auth_*`）与 obfs（`plain` / 各 `obfs_*`），

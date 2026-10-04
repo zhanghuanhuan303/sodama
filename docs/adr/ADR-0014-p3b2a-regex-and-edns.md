@@ -21,7 +21,7 @@ EDNS 参数区分、乐观/陈旧缓存」。其中有两项不需要等协议�
    - 模式在**编译期**编译（Rust `regex` 1.x，RE2 语法系，与 Go `regexp` 对齐；
      对照 dae `regexp.Compile`），编译错误是**硬失败**（不是 deferred）；
    - 匹配对象是**小写化、去尾点**的 qname；模式保持原大小写、非锚定匹配
-     （对照 dae `MatchString`）——即大写模式在 dae 语义下永不命中，mini-dae 保持一致；
+     （对照 dae `MatchString`）——即大写模式在 dae 语义下永不命中，sodama 保持一致；
    - 数据面不需要认识 regex：位图位下标照旧 = match_set 位置，匹配发生在用户态。
 2. **EDNS 解析与缓存键**：`query_edns()` 解析 OPT（payload size / DO 位 / options）。
    DO 位入缓存键（DO=1 与 DO=0 分属不同条目）；**带 EDNS options（ECS 等）的查询不入
@@ -34,7 +34,7 @@ EDNS 参数区分、乐观/陈旧缓存」。其中有两项不需要等协议�
    普通 RR（对照 dae `setRecordTTL`：只跳过 OPT，OPT 的 TTL 字段是扩展 rcode/flags）。
    ADR-0013 写的「additional 与 OPT 不动」收窄为「仅 OPT 不动」。
 5. **配置栈同步**：`config.rs` 的 `translate_function` 接受 `domain(regex: …)` 并透传给
-   mini 规则编译器；非法正则在加载器编译规则时**硬失败**（启动或热重载报错）。
+   sodama 规则编译器；非法正则在加载器编译规则时**硬失败**（启动或热重载报错）。
    注意：`validate` 阶段只做规则翻译不编译正则（与 dip/dport 等标量在翻译期做格式检查
    不同），正则合法性以加载器编译为准。
 6. **边界（剩余 P3b-2，留待后续 ADR）**：DoH/DoQ、嗅探 punt（`ROUTE_STATE_DNS_QUERY`）、

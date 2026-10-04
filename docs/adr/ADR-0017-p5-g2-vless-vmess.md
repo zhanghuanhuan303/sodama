@@ -56,7 +56,7 @@ G1 落地了 ss/trojan 与跨实现验收。G2 继续梯度，补齐 dae 生态�
 5. **拨号不再持锁**：`udp_nat_handle` 重排为「快路径持锁查表 / 慢路径锁外拨号 / 插入时防御性
    去重」。G1 的 ss/direct 拨号快到掩盖了原实现（拨号在 NAT 表锁内），TLS 拨号不允许这样。
    **遗留边界**：新会话首包仍在 `dns_loop` 线程同步拨号（dae 用 goroutine）；对循环里的
-   DNS 与其它 UDP 会话是一段 RTT 级停顿，mini 明确记为待改项，不假装已异步。
+   DNS 与其它 UDP 会话是一段 RTT 级停顿，sodama 明确记为待改项，不假装已异步。
 6. **能力与互斥**：vless/vmess `supports_offload()==false`（帧式封装不交内核拼接，
    `--offload` 时 `offloaded_total` 必须为 0）；`supports_udp()==true`（G2 起 ss/vless/vmess）。
 7. **验收口径（三方交叉）**：

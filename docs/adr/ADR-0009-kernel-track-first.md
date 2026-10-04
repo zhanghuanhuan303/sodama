@@ -33,12 +33,12 @@ K3 生态接入       全量 .dae 解析 + 只读状态面 +（可选）Go 后�
 1. **生态接入用契约级/进程级边界**：配置 DSL、订阅格式、协议矩阵、状态面。**禁止 cgo/FFI 复用 Go 库**（会把 Go 运行时与 GC 一起搬回来，丢掉重写的核心收益）。
 2. 可选过渡形态：**把 Go dae 当协议后端**（Rust 负责内核侧，代理流量经本地 socks5/tproxy 一跳交给 Go 实例），使内核侧能立刻用真实节点测试。
 3. Go 版 40k 行测试**不可直接复用**（多依赖内部 API），复用其**场景与夹具**（`example.dae`、DNS corpus、规则用例），黑盒化重写。
-4. 数据面**兜底路径**：若 Rust eBPF 化受阻，回退到 C 数据面（mini-dae 已验证 aya 可加载 C 对象），控制系统仍按 Rust 交付。
+4. 数据面**兜底路径**：若 Rust eBPF 化受阻，回退到 C 数据面（sodama 已验证 aya 可加载 C 对象），控制系统仍按 Rust 交付。
 
 ## 理由
 
 - 风险最集中：verifier 约束、内核矩阵、ABI（map 布局/打包位/枚举）一旦定型最难返工；先把它变成确定，后续所有模块都受益。
-- 工具链已验证：mini-dae 已跑通「aya 加载 + 跨 netns TCX 钩子 + sk_assign 交付 + LPM map-in-map」。
+- 工具链已验证：sodama 已跑通「aya 加载 + 跨 netns TCX 钩子 + sk_assign 交付 + LPM map-in-map」。
 - 对拍可以缩小：K0/K1 只需要「map dump + 包级 e2e」这一最小对拍器，不必等完整 oracle 基建。
 - 内核侧沉淀的资产（数据面工作台 + netns 实验场）会被后续每个模块复用。
 

@@ -2,7 +2,7 @@
 
 - **状态**：已采纳（2026-10-03）
 - **对应决策点**：D2
-- **相关**：ADR-0003（运行时）、`mini-dae/`（实测）
+- **相关**：ADR-0003（运行时）、`sodama/`（实测）
 
 ## 背景
 
@@ -10,7 +10,7 @@
 
 实测情况：
 
-- `aya` 加载 **C 编译产物** 已验证可行（mini-dae：3 个 TCX 钩子、跨 netns map 共享、`bpf_sk_assign` 交付、double-path e2e 全部通过）；
+- `aya` 加载 **C 编译产物** 已验证可行（sodama：3 个 TCX 钩子、跨 netns map 共享、`bpf_sk_assign` 交付、double-path e2e 全部通过）；
 - `aya-ebpf` 需要 **nightly + `-Z build-std`** 构建 `bpfel-unknown-none`；本次环境 rustup 官方源被网络策略拦截，**未验证**（`bpf-linker 0.11.1` 已装好）。
 
 ## 选项
@@ -32,7 +32,7 @@
 ## 理由
 
 - 数据面的风险不在语言，而在 **verifier 约束与内核版本矩阵**：栈 512B、循环上界、指针收敛、`bpf_loop` 回调状态机。这些约束在 C 上已有大量注释与测试沉淀（`tproxy.c` 里成片的 per-CPU scratch、`__noinline` 拆分、栈预算注释）。
-- mini-dae 的实测证明：**加载器用 Rust、数据面用 C** 这条组合今天就能产出可用系统（也顺带证明了 TCX 生命周期管理比 netlink 干净）。
+- sodama 的实测证明：**加载器用 Rust、数据面用 C** 这条组合今天就能产出可用系统（也顺带证明了 TCX 生命周期管理比 netlink 干净）。
 - 迁移是**可逆且可分批**的：Rust 控制面只依赖对象文件的 section/符号约定，换实现不影响上层。
 
 ## 后果
@@ -43,7 +43,7 @@
 
 ## 验证方式
 
-- P2 验收：同一份规则，Rust 控制面加载 C 对象后，direct/proxy/回程三路径 e2e 通过（mini-dae 已给出最小闭环）；
+- P2 验收：同一份规则，Rust 控制面加载 C 对象后，direct/proxy/回程三路径 e2e 通过（sodama 已给出最小闭环）；
 - 迁移验证：迁移前先落一份 map dump + 判决对拍基线，迁移后逐条比对。
 
 ## 修订条件

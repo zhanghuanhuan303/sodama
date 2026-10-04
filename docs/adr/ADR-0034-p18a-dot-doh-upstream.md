@@ -9,7 +9,7 @@
 
 - 对标表缺口 #5：dae 的 DNS 上游支持 `udp`/`tcp`/`tcp+udp`/`tls`(DoT)/`https`(DoH)/
   `quic`(DoQ)/`h3`(DoH3) 七种 scheme，并把上游当一等对象（`dns.upstream` 是
-  tag→url 的 map）。mini 此前只把它当 `host:port`，且**客户端入口协议顺带决定上游
+  tag→url 的 map）。sodama 此前只把它当 `host:port`，且**客户端入口协议顺带决定上游
   传输**（TCP 客户端 → TCP 上游）——与 dae 不一致。
 - 上游语义（研究结论）：无 scheme 或 `tcp+udp`/`udp+tcp` → **UDP 优先，应答 TC 位或
   失败再走 TCP**；`udp`/`tcp`/`tcp+udp` 默认端口 53；`tls`/`quic` 默认 **853**；
@@ -64,11 +64,11 @@
   编码侧（现有 `hpack.rs` 只有解码与 QPACK 静态表，h3 认证用），列为修订条件。
 - **`h3://`（DoH3）未实现**（显式报错，不降级）；`quic://`（DoQ）P18b。
 - **上游主机名解析**：dae 用 `bootstrap_resolver` 在内部解析（可走自己的 DNS 链）；
-  mini 用系统解析器在启动/重载时解析一次，此后固定 IP。若上游域名被污染，mini 会
+  sodama 用系统解析器在启动/重载时解析一次，此后固定 IP。若上游域名被污染，sodama 会
   解析失败/解析到坏 IP——用 IP 字面量 + `?sni=` 可完全规避（已验证公共 DoT/DoH）。
 - **`dns.upstream` 多 tag** 仍取第一个；该 config 段没有 tag 级引用语义（P18c 的
   `dns.routing` 才需要）。
-- `udp://` 上游是 mini 的严格单 UDP（dae 同名 scheme 亦为纯 UDP）；历史上 mini 把
+- `udp://` 上游是 sodama 的严格单 UDP（dae 同名 scheme 亦为纯 UDP）；历史上 sodama 把
   `udp://` 当纯前缀剥掉，属旧差异，现已对齐。
 
 ## 后果

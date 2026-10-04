@@ -15,7 +15,7 @@
   - 客户端**写完查询后要 FIN**，服务器在收到 FIN 后才应答（§4.2）；
   - 连接 `sync.Mutex` 复用；开流失败时换连接重试；超时用 8s（dae `doqExchangeTimeout`）；
   - 放弃查询时发 `DOQ_REQUEST_CANCELLED(0x3)`（§4.3.1）。
-- mini 已在 P5-G3/G3b 建立 QUIC 基建（quinn 0.11 + `tuic::runtime()` + marked UDP socket +
+- sodama 已在 P5-G3/G3b 建立 QUIC 基建（quinn 0.11 + `tuic::runtime()` + marked UDP socket +
   `tls::build_rustls_config`，含 `insecure` 自签校验路径）。
 
 ## 决策
@@ -51,9 +51,9 @@
 
 ## 与 dae 的差异（如实）
 
-- **0-RTT / EarlyConnection**：dae 用 `quic.EarlyConnection`；mini/quinn 用常规
+- **0-RTT / EarlyConnection**：dae 用 `quic.EarlyConnection`；sodama/quinn 用常规
   1-RTT 握手（首查询多一个 RTT，之后复用连接）。无 0-RTT 会话票缓存。
-- **超时**：dae 单向 8s；mini 5s（与其它上游一致），可调。
+- **超时**：dae 单向 8s；sodama 5s（与其它上游一致），可调。
 - **连接池**：各 1 连接、锁内串行；无并发多连接。
 - 无 DoQ 的 ECS/option 特殊处理（明文路径同）。
 

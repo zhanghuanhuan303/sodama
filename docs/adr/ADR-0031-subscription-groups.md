@@ -65,7 +65,7 @@
    `cargo test --release` **121/121**。
 2. lab：`sudo lab/lab.sh subscribe-up && sudo lab/lab.sh test-subscribe` 全 PASS
    （含状态面断言 group.members=2 / alive 2→1 与 failover 后探测）。
-3. 真机订阅#2：`gateway.sh up --subscribe /tmp/mini-dae-sub.url`（见「正面」）。
+3. 真机订阅#2：`gateway.sh up --subscribe /tmp/sodama-sub.url`（见「正面」）。
 
 ## 修订条件
 

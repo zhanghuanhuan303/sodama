@@ -14,7 +14,7 @@
 |---|---|
 | 构建 | `cargo build --release` + `lab/build-ebpf-rs.sh`（nightly 固定日期 + bpf-linker 0.11.1） |
 | CI | `.github/workflows/ci.yml`：eBPF 对象构建 + loader 编译/单测（无特权内核加载） |
-| 部署 | `install/install.sh`（--dry-run/--uninstall）+ `install/dae-mini.service`（capability 最小集 + ExecReload）+ `docs/deploy.md` |
+| 部署 | `install/install.sh`（--dry-run/--uninstall）+ `install/sodama.service`（capability 最小集 + ExecReload）+ `docs/deploy.md` |
 | 实验 | lab.sh（netns/verify/专项）、gateway.sh（真网关一键 + 启动自检回滚）、bench/soak/matrix/parity |
 | 文档 | ADR-0001..0056 + parity-status.md + HTML 决策档案 + NOTES §11.x + 协议模块规格 `docs/modules/` |
 
@@ -23,7 +23,7 @@
 | # | 事项 | 动机 / 对照 | 验收标准 |
 |---|---|---|---|
 | A1 | **Docker 镜像** | dae 有 `Dockerfile` + `docker-compose.yml`；容器是主要分发方式之一 | 多阶段构建（builder 固定 nightly+bpf-linker；runtime 含 loader/eBPF 对象/示例配置）；`docker run --privileged --network host` 冒烟通过并写入 README |
-| A2 | **发行包（tarball）** | dae 有 release 工件（多架构） | tag 产出 `mini-dae-<ver>-x86_64.tar.zst`：loader、`ebpf-rs.o`、systemd、install.sh、示例配置、README/LICENSE；解包后 `install.sh` 可装可卸 |
+| A2 | **发行包（tarball）** | dae 有 release 工件（多架构） | tag 产出 `sodama-<ver>-x86_64.tar.zst`：loader、`ebpf-rs.o`、systemd、install.sh、示例配置、README/LICENSE；解包后 `install.sh` 可装可卸 |
 | A3 | **发行 CI** | dae 有 release/prerelease/daily-build 工作流 | tag `v*` 触发：构建 → 冒烟（容器内 `--version`/单测）→ 上传 release 工件 + SHA256SUMS；失败不产出 |
 | A4 | **版本与 CHANGELOG** | 当前 Cargo 0.1.0、无 CHANGELOG | `--version` 输出语义化版本 + git sha；CHANGELOG 从提交生成；README 顶部版本徽章 |
 | A5 | **shell 补全** | dae 有 `install/shell-completion/`（bash/zsh/fish） | 补全 CLI 全部参数（`--config/--dialer/--subscribe/--listen-socks/...`）；安装脚本可选部署 |
@@ -92,12 +92,12 @@
 | # | 事项 | 现状 | 验收标准 |
 |---|---|---|---|
 | H1 | 顶层 `README.md` 状态区重写 | 数字停留在 P5 时期（121/121、ADR-0031 等），与当前（236 单测、ADR-0056）脱节 | 状态表与实际一致；仓库结构/快速开始重写 |
-| H2 | 用户手册（配置参考 + Go dae → mini-dae 迁移指南） | 散在 README/NOTES | 独立章节：逐项差异表（配置/CLI/部署） |
+| H2 | 用户手册（配置参考 + Go dae → sodama 迁移指南） | 散在 README/NOTES | 独立章节：逐项差异表（配置/CLI/部署） |
 | H3 | 基准报告 | bench.sh 有输出 | `docs/bench.md` 固化方法与结果 |
 
 ## 明确不在范围（永久）
 
-- **daed Web UI / GraphQL / 鉴权**：daemon 是独立项目，mini-dae 只做本体 + 状态面；
+- **daed Web UI / GraphQL / 鉴权**：daemon 是独立项目，sodama 只做本体 + 状态面；
 - **与 dae 二进制/配置 100% 兼容**：本项目定位研究性复现，配置语义对齐即可（ADR-0005/0011）；
 - **Windows/macOS**：数据面依赖 Linux eBPF，不做跨平台。
 

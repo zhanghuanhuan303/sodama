@@ -16,7 +16,7 @@
 1. **eBPF 数据面是 per-netns 单例**：钩子按优先级串行，多进程各挂一套会互相覆盖；
 2. **dae 用 `runtime.LockOSThread()` + `netns.Set()` 做 netns 亲和**（`control/netns_utils.go:264,496`），该模式与 tokio 的 task 跨线程迁移不兼容。
 
-故障语义实测：现代内核上 dae 优先使用 **TCX**（`control/tc_hook_set.go:199`），钩子是 bpf_link，**进程退出即摘除**（mini-dae 已验证）→ 分流消失、流量回落为普通转发。
+故障语义实测：现代内核上 dae 优先使用 **TCX**（`control/tc_hook_set.go:199`），钩子是 bpf_link，**进程退出即摘除**（sodama 已验证）→ 分流消失、流量回落为普通转发。
 
 ## 决策
 
@@ -41,7 +41,7 @@
 
 ## 验证方式
 
-- P2 验收：单进程形态下 direct/proxy/回程 e2e 通过（mini-dae 已给出最小闭环），进程退出后钩子摘除且流量回落正常；
+- P2 验收：单进程形态下 direct/proxy/回程 e2e 通过（sodama 已给出最小闭环），进程退出后钩子摘除且流量回落正常；
 - 故障注入：kill -9 supervisor，验证 fail-open 行为与 5s 内恢复；
 - 若启用死区开关：停止心跳，验证 proxy 判决转为 DROP 且 direct 不受影响；
 - 多 netns：并发创建 socket 的压力用例（见 ADR-0003）。

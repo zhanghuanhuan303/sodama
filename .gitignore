@@ -3,22 +3,22 @@
 
 # Rust 构建产物
 /target/
-/mini-dae/target/
-/mini-dae/ebpf-rs/target/
-/mini-dae/build/
+/sodama/target/
+/sodama/ebpf-rs/target/
+/sodama/build/
 **/*.o
 **/*.o.tmp
 
-# lab 生成物（都可由脚本重建，见 mini-dae/README.md）
-/mini-dae/lab/parity/dae-work/
-/mini-dae/lab/parity/.parity-out.*
-/mini-dae/lab/parity/.parity-test-log.*
-/mini-dae/lab/matrix/out/
-/mini-dae/lab/matrix/initramfs-*/
-/mini-dae/lab/proto-check/bin/
-/mini-dae/lab/certs/
-/mini-dae/lab/*.log
-/mini-dae/lab/proto-check/*.log
+# lab 生成物（都可由脚本重建，见 sodama/README.md）
+/sodama/lab/parity/dae-work/
+/sodama/lab/parity/.parity-out.*
+/sodama/lab/parity/.parity-test-log.*
+/sodama/lab/matrix/out/
+/sodama/lab/matrix/initramfs-*/
+/sodama/lab/proto-check/bin/
+/sodama/lab/certs/
+/sodama/lab/*.log
+/sodama/lab/proto-check/*.log
 
 # 杂项
 __pycache__/

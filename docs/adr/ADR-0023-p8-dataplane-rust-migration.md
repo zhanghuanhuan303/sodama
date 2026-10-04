@@ -6,7 +6,7 @@
 
 ## 背景
 
-- 全项目唯一未 Rust 化的核心是 eBPF 数据面：`ebpf/mini_dae.c`（1142 行，8 个程序、
+- 全项目唯一未 Rust 化的核心是 eBPF 数据面：`ebpf/sodama.c`（1142 行，8 个程序、
   14 张 map）。原阻塞不在代码而在环境：官方 `static.rust-lang.org` / `static.crates.io`
   被网络策略 TLS 拦截，装不了 nightly/`rust-src`，也拉不到 `aya-ebpf`。
 - 环境已解决（见 NOTES §11.13）：nightly + rust-src 走 Tuna 镜像；crates 走 USTC 完整镜像
@@ -17,7 +17,7 @@
 
 ## 决策
 
-1. **新 crate `mini-dae/ebpf-rs`**：`aya-ebpf 0.2.1`、`no_std`、`bpfel-unknown-none`、
+1. **新 crate `sodama/ebpf-rs`**：`aya-ebpf 0.2.1`、`no_std`、`bpfel-unknown-none`、
    `-Z build-std=core`、bpf-linker `--btf`；**不加入主 workspace**（`exclude`，避免普通
    `cargo build` 误入 BPF 目标）。构建入口 `lab/build-ebpf-rs.sh`（工具链缺失时给出安装命令）。
 2. **双对象共存**：C 对象保留全部程序；`--ebpf-offload <rust.o>` 时 offload verdict 改用
@@ -27,7 +27,7 @@
    未命中会丢包（不能“先调再判”）。Rust 对象因此增加 `offload_guard`（普通 HASH）镜像：
    注册时 loader **先写 fast_sock 再写 guard**（反之存在 guard 命中但 fast_sock 未命中 →
    redirect 丢包的窗口）；回收时**先摘 guard 再摘 fast_sock**。
-4. **计数合并**：Rust 对象自带 `mini_stats_map`（ARRAY，2=redirects，3=verdicts），
+4. **计数合并**：Rust 对象自带 `sodama_stats_map`（ARRAY，2=redirects，3=verdicts），
    状态面 `read_stats` 合并（0/1 仍来自 C 的 PERCPU_ARRAY）。
 5. **回归口径复用**：offload 两条路线共用同一组用例与基准（`offload-up` vs
    `offload-rs-up`；`bench.sh run offload|offload-rs`），行为以 lab 回归钉住。

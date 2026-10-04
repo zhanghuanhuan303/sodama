@@ -9,7 +9,7 @@
 
 - dae 在嗅探到域名后可「punt」——按域名重新跑一遍路由（direct/block/组），弥补
   `dial_mode: ip` 下域规则只能用 DNS 位图的不足。
-- mini-dae 此前：`dial_mode != ip` 时嗅探只把**拨号目标**换成域名（远端解析），
+- sodama 此前：`dial_mode != ip` 时嗅探只把**拨号目标**换成域名（远端解析），
   **出口选择仍完全依赖数据面**（DNS 位图 + conn_state 回读）。对「客户端直接连 IP、
   TLS 内嵌 SNI、且 DNS 不经我们」的流量，域规则无从生效。
 

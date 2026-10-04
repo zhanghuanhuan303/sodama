@@ -1,0 +1,13 @@
+# P17b：pname 规则（对拍与 lab 会话共用）
+# 只在 WAN egress（本机发起的连接）上匹配；采集来自 cgroup2 钩子（sodama_cgroup_*）。
+
+# lab：python3 连接的 8080 直连（WAN echo 回显）；其它进程走 fallback 代理
+pname(python3) && dport(8080) -> direct
+
+# 对拍：多值 OR（dae 按字符串序重排：bash, wget）
+pname(wget, bash) -> block
+
+# 对拍：NOT（负向 pname 在 pname 为空时也成立，与 dae 一致）
+!pname(sshd) && dport(22) -> direct
+
+fallback -> proxy

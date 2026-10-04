@@ -12,7 +12,7 @@
   `?ech=<base64(ECHConfigList)>`：`olicesx/outbound` 校验 base64/长度后透传给
   `olicesx/quic-go` fork 的 `EncryptedClientHelloConfigList`；**真实 ECH 密码学
   与 ClientHello 重组由该 fork 完成**。dae 主体源码无 ECH。
-- mini-dae 的 hysteria2 基于 `quinn + rustls`：
+- sodama 的 hysteria2 基于 `quinn + rustls`：
   - rustls 目前**没有客户端 ECH**（不暴露 ClientHello 构造，也无 ECH 钩子）；
   - quinn 要求 rustls 作为 QUIC 的 TLS 后端，无法替换成自实现栈；
   - 我方自实现的 `tls13.rs` 虽可完全控制 ClientHello（REALITY/shadow-tls v3

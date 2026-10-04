@@ -6,7 +6,7 @@
 
 ## 背景
 
-P12 之后，mini-dae 已能在 netns lab、`real-node-e2e.sh` 与本地 SOCKS5 入口三种方式下
+P12 之后，sodama 已能在 netns lab、`real-node-e2e.sh` 与本地 SOCKS5 入口三种方式下
 跑真实节点；但 SOCKS5 入口要求浏览器配置代理，与 dae 的真实形态（透明网关）仍有距离。
 用户希望在本机（Arch 桌面，`wlan0` 默认路由，有 root）验证「真网关」体验：
 **浏览器/系统零配置，整机 TCP 流量被 eBPF 接管并经真实节点出网**。
@@ -26,9 +26,9 @@ P12 之后，mini-dae 已能在 netns lab、`real-node-e2e.sh` 与本地 SOCKS5 
      169.254.0.11/32 + 静态邻居 + `fwmark 0x8000000 → table 2023`，与 lab 拓扑一致），
      放宽 `rp_filter`，启动 loader 并做存活检查；
    - `down` 杀进程、删 netns/veth、按 state 文件恢复 sysctl；
-   - 节点 URL 仅从 `--node <文件|URL>` 读取（默认 `/tmp/mini-dae-node.url`，建议 600），
+   - 节点 URL 仅从 `--node <文件|URL>` 读取（默认 `/tmp/sodama-node.url`，建议 600），
      日志与 status 输出对 `--dialer` 做 redact。
-3. **拓扑：物理网卡留在宿主 netns**，只挂 `mini_wan_egress` / `mini_wan_ingress`；
+3. **拓扑：物理网卡留在宿主 netns**，只挂 `sodama_wan_egress` / `sodama_wan_ingress`；
    被判 proxy 的 TCP 由 `bpf_redirect` 进 `dae0gw` → `dae0gwpeer` ingress → tproxy（daens），
    回程由 dae0 ingress 按 `redirect_track` 还原 MAC 后 `BPF_F_INGRESS` 注回 WAN。
    这正是实验室 `test-host-proxy` 已验证过的宿主流量路径。
@@ -69,9 +69,9 @@ P12 之后，mini-dae 已能在 netns lab、`real-node-e2e.sh` 与本地 SOCKS5 
 
 ## 验证方式（实测，2026-10-04，本机 Arch / 6.18.54-lts / wlan0 192.0.2.254）
 
-1. `sudo lab/gateway.sh up --node /tmp/mini-dae-node.url` → 钩子 4 个
-   （`mini_wan_egress@wlan0`、`mini_wan_ingress@wlan0`、`mini_dae0_ingress@dae0gw`、
-   `mini_dae0peer_ingress@dae0gwpeer`），规则 15 条 match_set 下发；
+1. `sudo lab/gateway.sh up --node /tmp/sodama-node.url` → 钩子 4 个
+   （`sodama_wan_egress@wlan0`、`sodama_wan_ingress@wlan0`、`sodama0_ingress@dae0gw`、
+   `sodama0peer_ingress@dae0gwpeer`），规则 15 条 match_set 下发；
 2. `lab/gateway.sh test`：204 / 出口 IP=节点侧 / DNS ok；
    `curl -4 https://www.youtube.com` 200；relay 931KB down、0 dial error；
 3. `sudo lab/gateway.sh down`：`bpftool net show dev wlan0` 无钩子、netns/veth 已删、

@@ -1,40 +1,40 @@
 #!/usr/bin/env bash
-# mini-dae 安装 / 卸载脚本（systemd 部署路径）。
+# sodama 安装 / 卸载脚本（systemd 部署路径）。
 #
 # 用法：
 #   sudo install/install.sh                 # 缺构建产物则构建；安装并打印 enable/start 提示
 #   sudo install/install.sh --build         # 强制重新构建 loader 与 eBPF 对象
 #   sudo install/install.sh --no-build      # 只用已构建产物（缺失则报错）
 #   install/install.sh --dry-run            # 只打印将执行的命令，零写入（可非 root）
-#   sudo install/install.sh --uninstall     # 停止/禁用并删除二进制与单元（保留 /etc/dae-mini）
+#   sudo install/install.sh --uninstall     # 停止/禁用并删除二进制与单元（保留 /etc/sodama）
 #   install/install.sh --help
 #
 # 安装布局：
-#   /usr/local/bin/mini-dae                     loader
-#   /usr/lib/dae-mini/mini-dae-ebpf             eBPF 数据面对象
-#   /etc/systemd/system/dae-mini.service        systemd 单元
-#   /etc/dae-mini/config.dae                    仅当不存在时从 mini-dae/lab/gateway.dae 拷贝
-#   /etc/dae-mini/blocklist.txt                 同上（gateway.dae 的 qname(file:) 相对配置目录解析）
+#   /usr/local/bin/sodama                     loader
+#   /usr/lib/sodama/sodama-ebpf             eBPF 数据面对象
+#   /etc/systemd/system/sodama.service        systemd 单元
+#   /etc/sodama/config.dae                    仅当不存在时从 sodama/lab/gateway.dae 拷贝
+#   /etc/sodama/blocklist.txt                 同上（gateway.dae 的 qname(file:) 相对配置目录解析）
 #
-# 重要：dae-mini.service 的 ExecStart 只是骨架，启动前必须补齐节点/订阅与数据面前置；
+# 重要：sodama.service 的 ExecStart 只是骨架，启动前必须补齐节点/订阅与数据面前置；
 # 见 docs/deploy.md（脚本结束时会打印同样的提示）。
 
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(dirname "$HERE")"
-MINI="$REPO_ROOT/mini-dae"
+MINI="$REPO_ROOT/sodama"
 
-LOADER_SRC="$MINI/target/release/mini-dae"
-OBJ_SRC="$MINI/ebpf-rs/target/bpfel-unknown-none/release/mini-dae-ebpf"
+LOADER_SRC="$MINI/target/release/sodama"
+OBJ_SRC="$MINI/ebpf-rs/target/bpfel-unknown-none/release/sodama-ebpf"
 CONFIG_SAMPLE="$MINI/lab/gateway.dae"
 BLOCKLIST_SAMPLE="$MINI/lab/blocklist.txt"
-SERVICE_SRC="$HERE/dae-mini.service"
+SERVICE_SRC="$HERE/sodama.service"
 
-BIN_DST="/usr/local/bin/mini-dae"
-OBJ_DST="/usr/lib/dae-mini/mini-dae-ebpf"
-SERVICE_DST="/etc/systemd/system/dae-mini.service"
-CONFIG_DIR="/etc/dae-mini"
+BIN_DST="/usr/local/bin/sodama"
+OBJ_DST="/usr/lib/sodama/sodama-ebpf"
+SERVICE_DST="/etc/systemd/system/sodama.service"
+CONFIG_DIR="/etc/sodama"
 CONFIG_DST="$CONFIG_DIR/config.dae"
 BLOCKLIST_DST="$CONFIG_DIR/blocklist.txt"
 
@@ -54,10 +54,10 @@ usage() {
 
 选项：
   --build      强制重新构建 loader 与 eBPF 对象
-               （mini-dae/lab/build-ebpf-rs.sh + cargo build --release）
+               （sodama/lab/build-ebpf-rs.sh + cargo build --release）
   --no-build   只用已构建产物；缺失则报错退出
   --dry-run    只打印将执行的命令，不写任何文件（可非 root 运行）
-  --uninstall  停止/禁用并删除已安装的二进制与 systemd 单元（保留 /etc/dae-mini 配置）
+  --uninstall  停止/禁用并删除已安装的二进制与 systemd 单元（保留 /etc/sodama 配置）
   -h, --help   显示本帮助
 EOF
 }
@@ -103,8 +103,8 @@ ensure_artifacts() {
     build_all
     ;;
   nobuild)
-    [ -x "$LOADER_SRC" ] || die "--no-build 但缺少 $LOADER_SRC（先跑 mini-dae/lab/lab.sh build）"
-    [ -f "$OBJ_SRC" ] || die "--no-build 但缺少 $OBJ_SRC（先跑 mini-dae/lab/build-ebpf-rs.sh）"
+    [ -x "$LOADER_SRC" ] || die "--no-build 但缺少 $LOADER_SRC（先跑 sodama/lab/lab.sh build）"
+    [ -f "$OBJ_SRC" ] || die "--no-build 但缺少 $OBJ_SRC（先跑 sodama/lab/build-ebpf-rs.sh）"
     info "使用已构建产物（--no-build）"
     ;;
   auto)
@@ -156,37 +156,37 @@ install_all() {
   cat <<'EOF'
 下一步（首次安装必读）：
   1) 补齐单元参数（节点/订阅 + 数据面接口）。用 drop-in 覆盖 ExecStart：
-       sudo systemctl edit dae-mini
+       sudo systemctl edit sodama
        [Service]
        ExecStart=
-       ExecStart=/usr/local/bin/mini-dae --config /etc/dae-mini/config.dae \
-           --ebpf /usr/lib/dae-mini/mini-dae-ebpf \
+       ExecStart=/usr/local/bin/sodama --config /etc/sodama/config.dae \
+           --ebpf /usr/lib/sodama/sodama-ebpf \
            --lan none --wan wlan0 --daens gwdae --dae0 dae0gw --dae0peer dae0gwpeer \
            --dialer 'anytls://<节点>'
-       # 或把订阅 URL 写进 /etc/dae-mini/sub.url（chmod 600）后：
-       #   --subscribe file:///etc/dae-mini/sub.url --group proxy
+       # 或把订阅 URL 写进 /etc/sodama/sub.url（chmod 600）后：
+       #   --subscribe file:///etc/sodama/sub.url --group proxy
        # 注意：systemd 单元里 URL 的 % 必须写成 %%；放进文件可绕开。
   2) geodata：样例 dns.routing 用到 geosite，需要 geosite.dat/geoip.dat。
-     放到 /etc/dae-mini/（配置文件所在目录会被自动搜索）或加 --geodata-dir <目录>。
+     放到 /etc/sodama/（配置文件所在目录会被自动搜索）或加 --geodata-dir <目录>。
   3) 数据面前置（netns/veth/sysctl）loader 不会自行创建，见 docs/deploy.md。
   4) 启动与观察：
-       sudo systemctl enable --now dae-mini
-       systemctl status dae-mini
-       journalctl -u dae-mini -f
-  5) 热重载（SIGHUP）：sudo systemctl reload dae-mini
+       sudo systemctl enable --now sodama
+       systemctl status sodama
+       journalctl -u sodama -f
+  5) 热重载（SIGHUP）：sudo systemctl reload sodama
 
 若本次拷贝了样例配置，请务必先完成 1)~3) 再启动；否则会启动失败或代理不通。
 EOF
 }
 
 uninstall_all() {
-  info "卸载 dae-mini（保留 $CONFIG_DIR）"
+  info "卸载 sodama（保留 $CONFIG_DIR）"
   if command -v systemctl >/dev/null 2>&1; then
-    run systemctl disable --now dae-mini.service || true
+    run systemctl disable --now sodama.service || true
   fi
   run rm -f "$BIN_DST" "$OBJ_DST" "$SERVICE_DST"
   if [ "$DRY_RUN" -eq 0 ]; then
-    rmdir /usr/lib/dae-mini 2>/dev/null || true
+    rmdir /usr/lib/sodama 2>/dev/null || true
   fi
   systemd_reload
   echo "已删除二进制与单元；配置保留在 $CONFIG_DIR（如需删除：sudo rm -rf $CONFIG_DIR）"

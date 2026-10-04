@@ -17,7 +17,7 @@
 
 ## 决策
 
-1. **DNS 侧 pname（mini 扩展）**：
+1. **DNS 侧 pname（sodama 扩展）**：
    - **采集**：`split_flow` 在 WAN egress 对 DNS 流（UDP 任意包 / TCP SYN）
      把 `{发起进程名(comm), ktime}` 写入新 map `dns_sender_pname_map`
      （键 = v4-mapped 16B 地址 + **主机序** u16 源端口）。
@@ -29,13 +29,13 @@
      清理 >120s 陈旧条目（否则客户端源端口轮换会耗尽 4096 槽位）。
 2. **bench 并发/多轮**：`dns-bench` 增 `--rounds R --concurrency C`，
    每点总样本 = runs×rounds，`C` 个 scoped 线程并发；输出新增 **p95**。
-3. **实现要点（踩坑）**：`MiniTuple.sport` 是**网络序原始值**（u16 从报文
+3. **实现要点（踩坑）**：`SodaTuple.sport` 是**网络序原始值**（u16 从报文
    直接装入），而 map 键统一用主机序——写侧改用 `pkt.h_sport`；首版实测
    「键不匹配、pname 永不错命」，对拍后修正（详见 NOTES §11.31）。
 
 ## 与 dae 的差异（如实）
 
-- dae 的 DNS 路由函数没有 pname；本项为 mini 方言扩展。
+- dae 的 DNS 路由函数没有 pname；本项为 sodama 方言扩展。
 - dae 无 bench 子命令；并发/多轮/p95 为本工具行为。
 - 进程名取 `bpf_get_current_comm`（≤15B），与 ADR-0033 同；非 argv basename。
 

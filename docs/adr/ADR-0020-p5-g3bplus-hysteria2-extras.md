@@ -50,7 +50,7 @@ ADR-0019 落地 hysteria2 时明确三项不做：salamander 混淆、Brutal CC�
    - 对 quinn 谎报逻辑地址（`meta.addr` 恒为 dial 地址）；
    - **新增 socket 后主动唤醒保存的 recv waker**，让 endpoint driver 重新对全部 socket 注册；
    - interval：链接扩展 `udphop-interval=<秒>`（默认 30，最小 5，与 Go 下限一致）——dae 把该值放在
-     全局配置，链接语法没有对应项，此为 mini-dae 扩展；
+     全局配置，链接语法没有对应项，此为 sodama 扩展；
    - 服务端：hy2-server 增加 `-hop-ports`（多 socket mux：从任意 socket 收，回复走「该客户端最后一次
      来包的 socket」）；quic-go fork 的服务端迁移不需要额外配置。
 4. **链接解析**：`obfs=salamander&obfs-password=…`、`cc_override=bbr|brutal|bbr3`、

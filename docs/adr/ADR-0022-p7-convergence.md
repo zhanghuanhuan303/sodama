@@ -11,7 +11,7 @@ P7 要做的是收敛：先量化，再按数字优化，然后长稳与发布�
 1. **perf 不可用**：`perf_event_paranoid=2` 且机器上没有 `perf` 二进制，也没有安装条件
    （网络受限）。因此本阶段的剖面口径只能是「墙钟吞吐 + 状态面 counters + `/proc` CPU/RSS」，
    **没有采样热点**；这一点必须在所有结论里如实标注。
-2. Python 探针（`client_probe.py`/`stream_probe.py`/`wan_echo.py`）作为端点会先于 mini-dae
+2. Python 探针（`client_probe.py`/`stream_probe.py`/`wan_echo.py`）作为端点会先于 sodama
    成为瓶颈，无法比较路径吞吐。
 3. P4c 的 offload 是最小实现，对照 dae `control/tcp_offload_linux.go` 缺了会话层：
    注册前队列检查、半关闭/终止判定、fast_sock 键注销。C 基准一压就暴露（见下）。
@@ -23,7 +23,7 @@ P7 要做的是收敛：先量化，再按数字优化，然后长稳与发布�
 - C 端点：TCP/UDP echo 服务端 + 多流客户端（带模式校验）、ping-pong RTT（p50/p99）；
   gcc 编译到 `build/bench_io`；服务端在 wan ns 内替换 Python `wan_echo`（bench.sh 负责换）。
 - 路径：`direct`（内核直转基线）/`relay`/`offload`/`ss`/`udp-direct`/`udp-nat`；
-  每条路径 CPU=进程 `utime+stime` 增量、RSS=`VmRSS`、字节=状态面 `mini_dae_relay_*`/`udp_nat_*` 增量。
+  每条路径 CPU=进程 `utime+stime` 增量、RSS=`VmRSS`、字节=状态面 `sodama_relay_*`/`udp_nat_*` 增量。
 - 客户端「收满即停」：吞吐只计数据面，不等 EOF；半关闭语义由专项用例覆盖。
 - 为 direct 路径新增 `bench-up` 会话（`lab/rules.bench.dae`：10.9.9.0/24 全直连）。
 
@@ -59,7 +59,7 @@ UDP blast 模式在本环境被端点/回环丢包主导（loss ~56%），不作
    `tcpConnHasPendingReadData` 拒绝逻辑仍是正确性护栏），对齐实现：排空 + 出错拒绝注册。
 
 **明确不做**：backlog fuse（pause map）、`skb_send_sock` kprobe 精确计费、tcp_info 看门狗——
-mini 用「半关闭超时 + 看门狗回收」兜底；代价是只做半关闭、不做反向关闭的协议最多等 10s
+sodama 用「半关闭超时 + 看门狗回收」兜底；代价是只做半关闭、不做反向关闭的协议最多等 10s
 （dae 同样有 10s 上限）。
 
 ### 3. 优化（先测后改，逐条留数字）

@@ -1,4 +1,4 @@
-# dae-rust · dae 核心数据面的 Rust 重写研究
+# sodama · dae 核心数据面的 Rust 重写研究
 
 [`dae`](https://github.com/daeuniverse/dae)（Go + eBPF 的透明代理网关）核心数据面的
 **Rust 重写实验工程**：可运行、可对拍、可复现，附带从源码研究到架构决策的完整文档。
@@ -48,7 +48,7 @@ docs/                        决策与架构文档
 ├── adr/                         ADR-0001..0031（背景/决策/后果/验证方式）
 └── modules/                     协议字节级规格（tuic-v5 / hysteria2）
 
-mini-dae/                    可运行工程（构建、实验、测试都在这里）
+sodama/                    可运行工程（构建、实验、测试都在这里）
 ├── loader/                    Rust 用户态：加载器 / 规则编译 / DNS / relay / 协议栈 / 状态面
 ├── ebpf-rs/                   Rust eBPF 数据面（aya-ebpf，bpfel-unknown-none + BTF maps）
 ├── lab/                       netns 实验环境与全部测试脚本
@@ -73,19 +73,19 @@ dae/                         上游 dae clone（不入库；对拍工具按需�
 gcc（仅压测夹具 `lab/bench_io.c`）。
 
 ```bash
-cd mini-dae
+cd sodama
 lab/lab.sh build           # 构建 Rust 加载器 + Rust eBPF 对象（不需要 root）
 sudo lab/lab.sh up         # 建 netns 拓扑并启动
 sudo lab/lab.sh verify     # 9 个用例（含单写者、状态面与故障注入）
 sudo lab/lab.sh down
 
-# 真网关模式（真实节点，浏览器零配置；节点 URL 放 /tmp，详见 mini-dae/README.md）
-#   sudo lab/gateway.sh up --node /tmp/mini-dae-node.url
+# 真网关模式（真实节点，浏览器零配置；节点 URL 放 /tmp，详见 sodama/README.md）
+#   sudo lab/gateway.sh up --node /tmp/sodama-node.url
 #   lab/gateway.sh test && sudo lab/gateway.sh down    # 快检后回滚
 ```
 
-详细的拓扑说明、全部会话/测试清单与实测输出见 [`mini-dae/README.md`](./mini-dae/README.md)；
-数据面机制与坑清单见 [`mini-dae/NOTES.md`](./mini-dae/NOTES.md)。
+详细的拓扑说明、全部会话/测试清单与实测输出见 [`sodama/README.md`](./sodama/README.md)；
+数据面机制与坑清单见 [`sodama/NOTES.md`](./sodama/NOTES.md)。
 
 ## 文档
 
@@ -97,7 +97,7 @@ sudo lab/lab.sh down
   0023/0024/0025（数据面 Rust 全量迁移 → C 对象退场）、0029（真网关模式）、
   0030（嗅探 + dial_mode）、0031（订阅/节点组/健康检查）、0032（IPv6 数据面 TCP 全链）、
   0033（geoip/geosite 展开 + pname）、0034/0035/0036（DoT/DoH/DoQ 上游 + dns.routing 分流）。
-- [`docs/parity-status.md`](./docs/parity-status.md) — 对标进度：dae（Go）↔ mini-dae（全 Rust）
+- [`docs/parity-status.md`](./docs/parity-status.md) — 对标进度：dae（Go）↔ sodama（全 Rust）
   分域覆盖度对照（15 域 + 汇总 + Top 缺口 + 优势项，逐行附证据锚点）。
 - [`docs/modules/`](./docs/modules/) — tuic v5 / hysteria2 的字节级客户端规格。
 
@@ -106,13 +106,13 @@ sudo lab/lab.sh down
 - 本仓库是对 dae（Go + eBPF）的**学习/研究性 Rust 重写**，不是 dae 官方项目；
   许多语义、map 布局与协议实现以 dae 源码为参照（逐项记录在文档与注释中）。
 - 许可证：**AGPL-3.0-only**（见 [`LICENSE`](./LICENSE)），与上游 dae 一致。
-- 上游代码不随本仓库分发：`dae/` 与 `mini-dae/lab/parity/dae-work/` 均在
+- 上游代码不随本仓库分发：`dae/` 与 `sodama/lab/parity/dae-work/` 均在
   `.gitignore` 中。需要运行规则对拍/跨实现联调时，把 dae clone 到本仓库同级目录：
 
   ```bash
   git clone https://github.com/daeuniverse/dae dae
-  cd mini-dae && lab/parity.sh          # 逐字节对拍 dae 的 Go 规则编译器
+  cd sodama && lab/parity.sh          # 逐字节对拍 dae 的 Go 规则编译器
   ```
 
-- 唯一保留的 C 源文件是压测服务端夹具 `mini-dae/lab/bench_io.c`（不属于数据面）。
+- 唯一保留的 C 源文件是压测服务端夹具 `sodama/lab/bench_io.c`（不属于数据面）。
 - 第三方商标与项目名称归其各自所有者；本仓库与 daeuniverse 无隶属关系。

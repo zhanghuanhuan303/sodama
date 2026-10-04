@@ -16,14 +16,14 @@
 
 ## 决策
 
-1. **应答侧 `sip(...)`**（`dnsroute.rs`，mini 扩展）：
+1. **应答侧 `sip(...)`**（`dnsroute.rs`，sodama 扩展）：
    - 与请求侧同义：CIDR/`geoip:`/`ext:`，支持 `!`，与 qname/qtype/upstream/ip
      同链参与 `&&`/fallback；
    - `response_select_for(resp, served, client)`：客户端地址由 main 透传
      （UDP 取 recvmsg 源地址、TCP 取 `peer_addr()`）；无来源信息时不命中；
    - 兼容签名 `response_select(resp, served)`（= client None）保留给测试。
-2. **`dns-bench` 子命令**（mini 扩展工具；用户态、不加载 eBPF）：
-   - `mini-dae dns-bench --config <file.dae> --names a,b [--tags t1,t2]
+2. **`dns-bench` 子命令**（sodama 扩展工具；用户态、不加载 eBPF）：
+   - `sodama dns-bench --config <file.dae> --names a,b [--tags t1,t2]
      [--runs N] [--client <IP>]`；
    - 从配置构建与运行时同一套 `UpstreamSet`（`build_upstream_set_core` 复用），
      对 names × tags 逐条 `exchange()`，输出 ok 数、min/avg/p50（ms）、
@@ -44,7 +44,7 @@
 
 ## 与 dae 的差异（如实）
 
-- dae 无应答侧 `sip`、无 bench 子命令；两者均为 mini 方言/工具扩展。
+- dae 无应答侧 `sip`、无 bench 子命令；两者均为 sodama 方言/工具扩展。
 - bench 的 p50 是 N 次样本中位数（默认 5），不追求统计严谨；不测并发。
 
 ## 后果
@@ -67,7 +67,7 @@
 
 1. 单测：`cargo test --release`（`response_sip_filters_by_client`）。
 2. lab：`sudo lab/lab.sh dnsroute-up && sudo lab/lab.sh test-dnsroute`。
-3. 真机：`sudo ./target/release/mini-dae dns-bench --config lab/gateway.dae
+3. 真机：`sudo ./target/release/sodama dns-bench --config lab/gateway.dae
    --names … --tags router,alidns_ecs,alidns --runs 5 --client <本机 IP>`。
 
 ## 修订条件

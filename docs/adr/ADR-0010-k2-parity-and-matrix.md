@@ -20,7 +20,7 @@ ADR-0009 给 K2 的验收是「map dump/判决对拍自动化；内核矩阵（5
 ## 决策
 
 1. **对拍口径**：K2 的「对拍」= **编译产物逐字节一致** —— 同一份 `.dae` 子集规则，
-   dae 原版 Go 编译器与 mini-dae 的 Rust 编译器输出的 `match_set` 数组（字段级：
+   dae 原版 Go 编译器与 sodama 的 Rust 编译器输出的 `match_set` 数组（字段级：
    type/not/outbound/mark/must/端口区间/掩码/LPM 前缀集合）必须逐字节一致，由
    `lab/parity.sh` 自动化。**判决对拍**由 `lab.sh verify` 的包级 e2e 承担（判决结果
    与 dae 常量、语义注释对齐）。**完整 Go 运行时对拍**（跑真实 dae 打同一条流）不列为

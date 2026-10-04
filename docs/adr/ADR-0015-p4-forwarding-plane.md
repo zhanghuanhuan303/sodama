@@ -6,7 +6,7 @@
 
 ## 背景
 
-P4 之前，mini-dae 的「代理出口」只有实验回显与 `--forward socks5://` 一跳：没有真正的转发面，
+P4 之前，sodama 的「代理出口」只有实验回显与 `--forward socks5://` 一跳：没有真正的转发面，
 offload 与 UDP NAT 完全缺失。P4 要补三块：**TCP relay**（真实转发 + 生命周期）、
 **UDP NAT**（非 DNS 的代理 UDP）、**TCP offload**（内核内拼接，`fast_sock`/`sk_skb`）。
 每块都有必须先定义的语义，否则会把「能跑」做成「跑错」：
@@ -21,7 +21,7 @@ offload 与 UDP NAT 完全缺失。P4 要补三块：**TCP relay**（真实转�
 1. **relay + Dialer（P4a）**：新增 `--dialer direct|socks5://host:port`；`--forward`
    等价于 socks5 dialer（过渡形态，P5 由原生协议栈取代）。accept 仍在 daens，连接经
    mpsc 转交 **host ns 的 relay 线程池**；上游 socket 一律打 `SO_MARK = 0x233`，
-   数据面在 `mini_lan_ingress`/`mini_wan_egress` 对带 mark 的包直接放行
+   数据面在 `sodama_lan_ingress`/`sodama_wan_egress` 对带 mark 的包直接放行
    （对照 dae `is_dae_socket`）。每连接双向泵送、半关闭（EOF → shutdown write），
    记录 bytes/active，空闲由 janitor（默认 300s，`--relay-idle-timeout`）强制回收。
 2. **UDP NAT（P4b）**：透明 UDP 监听按原始目的端口分流：53 → DNS 引擎，其余 → NAT。
@@ -31,7 +31,7 @@ offload 与 UDP NAT 完全缺失。P4 要补三块：**TCP relay**（真实转�
    `--udp-idle-timeout`）。**映射语义按 (client, orig_dst) 分流**：同一客户端去不同
    目的地址用不同上游端口（不是跨目标的 full-cone），回包不校验来源地址。
 3. **TCP offload（P4c，最小实现）**：数据面新增 `fast_sock` SOCKHASH 与
-   `sk_skb/stream_verdict` 程序 `mini_tcp_offload`（对照 dae `tcp_offload_redirect`）：
+   `sk_skb/stream_verdict` 程序 `sodama_tcp_offload`（对照 dae `tcp_offload_redirect`）：
    - 键 =「**对端**收到报文时的四元组」（sip=remote, dip=local, sport=remote_port,
      dport=local_port），因此每个 socket 以 peer 的元组入 map；
    - verdict 按当前 skb 自身元组查到 peer socket 后 `bpf_sk_redirect_hash(..., flags=0)`
@@ -39,10 +39,10 @@ offload 与 UDP NAT 完全缺失。P4 要补三块：**TCP relay**（真实转�
    - relay 建立后即注册两端（`--offload`，需配 dialer）；注册后用户态泵**继续存在**
      但把 EAGAIN/EOF 当「驻留重试」而不是断连（psock 接管后 read 会 EAGAIN；注册前
      已入队的数据仍需泵排空，顺序天然保持）。
-4. **边界（mini 明确不做，留给后续或不做）**：
+4. **边界（sodama 明确不做，留给后续或不做）**：
    - offload 无 backlog fuse / `tcp_info` 看门狗 / 半关闭计时 / 字节计费 / 暂停与
      用户态回退协调；已 offload 的连接不参与 janitor 回收（进程退出时统一关闭）。
-     dae 的对应机制见 `tcp_offload_linux.go`（约 950 行）——mini 的边界在此，不假装。
+     dae 的对应机制见 `tcp_offload_linux.go`（约 950 行）——sodama 的边界在此，不假装。
    - relay 无嗅探（TLS/QUIC）、无并发上限与 per-conn 超时策略、无 UDP full-cone 跨目标。
    - UDP NAT 不做 DNS 语义特判（DNS 已由独立分支处理）。
 5. **验收口径**：
@@ -69,10 +69,10 @@ offload 与 UDP NAT 完全缺失。P4 要补三块：**TCP relay**（真实转�
 
 ## 后果
 
-- 正面：mini-dae 具备完整转发面最小闭环（TCP/UDP 真实出口 + 内核拼接 offload），
+- 正面：sodama 具备完整转发面最小闭环（TCP/UDP 真实出口 + 内核拼接 offload），
   `--forward` 升级为 relay 的一种 dialer；状态面新增 `relay`/`udp_nat`/offload 计数，
   转发行为可观测；offload 的「用户态零字节」证据可回归。
-- 负面/代价：offload 连接在 mini 里不回收（长跑场景是 fd/内存泄漏点，进程退出才清）；
+- 负面/代价：offload 连接在 sodama 里不回收（长跑场景是 fd/内存泄漏点，进程退出才清）；
   UDP NAT 每目的地址一个上游 socket（端口消耗高于跨目标复用）；relay 线程池每连接
   两线程（无上限）。
 - 风险：sockhash 条目无法用 bpftool 枚举（`map dump` 显示 0 条、`map lookup` 返回

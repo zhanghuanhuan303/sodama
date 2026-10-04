@@ -31,7 +31,7 @@ P5 的目标是把 P4 的「过渡一跳」（`--forward socks5://`）替换为*
    - rustls 0.23（ring provider，进程内 `install_default` 一次）+ webpki 根；
      `allowInsecure=1` 时用 `NoVerify`（仅实验/自签）；SNI 可配（默认取 URL 的 host）；
    - 握手头：`hex(SHA224(password)) + CRLF + 0x01(CONNECT) + ATYP + ADDR + PORT + CRLF`，
-     ATYP 只做 IPv4（mini relay 的目标恒为 IPv4）；之后双向透明；
+     ATYP 只做 IPv4（sodama relay 的目标恒为 IPv4）；之后双向透明；
    - 边界：不做 UDP ASSOCIATE（03）、不做域名目标（0x03）、不做 TLS close_notify
      半关闭语义（直接 FIN）；URL 只支持 `trojan://pass@host:port?sni=&allowInsecure=`。
 3. **offload 与协议互斥（显式）**：`Outbound::supports_offload()` 只有 `direct`/`socks5`
@@ -44,10 +44,10 @@ P5 的目标是把 P4 的「过渡一跳」（`--forward socks5://`）替换为*
 5. **跨实现验收对端**：`lab/ss_server.py`（Python `cryptography` 独立实现 TCP+UDP）、
    `lab/trojan_server.py`（stdlib `ssl` 独立实现）——不复用 Rust 侧任何代码；两个服务端
    的上游 socket 与 Rust relay 一样打 `SO_MARK=0x233`（同 ADR-0015 的防自环理由，
-   否则服务端自己的出站流量会被 mini-dae 二次捕获成环）。
+   否则服务端自己的出站流量会被 sodama 二次捕获成环）。
    另有两个**本地复现器**（不依赖 netns，用本地 echo 目标）：`lab/ss_local_probe.py`、
    `lab/trojan_local_probe.py`，用于把协议层问题从拓扑问题里剥离。
-6. **边界（mini 明确不做，留给后续）**：VMess/VLESS/SOCKS5-UDP 等属 G2；uTLS/指纹、
+6. **边界（sodama 明确不做，留给后续）**：VMess/VLESS/SOCKS5-UDP 等属 G2；uTLS/指纹、
    obfs/ws 传输、多用户/密码表、trojan 的 UDP、IPv6 目标均不在 G1；ss 不做 2022 版。
 7. **验收口径**：
    - `test-ss` / `test-trojan`：小流量回显 + 512KB 随机数据逐字节一致；独立服务端日志
