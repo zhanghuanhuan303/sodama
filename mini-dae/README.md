@@ -8,7 +8,8 @@ QUIC + 最小 HTTP/3 认证）、P5-G3b+（salamander 混淆 / Brutal 近似 / u
 P18a–e（DoT/DoH、DoQ、`dns.routing`、ECS/sip、pname、REALITY+Vision、SS2022/http、热更新、CI/systemd）、
 P19（多组分派 + 启动健壮性）、
 P20（QUIC Initial SNI 嗅探）、P21（sniff-punt）、P22（UDP over IPv6 全链）、
-P23（sticky IP / DoH h2 / bootstrap / DNS 选项）、P24（uTLS Chrome-120 / Vision splice / TUIC 0-RTT）与
+P23（sticky IP / DoH h2 / bootstrap / DNS 选项）、P24（uTLS Chrome-120 / Vision splice / TUIC 0-RTT）、
+P25（naive / HTTP-2 CONNECT）与
 P6（suspend/reload/metrics/sysdump/日志轮转/整配置热重载）已完成**；P9+ 已删除 C 数据面，
 `ebpf-rs` 的 Rust 对象是**唯一数据面**（ADR-0025）。
 
@@ -170,6 +171,12 @@ P6（suspend/reload/metrics/sysdump/日志轮转/整配置热重载）已完成*
   ALPS/GREASE-ECH/Boring padding）；Vision 上行 splice（回归测试固化）；TUIC 0-RTT
   （无票据/被拒无痛回退）；显式边界：ECH/shadow-tls/juicity/naive/ssr、rustls
   路径 uTLS（ADR-0048、NOTES §11.39）
+- **P25 naive（HTTP/2 CONNECT 出站）**：复用 DoH 的 `h2client` 帧层新增 CONNECT 隧道
+  （HPACK `:method`/`:authority` + `connect_tunnel` reader 线程 + 双向流控 +
+  `END_STREAM` 半关闭 + 两半 drop 关底层）；`naive+https://`/`naive://`（Basic）,
+  `naive+quic://`（H3）显式未实现；`tls::connect_alpn` 必须协商 h2；lab 新增
+  Go 标准库参考服务端 + `naive-up`/`test-naive`（交互零延迟 + 512KB 逐字节；
+  ADR-0049、NOTES §11.40）
 - **P5-G3a QUIC（tuic v5）**：惰性 tokio 运行时 + quinn（阻塞 relay 用 block_on 桥接）；
   认证 token = TLS exporter（label=uuid 裸字节、context=password）；TCP 每条中继一条 QUIC
   双向流，UDP 走 QUIC DATAGRAM（含分片/重组）；上游 socket 用自建 `Endpoint` 打 `SO_MARK`；
@@ -398,6 +405,9 @@ sudo lab/lab.sh hy2-brutal-up    # P5-G3b+：cc_override=brutal + 带宽声明
 sudo lab/lab.sh test-hy2-brutal  # 512KB（Brutal 近似路径）
 sudo lab/lab.sh hy2-hop-up  # P5-G3b+：udphop（端口并集 + 5s 跳端口 + 多端口 mux）
 sudo lab/lab.sh test-hy2-hop     # 两轮 512KB 跨跳存活
+lab/proto-check/build-naive-server.sh  # P25：构建 naive 参考服务端（Go 标准库 h2）
+sudo lab/lab.sh naive-up    # P25：naive（HTTP/2 CONNECT + Basic）会话 + offload 互斥
+sudo lab/lab.sh test-naive       # 交互零延迟 + 512KB 双向流控 + 服务端 proto=HTTP/2.0
 # P12：本地 SOCKS5 入口（浏览器验收；不加载 eBPF、不需 root）：
 # target/release/mini-dae --listen-socks 127.0.0.1:11080 --dialer 'anytls://…' --dial-timeout 15
 # 浏览器：SOCKS5 127.0.0.1:11080（Firefox 勾“SOCKS v5 时代理 DNS”）；停止：pkill -f listen-socks

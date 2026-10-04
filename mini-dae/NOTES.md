@@ -1376,3 +1376,28 @@ lab 夹具 `http_connect_server.py` + `sub_server.py` 每次重读。）
 - 真机：新二进制重启网关自检通过；订阅含 48 条 REALITY 的组 66/66 alive、代理 204、0 panic。
 - 显式边界（本轮不做）：ECH（rustls 无客户端 ECH）、shadow-tls 插件（依赖 fork rustls
   暴露 TLS randoms）、juicity/naive/ssr、rustls 路径 uTLS 逐字节（rustls 不暴露 CH 构造）。
+
+### 11.40 P25（naive h2 CONNECT，ADR-0049）已验收的行为
+
+- `h2client.rs` 抽帧层（`write_frame_raw`/`read_frame_raw`/`strip_padding_io`）后新增
+  **HTTP/2 CONNECT 隧道**：`H2Conn::next_stream` + 对端 `SETTINGS_INITIAL_WINDOW_SIZE`（id=4）
+  解析；`encode_connect_headers`（HPACK：`:method` 静态名 2 + literal "CONNECT"、`:authority`
+  静态名 1、额外头用名字字面量）；`connect_tunnel` reader 线程（DATA→`VecDeque` 并回
+  `WINDOW_UPDATE`、对端窗口更新唤醒写者、SETTINGS/PING/RST/GOAWAY 处理）。
+- `TunnelReader`/`TunnelWriter`：写侧双向流控（连接级+流级 `wait_window`）、
+  `MAX_DATA_FRAME=16384`、`end_stream()` 幂等（半关闭必须发 END_STREAM，否则服务端读不到
+  EOF 不回包）、两半都 drop 时 shutdown 底层 TCP 唤醒 reader 线程。
+- `outbound::Naive`：`naive+https://`/`naive://` 解析（userinfo 用 `rsplit_once('@')` 兼容
+  密码含 `@`）、Basic=`base64(user:pass)`、`tls::connect_alpn` 必须协商 h2（不降级 H1）；
+  `naive+quic://`（H3）显式报错不静默。
+- lab：Go 标准库参考服务端（`lab/proto-check/naive-server/`）——CONNECT 直挂 Handler
+  （经 ServeMux 会 404：CONNECT 的 URL.Path 为空）、出口 socket SO_MARK=0x233 防数据面
+  二次接管、上行→客户端逐块 Flush；`test-naive`：交互零延迟（`RECV 0.00`）+ 512KB 逐字节
+  （`stream-ok bytes=524288`）+ 服务端日志 `proto=HTTP/2.0` + `offloaded_total=0`（h2 隧道
+  不可内核拼接，符合预期）。
+- 实测：`cargo test --release` **204/204**（新增 `connect_headers_encode` 字节级、
+  `parse_naive_url`）；回归 `verify` 9/9 + `test-sniff-punt`/`test-v6`/`test-doh-h2`/
+  `test-dns-options`/`test-tuic` 全 PASS；真机网关 66/66 alive、generate_204→204、0 panic。
+- 边界：仅 h2（无 H3/QUIC 形态）、不做跨目标连接池（每客户端连接一条底层 h2 连接）、
+  Basic 凭据仅 base64（安全性依赖外层 TLS；`insecure=1` 时有 MITM 风险）、服务端兼容性
+  未做矩阵穷举（按 RFC 9113 CONNECT 语义实现，已过 Go 标准库 `net/http` h2）。
