@@ -1,0 +1,23 @@
+# udp.sh 对照用：mihomo（Clash Verge 内核）tproxy 入站（UDP）+ ss UDP 出站。
+log-level: warning
+mode: rule
+allow-lan: true
+bind-address: "*"
+ipv6: false
+find-process-mode: off
+tproxy-port: 7897
+proxies:
+  - name: p
+    type: ss
+    server: 10.9.9.2
+    port: 8388
+    cipher: chacha20-ietf-poly1305
+    password: testpass
+    udp: true
+proxy-groups:
+  - name: PROXY
+    type: select
+    proxies: [p]
+rules:
+  - IP-CIDR,1.1.1.1/32,PROXY,no-resolve
+  - MATCH,DIRECT

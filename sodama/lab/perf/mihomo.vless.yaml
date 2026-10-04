@@ -1,0 +1,27 @@
+# mem.sh 五方对照用：mihomo（Clash Verge 内核）tproxy 入站 + VLESS 出站。
+# 与 run.sh 的 vless 上游（sing-box server @10.9.9.2:8543）对接。
+log-level: warning
+mode: rule
+# tproxy 必须绑通配地址：默认 allow-lan=false 会绑 127.0.0.1，
+# 透明流量（目的地址非本地）无法投递到 loopback 监听。
+allow-lan: true
+bind-address: "*"
+ipv6: false
+find-process-mode: off
+tproxy-port: 7897
+proxies:
+  - name: p
+    type: vless
+    server: 10.9.9.2
+    port: 8543
+    uuid: b831381d-6324-4d53-ad4f-8cda48b30811
+    network: tcp
+    tls: false
+    udp: false
+proxy-groups:
+  - name: PROXY
+    type: select
+    proxies: [p]
+rules:
+  - IP-CIDR,1.1.1.1/32,PROXY,no-resolve
+  - MATCH,DIRECT

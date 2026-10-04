@@ -31,6 +31,7 @@ BENCH_BIN="$ROOT/build/bench_io"
 DAE_BIN="${DAE_BIN:-/tmp/perf/usr/bin/dae}"
 SINGBOX_BIN="${SINGBOX_BIN:-sing-box}"
 V2RAY_BIN="${V2RAY_BIN:-v2ray}"
+MIHOMO_BIN="${MIHOMO_BIN:-mihomo}"
 CLIENT_NS=sodama_client
 WAN_NS=sodama_wan
 UDP_ECHO_PORT=9998
@@ -177,6 +178,18 @@ start_impl() {
     "$V2RAY_BIN" run -c "$cfg" >/tmp/perf-udp-v2ray.log 2>&1 &
     pid=$!
     ;;
+  mihomo)
+    command -v "$MIHOMO_BIN" >/dev/null || { echo "!! 缺 mihomo（Clash Verge 内核）"; return 1; }
+    mkdir -p /tmp/perf-udp-mihomo
+    nft_add 7897
+    local cfg="$HERE/mihomo.ss.yaml"
+    if [ "$SS_METHOD" != "chacha20-ietf-poly1305" ]; then
+      sed_method "$HERE/mihomo.ss.yaml" /tmp/perf-udp-mihomo.yaml
+      cfg=/tmp/perf-udp-mihomo.yaml
+    fi
+    "$MIHOMO_BIN" -d /tmp/perf-udp-mihomo -f "$cfg" >/tmp/perf-udp-mihomo.log 2>&1 &
+    pid=$!
+    ;;
   direct) ;; # 直连基线：不启实现
   *) die "未知实现：$impl" ;;
   esac
@@ -286,6 +299,7 @@ all() {
     bench_impl dae || echo "!! dae 跳过"
     bench_impl singbox || echo "!! singbox 跳过"
     bench_impl v2ray || echo "!! v2ray 跳过"
+    bench_impl mihomo || echo "!! mihomo 跳过"
     # 直连基线（拓扑已在，无实现）
     rm -f "$IMPL_PID_FILE"
     run_one direct direct "$DIRECT_TARGET"
@@ -307,7 +321,7 @@ prepare) prepare ;;
 bench)
   require_root
   case "${2:-}" in
-  sodama | sodama-nobatch | dae | singbox | v2ray)
+  sodama | sodama-nobatch | dae | singbox | v2ray | mihomo)
     : >"$RESULTS"
     for r in $(seq 1 "$ROUNDS"); do
       echo "-- 轮 $r/$ROUNDS --"
@@ -323,7 +337,7 @@ bench)
     done
     medians
     ;;
-  *) die "用法：bench sodama|sodama-nobatch|dae|singbox|v2ray|direct" ;;
+  *) die "用法：bench sodama|sodama-nobatch|dae|singbox|v2ray|mihomo|direct" ;;
   esac
   ;;
 all)

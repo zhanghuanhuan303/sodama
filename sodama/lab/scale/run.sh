@@ -36,6 +36,7 @@ build() {
 
 prepare() {
   require_root
+  mkdir -p "$DIR"
   [ -x "$ROOT/build/echo_server" ] || build
   "$LAB" down >/dev/null 2>&1 || true
   # 清理旧进程

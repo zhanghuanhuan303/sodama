@@ -1,0 +1,283 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>sodama · 内存终测报告（本版内核 · 五方对照）</title>
+<style>
+  :root{
+    --bg:#0f1115; --card:#171a21; --card2:#1d212b; --fg:#e6e9ef; --muted:#9aa3b2;
+    --line:#2a2f3a; --accent:#5ee0a0; --accent2:#7cc4ff; --warn:#ffcc66; --bad:#ff7b72;
+    --ok:#5ee0a0; --shadow:0 8px 28px rgba(0,0,0,.35); --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+    --sans:-apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans CJK SC","PingFang SC","Microsoft YaHei",sans-serif;
+  }
+  @media (prefers-color-scheme: light){
+    :root{ --bg:#f6f7fa; --card:#ffffff; --card2:#f0f2f6; --fg:#1c2028; --muted:#5b6472; --line:#e2e6ee;
+           --shadow:0 6px 20px rgba(20,30,60,.08); }
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.65 var(--sans);}
+  .wrap{max-width:1080px;margin:0 auto;padding:32px 20px 80px}
+  header.top{border-bottom:1px solid var(--line);padding-bottom:18px;margin-bottom:26px}
+  h1{font-size:26px;margin:0 0 6px;letter-spacing:.2px}
+  h2{font-size:20px;margin:38px 0 12px;padding-top:10px;border-top:1px solid var(--line)}
+  h3{font-size:16px;margin:24px 0 8px}
+  p{margin:8px 0}
+  .sub{color:var(--muted);font-size:13.5px}
+  .chips{display:flex;flex-wrap:wrap;gap:8px;margin:12px 0 0}
+  .chip{background:var(--card2);border:1px solid var(--line);border-radius:999px;padding:3px 11px;font-size:12.5px;color:var(--muted)}
+  .chip b{color:var(--fg);font-weight:600}
+  .grid{display:grid;gap:14px;grid-template-columns:repeat(auto-fit,minmax(230px,1fr))}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:16px 16px 14px;box-shadow:var(--shadow)}
+  .kpi{font-size:26px;font-weight:700;letter-spacing:.3px}
+  .kpi small{font-size:12.5px;color:var(--muted);font-weight:500;margin-left:4px}
+  .tag{display:inline-block;font-size:11.5px;padding:2px 8px;border-radius:6px;border:1px solid var(--line);color:var(--muted);margin-right:6px}
+  .tag.ok{color:var(--ok);border-color:rgba(94,224,160,.35)}
+  .tag.warn{color:var(--warn);border-color:rgba(255,204,102,.35)}
+  .tag.bad{color:var(--bad);border-color:rgba(255,123,114,.35)}
+  table{width:100%;border-collapse:collapse;margin:12px 0;font-size:14px}
+  th,td{border:1px solid var(--line);padding:7px 9px;text-align:right}
+  th:first-child,td:first-child{text-align:left}
+  thead th{background:var(--card2);color:var(--muted);font-weight:600;font-size:12.5px}
+  td.n{font-family:var(--mono)}
+  .best{color:var(--accent);font-weight:700}
+  .worst{color:var(--bad)}
+  .bar{height:10px;border-radius:5px;background:linear-gradient(90deg,var(--accent2),var(--accent));min-width:2px;display:inline-block;vertical-align:middle}
+  .bar.alt{background:linear-gradient(90deg,#8f9bb3,#c2cbd9)}
+  .bar.warm{background:linear-gradient(90deg,#e0a060,#ffcc66)}
+  .bars{display:grid;grid-template-columns:170px 1fr 100px;gap:6px 10px;align-items:center;margin:10px 0}
+  .bars .lbl{color:var(--muted);font-size:13px;text-align:left}
+  .bars .val{font-family:var(--mono);font-size:13px;text-align:right}
+  .note{background:var(--card2);border-left:3px solid var(--accent2);border-radius:8px;padding:10px 12px;margin:12px 0;color:var(--muted);font-size:13.5px}
+  .note b{color:var(--fg)}
+  .note.ok{border-left-color:var(--accent)}
+  .note.warn{border-left-color:var(--warn)}
+  code,pre{font-family:var(--mono)}
+  pre{background:var(--card2);border:1px solid var(--line);border-radius:10px;padding:12px;overflow:auto;font-size:12.5px;line-height:1.5}
+  .ok{color:var(--ok)} .warnc{color:var(--warn)} .badc{color:var(--bad)} .muted{color:var(--muted)}
+  .foot{margin-top:46px;border-top:1px solid var(--line);padding-top:14px;color:var(--muted);font-size:12.5px}
+  .two{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+  @media (max-width:760px){ .two{grid-template-columns:1fr} }
+  .done{color:var(--ok)}
+  .legend{font-size:12.5px;color:var(--muted);margin-top:4px}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header class="top">
+  <h1>sodama · 内存终测报告 <span class="tag ok">本版内核收口</span></h1>
+  <div class="sub">五方同拓扑对照（sodama / dae v2.1.1 / sing-box 1.14.2 / v2ray 5.52.0 / <b>mihomo 1.19.32（Clash Verge 内核）</b>）·
+  阶段：idle → 吞吐（VLESS 4×128MB）→ hold 2000 连接 → churn 10s → 静置 30s ·
+  200ms 采样 VmRSS/线程/fd · 两遍独立复测 · 2026-10-05 · v1.0（M1–M4 + O 系列 + G1 后）</div>
+  <div class="chips">
+    <span class="chip">夹具 <b>lab/perf/mem.sh（新增）</b></span>
+    <span class="chip">上游 <b>sing-box VLESS（五方共用）</b></span>
+    <span class="chip">负载 <b>bench_io echo · conn_scale hold/churn</b></span>
+    <span class="chip">sodama 稳态 <b class="ok">12.5 MB</b></span>
+    <span class="chip">10k 连接 <b class="ok">34.8 MB / 29 线程</b></span>
+    <span class="chip">hold 2000 <b class="ok">29–30.5 MB</b> vs dae <b class="badc">297–299 MB</b></span>
+    <span class="chip">回归 <b>257/257 单测 · G1 口径不回归</b></span>
+  </div>
+</header>
+
+<section>
+<h2>01 · 摘要</h2>
+<div class="grid">
+  <div class="card">
+    <div class="sub">稳态 RSS（静置 30s 后）</div>
+    <div class="kpi">12.5 <small>MB</small></div>
+    <div class="sub">启动期高水位 27–28.5 MB；周期 trim 后回落（两遍 12.4 / 12.5）</div>
+  </div>
+  <div class="card">
+    <div class="sub">hold 2000 连接（VLESS 路径）</div>
+    <div class="kpi">29–30.5 <small>MB</small></div>
+    <div class="sub">线程 28→29；dae 297–299 MB（<b class="ok">≈1/10</b>）· sing-box 91–95 · v2ray 139–144 · mihomo 168–174</div>
+  </div>
+  <div class="card">
+    <div class="sub">churn 10s（≈26k 新建）</div>
+    <div class="kpi">29.7–31.2 <small>MB</small></div>
+    <div class="sub">峰值线程 43；dae 406–419 MB · v2ray 463–495 MB（GC 前高水位）· sing-box 93–95 · mihomo 191–233</div>
+  </div>
+  <div class="card">
+    <div class="sub">10 000 连接（direct relay 夹具）</div>
+    <div class="kpi">34.8 <small>MB / 29 线程</small></div>
+    <div class="sub"><span class="tag ok">0 线程/连接</span> 线程模型同口径：20 012 线程 / <b class="badc">527.4 MB</b> · 建立 4 950/s</div>
+  </div>
+  <div class="card">
+    <div class="sub">UDP 20k pps（40k 包/轮，0 丢包）</div>
+    <div class="kpi">29.2 <small>MB</small></div>
+    <div class="sub">CPU 580 ms/40k 包（五方最低；dae 2 100 / sing-box 1 620 / v2ray 1 770 / mihomo 2 425）</div>
+  </div>
+  <div class="card">
+    <div class="sub">churn 10s 极限速率（专项夹具）</div>
+    <div class="kpi">26 026 <small>conn/s</small></div>
+    <div class="sub">260 336 条 / 10s，峰值 35.2 MB / 42 线程，fail=0</div>
+  </div>
+</div>
+
+<div class="note ok">
+<b>结论：</b>本版内核（eBPF 数据面 + reactor 池 + 缓冲池/回收）在全部五个压力阶段都是五方中内存占用最低的实现：
+idle 27–28.5 MB（对手 43.4–60.2 MB）；hold 为 dae 的 <b>1/10</b>、其余对手的 1/3–1/6；
+churn 后仍 ≤31.2 MB（对手 92.7–494.8 MB）；UDP 29.2 MB（对手 55.7–64.5 MB）；
+静置回收后 <b>12.5 MB</b>（对手 68.4–317.7 MB）。
+两遍独立复测的关键数字一致（偏差 ≤3%），作为本版内存终测口径收口。
+</div>
+</section>
+
+<section>
+<h2>02 · 方法与口径</h2>
+<ul class="sub">
+  <li><b>拓扑</b>：client ns — 网关（被测实现）— WAN ns（bench_io 全双工 echo <code>1.1.1.1:8080</code> + sing-box VLESS 上游 <code>10.9.9.2:8543</code>），与 <code>lab/perf/run.sh</code> 同一套夹具。</li>
+  <li><b>实现姿态</b>：sodama/dae 以各自原生 eBPF 数据面（生产模式）接管；sing-box/v2ray/mihomo 以各自 Linux <b>tproxy</b> 模式 + nft 规则接管（mihomo 配置需 <code>allow-lan: true</code> + <code>bind-address: "*"</code>，默认 loopback 绑定无法承接透明流量——已在 <code>lab/perf/mihomo.*.yaml</code> 固化）。</li>
+  <li><b>阶段</b>：idle（启动后 3–6s）→ load（VLESS 4 流 ×128 MB 全双工 echo）→ hold（2000 条并发，每条 32B ping 验证后持有 10s）→ churn（10s 限时 connect→ping→close，约 26k 条）→ recovery（全部关闭后静置 30s 读一次 RSS）。</li>
+  <li><b>指标</b>：每阶段对被测进程 200 ms 采样 <code>/proc/&lt;pid&gt;/status</code> 的 VmRSS / Threads 与 <code>/proc/&lt;pid&gt;/fd</code> 计数，取<b>峰值</b>；recovery 为静置后的单次读数。</li>
+  <li><b>样本</b>：五方 × 两遍独立全程（<code>/tmp/mem-results.tsv</code> / <code>/tmp/mem-results2.tsv</code>）；负载均由客户端侧验证（hold 2000/2000 全成功，churn ≈26 228 条/10s，吞吐 verify=ok）。</li>
+  <li><b>已知偏差</b>：dae 的 load 轮出现尾读截断（512 传 / 502 收，verify=ok），峰值采样仍有效；v2ray 的 recovery 两遍差异大（190 / 318 MB），与其 GC 时机相关；RSS 为进程视角，不含内核侧内存（五方共用同一内核路径，可比）。</li>
+</ul>
+</section>
+
+<section>
+<h2>03 · 五方 × 五阶段（RSS 峰值，两遍值）</h2>
+<table>
+  <thead><tr><th>实现</th><th>idle</th><th>load（512MB 代理）</th><th>hold 2000</th><th>churn 10s</th><th>recovery（30s）</th><th>hold 峰值线程</th><th>hold 峰值 fd</th></tr></thead>
+  <tbody>
+    <tr><td><b>sodama</b></td>
+      <td class="n best">27.0 / 28.5</td><td class="n best">27.4 / 28.9</td><td class="n best">29.0 / 30.5</td><td class="n best">29.7 / 31.2</td><td class="n best">12.4 / 12.5</td>
+      <td class="n">29</td><td class="n">16 087</td></tr>
+    <tr><td>dae v2.1.1</td>
+      <td class="n">50.3 / 50.5</td><td class="n">50.6 / 50.7</td><td class="n worst">297 / 299</td><td class="n worst">406 / 419</td><td class="n">83.3 / 81.7</td>
+      <td class="n">24</td><td class="n">4 095</td></tr>
+    <tr><td>sing-box 1.14.2</td>
+      <td class="n">60.2 / 58.7</td><td class="n">61.1 / 61.5</td><td class="n">94.5 / 90.6</td><td class="n">94.5 / 92.7</td><td class="n">78.4 / 76.8</td>
+      <td class="n">22–23</td><td class="n">12 008</td></tr>
+    <tr><td>v2ray 5.52.0</td>
+      <td class="n">45.7 / 43.4</td><td class="n">70.4 / 68.3</td><td class="n">144 / 139</td><td class="n">495 / 463</td><td class="n">190 / 318</td>
+      <td class="n">24</td><td class="n">4 006</td></tr>
+    <tr><td>mihomo 1.19.32</td>
+      <td class="n">50.5 / 51.4</td><td class="n">51.9 / 52.5</td><td class="n">168 / 174</td><td class="n">191 / 233</td><td class="n">68.4 / 72.3</td>
+      <td class="n">23–24</td><td class="n">8 008</td></tr>
+  </tbody>
+</table>
+<p class="sub">单位 MB（两遍独立全程，格式 <code>第一遍 / 第二遍</code>）；fd 为 hold 阶段峰值（2000 连接）。</p>
+<div class="bars">
+  <div class="lbl">sodama · hold</div><div><span class="bar" style="width:10%"></span></div><div class="val">29.8 MB</div>
+  <div class="lbl">sing-box · hold</div><div><span class="bar" style="width:31%"></span></div><div class="val">92.6 MB</div>
+  <div class="lbl">v2ray · hold</div><div><span class="bar alt" style="width:47.5%"></span></div><div class="val">141.5 MB</div>
+  <div class="lbl">mihomo · hold</div><div><span class="bar alt" style="width:57.4%"></span></div><div class="val">171.1 MB</div>
+  <div class="lbl">dae · hold</div><div><span class="bar warm" style="width:100%"></span></div><div class="val">298.1 MB</div>
+</div>
+<div class="note">
+<b>读法：</b>hold 阶段是「连接数 × 每连接内存」的直接口径——sodama 每条 ≈15 KB（29.8MB/2000），dae ≈153 KB、mihomo ≈88 KB、sing-box ≈47 KB、v2ray ≈72 KB。
+churn 口径更看回收能力：sodama 与 sing-box 基本不涨（+1–2 MB），dae/v2ray 出现数百 MB 级高水位（随后回收但不彻底，见 recovery 行）；mihomo 居中。
+</div>
+</section>
+
+<section>
+<h2>04 · 规模与线程专项（sodama，direct relay 夹具）</h2>
+<div class="two">
+  <div>
+    <h3>并发持有（reactor 池）</h3>
+    <table>
+      <thead><tr><th>并发</th><th>RSS 峰值</th><th>线程</th><th>建立</th><th>fail</th></tr></thead>
+      <tbody>
+        <tr><td>1 000</td><td class="n">29.3 MB</td><td class="n">29</td><td class="n">3 333/s</td><td class="n">0</td></tr>
+        <tr><td>5 000</td><td class="n">31.7 MB</td><td class="n">29</td><td class="n">4 425/s</td><td class="n">0</td></tr>
+        <tr><td>10 000</td><td class="n best">34.8 MB</td><td class="n best">29</td><td class="n">4 950/s</td><td class="n">0</td></tr>
+        <tr><td>churn 10s</td><td class="n">35.2 MB</td><td class="n">42</td><td class="n">26 026 conn/s</td><td class="n">0</td></tr>
+      </tbody>
+    </table>
+    <p class="sub">每连接 ≈0.6 KB 增量；线程数不随连接增长（29 常驻，churn 期短命 prelude 线程把峰值抬到 42）。</p>
+  </div>
+  <div>
+    <h3>线程模型对照（同夹具、同二进制唯一开关）</h3>
+    <table>
+      <thead><tr><th>10 000 连接</th><th>RSS 峰值</th><th>线程</th><th>建立</th></tr></thead>
+      <tbody>
+        <tr><td>reactor 池（本版）</td><td class="n best">34.8 MB</td><td class="n best">29</td><td class="n">4 950/s</td></tr>
+        <tr><td>每连接线程（历史模型）</td><td class="n worst">527.4 MB</td><td class="n worst">20 012</td><td class="n">3 534/s</td></tr>
+      </tbody>
+    </table>
+    <p class="sub"><code>SODAMA_NO_REACTOR=1</code> 单变量对照：RSS <b>15×</b>、线程 <b>690×</b> 的差距；
+    该开关保留用于排障（ADR-0058）。</p>
+  </div>
+</div>
+</section>
+
+<section>
+<h2>05 · UDP 专项（20k pps · 40 000 包 · 2 轮中位）</h2>
+<table>
+  <thead><tr><th>实现</th><th>丢包</th><th>CPU ms / 40k 包</th><th>RSS</th><th>线程</th></tr></thead>
+  <tbody>
+    <tr><td><b>sodama（批量）</b></td><td class="n">0</td><td class="n best">580</td><td class="n best">29.2 MB</td><td class="n">29</td></tr>
+    <tr><td>sodama（SODAMA_UDP_BATCH=0）</td><td class="n">0</td><td class="n">650</td><td class="n">28.8 MB</td><td class="n">29</td></tr>
+    <tr><td>sing-box 1.14.2</td><td class="n">0</td><td class="n">1 620</td><td class="n">64.5 MB</td><td class="n">19</td></tr>
+    <tr><td>v2ray 5.52.0</td><td class="n">0</td><td class="n">1 770</td><td class="n">55.7 MB</td><td class="n">21</td></tr>
+    <tr><td>dae v2.1.1</td><td class="n">0</td><td class="n">2 100</td><td class="n">58.9 MB</td><td class="n">22</td></tr>
+    <tr><td>mihomo 1.19.32</td><td class="n">0</td><td class="n worst">2 425</td><td class="n">59.8 MB</td><td class="n">21</td></tr>
+  </tbody>
+</table>
+<p class="sub">ss 上游（ssserver -u，chacha20-ietf-poly1305），代理目标 1.1.1.1:9998；与 O7 历史值一致（批量/非批量差在限速口径下 ~10%）。
+mihomo 本轮新纳入（tproxy UDP + ss UDP 出站）。</p>
+</section>
+
+<section>
+<h2>06 · 生命周期与回收</h2>
+<ul class="sub">
+  <li><b>静置回落</b>：load/hold/churn 后静置 30s，sodama RSS 由峰值 31.2 MB 回落到 <b>12.4–12.5 MB</b>（低于启动期 27–28.5 MB 的一次性高水位）；对手同口径 68.4（mihomo）/76.8（sing-box）/81.7（dae）/190–318（v2ray）MB。</li>
+  <li><b>缓冲池封顶（O8）</b>：转发缓冲池 64/128 KB 两档、按字节封顶 8 MB；UDP 槽按需增长；churn 300 条长连接 RSS 27.3 → 23.9 → trim 后 23.3 MB，无增长。</li>
+  <li><b>周期 trim</b>：30s 一次 <code>malloc_trim</code>，把 allocator 空闲页还给内核（本报告 recovery 数据即其效果）。</li>
+  <li><b>优雅退出</b>：SIGTERM 有界退出——50 条在途连接整机 462 ms（内部有界 302 ms），退出后 TC 钩子/管道无残留。</li>
+</ul>
+</section>
+
+<section>
+<h2>07 · 观察与下一版可做的内存优化</h2>
+<table>
+  <thead><tr><th>#</th><th>观察</th><th>下一版候选动作</th></tr></thead>
+  <tbody>
+    <tr><td>1</td><td>hold 2000 峰值 fd <b>16 087</b>（≈8/连接，五方最高；sing-box 6、mihomo 4、dae/v2ray 2）——reactor 每条连接持有 2 条管道（4 fd）+ client/upstream 两个 socket</td><td>评估<b>管道池/复用</b>（同 worker 内复用预建 pipe pair）或减少 fd 的 splice 变体；先做收益/语义评估（SPLICE_F_NONBLOCK、半关闭、错误路径）</td></tr>
+    <tr><td>2</td><td>启动期一次性高水位 27–28.5 MB（稳态 12.5 MB）</td><td>把启动期一次性缓冲（订阅/规则编译）纳入池化或复用；或在 status 里暴露 allocator 高水位便于观测</td></tr>
+    <tr><td>3</td><td>churn 期短命 prelude 线程把线程峰值抬到 42（常驻 29）</td><td>观察是否需要把 prelude 并入池/预算；低优先（不影响稳态）</td></tr>
+    <tr><td>4</td><td>dae/v2ray 在 hold/churn 后高水位不回收（数百 MB）</td><td>非 sodama 问题，作为对照记录；验证 sodama 缓冲池在更高压力（50k+ 连接）下仍单调有界（可加进 soak 夜间项 G5）</td></tr>
+  </tbody>
+</table>
+</section>
+
+<section>
+<h2>08 · 附录：复现</h2>
+<pre># 五方 × 五阶段内存终测（本报告主体；mihomo = Clash Verge 内核）
+sudo lab/perf/mem.sh prepare
+sudo env RESULTS=/tmp/mem-results.tsv  ./lab/perf/mem.sh all      # 第一遍
+sudo env RESULTS=/tmp/mem-results2.tsv ./lab/perf/mem.sh all      # 第二遍（复测）
+./lab/perf/mem.sh down
+
+# 规模/线程专项
+sudo env OUT=/tmp/scale-final.tsv ./lab/scale/run.sh all                       # 1k/5k/10k hold + churn
+sudo env SODAMA_NO_REACTOR=1 OUT=/tmp/scale-thread.tsv ./lab/scale/run.sh hold 10000 5
+
+# UDP 五方（含 mihomo）
+sudo ./lab/perf/udp.sh prepare
+sudo env ROUNDS=2 RESULTS=/tmp/perf-udp-mem.tsv ./lab/perf/udp.sh all
+
+# 夹具与配置
+lab/perf/mem.sh                     # 五阶段采样器（新增）
+lab/perf/mihomo.vless.yaml          # VLESS 对照（allow-lan + bind-address "*"，tproxy-port 7897）
+lab/perf/mihomo.ss.yaml             # UDP/ss 对照
+</pre>
+<p class="sub">
+实现落点：<code>lab/perf/mem.sh</code>（采样与阶段）、<code>lab/perf/mihomo.*.yaml</code>、<code>lab/perf/udp.sh</code>（+mihomo 分支）、
+<code>lab/scale/run.sh</code>（mkdir 修复）；数据文件 <code>/tmp/mem-results*.tsv</code>、<code>/tmp/scale-final.tsv</code>、<code>/tmp/scale-thread.tsv</code>、<code>/tmp/perf-udp-mem.tsv</code>（机器本地留存）。
+</p>
+</section>
+
+<div class="foot">
+  sodama · 内存终测报告 · v1.0（本版内核收口）· 2026-10-05 · Arch / 6.18.54-lts / i9-9900KF（8C16T）·
+  五方同拓扑同上游、200ms VmRSS/线程/fd 采样、两遍独立复测；sodama/dae 为原生 eBPF 数据面，sing-box/v2ray/mihomo 为 Linux tproxy 姿态（各自生产部署形态）。
+  相关文档：<code>docs/vless-proposal.html</code>（吞吐/CPU 提案）、<code>docs/optimization-roadmap.md</code>（O1–O10）、<code>docs/backlog.md</code>。
+</div>
+
+</div>
+</body>
+</html>
