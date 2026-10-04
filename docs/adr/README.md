@@ -75,6 +75,8 @@
 | [0048](./ADR-0048-p24-protocol-details.md) | P24：uTLS Chrome-120 对齐（签名算法集合/supported_versions/ALPS/GREASE-ECH/Boring padding，REALITY 自实现栈）；Vision 上行 splice 确认 + 回归；TUIC 0-RTT（into_0rtt 早数据，无票据/被拒无痛回退）；显式边界：ECH（rustls 无客户端 ECH）、shadow-tls（依赖 fork rustls randoms）、juicity/naive/ssr、rustls 路径 uTLS | 已采纳 | —（P24 第一批；余项列 parity/README） |
 | [0049](./ADR-0049-p25-naive.md) | P25 naive 出站：复用 DoH h2 帧层实现 HTTP/2 CONNECT 隧道 + Basic 认证（`encode_connect_headers`/`connect_tunnel` 双向流控/END_STREAM 半关闭/两半 drop 关底层）；`naive+https://`/`naive://`（当时 `naive+quic://` 显式未实现）；Go 标准库服务端跨实现（交互零延迟 + 512KB 逐字节）；边界：仅 h2、无连接池、Basic 依赖外层 TLS（H3 形态由 0050 补上） | 已采纳 | —（P25 执行；对标表缺口 #6 naive 收官） |
 | [0050](./ADR-0050-p26-http3.md) | P26 HTTP/3 双项：`h3client` 最小 HTTP/3（控制流/SETTINGS/QPACK/`request()`/CONNECT 隧道读写半，DATA 帧承载隧道）；DoH 上游 `h3://`（ALPN=h3、连接复用 + 重建重试）；`naive+quic://`（QUIC，socket=None）；varint 抽 `quicvarint`（RFC 9000 §A.1 向量）；quic-go 离线夹具跨实现（h3 512KB 双向 + 连接复用断言） | 已采纳 | —（P26 执行；对标表缺口 #5 h3、#6 naive H3 收官） |
+| [0051](./ADR-0051-p27-juicity.md) | P27 juicity v0 出站：quinn + TLS exporter 认证（认证单向流保持打开）+ trojan 风格元数据（1/4/3/2）；TCP 每连接一条流、UDP 每 NAT 会话一条流（`[元数据][len u16][载荷]` 双工）；链接 `juicity://uuid:password@host:port`；lab 上游 e2e 服务端移植夹具跨实现（TCP 512KB + UDP 3/3）；边界：full-cone underlay/0-RTT/本地 CC 不做 | 已采纳 | —（P27 执行；对标表缺口 #6 juicity 收官） |
+| [0052](./ADR-0052-p28-ecs-cache.md) | P28 ECS 回填 / ecs_cache：解析上游应答 ECS 回显（RFC 7871 scope）并按回填 scope 作用域化缓存；`ecs_scope_ladder` 阶梯查找（请求前缀 → 本机 /32 → 更宽规范前缀，只向宽复用）；`ecs=auto` 改传完整客户端地址（修 /32 回填键覆盖 /24 的语义瑕疵）；状态面 `dns.ecs.echo/scope`；lab scope=0//16 复用断言 | 已采纳 | —（P28 执行；对标表缺口 #5 收官） |
 
 ## 新增一条 ADR
 

@@ -9,7 +9,8 @@ P18a–e（DoT/DoH、DoQ、`dns.routing`、ECS/sip、pname、REALITY+Vision、SS
 P19（多组分派 + 启动健壮性）、
 P20（QUIC Initial SNI 嗅探）、P21（sniff-punt）、P22（UDP over IPv6 全链）、
 P23（sticky IP / DoH h2 / bootstrap / DNS 选项）、P24（uTLS Chrome-120 / Vision splice / TUIC 0-RTT）、
-P25（naive / HTTP-2 CONNECT）、P26（HTTP/3：DoH h3 / naive+quic）与
+P25（naive / HTTP-2 CONNECT）、P26（HTTP/3：DoH h3 / naive+quic）、P27（juicity v0）、
+P28（ECS 回填 / ecs_cache）与
 P6（suspend/reload/metrics/sysdump/日志轮转/整配置热重载）已完成**；P9+ 已删除 C 数据面，
 `ebpf-rs` 的 Rust 对象是**唯一数据面**（ADR-0025）。
 
@@ -182,6 +183,15 @@ P6（suspend/reload/metrics/sysdump/日志轮转/整配置热重载）已完成*
   DNS 上游 `h3://`（ALPN=h3、连接复用、失败重建）；`naive+quic://`（QUIC；socket=None）；
   varint 抽 `quicvarint` 共享；lab quic-go 离线夹具 `naive-h3-up`/`test-naive-h3`
   与 `doh-h3-up`/`test-doh-h3`（连接复用断言；ADR-0050、NOTES §11.41）
+- **P27 juicity v0（QUIC）**：`juicity.rs`（TLS exporter 认证（保持打开的 50B 认证流）+
+  trojan 风格元数据；TCP 每连接一条双向流、UDP 每 NAT 会话一条双向流
+  `[元数据][len u16][载荷]`）；链接 `juicity://uuid:password@host:port?sni=…`；
+  lab Go/quic-go 夹具 `juicity-up`/`test-juicity` 与 `juicity-udp-up`/`test-juicity-udp`
+  （ADR-0051、NOTES §11.42）
+- **P28 ECS 回填 / ecs_cache**：解析上游应答 ECS 回显（RFC 7871 scope）并按回填 scope
+  作用域化缓存；`ecs_scope_ladder` 阶梯查找（请求前缀 → 本机 /32 → 更宽 /20/16/12/8/0，
+  只向宽复用）；状态面 `dns.ecs.echo/scope`；lab `ecscache-up`/`test-ecs-cache`
+  （scope=0 全局与 /16 跨子网复用；ADR-0052、NOTES §11.43）
 - **P5-G3a QUIC（tuic v5）**：惰性 tokio 运行时 + quinn（阻塞 relay 用 block_on 桥接）；
   认证 token = TLS exporter（label=uuid 裸字节、context=password）；TCP 每条中继一条 QUIC
   双向流，UDP 走 QUIC DATAGRAM（含分片/重组）；上游 socket 用自建 `Endpoint` 打 `SO_MARK`；
@@ -419,6 +429,13 @@ sudo lab/lab.sh naive-h3-up # P26：naive（HTTP/3 CONNECT + Basic）会话
 sudo lab/lab.sh test-naive-h3    # 交互零延迟 + 512KB 双向 + 服务端 proto=HTTP/3.0
 sudo lab/lab.sh doh-h3-up   # P26：DoH over HTTP/3（上游 h3://）
 sudo lab/lab.sh test-doh-h3      # 两查询复用一条 QUIC 连接（服务端 new-conn 计数断言）
+lab/proto-check/build-juicity-server.sh  # P27：构建 juicity 参考服务端（Go/quic-go）
+sudo lab/lab.sh juicity-up  # P27：juicity v0（QUIC）TCP 会话 + offload 互斥
+sudo lab/lab.sh test-juicity     # 交互 + 512KB 双向 + 服务端 target 日志
+sudo lab/lab.sh juicity-udp-up   # P27：juicity UDP（每 NAT 会话一条双向流）
+sudo lab/lab.sh test-juicity-udp # 3/3 + 服务端 UDP 会话 target 日志
+sudo lab/lab.sh ecscache-up # P28：ECS 回填 / ecs_cache（上游 ecs=auto）
+sudo lab/lab.sh test-ecs-cache   # scope=0 全局与 /16 跨子网复用（上游增量恰好 1 次）
 # P12：本地 SOCKS5 入口（浏览器验收；不加载 eBPF、不需 root）：
 # target/release/mini-dae --listen-socks 127.0.0.1:11080 --dialer 'anytls://…' --dial-timeout 15
 # 浏览器：SOCKS5 127.0.0.1:11080（Firefox 勾“SOCKS v5 时代理 DNS”）；停止：pkill -f listen-socks

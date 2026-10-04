@@ -1429,3 +1429,48 @@ lab 夹具 `http_connect_server.py` + `sub_server.py` 每次重读。）
 - 边界：QPACK 只解静态表/字面量（引用动态表报错；不广告动态表容量、不开 QPACK
   encoder/decoder 流）；无 0-RTT/服务端推送/GOAWAY 重试；`https://` 仍优先 h2，
   H3 需显式 `h3://`。
+
+### 11.42 P27（juicity v0，ADR-0051）已验收的行为
+
+- `juicity.rs`：一个 dialer 复用一条 QUIC 连接（失效重建）；认证单向流
+  `[00][00][uuid16][token32]`（token = TLS exporter，label=uuid 裸字节、context=password）
+  **保持打开**（不 FIN）；TCP 每连接一条双向流，拨号即写 `[01][TYPE ADDR PORT]`
+  （trojan 风格：1/4/3/2，复用 `Target::encode_socks_addr_port`），`shutdown_write`=FIN；
+  UDP 每 NAT 会话一条双向流：流首 `[03][会话元数据]`，每帧 `[目标元数据][len u16][payload]`，
+  回包跳过来源元数据；读超时机制同 tuic UDP（阻塞 `recv` + `set_read_timeout`）。
+- 链接：`juicity://uuid:password@host:port?sni=…&allow_insecure=1`（uuid 严格 32 hex；
+  `congestion_control`/`cwnd`/`pinned_certchain_sha256` 忽略，边界见 ADR-0051）。
+- lab：Go/quic-go 夹具 `lab/proto-check/juicity-server`（自上游 e2e 服务端移植；协议常量
+  就地重述；上游 TCP/UDP socket 打 SO_MARK）+ `juicity-up`/`test-juicity`（TCP：交互 +
+  512KB 双向 + `JUICITY tcp target=…` + offloaded=0）与 `juicity-udp-up`/`test-juicity-udp`
+  （3/3 + `JUICITY udp session target=…` + `sessions_proxied≥1`/`direct_fallback=0`）。
+- 跨实现踩坑：夹具 UDP socket 必须绑 `0.0.0.0:0`（绑 127.0.0.1 时 `sendto` 非回环地址
+  EINVAL）；与 naive 夹具同源的 SO_MARK 坑同样适用。
+- 实测：`cargo test --release` **215/215**；lab 四项（juicity TCP/UDP + naïve-
+  系列回归）全 PASS；真机网关 66/66、generate_204→204、0 panic。
+- 边界：不做 full-cone underlay（`IV||PSK` + chacha20-poly1305 包加密的
+  `TransportPacketConn`）、0-RTT、本地 CC 参数（均见 ADR-0051）。
+
+### 11.43 P28（ECS 回填 / ecs_cache，ADR-0052）已验收的行为
+
+- `dns::parse_ecs_echo`：从应答 OPT RR（复用 `parse_rrs`）解 ECS option 8 的
+  FAMILY/SOURCE-PREFIX/SCOPE-PREFIX/ADDRESS；`dns::truncate_prefix` 与
+  `dns::ecs_scope_ladder`（v4：请求前缀 → 本机 /32 → /20/16/12/8/0；
+  v6：→ /128 → /48/32/0）构成作用域阶梯。
+- `DnsCache::answer_from_cache_ecs`：候选键逐个 `get_scoped`（命中/乐观 stale/过期移除
+  逻辑抽自旧单键路径），全 miss 只计一次；`answer_from_cache_scoped` 语义不变。
+- 解析路径：`ecs=auto` 现在把**客户端完整地址**交给 `add_ecs`（它自己按前缀截断写线上）——
+  此前 `ecs_auto_prefix` 先截断会让 /32 回填键变成整个 /24 共享（已修）；应答带 ECS
+  回显时按 `truncate(回显地址, scope)` 入缓存（scope=0 → `0.0.0.0/0` / `::/0` 全局键），
+  无回显回退请求前缀；状态面新增 `dns.ecs.echo`/`dns.ecs.scope`。
+- lab：`lab/ecscache.dae`（上游 `udp://…?ecs=auto`）+ fake_dns 的 `ECS_ECHO` 表
+  （`ecs0.test` scope=0、`ecs16.test` scope=16，回显地址/source 照抄客户端请求）+
+  `ecscache-up`/`test-ecs-cache`：两域各两次查询，假上游各只收到 1 次（第二次命中
+  回填键）；状态面 `echo>=2`、`scope=="10.0.0.0/16"`。
+- 单测：`parse_ecs_echo`（v4 scope=0/16、无 OPT/非法输入）、`ecs_scope_ladder`
+  （v4/v6 顺序与截断）、缓存集成三例（/16 跨 /24 命中、不同 /16 不命中；/0 全局；
+  /32 仅本机命中；自带 OPT 不入缓存）。
+- 实测：`cargo test --release` **215/215**；lab `test-ecs-cache` PASS；回归 `verify` 9/9 +
+  `test-dns-cache`/`test-dns-options`/`test-dnsroute` 全 PASS；真机网关重启自检 + 66/66 + 0 panic。
+- 边界：不做乐观预取/后台刷新；客户端自带 OPT（含 ECS）仍透传且不入缓存（既有语义）；
+  阶梯只覆盖规范前缀，非规范回显 scope（如 /22）按 miss 保守处理。
