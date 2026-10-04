@@ -22,6 +22,8 @@ LOG = sys.argv[1]
 METHOD = sys.argv[2]
 PASSWORD = sys.argv[3].encode()
 PORT = int(sys.argv[4])
+# 可选第 5 参：监听地址（默认 127.0.0.1；性能对比时在 WAN ns 里用 WAN 地址）。
+BIND = sys.argv[5] if len(sys.argv) > 5 else "127.0.0.1"
 
 # 上游 socket 必须打 SO_MARK：否则被 sodama 数据面（wan_egress）再抓一次成环。
 SO_MARK = getattr(socket, "SO_MARK", 36)
@@ -198,9 +200,9 @@ def handle_tcp(conn):
 def serve_tcp():
     s = socket.socket()
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    s.bind(("127.0.0.1", PORT))
+    s.bind((BIND, PORT))
     s.listen(32)
-    print(f"ss-server TCP on 127.0.0.1:{PORT} method={METHOD}", flush=True)
+    print(f"ss-server TCP on {BIND}:{PORT} method={METHOD}", flush=True)
     while True:
         c, _ = s.accept()
         threading.Thread(target=handle_tcp, args=(c,), daemon=True).start()
@@ -208,8 +210,8 @@ def serve_tcp():
 
 def serve_udp():
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    s.bind(("127.0.0.1", PORT))
-    print(f"ss-server UDP on 127.0.0.1:{PORT} method={METHOD}", flush=True)
+    s.bind((BIND, PORT))
+    print(f"ss-server UDP on {BIND}:{PORT} method={METHOD}", flush=True)
     # (client addr, 地址族) -> 已建立的出口 socket（回包走同一 socket）
     out = {}
     while True:
@@ -232,19 +234,30 @@ def serve_udp():
             out[(peer, fam)] = us
             threading.Thread(target=udp_reply_loop, args=(us, peer, s), daemon=True).start()
         log_line(f"UDP target={ip}:{port}")
-        us.sendto(plain[off:], (ip, port))
+        try:
+            us.sendto(plain[off:], (ip, port))
+        except OSError as e:
+            # 目标不可达（例如性能对比时 dae 的 8.8.8.8:53 检查）：只记日志，
+            # 绝不能因单个数据包让服务端整体退出。
+            log_line(f"UDP send {ip}:{port} failed: {e}")
 
 
 def udp_reply_loop(us, peer, listener):
     while True:
-        data, _ = us.recvfrom(65536)
+        try:
+            data, _ = us.recvfrom(65536)
+        except OSError:
+            return
         import os
 
         salt = os.urandom(32)
         key = subkey(salt)
         aead = new_aead(key)
         ct = aead.encrypt(nonce(0), data, None)
-        listener.sendto(salt + ct, peer)
+        try:
+            listener.sendto(salt + ct, peer)
+        except OSError:
+            return
 
 
 threading.Thread(target=serve_tcp, daemon=True).start()

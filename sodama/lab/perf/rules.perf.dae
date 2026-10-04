@@ -1,0 +1,5 @@
+# 性能对比规则（sodama）：direct 基线 + ss 代理路径。
+# 与 dae/sing-box/v2ray 的四份配置一一对应，只区分这两条路径。
+dip(10.9.9.0/24) -> direct
+dip(1.1.1.1/32) && dport(8080) -> proxy
+fallback -> block

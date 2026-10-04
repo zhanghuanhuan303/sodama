@@ -531,6 +531,12 @@ up() {
   # “假公共 DNS”：客户端会把查询发到这里（若没被接管则自然超时）
   ip route add 9.9.9.9/32 via "$DIRECT_DST" dev wan
 
+  # 性能对比（lab/perf/run.sh）：只要拓扑，不启动 sodama / echo 夹具。
+  if [ -n "${TOPO_ONLY:-}" ]; then
+    echo "== TOPO_ONLY：netns/veth/路由已就绪（未启动 sodama） =="
+    return 0
+  fi
+
   echo "== 启动 WAN 侧 echo 服务 =="
   ip netns exec "$WAN_NS" python3 "$HERE/wan_echo.py" >"$WAN_LOG" 2>&1 &
   echo $! >"$WAN_PID_FILE"

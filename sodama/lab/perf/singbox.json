@@ -1,0 +1,27 @@
+{
+  "log": { "level": "warn" },
+  "inbounds": [
+    {
+      "type": "tproxy",
+      "tag": "tproxy-in",
+      "listen": "0.0.0.0",
+      "listen_port": 7895,
+      "sniff": false
+    }
+  ],
+  "outbounds": [
+    { "type": "direct", "tag": "direct" },
+    {
+      "type": "shadowsocks",
+      "tag": "ss",
+      "server": "10.9.9.2",
+      "server_port": 8388,
+      "method": "chacha20-ietf-poly1305",
+      "password": "testpass"
+    }
+  ],
+  "route": {
+    "rules": [{ "ip_cidr": ["10.9.9.0/24"], "outbound": "direct" }],
+    "final": "ss"
+  }
+}

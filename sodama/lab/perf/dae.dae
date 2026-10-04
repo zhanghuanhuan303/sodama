@@ -1,0 +1,32 @@
+# dae v2.1.1 性能对比配置（与 rules.perf.dae / singbox.json / v2ray.json 对齐）：
+#   - 10.9.9.0/24 → direct（内核基线路径）
+#   - 1.1.1.1:8080 → group:proxy（节点 = WAN ns 里的 python ss 服务端）
+# 用法：sudo dae run --config lab/perf/dae.dae
+global {
+    wan_interface: wan
+    lan_interface: landae
+    tproxy_port: 12345
+    log_level: warn
+    auto_config_kernel_parameter: true
+    # 节点存活检查：WAN ns 里的 python http.server（HEAD 200）
+    tcp_check_url: 'http://10.9.9.2:8390'
+    tcp_check_http_method: HEAD
+    check_interval: 30s
+}
+
+node {
+    ss1: 'ss://chacha20-ietf-poly1305:testpass@10.9.9.2:8388'
+}
+
+group {
+    proxy {
+        policy: min_moving_avg
+        filter: name(ss1)
+    }
+}
+
+routing {
+    dip(10.9.9.0/24) -> direct
+    dip(1.1.1.1/32) && dport(8080) -> proxy
+    fallback: block
+}

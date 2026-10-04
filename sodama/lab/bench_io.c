@@ -263,7 +263,11 @@ static void *stream_writer(void *arg) {
     }
     st->sent = off;
     free(buf);
-    shutdown(st->fd, SHUT_WR);
+    /* 设置 BENCH_NOSHUT=1 跳过半关闭：跨实现吞吐对比时避免把各家半关闭
+     * 语义差异混入结果（半关闭语义由 stream_probe / 各协议专项覆盖）。 */
+    if (!getenv("BENCH_NOSHUT")) {
+        shutdown(st->fd, SHUT_WR);
+    }
     return NULL;
 }
 
