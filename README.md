@@ -44,11 +44,10 @@ byte-exact parity tests against dae's Go rule compiler and a netns test lab.*
 > include 展开、UDP endpoint pool、fuzz、同机对拍、README 状态区重写等）已固化为全量清单
 > （含验收标准）：[`docs/backlog.md`](docs/backlog.md)。
 >
-> **性能对比**：sodama vs dae v2.1.1 vs sing-box 1.14.2 vs v2ray 5.52 的同机同拓扑结果与方法见
-> [`docs/perf-report.md`](docs/perf-report.md)（direct 30.0/29.7/28.0/18.1 Gbps；ss 2.20/1.93/2.76/0.54 Gbps；复现：`sudo lab/perf/run.sh all`）。
->
-> **内存边界**：RSS/内核侧/系统总内存的四层终测（含 FD 治理、转发原语、长稳）见
-> [`docs/memory-report-v2.html`](docs/memory-report-v2.html)（v1 存档见 [`docs/memory-report.html`](docs/memory-report.html)）。
+> **性能与资源边界（现行报告）**：吞吐四方对拍（direct/ss/vless/vless-tls，含 M1 splice 与 M2 kTLS 前后）、
+> 四层内存模型（Process → Kernel → Total → per-connection）、FD 治理、转发原语对照、长稳与
+> **五万并发压测**见 [`docs/benchmark-report.html`](docs/benchmark-report.html)（自包含可离线打开；
+> perf-report / memory-report v1·v2 已并入，保留为存档）。复现：`sudo lab/perf/run.sh all` · `lab/perf/mem-system.sh`。
 
 ## 仓库结构
 
@@ -59,9 +58,10 @@ docs/                        决策、架构与报告
 ├── adr/                         ADR-0001..0063（背景/决策/后果/验证方式）
 ├── modules/                     协议字节级规格（tuic-v5 / hysteria2）
 ├── reviews/                     第三方评审原文存档 + 工程方采纳提案（I1–I5）
-├── memory-report-v2.html        内存终测 v2.1（四层模型；v1 存档 memory-report.html）
+├── benchmark-report.html        ★ 性能与资源边界报告 v3.0（合并版：吞吐对拍 + 四层内存 + 五万并发压测）
+├── memory-report-v2.html        内存终测 v2.1（已并入 benchmark-report；存档）
 ├── project-summary.html         工程总结报告
-├── perf-report.md               四方性能对拍（dae / sing-box / v2ray）
+├── perf-report.md               四方性能对拍（已并入 benchmark-report；存档）
 ├── parity-status.md             对标进度：dae（Go）↔ sodama（全 Rust）分域覆盖度
 └── notes/                       本地工程笔记（**不入库**：含真实订阅/节点信息，见 .git/info/exclude）
 

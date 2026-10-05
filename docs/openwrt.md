@@ -10,7 +10,7 @@
   `# CONFIG_NAMESPACES is not set`（dae 上游同样依赖 `/run/netns/daens`，因此这不是 sodama 特有要求）。
   → 想在 OpenWrt 上用 sodama，需要按 §2 的 kernel fragment **自编一次内核+镜像**（一次性成本）。
 - 应用侧是**静态 musl 单文件**（x86_64/aarch64/armv7 已验证可构建），另有 ~0.5MB 的 eBPF 对象；
-  内存稳态 ~12MB（见 `docs/memory-report.html`），很适合路由器。
+  内存稳态 ~12MB（见 `docs/benchmark-report.html`），很适合路由器。
 - QEMU 冒烟（§5）在自编镜像上自动验证：二进制运行 → veth/netns/datapath → eBPF 加载/TCX 挂载 → status。
 
 ## 0.1 当前进度（2026-10-05：P0 应用侧已完成，自编内核冒烟阶段暂停）

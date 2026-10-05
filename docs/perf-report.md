@@ -1,5 +1,7 @@
 # sodama 性能对比报告（vs dae / sing-box / v2ray）
 
+> ⚠️ 本报告已并入 [《性能与资源边界报告 v3.0（合并版）》](./benchmark-report.html)（含四层内存模型与五万并发压测）；本文保留为历史存档，口径以合并版为准。
+
 > P33.2 · 2026-10-04 · 第二轮加深：高速 ss 上游（shadowsocks-rust）、全双工基准夹具、
 > 四路对比 5 轮中位数、并发扩展、perf 热点剖面、内存/线程规模。
 > 优化方向（基于本报告的实测数据）见 [`optimization-roadmap.md`](./optimization-roadmap.md)。

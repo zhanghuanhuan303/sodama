@@ -12,5 +12,5 @@
 | `2026-10-05-i1-system-memory-data.md` | **I1 执行数据**（工程方）：四层模型口径、100–20 000 扫描、与 dae 同口径对照、20 k slab 归因、pipe capacity≠resident 结论、局限 |
 | `2026-10-05-i3-forwarding-primitives.md` | **I3 执行数据**（工程方）：splice/copy/io_uring/MSG_ZEROCOPY 对照与三档选型 |
 
-关联：评审对象 `docs/memory-report.html` v1（存档）；四层模型与系统内存结论的正式版本见
-`docs/memory-report-v2.html`（I5 交付物）；执行项状态见 `../backlog.md` I 节。
+关联：评审对象 `docs/memory-report.html` v1（存档）；四层模型与系统内存结论的**现行版本**见
+`docs/benchmark-report.html`（v3.0 合并版；旧 v2.1 已并入，见存档 `docs/memory-report-v2.html`）；执行项状态见 `../backlog.md` I 节。
