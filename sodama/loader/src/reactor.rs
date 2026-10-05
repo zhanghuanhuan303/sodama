@@ -9,6 +9,8 @@
 //! - N 个 worker 线程，各持独立 epoll；新会话经共享 channel + eventfd 唤醒；
 //! - 每连接两个惰性缓冲方向：`splice(src→pipe)` 读入、`splice(pipe→dst)` 写出，
 //!   以管道水位（HIGH_WM）控制「先排空再续读」，避免 level-triggered 忙轮询；
+//! - I6：需要消费响应头的链路（VLESS）由 worker 内 `PreludeBuf` 状态机非阻塞驱动
+//!   （读半消费响应头 → 明文冲刷客户端 → 解除 u2c 暂停转 splice），无按会话线程；
 //! - EOF → `shutdown(dst, SHUT_WR)`（与 splice_pump 半关闭语义一致）；
 //!   两方向都 EOF 且管道排空 → 关闭并收尾（注册表/统计）；
 //! - 收尾动作与原线程路径一致：从 `RELAY_CONNS` 摘除 + `conns_active` 递减；
@@ -46,7 +48,7 @@ static CODEC_ENABLED: OnceLock<bool> = OnceLock::new();
 static WORKERS: OnceLock<Vec<Arc<Mutex<Worker>>>> = OnceLock::new();
 static SUBMIT_TX: OnceLock<Sender<Session>> = OnceLock::new();
 static NEXT_WORKER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-/// 会话 → worker 索引（prelude 完成后的 resume/kill 需要跨线程定位）。
+/// 会话 → worker 索引（看门狗 `kill` 需要跨线程定位）。
 static LOCATIONS: OnceLock<Mutex<HashMap<u64, usize>>> = OnceLock::new();
 
 fn dbg_on() -> bool {
@@ -171,6 +173,21 @@ enum Mode {
     Codec { c2u: CodecDir, u2c: CodecDir },
 }
 
+/// I6：容器内 prelude——把 VLESS 响应头的「首读」从按会话短命线程迁入 worker 状态机。
+///
+/// 语义与原 `prelude` 线程一致：读半消费响应头/首个数据块，明文写给客户端；
+/// 完成后解除 `u2c_paused`，下行转入 splice。区别在于驱动方式：
+/// - 读半与 reactor 的 fill 共用同一 file description（均 O_NONBLOCK），
+///   `read` 返回 WouldBlock 时等下一次 EPOLLIN 重试（读半已对 WouldBlock 可重入）；
+/// - 写给客户端的部分写排队在 `out`，等客户端 EPOLLOUT 冲刷；
+/// - 首读完成 + `out` 清空 → 丢弃 reader，恢复 splice。
+struct PreludeBuf {
+    reader: Box<dyn crate::outbound::ReadHalf>,
+    out: Vec<u8>,
+    off: usize,
+    read_done: bool,
+}
+
 struct Session {
     id: u64,
     client: OwnedFd,
@@ -179,9 +196,12 @@ struct Session {
     /// prelude（codec 响应头消费）未完成时，u2c 暂停读取，避免与 header 读半抢字节。
     /// 仅 Splice 使用（Codec 的读半自身可重入）。
     u2c_paused: bool,
+    /// I6：容器内 prelude——VLESS 响应头首读从「按会话短命线程」迁入 worker 状态机
+    /// （详见 `PreludeBuf`）。会话自始非阻塞，prelude 完成后清空并解除 u2c 暂停。
+    prelude: Option<PreludeBuf>,
     /// 仅 Splice：两个 socket 是否已设为 O_NONBLOCK：置位后 fill/drain 可循环搬运到
-    /// EAGAIN；prelude 阶段必须保持阻塞（读半/写在同一 file description 上），
-    /// resume 后置位。
+    /// EAGAIN。I6 起 prelude 也在非阻塞语义下驱动，本字段恒为 true（保留以明确
+    /// fill/drain 的搬运语义）。
     nonblock: bool,
     handle: Arc<RelayHandle>,
     client_reg: bool,
@@ -205,10 +225,20 @@ impl Session {
                 } else {
                     u2c.interest_in()
                 };
-                if fd == self.fd_client() {
-                    c2u.interest_in() | u2c.interest_out()
+                let prelude_in = if self.prelude.as_ref().is_some_and(|p| !p.read_done) {
+                    libc::EPOLLIN as u32
                 } else {
-                    u2c_in | c2u.interest_out()
+                    0
+                };
+                let prelude_out = if self.prelude.as_ref().is_some_and(|p| p.off < p.out.len()) {
+                    libc::EPOLLOUT as u32
+                } else {
+                    0
+                };
+                if fd == self.fd_client() {
+                    c2u.interest_in() | u2c.interest_out() | prelude_out
+                } else {
+                    u2c_in | c2u.interest_out() | prelude_in
                 }
             }
             Mode::Codec { c2u, u2c } => {
@@ -428,14 +458,46 @@ impl Session {
         let mut err = false;
         let mut more = false;
         if matches!(self.mode, Mode::Splice { .. }) {
+            // I6：prelude（首读/部分写）驱动——upstream 可读驱动首读，client 可写冲刷明文。
+            // `had_prelude`：本事件是否属于 prelude 阶段；prelude 刚完成时不要在同事件内
+            // 主动 fill(u2c)——残留字节交给 level-triggered EPOLLIN 下一轮驱动，
+            // 与旧 resume() 语义一致（避免无数据也把 u2c 管道建制起来）。
+            let had_prelude = self.prelude.is_some();
+            if had_prelude {
+                if !is_client {
+                    if revents
+                        & (libc::EPOLLIN as u32 | libc::EPOLLHUP as u32 | libc::EPOLLERR as u32)
+                        != 0
+                    {
+                        if let Err(e) = self.prelude_read() {
+                            log(&format!("reactor: prelude 首读失败 #{sid}（{e}）"));
+                            err = true;
+                        }
+                    }
+                } else if revents & (libc::EPOLLOUT as u32) != 0 {
+                    if let Err(e) = self.prelude_flush() {
+                        log(&format!("reactor: prelude 写客户端失败 #{sid}（{e}）"));
+                        err = true;
+                    }
+                }
+                self.prelude_finish_if_done();
+            }
             // 该 fd 在两个方向中的角色：client 是 c2u 的 src、u2c 的 dst；upstream 反之。
             if revents & (libc::EPOLLIN as u32)
                 | revents & (libc::EPOLLHUP as u32 | libc::EPOLLERR as u32)
                 != 0
             {
-                if let Err(e) = self.fill(is_client, cache) {
-                    log(&format!("reactor: splice 读失败 #{sid}（{e}）"));
-                    err = true;
+                // prelude 未完成时 upstream 的 IN 属于首读，不得交给 u2c splice。
+                if is_client {
+                    if let Err(e) = self.fill(true, cache) {
+                        log(&format!("reactor: splice 读失败 #{sid}（{e}）"));
+                        err = true;
+                    }
+                } else if !self.u2c_paused && !had_prelude {
+                    if let Err(e) = self.fill(false, cache) {
+                        log(&format!("reactor: splice 读失败 #{sid}（{e}）"));
+                        err = true;
+                    }
                 }
             }
             if revents & (libc::EPOLLOUT as u32) != 0 || revents & (libc::EPOLLERR as u32) != 0 {
@@ -513,6 +575,82 @@ impl Session {
         match &self.mode {
             Mode::Splice { c2u, u2c } => c2u.done && u2c.done,
             Mode::Codec { c2u, u2c } => c2u.done && u2c.done,
+        }
+    }
+
+    /// I6：驱动一次 prelude 首读（非阻塞；WouldBlock 由 EPOLLIN 重试）。
+    fn prelude_read(&mut self) -> io::Result<()> {
+        {
+            let Some(p) = self.prelude.as_mut() else {
+                return Ok(());
+            };
+            if p.read_done {
+                return Ok(());
+            }
+            let mut buf = [0u8; 65536];
+            match p.reader.read(&mut buf) {
+                Ok(0) => p.read_done = true,
+                Ok(n) => {
+                    self.handle
+                        .last_ns
+                        .store(monotonic_now_ns(), Ordering::Relaxed);
+                    RELAY_STATS
+                        .bytes_down
+                        .fetch_add(n as u64, Ordering::Relaxed);
+                    p.out.extend_from_slice(&buf[..n]);
+                    // 与原 prelude 线程「一次 read 即完成」语义一致：首读已消费响应头，
+                    // 其余字节留在 socket 由 u2c splice 接管；继续在此循环读会一直
+                    // 占用 prelude（非零拷贝）并改变生命周期，必须置位。
+                    p.read_done = true;
+                }
+                Err(e) if retryable(&e) => return Ok(()),
+                Err(e) => return Err(e),
+            }
+        }
+        self.prelude_flush()
+    }
+
+    /// I6：把 prelude 首读出的明文冲刷给客户端（部分写排队，等 EPOLLOUT）。
+    fn prelude_flush(&mut self) -> io::Result<()> {
+        let cfd = self.fd_client();
+        let Some(p) = self.prelude.as_mut() else {
+            return Ok(());
+        };
+        while p.off < p.out.len() {
+            let n = unsafe {
+                libc::write(
+                    cfd,
+                    p.out[p.off..].as_ptr() as *const libc::c_void,
+                    p.out.len() - p.off,
+                )
+            };
+            if n > 0 {
+                p.off += n as usize;
+                continue;
+            }
+            let e = io::Error::last_os_error();
+            match e.kind() {
+                io::ErrorKind::WouldBlock => break,
+                io::ErrorKind::Interrupted => continue,
+                _ => return Err(e),
+            }
+        }
+        if p.off == p.out.len() {
+            p.out.clear();
+            p.off = 0;
+        }
+        Ok(())
+    }
+
+    /// I6：首读完成且明文冲刷干净 → 丢弃 reader、解除 u2c 暂停（转入 splice）。
+    fn prelude_finish_if_done(&mut self) {
+        let done = self
+            .prelude
+            .as_ref()
+            .is_some_and(|p| p.read_done && p.off == p.out.len());
+        if done {
+            self.prelude = None;
+            self.u2c_paused = false;
         }
     }
 }
@@ -1055,26 +1193,8 @@ impl Worker {
     }
 }
 
-/// 在拨号线程完成的「首读」：消费 VLESS 响应头/首个数据块并写给客户端。
-/// 返回 `true` 表示还有后续数据（可交 reactor 继续 splice），`false` 表示首读即 EOF。
-pub fn prelude<R: Read + ?Sized>(
-    from_remote: &mut R,
-    client: &mut TcpStream,
-    handle: &RelayHandle,
-) -> io::Result<bool> {
-    let mut buf = [0u8; 65536];
-    match from_remote.read(&mut buf)? {
-        0 => Ok(false),
-        n => {
-            client.write_all(&buf[..n])?;
-            handle.last_ns.store(monotonic_now_ns(), Ordering::Relaxed);
-            RELAY_STATS
-                .bytes_down
-                .fetch_add(n as u64, Ordering::Relaxed);
-            Ok(true)
-        }
-    }
-}
+/// 在 worker 内消费协议响应头（VLESS）的读半：旧实现为「按会话短命线程」，
+/// I6 起由 `PreludeBuf` 状态机非阻塞驱动（每连接 0 线程）。
 
 /// 初始化 worker 池（幂等；在 relay 通道建立后调用一次）。
 pub fn init() {
@@ -1116,7 +1236,7 @@ pub fn init() {
 /// 交一条 splice 会话给 reactor。所有权：client/upstream fd 全部移交。
 ///
 /// `prelude`：需要先消费协议响应头（VLESS）的读半。存在时下行（u2c）暂停，
-/// 由一个短命线程用 codec 读半消费响应头/首块并写给客户端，完成后 `resume`。
+/// 由 worker 内 `PreludeBuf` 非阻塞消费响应头/首块并写给客户端（每连接 0 线程）。
 /// 返回 false 表示 reactor 不可用或投递失败（fd 已关闭，调用方自行收尾统计）。
 pub fn submit(
     client: TcpStream,
@@ -1125,24 +1245,12 @@ pub fn submit(
     id: u64,
     prelude: Option<Box<dyn crate::outbound::ReadHalf>>,
 ) -> bool {
-    // prelude 需要自己的一份 client 写半（此时 reactor 不碰 u2c）
     let (ca, cp, ua, upa) = (
         client.local_addr(),
         client.peer_addr(),
         upstream.local_addr(),
         upstream.peer_addr(),
     );
-    let prelude_client = if prelude.is_some() {
-        match client.try_clone() {
-            Ok(c) => Some(c),
-            Err(e) => {
-                log(&format!("reactor: prelude client 克隆失败（{e}）"));
-                return false;
-            }
-        }
-    } else {
-        None
-    };
     let client: OwnedFd = client.into();
     let upstream: OwnedFd = upstream.into();
     let Some(tx) = SUBMIT_TX.get() else {
@@ -1150,64 +1258,18 @@ pub fn submit(
         return false;
     };
     let paused = prelude.is_some();
-    let sess = new_session(id, client, upstream, handle.clone(), paused);
+    let sess = new_session(id, client, upstream, handle.clone(), prelude);
     if tx.send(sess).is_err() {
         return false;
     }
     if dbg_on() {
         log(&format!(
             "reactor-dbg: 投递 #{id} paused={paused} prelude={} client={ca:?}->{cp:?} upstream={ua:?}->{upa:?}",
-            prelude.is_some(),
+            paused,
         ));
     }
     wake_next();
-    if let (Some(mut reader), Some(mut cw)) = (prelude, prelude_client) {
-        std::thread::spawn(
-            move || match self::prelude(&mut *reader, &mut cw, &handle) {
-                Ok(_) => resume(id),
-                Err(e) => {
-                    log(&format!("reactor: prelude 首读失败（{e}）"));
-                    kill(id);
-                }
-            },
-        );
-    }
     true
-}
-
-/// prelude 完成：恢复下行 splice。
-pub fn resume(id: u64) {
-    let Some(workers) = WORKERS.get() else { return };
-    let Some(loc) = LOCATIONS.get() else { return };
-    let idx = loc.lock().unwrap().get(&id).copied();
-    let Some(idx) = idx else { return };
-    let Some(w) = workers.get(idx) else { return };
-    let mut w = w.lock().unwrap();
-    let Some(sess) = w.sessions.get_mut(&id) else {
-        return;
-    };
-    if !matches!(sess.mode, Mode::Splice { .. }) {
-        return; // prelude 仅用于 splice 会话
-    }
-    sess.u2c_paused = false;
-    // prelude 结束：读/写半不再被 codec 阻塞使用，切非阻塞让 fill/drain 批量搬运。
-    set_nonblock(sess.fd_client());
-    set_nonblock(sess.fd_upstream());
-    sess.nonblock = true;
-    let (mut c_reg, mut u_reg) = (sess.client_reg, sess.upstream_reg);
-    let (cfd, ufd) = (sess.fd_client(), sess.fd_upstream());
-    if let Err(e) = w
-        .sync_fd(id, cfd, &mut c_reg)
-        .and_then(|_| w.sync_fd(id, ufd, &mut u_reg))
-    {
-        log(&format!("reactor: resume 重新武装失败 #{id}（{e}）"));
-        w.destroy(id);
-        return;
-    }
-    if let Some(s) = w.sessions.get_mut(&id) {
-        s.client_reg = c_reg;
-        s.upstream_reg = u_reg;
-    }
 }
 
 /// prelude 失败：立即结束会话。
@@ -1301,6 +1363,7 @@ fn new_codec_session(
             },
         },
         u2c_paused: false,
+        prelude: None,
         nonblock: true,
         handle,
         client_reg: false,
@@ -1332,17 +1395,13 @@ fn new_session(
     client: OwnedFd,
     upstream: OwnedFd,
     handle: Arc<RelayHandle>,
-    u2c_paused: bool,
+    prelude: Option<Box<dyn crate::outbound::ReadHalf>>,
 ) -> Session {
     let (cfd, ufd) = (client.as_raw_fd(), upstream.as_raw_fd());
-    // 无 prelude（Direct 等）时立即切非阻塞，fill/drain 可批量搬运；
-    // 有 prelude 时不能提前切（读半与 prelude 共享同一 file description），
-    // 由 resume() 在首读完成后切。
-    let nonblock = !u2c_paused;
-    if nonblock {
-        set_nonblock(cfd);
-        set_nonblock(ufd);
-    }
+    // I6：prelude 在 worker 内以 WouldBlock 可重入方式驱动，会话自始即非阻塞；
+    // fill/drain 可循环搬运到 EAGAIN。
+    set_nonblock(cfd);
+    set_nonblock(ufd);
     Session {
         id,
         client,
@@ -1365,8 +1424,14 @@ fn new_session(
                 done: false,
             },
         },
-        u2c_paused,
-        nonblock,
+        u2c_paused: prelude.is_some(),
+        prelude: prelude.map(|reader| PreludeBuf {
+            reader,
+            out: Vec::new(),
+            off: 0,
+            read_done: false,
+        }),
+        nonblock: true,
         handle,
         client_reg: false,
         upstream_reg: false,

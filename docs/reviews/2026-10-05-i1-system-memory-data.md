@@ -144,3 +144,20 @@ dae 的 per-connection Go/协议栈结构；sodama 多出的部分是 splice 的
 3. 采样为进程存活期瞬时值（非峰值积分）；`task_struct` 等夹具线程项已通过 echo_server 消除；
 4. 系统同机环回拓扑，无真实 NIC DMA/中断开销；
 5. UDP 与 churn 的系统内存不在本文件扫描范围内：churn 稳态由 soak 曲线覆盖（35 min Slab 漂移 ≈0），UDP 路径由五方 UDP 回归覆盖（40k pkt、20k pps、0 丢包；sodama 代理路径 CPU 630 ms vs 对照 1.6–2.4 s）。
+
+## 7. I6 增量（2026-10-05 下午，ADR-0059）
+
+交付 I6（in-worker prelude / 启动水位 / 入口线程栈）后的复测（同夹具/同口径）：
+
+| 指标 | I2 版本 | I6 版本 |
+|---|---|---|
+| 启动/空闲 RSS（mem.sh idle） | 26.7 MB | **11.1–11.7 MB**（启动完成即 `malloc_trim`） |
+| `N=0` 扫描基线（mem-system） | 28.3 MB | **11.4 MB** |
+| churn 线程峰值（hold 2000 + churn 10 s） | 46 | **35**（prelude 不再起线程） |
+| hold 2000 / recovery RSS | 28.8 / 12.2 MB | 14.3 / 12.5 MB |
+| vless splice 吞吐（4×48 MB） | 16.9 Gbps | 16.4/15.6 Gbps（噪声内） |
+| 20 k 扫描活跃 RSS / fd | 23.3 MB / 4.0 per conn | 30.4 MB / 4.0 per conn |
+| 内核净增（配对，20 k） | 52.7 KB/conn | 52.5 KB/conn（对照组同刻配对复现） |
+| 长稳 | 35 min PASS | **60 min PASS**（RSS +3.1% / Slab −0.5% / SUnreclaim −1.4%，零失败） |
+
+口径不变（pre→active 邻近增量、对照扣除）；I6 仅改变启动基线与 churn 线程，内核侧与每连接净增结论不受影响。

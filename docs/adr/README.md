@@ -83,6 +83,7 @@
 | [0056](./ADR-0056-p32-ech-boundary.md) | P32 ECH 边界（不实现）：dae 生态 ECH 仅 hy2 `?ech=` 经 ot/quic-go fork；rustls/quinn 无客户端 ECH 且无 CH 构造集成点 → 解析即显式报错（不静默降级）；剩余缺口的闭环记录 + 单测锁定 | 已采纳 | —（P32 执行；对标表缺口 #6 ECH 转边界） |
 | [0057](./ADR-0057-m3-vision-over-tls.md) | M3 Vision-over-TLS：内层 TLS 嗅探（dae FilterTLS 移植）+ 双向 XTLS DIRECT（0x02）裸 TCP；rustls 逐记录有界读替代 dae 的 unsafe 反射交接；tls13 补 raw 写；vision 旁路 kTLS、限 TCP；`lab/vision` Xray 夹具（tls/reality/ws/wss 四模式逐字节） | 已采纳 | —（M3 执行；对标表协议域 Vision 组合闭环） |
 | [0058](./ADR-0058-m4-reactor.md) | M4 reactor：epoll worker 池——stage 1 splice + stage 2 codec（VLESS 全组合含 reality/vision/ws、Trojan、vmess）每连接 0 线程（核并行度 worker、会话状态机、prelude；可重入：TlsWriter 待刷、读半状态机（Vless/Vision/Ws）、写半待刷队列、预算耗尽自驱补泵、vmess 终止帧幂等）；10k 连接 28 线程/32.1 MB、风暴 25 606/s；vless-tls 2 000 连接 27 线程/61 MB；`SODAMA_NO_REACTOR=1`/`SODAMA_REACTOR_CODEC=0` 可关；余段：ss/ssr/anytls + io_uring | 已采纳 | —（M4 执行；对标表性能域） |
+| [0059](./ADR-0059-i6-zero-thread-handshake.md) | I6：会话建立零线程（in-worker prelude 取代短命线程；首读即完成 + 部分写排队 + 残留数据交 level-trigger）+ 启动/重载即 `malloc_trim`（空闲 26.7→11.1–11.7 MB）+ 入口线程 1 MiB 栈与 spawn 失败降级（不再 panic 打死分发）；实测 churn 线程峰值 46→35、VLESS 吞吐/延迟不回退、fd 维持 4.0/连接 | 已采纳 | —（第三方评审 A5 落地；I6 执行） |
 
 ## 新增一条 ADR
 

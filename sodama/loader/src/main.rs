@@ -177,6 +177,9 @@ fn group_index_map(cfg: Option<&config::Config>) -> std::collections::HashMap<St
 static RELAY_IDLE_SECS: AtomicU64 = AtomicU64::new(300);
 /// M1：relay splice 零拷贝开关（默认开；`--no-splice` 关闭）。
 static RELAY_SPLICE: AtomicBool = AtomicBool::new(true);
+/// I6：会话建立/relay 入口线程栈（默认 8 MiB 对万级瞬时建立意味着可观的虚拟内存；
+/// 实际调用深度远低于 1 MiB，全量回归覆盖）。
+const RELAY_HANDLER_STACK: usize = 1 << 20;
 /// M1：splice 不可用回退日志（只打一次，避免刷屏）。
 static SPLICE_FALLBACK_LOGGED: AtomicBool = AtomicBool::new(false);
 /// P11：relay 拨号超时（毫秒，默认 5000；真实节点首连可能较慢）
@@ -1544,7 +1547,12 @@ fn serve(listener: TcpListener) {
             Ok(stream) => {
                 // P7：tproxy 接受的连接关 Nagle（小包回程不叠加延迟 ACK 的 40ms）
                 let _ = stream.set_nodelay(true);
-                std::thread::spawn(move || handle_tproxy_conn(stream));
+                let b = std::thread::Builder::new()
+                    .name("tproxy".into())
+                    .stack_size(RELAY_HANDLER_STACK);
+                if let Err(e) = b.spawn(move || handle_tproxy_conn(stream)) {
+                    log(&format!("tproxy: 会话线程创建失败（{e}），丢弃该连接"));
+                }
             }
             Err(e) => eprintln!("[sodama] accept error: {e}"),
         }
@@ -2659,7 +2667,7 @@ fn handle_relay_conn(mut client: TcpStream) {
         }
     }
     // M4：splice 连接的 epoll worker 池（每连接 0 线程）。需要响应头前缀的链路
-    // （VLESS）由 prelude 线程用 codec 读半消费后恢复；Direct 直接接管。
+    // （VLESS）由 worker 内 PreludeBuf 非阻塞消费后恢复；Direct 直接接管。
     if reactor_splice {
         if let Some(up) = socket.take() {
             let prelude: Option<Box<dyn outbound::ReadHalf>> = if wire_prelude {
@@ -3193,6 +3201,8 @@ fn do_reload(args: &Args, ebpf: &mut Ebpf, startup: bool) -> ReloadOutcome {
                 reload_group_members(args);
             }
             log(&format!("热重载完成（{n} 条 match_set）"));
+            // I6：热重载会重新编译规则/重建投影，同样回收一次分配器空闲页。
+            trim_allocator();
             ReloadOutcome {
                 ok: true,
                 match_sets: n,
@@ -3986,6 +3996,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let n = initial.match_sets;
     log(&format!("路由规则已下发给数据面（{n} 条 match_set）"));
     log("running; SIGHUP 重载规则 / SIGUSR2 挂起，Ctrl-C 退出");
+    // I6：启动水位——规则编译/订阅/geodata/BPF 装载的分配高水位会留在分配器
+    // 空闲链中；启动完成后立即回收一次，让常驻水位直接落低（不必等 30s 周期 trim）。
+    trim_allocator();
 
     // 只读状态面：请求经 channel 交给主循环（唯一持有 Ebpf 的地方）处理
     let (status_tx, status_rx) = std::sync::mpsc::channel::<status::MainMsg>();
@@ -4046,7 +4059,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let _ = TCP_RELAY_TX.set(relay_tx);
         std::thread::spawn(move || {
             for stream in relay_rx {
-                std::thread::spawn(move || handle_relay_conn(stream));
+                // I6：固定 1 MiB 栈（默认 8 MiB）；创建失败仅丢弃该连接——
+                // 旧行为是 spawn panic 打死分发线程（20k 连接 / cgroup pids 撞限场景曾复现）。
+                let b = std::thread::Builder::new()
+                    .name("relay".into())
+                    .stack_size(RELAY_HANDLER_STACK);
+                if let Err(e) = b.spawn(move || handle_relay_conn(stream)) {
+                    log(&format!("relay: 会话线程创建失败（{e}），丢弃该连接"));
+                }
             }
         });
         std::thread::spawn(relay_janitor_loop);
