@@ -1561,3 +1561,34 @@ lab 夹具 `http_connect_server.py` + `sub_server.py` 每次重读。）
   P31 批次一并跑过）。
 - 未来解的前置条件见 ADR-0056（rustls/quinn 提供 ECH 或可插拔 TLS + HPKE
   依赖 + ot/quic-go ECH 服务端夹具），届时新 ADR 覆盖。
+
+### 11.48 P33（配置热驱动：运行时参数热更新 + --watch-config，ADR-0060）已验收的行为
+
+- **运行参数热更新**：reload/SIGHUP 同口径（CLI 显式值 > config `global` > 保持现值）更新
+  `relay_idle_timeout / udp_idle_timeout / dial_timeout / max_conns / dial_mode /
+  sniffing_timeout / sniff-punt`（`apply_runtime_params`）；仅变更记「热更新: key old -> new」。
+- **`--watch-config <秒>`**：专用线程轮询 `--config`/`--rules` 与 `CONFIG_STATE` 记录的
+  include 文件（mtime+size 快照），变更经状态面通道发 reload（等价自动 SIGHUP，60s 超时），
+  reload 后重取快照避免自触发；状态面 `config_watch {enabled, interval_secs}`。
+- 部署集成：`GATEWAY_WATCH_CONFIG=<秒>`（gateway.sh，默认 0=关）、`USE_WATCH_CONFIG`（lab.sh）。
+- 实测：`cargo test` **257/257**；lab `--watch-config 2`：改 `relay_idle_timeout 60→7` 6s 内
+  自动 reload+热更新（状态面读数同步）；坏配置 `ok=false` 且运行值不变（不切槽）；恢复后 7→9。
+
+### 11.49 P34（多订阅按声明顺序回退 + 默认配置目录，ADR-0061）已验收的行为
+
+- **顺序回退（pacman 风格）**：`Member.rank` = 来源顺序（内联 node=0 → CLI `--subscribe`
+  按给出顺序 → config `subscription` 按声明顺序）；`GroupRuntime` 在 alive 成员中取 rank
+  最小者为「活动层」，层内按 policy 排序，其余来源兜底（层键在健康之后、延迟之前，dead 一律最后）；
+  `global { subscription_failover: false }` 关回退=旧池化语义。
+- **可观测**：`group_json.active_tag`（活动层 tag）+ 健康探测周期内记
+  「组 <name>: 活动订阅 -> <tag>（顺序回退 rank N）」；`GroupStats.active_rank`（rank+1 编码）。
+- **默认配置目录**：未给 `--config/--rules` 且 `$XDG_CONFIG_HOME/sodama/config.dae`
+  （缺省 `~/.config/sodama/config.dae`）存在时自动使用；config 内相对订阅路径按配置目录解析；
+  订阅 URL 文件（单行 http(s) URL，如 `sub2.url`）自动按 URL 抓取（一层间接，`url_file_target`）。
+- 部署集成：gateway.sh 在未显式 `--rules/--config` 时默认用该配置（sudo 下按 SUDO_USER 家目录），
+  config 提供订阅时可不带 `--node/--subscribe`。
+- 实测：`cargo test` **259/259**（新增 `url_file_target_detects_single_http_url`、
+  `select_order_prefers_earlier_subscription_rank`）；lab 新增 `sub-order-up`/`test-sub-order`
+  （sub1/sub2 双源；`sub2` 用相对路径 URL 文件）：初始 active_tag=sub1，kill 第一源 4s 内
+  active_tag=sub2 + 日志可见 + 切换后端到端 204；真网关以 `~/.config/sodama/config.dae`
+  （`main: 'sub2.url'`）启动：66/66 alive、active_tag=main、watch=10s、`gateway.sh test` PASS。

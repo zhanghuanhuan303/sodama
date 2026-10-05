@@ -16,11 +16,30 @@ use crate::outbound;
 pub struct ParsedNode {
     pub name: String,
     pub tag: String,
+    /// P34：来源顺序（0 = 最高优先；`subscription_failover` 按此分层回退）。
+    pub rank: u32,
     pub outbound: outbound::Outbound,
 }
 
 const MAX_BODY: usize = 8 * 1024 * 1024;
 const MAX_REDIRECTS: usize = 3;
+
+/// P34：订阅 URL 文件——文件内容只有一行 http(s) URL 时，按该 URL 抓取（一层间接）。
+/// 空文件/多行/非 http(s) 一律当作普通订阅正文（节点列表）。
+fn url_file_target(body: &[u8]) -> Option<&str> {
+    if body.is_empty() || body.len() > 4096 {
+        return None;
+    }
+    let t = std::str::from_utf8(body).ok()?.trim();
+    if t.is_empty() || t.contains('\n') || t.contains('\r') {
+        return None;
+    }
+    if t.starts_with("http://") || t.starts_with("https://") {
+        Some(t)
+    } else {
+        None
+    }
+}
 
 /// 拉取订阅正文：支持 `file://`、裸路径、`http://`、`https://`。
 pub fn fetch(url: &str, timeout: Duration) -> io::Result<Vec<u8>> {
@@ -41,11 +60,20 @@ enum Fetch {
 
 fn fetch_once(url: &str, timeout: Duration) -> io::Result<Fetch> {
     if let Some(path) = url.strip_prefix("file://") {
-        return Ok(Fetch::Body(std::fs::read(path)?));
+        let body = std::fs::read(path)?;
+        if let Some(target) = url_file_target(&body) {
+            return fetch(target, timeout).map(Fetch::Body);
+        }
+        return Ok(Fetch::Body(body));
     }
     if !url.starts_with("http://") && !url.starts_with("https://") {
-        // 裸路径也当文件（lab 测试方便）
-        return Ok(Fetch::Body(std::fs::read(url)?));
+        // 裸路径也当文件（lab 测试方便）；P34：内容为单行 http(s) URL 时按「订阅 URL 文件」处理
+        // （便于把 token 单独放 ~/.config/sodama/subN.url，config 只写文件名）。
+        let body = std::fs::read(url)?;
+        if let Some(target) = url_file_target(&body) {
+            return fetch(target, timeout).map(Fetch::Body);
+        }
+        return Ok(Fetch::Body(body));
     }
     let (use_tls, host, port, path) = parse_http_url(url)?;
     // P23：配置了 bootstrap resolver 时，订阅主机名也直连解析（对照 dae：
@@ -308,6 +336,8 @@ pub fn parse_subscription(text: &str, tag: &str) -> (Vec<ParsedNode>, Vec<String
             Ok(o) => nodes.push(ParsedNode {
                 name,
                 tag: tag.to_string(),
+                // P34：来源顺序由调用方（fetch_nodes）按订阅声明顺序覆写。
+                rank: 0,
                 outbound: o,
             }),
             Err(e) => errors.push(format!("第 {} 行不支持: {e}", i + 1)),
@@ -339,6 +369,22 @@ mod tests {
         assert_eq!(nodes[0].name, "香港-01");
         assert_eq!(nodes[0].tag, "sub");
         assert_eq!(errors.len(), 1);
+    }
+
+    #[test]
+    fn url_file_target_detects_single_http_url() {
+        // P34：subN.url 这类「URL 文件」——只有一行 http(s) URL 才当间接；其余当普通正文
+        assert_eq!(
+            url_file_target(b"https://example.com/sub?token=x\n"),
+            Some("https://example.com/sub?token=x")
+        );
+        assert_eq!(
+            url_file_target(b"http://1.2.3.4:8080/a"),
+            Some("http://1.2.3.4:8080/a")
+        );
+        assert_eq!(url_file_target(b"https://a\nhttps://b\n"), None);
+        assert_eq!(url_file_target(b"ss://a@1.1.1.1:1#n"), None);
+        assert_eq!(url_file_target(b""), None);
     }
 
     #[test]

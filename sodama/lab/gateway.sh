@@ -51,6 +51,7 @@ DEFAULT_NODE_FILE=/tmp/sodama-node.url
 
 IFACE=""
 RULES="$HERE/rules.gateway.dae"
+RULES_GIVEN=0
 CONFIG=""
 DNS=""
 GEODATA_DIR=""
@@ -109,6 +110,10 @@ usage() {
 
 配置文件热驱动（P33）：GATEWAY_WATCH_CONFIG=<秒>（默认 0=关）。>0 时 loader
 轮询 --config/--rules 及其 include 文件，变更即自动 reload（等价自动 SIGHUP）。
+
+配置文件（P34）：未显式给 --rules/--config 时，默认用 ~/.config/sodama/config.dae
+（存在时；配置里的 subscription 段按声明顺序回退，首源有活节点就不看后面的源，
+pacman 镜像风格；改顺序/注释即切换，配合 GATEWAY_WATCH_CONFIG 免重启生效）。
 EOF
 }
 
@@ -192,7 +197,19 @@ up() {
   [ "$DRY_RUN" -eq 1 ] || require_root up
   [ -x "$LOADER" ] || die "缺 loader：$LOADER（先 lab/lab.sh build）"
   [ -f "$OBJ" ] || die "缺 eBPF 对象：$OBJ（先 lab/build-ebpf-rs.sh）"
-  [ -f "$RULES" ] || die "缺规则文件：$RULES"
+  # P34：默认配置目录——未显式给 --config/--rules 时，存在 ~/.config/sodama/config.dae 就用它
+  # （订阅列表/切换顺序写在里面；GATEWAY_USER_CONFIG 可改路径；sudo 下取 SUDO_USER 家目录）
+  local user_home="${HOME:-/root}"
+  if [ -n "${SUDO_USER:-}" ]; then
+    user_home="$(getent passwd "$SUDO_USER" | cut -d: -f6)"
+    [ -n "$user_home" ] || user_home="${HOME:-/root}"
+  fi
+  local user_config="${GATEWAY_USER_CONFIG:-$user_home/.config/sodama/config.dae}"
+  if [ -z "$CONFIG" ] && [ "$RULES_GIVEN" -eq 0 ] && [ -f "$user_config" ]; then
+    CONFIG="$user_config"
+  fi
+  # 只用 config 时无需仓库 rules 文件
+  [ -n "$CONFIG" ] || [ -f "$RULES" ] || die "缺规则文件：$RULES"
   case "$DIAL_MODE" in
   ip | domain | domain+ | domain++) ;;
   *) die "--dial-mode 取值非法：$DIAL_MODE（ip|domain|domain+）" ;;
@@ -202,7 +219,8 @@ up() {
   [ -n "$IFACE" ] || die "拿不到默认路由网卡，请用 --iface 指定"
   ip link show dev "$IFACE" >/dev/null 2>&1 || die "网卡 $IFACE 不存在"
 
-  if [ -z "$NODE" ] && [ -z "$SUBSCRIBE" ]; then NODE="$DEFAULT_NODE_FILE"; fi
+  # P34：订阅来自 config subscription 段时（有 --config 无 --node/--subscribe），不再要求节点参数
+  if [ -z "$NODE" ] && [ -z "$SUBSCRIBE" ] && [ -z "$CONFIG" ]; then NODE="$DEFAULT_NODE_FILE"; fi
   local node_url="" sub_url=""
   if [ -n "$SUBSCRIBE" ]; then
     if [ -f "$SUBSCRIBE" ]; then
@@ -328,7 +346,7 @@ up() {
   if [ -n "$sub_url" ]; then
     dial_args=(--subscribe "$sub_url")
     [ -n "$GROUP" ] && dial_args+=(--group "$GROUP")
-  else
+  elif [ -n "$node_url" ]; then
     dial_args=(--dialer "$node_url")
   fi
   if [ "$DRY_RUN" -eq 1 ]; then
@@ -663,7 +681,7 @@ while [ $# -gt 0 ]; do
   --node) NODE="$2"; shift 2 ;;
   --subscribe) SUBSCRIBE="$2"; shift 2 ;;
   --group) GROUP="$2"; shift 2 ;;
-  --rules) RULES="$2"; shift 2 ;;
+  --rules) RULES="$2"; RULES_GIVEN=1; shift 2 ;;
   --config) CONFIG="$2"; shift 2 ;;
   --dns) DNS="$2"; shift 2 ;;
   --geodata-dir) GEODATA_DIR="$2"; shift 2 ;;

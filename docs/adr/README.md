@@ -85,6 +85,7 @@
 | [0058](./ADR-0058-m4-reactor.md) | M4 reactor：epoll worker 池——stage 1 splice + stage 2 codec（VLESS 全组合含 reality/vision/ws、Trojan、vmess）每连接 0 线程（核并行度 worker、会话状态机、prelude；可重入：TlsWriter 待刷、读半状态机（Vless/Vision/Ws）、写半待刷队列、预算耗尽自驱补泵、vmess 终止帧幂等）；10k 连接 28 线程/32.1 MB、风暴 25 606/s；vless-tls 2 000 连接 27 线程/61 MB；`SODAMA_NO_REACTOR=1`/`SODAMA_REACTOR_CODEC=0` 可关；余段：ss/ssr/anytls + io_uring | 已采纳 | —（M4 执行；对标表性能域） |
 | [0059](./ADR-0059-i6-zero-thread-handshake.md) | I6：会话建立零线程（in-worker prelude 取代短命线程；首读即完成 + 部分写排队 + 残留数据交 level-trigger）+ 启动/重载即 `malloc_trim`（空闲 26.7→11.1–11.7 MB）+ 入口线程 1 MiB 栈与 spawn 失败降级（不再 panic 打死分发）；实测 churn 线程峰值 46→35、VLESS 吞吐/延迟不回退、fd 维持 4.0/连接 | 已采纳 | —（第三方评审 A5 落地；I6 执行） |
 | [0060](./ADR-0060-p33-runtime-params-config-watch.md) | P33：运行时参数热更新（reload/SIGHUP 同口径，CLI > config global > 现值：relay/udp idle、dial_timeout、max_conns、dial_mode、sniffing_timeout、sniff-punt）+ `--watch-config <秒>` 配置热驱动（轮询 --config/--rules 及 include，变更即自动 reload，坏配置保留旧槽/旧参数）；gateway.sh `GATEWAY_WATCH_CONFIG`、lab `USE_WATCH_CONFIG`、状态面 `config_watch` | 已采纳 | —（用户决策：内核命令行操控 + 配置文件热驱动） |
+| [0061](./ADR-0061-p34-subscription-order-and-default-config.md) | P34：多订阅按声明顺序回退（pacman 镜像风格；来源顺序 = node → CLI --subscribe → config subscription，alive 中 rank 最小者为活动层，全标死才切下一源；`subscription_failover` 默认开，关=旧池化；状态面 `active_tag`）+ 默认配置目录 `~/.config/sodama/config.dae`（XDG；相对订阅路径按配置目录解析；单行 http(s) URL 文件自动按 URL 抓取）+ gateway.sh 默认用该配置 | 已采纳 | —（用户决策：配置文件切换订阅/默认放 ~/.config/sodama） |
 
 ## 新增一条 ADR
 

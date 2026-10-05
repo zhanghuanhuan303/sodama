@@ -1011,6 +1011,8 @@ struct Args {
     log_file: Option<String>,
     /// P33：轮询 --config/--rules 及其 include 文件，变更时自动 reload（秒；缺省关）
     watch_config: Option<u64>,
+    /// P34：未给 --config/--rules 时自动采用 ~/.config/sodama/config.dae（仅用于日志明示）
+    auto_config: bool,
 }
 
 fn log(msg: &str) {
@@ -1070,8 +1072,9 @@ fn usage() -> ! {
            --dae0peer <ifname>   dae netns 内对端设备（默认 dae0peer）\n\
            --daens <name>        dae netns 名字（默认 daens）\n\
            --tproxy-port <port>  tproxy 监听端口（默认 12345）\n\
-           --rules <path>        路由规则文件（sodama 语法，缺省时由 --proxy 生成）\n\
-           --config <path>       完整 dae .dae 配置（含 include；优先于 --rules）\n\
+           --rules <path>        路由规则文件（sodama 语法，缺省时由 --proxy 生成）
+           --config <path>       完整 dae .dae 配置（含 include；优先于 --rules；
+                                 未给 --config/--rules 时默认 $XDG_CONFIG_HOME/sodama/config.dae）\n\
            --strict-config       配置中有规则无法编译时直接报错（默认列 deferred 后继续）\n\
            --status-socket <path> 状态面：Unix socket 上的 JSON（status/rules/config/maps + 控制命令）\n\
            --log-file <path>     P6：日志写文件（默认 stdout；SIGHUP 时 reopen，轮转友好）\n\
@@ -1081,7 +1084,8 @@ fn usage() -> ! {
            --dial-mode <m>          P14：ip|domain|domain+（默认 ip；域名模式嗅探 SNI/Host 后远端解析，绕 DNS 污染）
            --sniffing-timeout-ms <n> P14：嗅探等待上限毫秒（默认 100；仅 dial_mode != ip 时生效）
            --sniff-punt             P21：嗅探命中域名后按规则在 relay 侧重选出口（direct/block/用户组）
-           --subscribe <url>        P15：订阅（可重复；config subscription 段同源），与 --group 搭配
+           --subscribe <url>        P15：订阅（可重复；config subscription 段同源），与 --group 搭配；
+                                     P34：多源默认按顺序回退（pacman 风格，subscription_failover）
            --group <name>           P15：选用 config 中的组（默认 proxy / 唯一组）
            --geodata-dir <dir>      P17a：geoip.dat/geosite.dat 搜索目录（可重复；优先于 DAE_LOCATION_ASSET）
            --listen-socks <addr>    P12：本地 SOCKS5 入口（浏览器测试用；不加载 eBPF、不需 root）\n\
@@ -1156,6 +1160,7 @@ fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
         proxy_dsts: Vec::new(),
         log_file: None,
         watch_config: None,
+        auto_config: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
@@ -1226,7 +1231,28 @@ fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
         args.proxy_dsts
             .push(u32::from(std::net::Ipv4Addr::new(1, 1, 1, 1)).to_be());
     }
+    // P34：默认配置文件——未给 --config/--rules 时用 ~/.config/sodama/config.dae（若存在）。
+    // 对拍（--compile-dump）排除在外，保持输出可复现。
+    if args.config.is_none() && args.rules.is_none() && args.compile_dump.is_none() {
+        if let Some(p) = default_config_path() {
+            args.config = Some(p.to_string_lossy().into_owned());
+            args.auto_config = true;
+        }
+    }
     Ok(args)
+}
+
+/// P34：默认配置文件路径——`$XDG_CONFIG_HOME/sodama/config.dae`
+/// （缺省 `~/.config/sodama/config.dae`），仅在文件存在时返回。
+fn default_config_path() -> Option<std::path::PathBuf> {
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config"))
+        })?;
+    let p = base.join("sodama").join("config.dae");
+    p.is_file().then_some(p)
 }
 
 fn if_nametoindex(name: &str) -> Result<u32, Box<dyn std::error::Error>> {
@@ -3451,16 +3477,73 @@ fn make_group_runtime(
         tolerance,
         udp_check_dns.clone(),
     );
+    // P34：订阅顺序回退（pacman 风格）——global `subscription_failover`（默认开）。
+    let failover = global_str("subscription_failover")
+        .map(|v| !matches!(v.trim(), "false" | "0" | "no" | "off"))
+        .unwrap_or(true);
+    rt.set_sub_failover(failover);
     log(&format!(
-        "节点组 {gname}: {} 个成员, policy={policy:?}, check={targets:?} 每 {interval}s, 容忍 {tolerance} 次失败, udp_check={udp_check_dns:?}",
-        rt.member_count()
+        "节点组 {gname}: {} 个成员, policy={policy:?}, check={targets:?} 每 {interval}s, 容忍 {tolerance} 次失败, udp_check={udp_check_dns:?}, 订阅顺序回退={}",
+        rt.member_count(),
+        if failover { "开" } else { "关" }
     ));
     rt.spawn_health_loop();
     rt
 }
 
+/// P34：订阅 URL 规整——`~/` 展开；config 里的裸路径（无 scheme）优先按配置目录解析，
+/// 便于把 `config.dae` 与订阅正文文件（如 `sub1.url`）放同一目录；URL/绝对路径语义不变。
+fn resolve_sub_url(cfg_dir: Option<&Path>, url: &str) -> String {
+    let expanded = match url.strip_prefix("~/") {
+        Some(rest) => match std::env::var("HOME") {
+            Ok(h) => format!("{h}/{rest}"),
+            Err(_) => url.to_string(),
+        },
+        None => url.to_string(),
+    };
+    if expanded.contains("://") || expanded.starts_with('/') {
+        return expanded;
+    }
+    if let Some(dir) = cfg_dir {
+        let cand = dir.join(&expanded);
+        if cand.is_file() {
+            return cand.to_string_lossy().into_owned();
+        }
+    }
+    expanded
+}
+
+/// P34：拉取单个订阅并解析（失败记日志返回空；rank = 来源顺序）。
+fn fetch_one_sub(tag: &str, url: &str, rank: u32, timeout: Duration) -> Vec<subscribe::ParsedNode> {
+    match subscribe::fetch(url, timeout).and_then(|b| subscribe::decode_body(&b)) {
+        Ok(text) => {
+            let (mut ns, errs) = subscribe::parse_subscription(&text, tag);
+            for e in errs.iter().take(3) {
+                log(&format!("订阅 {tag}: {e}"));
+            }
+            if errs.len() > 3 {
+                log(&format!("订阅 {tag}: 另有 {} 行不支持", errs.len() - 3));
+            }
+            for n in &mut ns {
+                n.rank = rank;
+            }
+            log(&format!(
+                "订阅 {tag}: 拉取成功，{} 个节点（来源顺序 #{rank}）",
+                ns.len()
+            ));
+            ns
+        }
+        Err(e) => {
+            log(&format!("订阅 {tag} 拉取失败: {e}"));
+            Vec::new()
+        }
+    }
+}
+
 /// 拉取内联节点 + 全部订阅（config subscription 与 CLI `--subscribe`）——
 /// 组构建与 SIGHUP 订阅热更新共用。
+/// P34：来源顺序 = 内联 node(0) → CLI --subscribe(1..) → config subscription(声明顺序)；
+/// 顺序回退（pacman 风格，`subscription_failover` 默认开）：前面来源有活节点就用它。
 fn fetch_nodes(cfg: Option<&config::Config>, args: &Args) -> Vec<subscribe::ParsedNode> {
     let node_specs = cfg.map(config::inline_nodes).unwrap_or_default();
     let sub_specs = cfg.map(config::subscriptions).unwrap_or_default();
@@ -3470,37 +3553,31 @@ fn fetch_nodes(cfg: Option<&config::Config>, args: &Args) -> Vec<subscribe::Pars
             Ok(o) => nodes.push(subscribe::ParsedNode {
                 name: n.name.clone(),
                 tag: "node".into(),
+                rank: 0,
                 outbound: o,
             }),
             Err(e) => log(&format!("节点 {} 不支持: {e}", n.name)),
         }
     }
     let timeout = Duration::from_secs(15);
-    let cli_subs: Vec<(String, String)> = args
-        .subscribe
-        .iter()
-        .enumerate()
-        .map(|(i, u)| (format!("cli{}", i + 1), u.clone()))
-        .collect();
-    for (tag, url) in sub_specs
-        .iter()
-        .map(|s| (s.tag.clone(), s.url.clone()))
-        .chain(cli_subs)
-    {
-        match subscribe::fetch(&url, timeout).and_then(|b| subscribe::decode_body(&b)) {
-            Ok(text) => {
-                let (mut ns, errs) = subscribe::parse_subscription(&text, &tag);
-                for e in errs.iter().take(3) {
-                    log(&format!("订阅 {tag}: {e}"));
-                }
-                if errs.len() > 3 {
-                    log(&format!("订阅 {tag}: 另有 {} 行不支持", errs.len() - 3));
-                }
-                log(&format!("订阅 {tag}: 拉取成功，{} 个节点", ns.len()));
-                nodes.append(&mut ns);
-            }
-            Err(e) => log(&format!("订阅 {tag} 拉取失败: {e}")),
-        }
+    let cfg_dir = args
+        .config
+        .as_deref()
+        .map(Path::new)
+        .and_then(|p| p.parent());
+    let mut rank = 1u32;
+    for (i, raw) in args.subscribe.iter().enumerate() {
+        let tag = format!("cli{}", i + 1);
+        let url = resolve_sub_url(None, raw);
+        let mut ns = fetch_one_sub(&tag, &url, rank, timeout);
+        nodes.append(&mut ns);
+        rank += 1;
+    }
+    for s in &sub_specs {
+        let url = resolve_sub_url(cfg_dir, &s.url);
+        let mut ns = fetch_one_sub(&s.tag, &url, rank, timeout);
+        nodes.append(&mut ns);
+        rank += 1;
     }
     nodes
 }
@@ -3793,6 +3870,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             log(&format!("log file: {path}"));
         } else {
             eprintln!("[sodama] 无法打开日志文件 {path}，继续用 stdout");
+        }
+    }
+    if args.auto_config {
+        if let Some(c) = &args.config {
+            log(&format!(
+                "默认配置: {c}（未给 --config/--rules，P34；订阅切换/顺序见 subscription_failover）"
+            ));
         }
     }
 
@@ -6220,6 +6304,8 @@ fn group_json(g: &group::GroupRuntime, index: usize, default: bool) -> serde_jso
         "failovers": g.stats.failovers.load(Ordering::Relaxed),
         "probes_ok": g.stats.probes_ok.load(Ordering::Relaxed),
         "probes_fail": g.stats.probes_fail.load(Ordering::Relaxed),
+        "subscription_failover": g.sub_failover_enabled(),
+        "active_tag": g.active_tag(),
         "nodes": snap.iter().map(|(n, tag, alive, last, ema)| json!({
             "name": n, "tag": tag, "alive": alive, "last_ms": last, "ema_ms": ema
         })).collect::<Vec<_>>(),

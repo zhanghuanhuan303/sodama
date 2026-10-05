@@ -238,6 +238,14 @@ loader 会轮询 `--config`/`--rules` 及其 include 文件，变更即自动 re
 `max_conns`、dial_mode、sniffing_timeout、sniff-punt），优先级：CLI 显式值 > config `global` > 现值。
 真机 `gateway.sh` 方式用环境变量开启：`sudo env GATEWAY_WATCH_CONFIG=10 lab/gateway.sh up …`（默认 0=关）。
 
+多订阅与默认配置目录（P34）：config `subscription` 段按**声明顺序回退**（pacman 镜像风格）——
+首个有 alive 节点的源生效，全部标死才切下一源；`global { subscription_failover: false }`
+关闭回退（旧池化语义），状态面 `group.active_tag` 可查当前活动源。loader 未给
+`--config/--rules` 且 `$XDG_CONFIG_HOME/sodama/config.dae`（缺省 `~/.config/sodama/config.dae`）
+存在时自动使用它；config 内相对订阅路径按配置目录解析，单行 http(s) URL 文件（如 `subN.url`）
+自动按 URL 抓取。systemd 场景 `HOME` 常为 `/`，建议 drop-in 显式 `--config /etc/sodama/config.dae`，
+不依赖默认路径。
+
 ## 9. 升级 / 回滚
 
 升级：

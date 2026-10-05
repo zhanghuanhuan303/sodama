@@ -12,7 +12,8 @@ P23（sticky IP / DoH h2 / bootstrap / DNS 选项）、P24（uTLS Chrome-120 / V
 P25（naive / HTTP-2 CONNECT）、P26（HTTP/3：DoH h3 / naive+quic）、P27（juicity v0）、
 P28（ECS 回填 / ecs_cache）、P29（optimistic 后台刷新）、P30（SSR origin+plain）、
 P31（shadow-tls v1/v2/v3，ss 插件）、P32（ECH 边界：已评估不实现）、
-P33（运行时参数热更新 + `--watch-config` 配置热驱动）与
+P33（运行时参数热更新 + `--watch-config` 配置热驱动）、
+P34（多订阅按声明顺序回退 + 默认配置目录 `~/.config/sodama`）与
 P6（suspend/reload/metrics/sysdump/日志轮转/整配置热重载）已完成**；P9+ 已删除 C 数据面，
 `ebpf-rs` 的 Rust 对象是**唯一数据面**（ADR-0025）。
 
@@ -81,7 +82,11 @@ P6（suspend/reload/metrics/sysdump/日志轮转/整配置热重载）已完成*
   **优先 IPv4**/marked socket）+ base64/明文解码 + 逐行容错；filter（name 精确/keyword:/regex:/
   subtag/`!`，行内 AND / 行间 OR）；policy（min/min_moving_avg/min_avg10/random/fixed）；
   经节点健康探测（last/EMA/hist10，tolerance 标死）+ 拨号失败自动切换；状态面 `group`
-  （ADR-0031、NOTES §11.22）
+  （ADR-0031、NOTES §11.22；**P34**：多来源按声明顺序回退——pacman 镜像风格，alive 中
+  rank 最小者（活动层）独占出口，全部标死才切下一源，`subscription_failover: false` = 池化；
+  状态面 `active_tag`；来源顺序 = node → CLI --subscribe → config subscription；默认配置目录
+  `~/.config/sodama/config.dae`，相对订阅路径按配置目录解析、`subN.url` 单行 URL 文件
+  自动按 URL 抓取，ADR-0061、NOTES §11.49）
 - **P16 IPv6 数据面（TCP 全链）**：五元组统一 16 字节（v4-mapped + `is_v6`）；`parse_v6`
   （跳扩展头、分片放行）+ `IPV6_TRANSPARENT` 双监听（sockmap key 2）；规则 v6 前缀、
   协议目标 v6 编码（ss 0x04/vray 0x03/tuic 0x02/hy2 `[v6]:port`）、v6 嗅探远端解析、
@@ -543,6 +548,11 @@ target/release/sodama trace [--seconds N]
 target/release/sodama reload --socket /tmp/sodama-status.sock   # 手动线：等价 SIGHUP（同步等结果，热更新运行参数）
 sudo env USE_CONFIG=/tmp/sodama-watch.dae USE_WATCH_CONFIG=2 USE_DIALER=direct lab/lab.sh up  # lab 自动线
 # 真网关：sudo env GATEWAY_WATCH_CONFIG=10 lab/gateway.sh up …（默认 0=关）
+# P34：多订阅顺序回退（pacman 风格）与默认配置目录（ADR-0061）
+#   config `subscription { 主: 'url1'; 备: 'url2' }`：声明顺序 = 优先级，首个有活节点的源生效；
+#   `global { subscription_failover: false }` 关回退（池化）。默认配置：
+#   ~/.config/sodama/config.dae（未给 --config/--rules 且存在时自动使用；配 --watch-config 保存即切换）
+sudo lab/lab.sh sub-order-up && sudo lab/lab.sh test-sub-order   # 首源标死 → 4s 内切次源（状态面/日志/端到端）
 # P7 工具链：
 lab/bench.sh build                 # 编译 C 基准端点（gcc）
 lab/bench.sh all                   # 六路径性能表（root；自动起/停会话：direct relay offload ss udp-direct udp-nat）

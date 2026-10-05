@@ -1144,6 +1144,8 @@ const GLOBAL_KEYS: &[&str] = &[
     "udp_idle_timeout",
     "dial_timeout",
     "max_conns",
+    // P34：订阅顺序回退（pacman 风格；默认开）= 按声明顺序优先，全部活节点死才切下一源
+    "subscription_failover",
 ];
 
 const DNS_KEYS: &[&str] = &[

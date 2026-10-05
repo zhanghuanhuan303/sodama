@@ -60,6 +60,8 @@
 #   sudo lab/lab.sh test-hy2-brutal / test-hy2-hop
 #   sudo lab/lab.sh sniff-punt-up     # P21：嗅探重判（dial_mode domain+ + ss 后端 + --sniff-punt）
 #   sudo lab/lab.sh test-sniff-punt   # direct(直连不经 ss)/组(ss 远端解析)/block(关连接) 三条路径
+#   sudo lab/lab.sh sub-order-up      # P34：两个订阅源（/sub、/sub2）+ 顺序回退
+#   sudo lab/lab.sh test-sub-order    # 首源标死 → 活动订阅切次源（日志/状态面/端到端）
 #   sudo lab/lab.sh ops-up           # P6：运维面会话（--log-file + 状态面控制命令）
 #   sudo lab/lab.sh test-ops         # suspend/reload/metrics/sysdump/日志轮转
 #   sudo lab/lab.sh bench-up         # P7：基准直连会话（rules.bench.dae；供 lab/bench.sh）
@@ -152,6 +154,10 @@ SUB_PORT=18530
 SUB_PID_FILE=/tmp/sodama-sub.pid
 SUB_BODY=/tmp/sodama-sub-body.txt
 SUB_CONFIG=/tmp/sodama-subscribe.dae
+# P34：订阅顺序回退夹具（两个订阅源，各 1 节点，分别指向 ss A/B）
+SUB_BODY2=/tmp/sodama-sub2-body.txt
+SUB_URL_FILE=/tmp/sodama-sub2.url
+SUB_ORDER_CONFIG=/tmp/sodama-sub-order.dae
 # P19：多组分派夹具配置（groups-up 生成）
 SUB_GROUPS_CONFIG=/tmp/sodama-groups.dae
 # P18e：SS2022（shadowsocks-rust ssserver 参考对端；PSK 为 16 字节 "0123456789abcdef" 的 base64）
@@ -573,7 +579,10 @@ up() {
     kill -0 "$(cat "$SSB_PID_FILE")" 2>/dev/null || { cat /tmp/sodama-ssb.log; die "ss-B 服务端启动失败"; }
   fi
   if [ -n "${USE_SUB_SERVER:-}" ]; then
-    python3 "$HERE/sub_server.py" "$SUB_PORT" "$SUB_BODY" \
+    local sub_args=("$SUB_BODY")
+    # P34：/sub2 第二订阅源（文件存在时）
+    [ -f "$SUB_BODY2" ] && sub_args+=("$SUB_BODY2")
+    python3 "$HERE/sub_server.py" "$SUB_PORT" "${sub_args[@]}" \
       >/tmp/sodama-sub.log 2>&1 &
     echo $! >"$SUB_PID_FILE"
     sleep 0.3
@@ -2380,6 +2389,88 @@ print("alive=%d dead=%s" % (g["alive"], dead))
   echo "PASS: failover 后经节点 B 拨号成功（组 select/failover 计数见状态面）"
 }
 
+# P34：订阅顺序回退（pacman 风格）——两个订阅源各 1 节点（ss A/B）；
+# 首拨走声明顺序第一源；kill 第一源后被标死 → 活动层切到第二源。
+sub_order_up() {
+  require_root
+  [ -f "$OBJ" ] && [ -x "$LOADER" ] || die "先运行 $0 build"
+  cleanup
+  local meth="chacha20-ietf-poly1305" pass="testpass"
+  { echo "ss://$meth:$pass@127.0.0.1:$SS_PORT#主源-节点"; } | base64 -w0 >"$SUB_BODY"
+  echo >>"$SUB_BODY"
+  { echo "ss://$meth:$pass@127.0.0.1:$SS_PORT_B#备源-节点"; } | base64 -w0 >"$SUB_BODY2"
+  echo >>"$SUB_BODY2"
+  # P34：第二源用「URL 文件」（相对路径按 config 目录解析）+ 单行 URL 间接抓取
+  printf 'http://127.0.0.1:%s/sub2' "$SUB_PORT" >"$SUB_URL_FILE"
+  cat >"$SUB_ORDER_CONFIG" <<EOF
+# P34：订阅顺序回退（两个来源；按声明顺序优先，全部标死才切下一源）
+global {
+    tcp_check_url: 'http://10.9.9.2:9999'
+    check_interval: '1s'
+    check_tolerance: '1'
+}
+subscription {
+    sub1: 'http://127.0.0.1:$SUB_PORT/sub'
+    sub2: 'sodama-sub2.url'
+}
+group {
+    proxy {
+        policy: min_moving_avg
+    }
+}
+routing {
+    dip(1.1.1.1/32) && dport(8080) -> proxy
+    fallback: direct
+}
+EOF
+  chmod 640 "$SUB_ORDER_CONFIG"
+  USE_CONFIG="$SUB_ORDER_CONFIG" USE_SS=1 USE_SS_METHOD="$meth" USE_SS_PASSWORD="$pass" \
+    USE_SS_B=1 USE_SUB_SERVER=1 USE_RELAY_IDLE=600 up
+}
+
+test_sub_order() {
+  require_root
+  echo "== P34：订阅顺序回退（pacman 风格：按声明顺序优先，标死才切）=="
+  local out json
+  out="$(ip netns exec "$CLIENT_NS" timeout 8 python3 "$HERE/client_probe.py" "$PROXY_DST" 8080 2>&1 || true)"
+  echo "$out" | grep -q "wan-echo-ok" || { echo "FAIL: 首次经组拨号未成功"; echo "$out"; exit 1; }
+  grep -q "订阅 sub1: 拉取成功，1 个节点（来源顺序 #1）" "$LOG" \
+    || { echo "FAIL: 日志无 sub1 拉取/顺序记录"; tail -5 "$LOG"; exit 1; }
+  grep -q "订阅 sub2: 拉取成功，1 个节点（来源顺序 #2）" "$LOG" \
+    || { echo "FAIL: 日志无 sub2 拉取/顺序记录"; tail -5 "$LOG"; exit 1; }
+  json="$("$LOADER" status --socket "$STATUS_SOCK" --json 2>/dev/null || true)"
+  echo "$json" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+g = d.get("group") or {}
+assert g.get("subscription_failover") is True, g
+assert g.get("active_tag") == "sub1", ("初始活动层应为 sub1", g.get("active_tag"))
+print("active_tag=%s members=%d alive=%d" % (g["active_tag"], g["members"], g["alive"]))
+' || { echo "FAIL: 初始活动订阅应为 sub1"; exit 1; }
+  echo "PASS: 初始活动订阅 = sub1（声明顺序第一）"
+
+  echo "-- kill 第一源节点（ss A），等健康检查标死（interval=1s tolerance=1）--"
+  kill "$(cat "$SS_PID_FILE")" 2>/dev/null || true
+  rm -f "$SS_PID_FILE"
+  sleep 4
+  json="$("$LOADER" status --socket "$STATUS_SOCK" --json 2>/dev/null || true)"
+  echo "$json" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+g = d.get("group") or {}
+assert g.get("active_tag") == "sub2", ("第一源标死后应切 sub2", g.get("active_tag"))
+dead = [n["name"] for n in g["nodes"] if not n["alive"]]
+print("active_tag=%s dead=%s" % (g["active_tag"], dead))
+' || { echo "FAIL: 活动订阅未切到 sub2"; exit 1; }
+  grep -q "活动订阅 -> sub2" "$LOG" || { echo "FAIL: 日志无切换记录"; tail -5 "$LOG"; exit 1; }
+  echo "PASS: 第一源标死 → 活动订阅切到 sub2（日志可见）"
+
+  out="$(ip netns exec "$CLIENT_NS" timeout 8 python3 "$HERE/client_probe.py" "$PROXY_DST" 8080 2>&1 || true)"
+  echo "$out" | grep -q "wan-echo-ok" \
+    || { echo "FAIL: 切换后探测未成功"; echo "$out"; exit 1; }
+  echo "PASS: 切换后经第二源拨号成功（顺序回退端到端）"
+}
+
 # P18e：SS2022——跨实现验证（shadowsocks-rust ssserver，SIP022）。
 ss2022_up() {
   require_root
@@ -3449,11 +3540,13 @@ case "${1:-}" in
     # P17a：配置里有 dip(geoip: cn)（编译期展开），用小型夹具提供 geodata 文件。
     USE_CONFIG="$HERE/real-user.dae" USE_GEODATA_DIR=/tmp/sodama-geodata up ;;
   subscribe-up) subscribe_up ;;
+  sub-order-up) sub_order_up ;;  # P34：订阅顺序回退（pacman 风格，多源）
   sub-reload-up) subscribe_up ;;  # P18e：热更新测试的前置（与 subscribe-up 相同）
   test-sub-reload) test_sub_reload ;;
   groups-up) groups_up ;;  # P19：多组分派（proxy→A / alt→B）
   test-groups) test_groups ;;
   test-subscribe) test_subscribe ;;
+  test-sub-order) test_sub_order ;;  # P34：顺序回退（首源标死 → 切次源）
   v6-up) USE_RULES="$HERE/rules.v6.dae" USE_SS=1 USE_SS_METHOD=chacha20-ietf-poly1305 \
     USE_SS_PASSWORD=testpass USE_DIALER="ss://chacha20-ietf-poly1305:testpass@127.0.0.1:$SS_PORT" \
     USE_FAKE_DNS=1 USE_DNS_UPSTREAM="127.0.0.1:$FAKE_DNS_PORT" USE_RELAY_IDLE=600 up ;;  # P22：+假 DNS（v6 DNS 接管用）
@@ -3617,5 +3710,5 @@ test-dns-udp) test_dns_udp ;;  # 显式 udp:// 上游（仅 UDP）
   status) status ;;
   trace) trace ;;
   down) down ;;
-  *) echo "usage: $0 {build|up|dual-up|config-up|forward-up|dns-up|dot-up|doh-up|doh-h2-up|doh-h3-up|doq-up|dnsroute-up|dnsopts-up|ecscache-up|dns-udp-up|dns-tcpup-up|geo-up|pname-up|regex-up|relay-up|offload-up|udp-up|ss-up|ss2022-up|http-up|groups-up|ss-udp-up|trojan-up|vless-up|vless-tls-up|vless-udp-up|vmess-up|vmess-tls-up|vmess-udp-up|tuic-up|tuic-udp-up|hy2-up|hy2-udp-up|hy2-obfs-up|hy2-obfs-udp-up|hy2-brutal-up|hy2-hop-up|juicity-up|juicity-udp-up|ssr-up|shadowtls-up|shadowtls-v2-up|shadowtls-v1-up|ops-up|naive-up|test-naive|naive-h3-up|test-naive-h3|ops-reload-up|bench-up|test-proxy|test-direct|test-block|test-host-proxy|test-reload|test-rebind|test-status|test-config|test-forward|test-domain|test-dns-cache|test-dns-tcp|test-dns-reload|test-domain-regex|test-dns-edns|test-dot|test-doh|test-doh-h2|test-doh-h3|test-doq|test-dnsroute|test-dns-options|test-ecs-cache|test-dns-udp|test-dns-tcpup|test-geo|test-pname|test-v6|test-relay|test-relay-idle|test-relay-offload|test-offload-lifecycle|test-udp-relay|test-quic-sniff|test-udp-idle|test-ss|test-ss2022|test-http|test-groups|test-trojan|test-ss-udp|test-vless|test-vless-udp|test-vmess|test-vmess-udp|test-tuic|test-tuic-udp|test-juicity|test-juicity-udp|test-ssr|test-shadowtls|test-shadowtls-v2|test-shadowtls-v1|test-hy2|test-hy2-udp|test-hy2-obfs|test-hy2-obfs-udp|test-hy2-brutal|test-hy2-hop|test-ops|test-config-reload|test-fault-reload|test-fault-kill|reload|verify|status|trace|down|sniff-punt-up|test-sniff-punt}"; exit 2 ;;
+  *) echo "usage: $0 {build|up|dual-up|config-up|forward-up|dns-up|dot-up|doh-up|doh-h2-up|doh-h3-up|doq-up|dnsroute-up|dnsopts-up|ecscache-up|dns-udp-up|dns-tcpup-up|geo-up|pname-up|regex-up|relay-up|offload-up|udp-up|ss-up|ss2022-up|http-up|groups-up|ss-udp-up|trojan-up|vless-up|vless-tls-up|vless-udp-up|vmess-up|vmess-tls-up|vmess-udp-up|tuic-up|tuic-udp-up|hy2-up|hy2-udp-up|hy2-obfs-up|hy2-obfs-udp-up|hy2-brutal-up|hy2-hop-up|juicity-up|juicity-udp-up|ssr-up|shadowtls-up|shadowtls-v2-up|shadowtls-v1-up|ops-up|naive-up|test-naive|naive-h3-up|test-naive-h3|ops-reload-up|bench-up|test-proxy|test-direct|test-block|test-host-proxy|test-reload|test-rebind|test-status|test-config|test-forward|test-domain|test-dns-cache|test-dns-tcp|test-dns-reload|test-domain-regex|test-dns-edns|test-dot|test-doh|test-doh-h2|test-doh-h3|test-doq|test-dnsroute|test-dns-options|test-ecs-cache|test-dns-udp|test-dns-tcpup|test-geo|test-pname|test-v6|test-relay|test-relay-idle|test-relay-offload|test-offload-lifecycle|test-udp-relay|test-quic-sniff|test-udp-idle|test-ss|test-ss2022|test-http|test-groups|test-trojan|test-ss-udp|test-vless|test-vless-udp|test-vmess|test-vmess-udp|test-tuic|test-tuic-udp|test-juicity|test-juicity-udp|test-ssr|test-shadowtls|test-shadowtls-v2|test-shadowtls-v1|test-hy2|test-hy2-udp|test-hy2-obfs|test-hy2-obfs-udp|test-hy2-brutal|test-hy2-hop|test-ops|test-config-reload|test-fault-reload|test-fault-kill|reload|verify|status|trace|down|sniff-punt-up|test-sniff-punt|subscribe-up|test-subscribe|sub-order-up|test-sub-order}"; exit 2 ;;
 esac

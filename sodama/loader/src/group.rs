@@ -8,7 +8,7 @@
 
 use std::collections::VecDeque;
 use std::io::{Read as _, Write as _};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -147,6 +147,8 @@ impl Health {
 pub struct Member {
     pub name: String,
     pub tag: String,
+    /// P34：来源顺序（0 = 最高优先；`subscription_failover` 按此分层回退）。
+    pub rank: u32,
     pub outbound: outbound::Outbound,
 }
 
@@ -156,6 +158,8 @@ pub struct GroupStats {
     pub failovers: AtomicU64,
     pub probes_ok: AtomicU64,
     pub probes_fail: AtomicU64,
+    /// P34：活动订阅层（rank+1 编码；0 = 尚未选出/未启用顺序回退）。
+    pub active_rank: AtomicU64,
 }
 
 pub struct GroupRuntime {
@@ -169,6 +173,8 @@ pub struct GroupRuntime {
     pub check_interval_secs: u64,
     pub check_tolerance: u32,
     pub stats: GroupStats,
+    /// P34：订阅顺序回退开关（config global `subscription_failover`，默认开）。
+    sub_failover: AtomicBool,
 }
 
 /// 成员 + 健康（整体替换以实现“生成代”隔离）。
@@ -212,6 +218,7 @@ impl GroupRuntime {
             check_interval_secs,
             check_tolerance,
             stats: GroupStats::default(),
+            sub_failover: AtomicBool::new(true),
         })
     }
 
@@ -224,6 +231,33 @@ impl GroupRuntime {
 
     pub fn member_count(&self) -> usize {
         self.inner().members.len()
+    }
+
+    /// P34：订阅顺序回退开关（config global `subscription_failover`，默认开）。
+    pub fn set_sub_failover(&self, on: bool) {
+        self.sub_failover.store(on, Ordering::Relaxed);
+    }
+
+    pub fn sub_failover_enabled(&self) -> bool {
+        self.sub_failover.load(Ordering::Relaxed)
+    }
+
+    /// P34：当前活动订阅层来源 tag（未启用顺序回退或全 dead 时为 None）。
+    pub fn active_tag(&self) -> Option<String> {
+        if !self.sub_failover.load(Ordering::Relaxed) {
+            return None;
+        }
+        let inner = self.inner();
+        let hs = Self::health_lock(&inner);
+        let a = (0..inner.members.len())
+            .filter(|&i| hs[i].alive)
+            .map(|i| inner.members[i].rank)
+            .min()?;
+        inner
+            .members
+            .iter()
+            .find(|m| m.rank == a)
+            .map(|m| m.tag.clone())
     }
 
     /// P18e：订阅热更新——整体替换成员（同 name+tag 的成员继承健康/延迟）。
@@ -285,11 +319,43 @@ impl GroupRuntime {
         }
     }
 
+    /// P34：计算活动订阅层（alive 成员中 rank 最小）并在变化时记日志；
+    /// select_order 与健康探测轮共用（探测周期内即可发现切换，不必等下一次拨号）。
+    fn note_active_layer(&self, inner: &GroupInner, hs: &[Health]) -> Option<u32> {
+        if !self.sub_failover.load(Ordering::Relaxed) {
+            return None;
+        }
+        let a = (0..inner.members.len())
+            .filter(|&i| hs[i].alive)
+            .map(|i| inner.members[i].rank)
+            .min()?;
+        let enc = a as u64 + 1;
+        if self.stats.active_rank.swap(enc, Ordering::Relaxed) != enc {
+            if let Some(m) = inner.members.iter().find(|m| m.rank == a) {
+                crate::log(&format!(
+                    "组 {}: 活动订阅 -> {}（顺序回退 rank {a}）",
+                    self.name, m.tag
+                ));
+            }
+        }
+        Some(a)
+    }
+
     /// 按 policy + 健康状态给出尝试顺序（alive/已知延迟优先，其后未探测，最后 dead）。
     pub fn select_order(&self) -> Vec<usize> {
         let inner = self.inner();
         let hs = Self::health_lock(&inner);
         let n = inner.members.len();
+        // P34：订阅顺序回退（pacman 风格）——alive 成员中 rank 最小者为「活动层」，
+        // 层内按 policy 排序；其余来源作兜底（层键在健康之后、延迟之前）。
+        // `subscription_failover` 关闭时为 None → 与旧行为（全池按 policy）一致。
+        let active = self.note_active_layer(&inner, &hs);
+        let layer = |i: usize| -> u8 {
+            match active {
+                Some(a) if inner.members[i].rank != a => 1,
+                _ => 0,
+            }
+        };
         match self.policy {
             Policy::Random => {
                 let mut idx: Vec<usize> = (0..n).collect();
@@ -298,11 +364,12 @@ impl GroupRuntime {
                     let j = (rand::random::<u64>() % (i as u64 + 1)) as usize;
                     idx.swap(i, j);
                 }
-                // alive 排在 dead 前
-                idx.sort_by_key(|&i| !hs[i].alive);
+                // 活动订阅层在前（仅对 alive 有意义），dead 一律最后
+                idx.sort_by_key(|&i| (if hs[i].alive { layer(i) } else { 0 }, !hs[i].alive));
                 idx
             }
             Policy::Fixed(k) => {
+                // fixed 是显式点名：不做订阅分层（避免层逻辑抢走用户指定的成员）。
                 let mut idx = Vec::with_capacity(n);
                 if k < n {
                     idx.push(k);
@@ -335,22 +402,20 @@ impl GroupRuntime {
             }
             _ => {
                 let mut idx: Vec<usize> = (0..n).collect();
+                // 键 =（dead, 层, 是否有延迟）：dead 最后；活动订阅层优先；
+                // 同层内已知延迟先于未探测，再按 metric/crypto 排序。
+                let key = |i: usize| -> (u8, u8, u8) {
+                    if !hs[i].alive {
+                        (1, 0, 2)
+                    } else if self.metric(&hs[i]).is_some() {
+                        (0, layer(i), 0)
+                    } else {
+                        (0, layer(i), 1)
+                    }
+                };
                 idx.sort_by(|&a, &b| {
-                    let ca = if !hs[a].alive {
-                        2
-                    } else if self.metric(&hs[a]).is_some() {
-                        0
-                    } else {
-                        1
-                    };
-                    let cb = if !hs[b].alive {
-                        2
-                    } else if self.metric(&hs[b]).is_some() {
-                        0
-                    } else {
-                        1
-                    };
-                    ca.cmp(&cb)
+                    key(a)
+                        .cmp(&key(b))
                         .then_with(|| {
                             let ma = self.metric(&hs[a]).unwrap_or(f64::INFINITY);
                             let mb = self.metric(&hs[b]).unwrap_or(f64::INFINITY);
@@ -491,6 +556,12 @@ impl GroupRuntime {
                 });
                 i = end;
             }
+            // P34：探测一轮后刷新活动订阅层（切换在探测周期内记日志，空闲期也可见）
+            {
+                let inner = g.inner();
+                let hs = Self::health_lock(&inner);
+                g.note_active_layer(&inner, &hs);
+            }
             std::thread::sleep(Duration::from_secs(g.check_interval_secs.max(1)));
         });
     }
@@ -606,6 +677,7 @@ pub fn build_members(nodes: &[ParsedNode], filters: &[Vec<config::Function>]) ->
         .map(|n| Member {
             name: n.name.clone(),
             tag: n.tag.clone(),
+            rank: n.rank,
             outbound: n.outbound.clone(),
         })
         .collect()
@@ -684,6 +756,7 @@ mod tests {
         let mk = |url: &str, name: &str| Member {
             name: name.into(),
             tag: "t".into(),
+            rank: 0,
             outbound: crate::outbound::parse(url).unwrap(),
         };
         let g = GroupRuntime::new(
@@ -718,6 +791,7 @@ mod tests {
         let mk = |name: &str| Member {
             name: name.into(),
             tag: "t".into(),
+            rank: 0,
             outbound: dummy.clone(),
         };
         let g = GroupRuntime::new(
@@ -766,16 +840,19 @@ mod tests {
             Member {
                 name: "slow".into(),
                 tag: "t".into(),
+                rank: 0,
                 outbound: dummy.clone(),
             },
             Member {
                 name: "fast".into(),
                 tag: "t".into(),
+                rank: 0,
                 outbound: dummy.clone(),
             },
             Member {
                 name: "dead".into(),
                 tag: "t".into(),
+                rank: 0,
                 outbound: dummy,
             },
         ];
@@ -791,6 +868,56 @@ mod tests {
         assert_eq!(order[0], 1, "fast first");
         assert_eq!(order[1], 0, "slow second");
         assert_eq!(order[2], 2, "dead last");
+    }
+
+    #[test]
+    fn select_order_prefers_earlier_subscription_rank() {
+        // P34：订阅顺序回退——同 rank 内按 policy；跨 rank 时活动层优先（即使延迟更差），
+        // 主源全部标死才切下一源；`subscription_failover=false` 恢复池化。
+        let dummy = crate::outbound::Outbound::Direct;
+        let mk = |name: &str, rank: u32| Member {
+            name: name.into(),
+            tag: format!("s{rank}"),
+            rank,
+            outbound: dummy.clone(),
+        };
+        let members = vec![mk("primary", 0), mk("backup", 1)];
+        let g = GroupRuntime::new(
+            "g".into(),
+            Policy::MinMovingAvg,
+            members,
+            vec![],
+            30,
+            1,
+            None,
+        );
+        {
+            let inner = g.inner();
+            let mut hs = GroupRuntime::health_lock(&inner);
+            hs[0].note_probe(true, 200, 1); // 主源延迟更差也不动摇顺序
+            hs[1].note_probe(true, 20, 1);
+        }
+        assert_eq!(g.select_order()[0], 0, "rank 小的在前");
+        assert_eq!(g.active_tag().as_deref(), Some("s0"));
+
+        // 主源标死 → 活动层切到下一源
+        {
+            let inner = g.inner();
+            let mut hs = GroupRuntime::health_lock(&inner);
+            hs[0].alive = false;
+        }
+        assert_eq!(g.select_order()[0], 1, "主源死后切备用源");
+        assert_eq!(g.active_tag().as_deref(), Some("s1"));
+
+        // 关闭顺序回退 → 恢复池化：按延迟挑（备用源更快）
+        g.set_sub_failover(false);
+        {
+            let inner = g.inner();
+            let mut hs = GroupRuntime::health_lock(&inner);
+            hs[0].alive = true;
+        }
+        assert_eq!(g.select_order()[0], 1, "池化模式按延迟");
+        assert_eq!(g.active_tag(), None);
     }
 
     #[test]
