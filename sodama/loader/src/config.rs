@@ -1155,6 +1155,8 @@ const GLOBAL_KEYS: &[&str] = &[
     // P36：规则集（片格式分流规则文件）的更新/缓存
     "rule_set_update_interval",
     "rule_set_cache_dir",
+    // 优雅空闲：无人看状态且无流量时，健康探测指数退避到该上限（秒；0 = 不退避）
+    "probe_idle_cap",
 ];
 
 const DNS_KEYS: &[&str] = &[

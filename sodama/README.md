@@ -82,9 +82,14 @@ P6（suspend/reload/metrics/sysdump/日志轮转/整配置热重载）已完成*
 - **P15 订阅 / 节点组 / 健康检查（多节点选路）**：`--subscribe <url>`（可重复）/`--group <name>`，
   config `subscription/node/group` 生效；极小 HTTP(S) 订阅拉取（3 跳重定向/chunked/webpki/
   **优先 IPv4**/marked socket）+ base64/明文解码 + 逐行容错；filter（name 精确/keyword:/regex:/
-  subtag/`!`，行内 AND / 行间 OR）；policy（min/min_moving_avg/min_avg10/random/fixed）；
+  subtag/`!`，行内 AND / 行间 OR）；policy（min/min_moving_avg/min_avg10/random/fixed(i)/
+  `fixed('节点名')`——**名字点名**：订阅刷新重排成员索引后仍指向同一节点，
+  改名/下线则自动兑底；reload 时 policy 与成员/filter 一起热应用）；
   经节点健康探测（last/EMA/hist10，tolerance 标死）+ 拨号失败自动切换；状态面 `group`
-  （ADR-0031、NOTES §11.22；**P34**：多来源按声明顺序回退——pacman 镜像风格，alive 中
+  （ADR-0031、NOTES §11.22；**优雅空闲**：探测节奏由「有人查状态面（20s 内）」与
+  「有活跃连接/30s 内有转发」决定，两者皆无时指数退避 30→60→120→240→480→`probe_idle_cap`
+  （默认 600s，`0` = 不退避），退避中每秒检查一次可被立刻叫醒；状态面 `probe_interval_secs`/
+  `probe_active`，节奏变化写日志；**P34**：多来源按声明顺序回退——pacman 镜像风格，alive 中
   rank 最小者（活动层）独占出口，全部标死才切下一源，`subscription_failover: false` = 池化；
   状态面 `active_tag`；来源顺序 = node → CLI --subscribe → config subscription；默认配置目录
   `~/.config/sodama/config.dae`，相对订阅路径按配置目录解析、`subN.url` 单行 URL 文件
@@ -397,6 +402,8 @@ sudo lab/lab.sh verify     # 同一套用例在单臂拓扑上重跑
 target/release/sodama validate <config.dae>        # 解析 + schema 校验 + 可编译性
 target/release/sodama export-config <config.dae>   # 合并后的配置（JSON）
 target/release/sodama extract-routing <config.dae> # 数据面可编译的规则（deferred 到 stderr）
+target/release/sodama sub-parse <url|path> [--tag <t>] [--json] [--limit <n>] [--timeout <s>]
+                                                   # 只读：拉订阅→解码→逐行解析（控制面板导入预览用）
 target/release/sodama status [--socket <path>] [--cmd status|rules|config|maps] [--json]
 
 sudo lab/lab.sh config-up  # 用 lab/real-user.dae 启动（K3；该文件需 chmod 640，loader 会校验权限）

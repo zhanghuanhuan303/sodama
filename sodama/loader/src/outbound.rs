@@ -783,6 +783,19 @@ pub enum VlessTransport {
     },
 }
 
+/// 可公开的节点元信息（状态面用；不含凭据）。
+#[derive(Debug, Clone, Copy)]
+pub struct NodeFacts {
+    pub protocol: &'static str,
+    /// tcp / ws / quic / h2 / —
+    pub transport: &'static str,
+    /// tls / reality / shadowtls / none / —
+    pub security: &'static str,
+    /// 该协议能否承载 UDP（不代表路由已放行 UDP；当前路由把 UDP 送 direct）
+    pub udp: bool,
+    pub addr: Option<SocketAddr>,
+}
+
 #[derive(Clone, Debug)]
 pub enum Outbound {
     Direct,
@@ -917,6 +930,33 @@ impl Outbound {
         }
     }
 
+    /// 协议标签（稳定小写串；订阅解析预览/统计用）。
+    pub fn protocol(&self) -> &'static str {
+        match self {
+            Self::Direct => "direct",
+            Self::Socks5 { .. } => "socks5",
+            Self::Http { .. } => "http",
+            Self::Shadowsocks { shadowtls, .. } => {
+                if shadowtls.is_some() {
+                    "shadowtls"
+                } else {
+                    "shadowsocks"
+                }
+            }
+            Self::Trojan { .. } => "trojan",
+            Self::Vless { .. } => "vless",
+            Self::Vmess { .. } => "vmess",
+            Self::Tuic { .. } => "tuic",
+            Self::Hysteria2 { .. } => "hysteria2",
+            Self::AnyTls { .. } => "anytls",
+            Self::Juicity { .. } => "juicity",
+            Self::Ssr { .. } => "ssr",
+            Self::Naive { h3: true, .. } => "naive-quic",
+            Self::Naive { .. } => "naive",
+            Self::Group(_) => "group",
+        }
+    }
+
     /// O6：同健康/同延迟节点的 AEAD 方法偏好（小者优先）。
     ///
     /// 实测（本机 i9-9900KF，RustCrypto AEAD，16KB 块）：chacha20-poly1305
@@ -963,6 +1003,67 @@ impl Outbound {
             // anytls：读半 inbuf 帧解析、写半组帧入队（padding 只打散一次）。
             Self::AnyTls { .. } => true,
             _ => false,
+        }
+    }
+
+    /// 状态面 / 控制面板用的「节点事实」：协议 + 传输 + 安全 + UDP 能力 + 地址。
+    /// 只暴露可公开的元信息（不含 uuid/密码/密钥）。
+    pub fn facts(&self) -> NodeFacts {
+        let udp = self.supports_udp();
+        let addr = self.server_addr();
+        let (protocol, transport, security) = match self {
+            Self::Direct => ("direct", "—", "—"),
+            Self::Socks5 { .. } => ("socks5", "tcp", "—"),
+            Self::Http { .. } => ("http", "tcp", "—"),
+            Self::Shadowsocks { shadowtls, .. } => (
+                if shadowtls.is_some() {
+                    "shadowsocks"
+                } else {
+                    "shadowsocks"
+                },
+                "tcp",
+                if shadowtls.is_some() {
+                    "shadowtls"
+                } else {
+                    "none"
+                },
+            ),
+            Self::Trojan { .. } => ("trojan", "tcp", "tls"),
+            Self::Vless {
+                tls,
+                transport,
+                reality,
+                ..
+            } => (
+                "vless",
+                match transport {
+                    VlessTransport::Tcp => "tcp",
+                    VlessTransport::Ws { .. } => "ws",
+                },
+                if reality.is_some() {
+                    "reality"
+                } else if *tls {
+                    "tls"
+                } else {
+                    "none"
+                },
+            ),
+            Self::Vmess { tls, .. } => ("vmess", "tcp", if *tls { "tls" } else { "none" }),
+            Self::Tuic { .. } => ("tuic", "quic", "tls"),
+            Self::Hysteria2 { .. } => ("hysteria2", "quic", "tls"),
+            Self::AnyTls { .. } => ("anytls", "tcp", "tls"),
+            Self::Juicity { .. } => ("juicity", "quic", "tls"),
+            Self::Ssr { .. } => ("ssr", "tcp", "none"),
+            Self::Naive { h3: true, .. } => ("naive", "quic", "tls"),
+            Self::Naive { .. } => ("naive", "h2", "tls"),
+            Self::Group(_) => ("group", "—", "—"),
+        };
+        NodeFacts {
+            protocol,
+            transport,
+            security,
+            udp,
+            addr,
         }
     }
 

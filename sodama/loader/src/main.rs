@@ -126,6 +126,8 @@ struct ReloadOutcome {
 /// P6：`--log-file`（轮转友好：SIGHUP reload 时 reopen）。
 static LOG_PATH: OnceLock<String> = OnceLock::new();
 static LOG_SINK: Mutex<Option<std::fs::File>> = Mutex::new(None);
+/// CLI 子命令：日志改走 stderr，保持 stdout 只有机器可读输出（JSON/文本）。
+static LOG_STDERR: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// 只读状态面：进程启动时间 / 监听端口 / 钩子列表 / 最近编译结果 / 配置解析结果
 static STARTED: OnceLock<Instant> = OnceLock::new();
 static TPROXY_PORT: AtomicU32 = AtomicU32::new(0);
@@ -1042,8 +1044,13 @@ fn log(msg: &str) {
         }
     }
     if !done {
-        println!("{line}");
-        let _ = std::io::stdout().flush();
+        if LOG_STDERR.load(std::sync::atomic::Ordering::Relaxed) {
+            eprintln!("{line}");
+            let _ = std::io::stderr().flush();
+        } else {
+            println!("{line}");
+            let _ = std::io::stdout().flush();
+        }
     }
 }
 
@@ -1132,6 +1139,7 @@ fn usage() -> ! {
            sodama reload [--socket <path>]      P6：热重载（等价 kill -HUP，同步等结果）\n\
            sodama suspend|resume [--socket <path>] P6：no-load 挂起 / 恢复（对照 dae suspend）\n\
            sodama metrics [--socket <path>]     P6：Prometheus 文本格式统计导出\n\
+           sodama sub-parse <url|path> [--tag <t>] [--json] [--limit <n>] [--timeout <s>] 只读：拉取订阅解析预览\n\
            sodama sysdump [--socket <path>] [--out <file>] P6：状态+规则+系统网络信息归档\n\
            sodama trace [--seconds N]           P6：过滤 sodama 的 ftrace 输出（需 root）\n\
          \n\
@@ -2643,6 +2651,7 @@ fn handle_relay_conn(mut client: TcpStream) {
     ));
     RELAY_STATS.conns_total.fetch_add(1, Ordering::Relaxed);
     RELAY_STATS.conns_active.fetch_add(1, Ordering::Relaxed);
+    note_traffic();
     let outbound::DialedStream {
         from_remote,
         mut to_remote,
@@ -2779,14 +2788,31 @@ fn handle_relay_conn(mut client: TcpStream) {
         }
     }
     // 客户端 → 上游
-    if let Ok(c_read) = client.try_clone() {
+    // O9：两个方向各一个泵，**最后一个泵结束时**才收尾（relay_finish）。
+    // 旧行为是 handler 线程（上游→客户端）一结束就 relay_finish —— 连接随即从
+    // RELAY_CONNS 摘除：另一个方向若还卡在 recv（半开连接 / 对端不关），既不会被
+    // 空闲 janitor 回收（看不见），也不再计入 conns_active
+    // （路由器实测：泄漏 54+ 泵线程 / 每线程 1MiB 栈 + 64KB 缓冲 + ~6 个 fd）。
+    let sibling_read = client.try_clone().ok();
+    let pumps_left = Arc::new(AtomicU32::new(if sibling_read.is_some() { 2 } else { 1 }));
+    let pump_done = {
+        let p = pumps_left.clone();
+        move || {
+            if p.fetch_sub(1, Ordering::AcqRel) == 1 {
+                relay_finish(id);
+            }
+        }
+    };
+    if let Some(c_read) = sibling_read {
         let h2 = handle.clone();
         let up_dst = upstream_fd;
+        let done = pump_done.clone();
         std::thread::spawn(move || {
+            let mut spliced = false;
             if splice {
                 if let Some(dst) = up_dst {
                     match splice_pump(c_read.as_raw_fd(), dst, &h2.last_ns, &RELAY_STATS.bytes_up) {
-                        Ok(()) => return,
+                        Ok(()) => spliced = true,
                         Err(SpliceErr::Unsupported(e)) => {
                             RELAY_STATS.splice_fallbacks.fetch_add(1, Ordering::Relaxed);
                             if !SPLICE_FALLBACK_LOGGED.swap(true, Ordering::Relaxed) {
@@ -2795,19 +2821,22 @@ fn handle_relay_conn(mut client: TcpStream) {
                         }
                         Err(SpliceErr::Fatal(e)) => {
                             log(&format!("splice: 上游传输错误（{e}）"));
-                            return;
+                            spliced = true;
                         }
                     }
                 }
             }
-            pump(
-                Box::new(c_read),
-                to_remote,
-                &h2.last_ns,
-                &RELAY_STATS.bytes_up,
-                offloaded,
-                Some(&h2.stop),
-            );
+            if !spliced {
+                pump(
+                    Box::new(c_read),
+                    to_remote,
+                    &h2.last_ns,
+                    &RELAY_STATS.bytes_up,
+                    offloaded,
+                    Some(&h2.stop),
+                );
+            }
+            done();
         });
     }
     // 上游 → 客户端（本线程）
@@ -2842,7 +2871,7 @@ fn handle_relay_conn(mut client: TcpStream) {
         }
         log(&format!("offload: {target} 已注销 fast_sock 键"));
     }
-    relay_finish(id);
+    pump_done();
 }
 
 /// relay 会话收尾：摘注册表 + 活跃计数递减（线程泵路径与 reactor 共用）。
@@ -3367,6 +3396,41 @@ fn unix_now_sec() -> u64 {
         .unwrap_or(0)
 }
 
+// ---------------------------------------------------------------- 活跃度信号（优雅空闲）
+//
+// 组健康探测的节奏由「有人在看吗」+「有流量吗」决定：
+//   * `note_watch()`：每次状态面查询（面板/CLI）打点——面板开着就等于“有人看”；
+//   * `note_traffic()`：每次 relay 建连打点（加上 conns_active 计数）——有真实转发。
+// 两者皆无时健康探测指数退避，避免空闲时每 30s 拨全部节点（省 CPU/内存/流量）。
+
+/// 最近一次状态面查询（unix 秒；0 = 从未）。
+static LAST_WATCH: AtomicU64 = AtomicU64::new(0);
+/// 最近一次真实转发活动（unix 秒；0 = 从未）。
+static LAST_TRAFFIC: AtomicU64 = AtomicU64::new(0);
+
+pub fn note_watch() {
+    LAST_WATCH.store(unix_now_sec(), Ordering::Relaxed);
+}
+
+pub fn note_traffic() {
+    LAST_TRAFFIC.store(unix_now_sec(), Ordering::Relaxed);
+}
+
+/// 最近 `within` 秒内有人查询过状态。
+pub fn watched_recently(within: u64) -> bool {
+    let t = LAST_WATCH.load(Ordering::Relaxed);
+    t > 0 && unix_now_sec().saturating_sub(t) < within
+}
+
+/// 最近 `within` 秒内有真实转发（或有活跃连接）。
+pub fn traffic_active(within: u64) -> bool {
+    if RELAY_STATS.conns_active.load(Ordering::Relaxed) > 0 {
+        return true;
+    }
+    let t = LAST_TRAFFIC.load(Ordering::Relaxed);
+    t > 0 && unix_now_sec().saturating_sub(t) < within
+}
+
 /// 解析 `--dialer`：G1 支持 direct / socks5:// / ss:// / trojan://（见 outbound）。
 
 fn monotonic_now_ns() -> u64 {
@@ -3560,7 +3624,7 @@ fn make_group_runtime(
 
     let rt = group::GroupRuntime::new(
         gname.to_string(),
-        policy,
+        policy.clone(),
         members,
         targets.clone(),
         interval,
@@ -3572,9 +3636,15 @@ fn make_group_runtime(
         .map(|v| !matches!(v.trim(), "false" | "0" | "no" | "off"))
         .unwrap_or(true);
     rt.set_sub_failover(failover);
+    // 优雅空闲：无人看状态且无流量时，健康探测退避到该上限（秒；0 = 不退避）。
+    let idle_cap = global_str("probe_idle_cap")
+        .and_then(|v| parse_duration_secs(&v))
+        .unwrap_or(600);
+    rt.set_idle_cap(idle_cap);
     log(&format!(
-        "节点组 {gname}: {} 个成员, policy={policy:?}, check={targets:?} 每 {interval}s, 容忍 {tolerance} 次失败, udp_check={udp_check_dns:?}, 订阅顺序回退={}",
+        "节点组 {gname}: {} 个成员, policy={}, check={targets:?} 每 {interval}s, 容忍 {tolerance} 次失败, udp_check={udp_check_dns:?}, 订阅顺序回退={}",
         rt.member_count(),
+        group::policy_name(&policy),
         if failover { "开" } else { "关" }
     ));
     rt.spawn_health_loop();
@@ -3786,6 +3856,15 @@ fn reload_group_members(args: &Args, fast: bool) {
                 continue;
             }
             let (n, inherited) = g.groups[i].replace_members(members);
+            // policy 也随 config 热应用（控制面板「手动切节点/恢复自动」靠这条即时生效）。
+            let want = group::parse_policy(spec.as_ref().and_then(|s| s.policy.as_deref()));
+            if *g.groups[i].policy() != want {
+                log(&format!(
+                    "订阅热更新：组 {name} policy -> {}",
+                    group::policy_name(&want)
+                ));
+                g.groups[i].set_policy(want);
+            }
             log(&format!(
                 "订阅热更新：组 {name} {n} 成员（继承 {inherited} 健康）"
             ));
@@ -4100,6 +4179,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 | "suspend"
                 | "resume"
                 | "metrics"
+                | "sub-parse"
                 | "sysdump"
                 | "trace"
         )
@@ -4704,6 +4784,10 @@ fn trim_allocator() {
         libc::malloc_trim(0);
     }
 }
+// 边界（如实）：musl 的 malloc 没有 malloc_trim，释放后不归还内核页。
+// 实测过换 mimalloc（每线程堆 + mi_collect 显式归还）：用户态很省且 RSS 会回落，
+// 但 daemon 侧（50+ 线程 → 每线程堆/段）反而更高（66–87MB vs musl 37.8–50MB），
+// 故保留系统分配器，不引入 mimalloc。
 #[cfg(not(target_env = "gnu"))]
 fn trim_allocator() {}
 
@@ -6002,6 +6086,8 @@ fn udp_nat_janitor_loop() {
 // ---------------------------------------------------------------- K3：子命令
 
 fn run_subcommand(argv: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    // 子命令的 stdout 留给数据（JSON/文本），诊断信息一律 stderr。
+    LOG_STDERR.store(true, std::sync::atomic::Ordering::Relaxed);
     match argv[1].as_str() {
         "validate" | "export-config" | "extract-routing" => {
             let path = argv
@@ -6139,6 +6225,103 @@ fn run_subcommand(argv: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             let (sock, _) = parse_socket_args(argv, 2)?;
             let resp = status::client(Path::new(&sock), "metrics")?;
             println!("{resp}");
+            Ok(())
+        }
+        "sub-parse" => {
+            // 只读：拉取订阅 → base64/明文解码 → 逐行解析节点。不加载 eBPF、不改配置。
+            // 面板「导入订阅」前的解析预览就靠这一步（复用运行时同一套解析逻辑）。
+            let mut src = String::new();
+            let mut tag = "sub".to_string();
+            let mut timeout = 15u64;
+            let mut limit = 200usize;
+            let mut json_out = false;
+            let mut it = argv.iter().skip(2);
+            while let Some(a) = it.next() {
+                match a.as_str() {
+                    "--tag" => tag = it.next().ok_or("--tag 需要值")?.clone(),
+                    "--timeout" => timeout = it.next().ok_or("--timeout 需要值")?.parse()?,
+                    "--limit" => limit = it.next().ok_or("--limit 需要值")?.parse()?,
+                    "--json" => json_out = true,
+                    other if src.is_empty() && !other.starts_with("--") => src = other.to_string(),
+                    other => return Err(format!("未知参数 {other}").into()),
+                }
+            }
+            if src.is_empty() {
+                return Err(
+                    "用法: sodama sub-parse <url|path> [--tag <t>] [--timeout <s>] [--limit <n>] [--json]"
+                        .into(),
+                );
+            }
+            let timeout = Duration::from_secs(timeout.clamp(1, 120));
+            let started = std::time::Instant::now();
+            let body = subscribe::fetch(&src, timeout).map_err(|e| format!("拉取订阅失败: {e}"))?;
+            let plain = String::from_utf8_lossy(&body).into_owned();
+            let text =
+                subscribe::decode_body(&body).map_err(|e| format!("订阅正文解码失败: {e}"))?;
+            let format = if text == plain { "plain" } else { "base64" };
+            let (nodes, errors) = subscribe::parse_subscription(&text, &tag);
+            let mut protos: std::collections::BTreeMap<&str, usize> =
+                std::collections::BTreeMap::new();
+            for n in &nodes {
+                *protos.entry(n.outbound.protocol()).or_default() += 1;
+            }
+            let elapsed_ms = started.elapsed().as_millis() as u64;
+            let take = if limit == 0 {
+                nodes.len()
+            } else {
+                limit.min(nodes.len())
+            };
+            if json_out {
+                let list: Vec<serde_json::Value> = nodes
+                    .iter()
+                    .take(take)
+                    .map(|n| {
+                        json!({
+                            "name": n.name,
+                            "protocol": n.outbound.protocol(),
+                            "addr": n.outbound.server_addr().map(|a| a.to_string()),
+                            "detail": n.outbound.name(),
+                        })
+                    })
+                    .collect();
+                println!(
+                    "{}",
+                    serde_json::to_string(&json!({
+                        "ok": true,
+                        "tag": tag,
+                        "source": src,
+                        "bytes": body.len(),
+                        "format": format,
+                        "count": nodes.len(),
+                        "protocols": protos,
+                        "nodes": list,
+                        "truncated": nodes.len() > take,
+                        "errors": errors,
+                        "elapsed_ms": elapsed_ms,
+                    }))?
+                );
+            } else {
+                println!("tag: {tag}");
+                println!("source: {src}");
+                println!("bytes: {}（{format}）", body.len());
+                println!("nodes: {}（{elapsed_ms} ms）", nodes.len());
+                let ps: Vec<String> = protos.iter().map(|(k, v)| format!("{k} {v}")).collect();
+                println!("protocols: {}", ps.join(", "));
+                for n in nodes.iter().take(take) {
+                    println!(
+                        "  - {} [{}] {}",
+                        n.name,
+                        n.outbound.protocol(),
+                        n.outbound.name()
+                    );
+                }
+                if nodes.len() > take {
+                    println!("  … 其余 {} 个节点（--limit 0 看全部）", nodes.len() - take);
+                }
+                for e in &errors {
+                    println!("  ! {e}");
+                }
+            }
             Ok(())
         }
         "sysdump" => {
@@ -6562,21 +6745,33 @@ fn read_stats(ebpf: &mut Ebpf) -> (u64, u64, u64, u64) {
 /// P19：单个组的 JSON（status 的 `group` 与 `groups[]` 共用）。
 fn group_json(g: &group::GroupRuntime, index: usize, default: bool) -> serde_json::Value {
     let snap = g.snapshot();
+    let (current, pinned, pinned_ok) = g.current_and_pinned();
     json!({
         "name": g.name,
         "index": index,
         "default": default,
-        "policy": format!("{:?}", g.policy),
+        "policy": group::policy_name(&g.policy()),
+        "pinned": pinned,
+        "pinned_ok": pinned_ok,
+        "current": current,
+        "probe_interval_secs": g.stats.probe_interval.load(Ordering::Relaxed),
+        "probe_active": g.stats.probe_active.load(Ordering::Relaxed) == 1,
         "members": g.member_count(),
-        "alive": snap.iter().filter(|x| x.2).count(),
+        "alive": snap.iter().filter(|x| x.alive).count(),
         "dials": g.stats.dials.load(Ordering::Relaxed),
         "failovers": g.stats.failovers.load(Ordering::Relaxed),
         "probes_ok": g.stats.probes_ok.load(Ordering::Relaxed),
         "probes_fail": g.stats.probes_fail.load(Ordering::Relaxed),
         "subscription_failover": g.sub_failover_enabled(),
         "active_tag": g.active_tag(),
-        "nodes": snap.iter().map(|(n, tag, alive, last, ema)| json!({
-            "name": n, "tag": tag, "alive": alive, "last_ms": last, "ema_ms": ema
+        "nodes": snap.iter().map(|n| json!({
+            "name": n.name, "tag": n.tag, "alive": n.alive, "last_ms": n.last_ms, "ema_ms": n.ema_ms,
+            // 可公开的协议事实（TCP/UDP/传输/安全/地址；不带任何凭据）
+            "protocol": n.facts.protocol,
+            "transport": n.facts.transport,
+            "security": n.facts.security,
+            "udp": n.facts.udp,
+            "addr": n.facts.addr.map(|a| a.to_string()),
         })).collect::<Vec<_>>(),
     })
 }
@@ -6613,6 +6808,8 @@ fn rule_sets_json() -> serde_json::Value {
 
 /// P6：状态面主查询体（status / metrics 共用数据源）。
 fn status_json(ebpf: &mut Ebpf) -> serde_json::Value {
+    // 有人查状态 = “有人在看”→ 健康探测保持活跃节奏（优雅空闲的信号源之一）。
+    note_watch();
     let rules_state = LAST_RULES.lock().ok().and_then(|g| g.clone());
     let cfg_state = CONFIG_STATE.lock().ok().and_then(|g| g.clone());
     let conn_state = count_map::<SodaTuple, SodaConnState>(ebpf, "conn_state_map");
