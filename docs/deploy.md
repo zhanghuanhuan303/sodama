@@ -247,6 +247,14 @@ geodata_dir/log_file/status_socket` 等）——**配置文件即唯一事实来
 订阅路径按配置目录解析，单行 http(s) URL 文件（如 `subN.url`）自动按 URL 抓取。systemd 场景
 建议 drop-in 显式 `--config /etc/sodama/config.dae`（更直观，且 `HOME` 常为 `/`）。
 
+规则集与用户名单（P36）：`rule_set { tag: 'url|路径' }` 支持标准格式（Clash rule-provider
+YAML / sing-box rule-set JSON / 纯文本域名列表），远程 URL 自动下载并按
+`global.rule_set_update_interval`（缺省 86400s；0=每次 reload）刷新，缓存目录缺省走
+XDG cache → `~/.cache` → `/var/cache`（可用 `global.rule_set_cache_dir` 指定；OpenWrt 等
+无 home 环境自动落到 `/var/cache/sodama/rulesets`）；路由用 `domain(ruleset: tag)` 引用。
+用户名单文件（`rules/user_proxy.txt` / `rules/user_direct.txt`，相对配置目录解析）已纳入
+inotify 监听——**编辑名单即热生效**，无需改 config 或重启。
+
 ## 9. 升级 / 回滚
 
 升级：

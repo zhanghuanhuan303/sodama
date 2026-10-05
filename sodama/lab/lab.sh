@@ -62,6 +62,8 @@
 #   sudo lab/lab.sh test-sniff-punt   # direct(直连不经 ss)/组(ss 远端解析)/block(关连接) 三条路径
 #   sudo lab/lab.sh sub-order-up      # P34：两个订阅源（/sub、/sub2）+ 顺序回退
 #   sudo lab/lab.sh test-sub-order    # 首源标死 → 活动订阅切次源（日志/状态面/端到端）
+#   sudo lab/lab.sh ruleset-up        # P36：规则集（Clash YAML / sing-box JSON / 纯文本）
+#   sudo lab/lab.sh test-ruleset      # 三种格式分流 + URL 刷新 + 未知规则集硬失败
 #   sudo lab/lab.sh ops-up           # P6：运维面会话（--log-file + 状态面控制命令）
 #   sudo lab/lab.sh test-ops         # suspend/reload/metrics/sysdump/日志轮转
 #   sudo lab/lab.sh bench-up         # P7：基准直连会话（rules.bench.dae；供 lab/bench.sh）
@@ -158,6 +160,12 @@ SUB_CONFIG=/tmp/sodama-subscribe.dae
 SUB_BODY2=/tmp/sodama-sub2-body.txt
 SUB_URL_FILE=/tmp/sodama-sub2.url
 SUB_ORDER_CONFIG=/tmp/sodama-sub-order.dae
+# P36：规则集夹具（标准格式：Clash YAML / sing-box JSON / 纯文本）
+RS_DIR=/tmp/sodama-rulesets
+RS_CLASH_YAML=$RS_DIR/clash.yaml
+RS_SINGBOX_JSON=$RS_DIR/singbox.json
+RS_PLAIN_TXT=$RS_DIR/plain.txt
+RS_CONFIG=/tmp/sodama-ruleset.dae
 # P19：多组分派夹具配置（groups-up 生成）
 SUB_GROUPS_CONFIG=/tmp/sodama-groups.dae
 # P18e：SS2022（shadowsocks-rust ssserver 参考对端；PSK 为 16 字节 "0123456789abcdef" 的 base64）
@@ -460,6 +468,8 @@ up() {
   # P3a 假 DNS 应答的地址（域位图测试用）
   ip -n "$WAN_NS" addr add 10.9.10.3/32 dev wanpeer
   ip -n "$WAN_NS" addr add 10.9.10.4/32 dev wanpeer
+  # P36：规则集夹具 plain.test 的应答地址
+  ip -n "$WAN_NS" addr add 10.9.10.5/32 dev wanpeer
   # P3b-2a regex 域分流测试用
   ip -n "$WAN_NS" addr add 10.9.10.21/32 dev wanpeer
   ip -n "$WAN_NS" addr add 10.9.10.22/32 dev wanpeer
@@ -580,9 +590,9 @@ up() {
   fi
   if [ -n "${USE_SUB_SERVER:-}" ]; then
     local sub_args=("$SUB_BODY")
-    # P34：/sub2 第二订阅源（文件存在时）
+    # P34：/sub2 第二订阅源（文件存在时）；P36：SUB_ROUTES_SPEC 追加任意路由（规则集）
     [ -f "$SUB_BODY2" ] && sub_args+=("$SUB_BODY2")
-    python3 "$HERE/sub_server.py" "$SUB_PORT" "${sub_args[@]}" \
+    SUB_EXTRA_ROUTES="${SUB_ROUTES_SPEC:-}" python3 "$HERE/sub_server.py" "$SUB_PORT" "${sub_args[@]}" \
       >/tmp/sodama-sub.log 2>&1 &
     echo $! >"$SUB_PID_FILE"
     sleep 0.3
@@ -2505,6 +2515,149 @@ print("active_tag=%s dead=%s" % (g["active_tag"], dead))
   echo "PASS: 切换后经第二源拨号成功（顺序回退端到端）"
 }
 
+# P36：规则集——标准格式分流规则文件（Clash YAML / sing-box JSON / 纯文本）+ URL 自动下载。
+ruleset_up() {
+  require_root
+  [ -f "$OBJ" ] && [ -x "$LOADER" ] || die "先运行 $0 build"
+  cleanup
+  local meth="chacha20-ietf-poly1305" pass="testpass"
+  mkdir -p "$RS_DIR"
+  { echo "ss://$meth:$pass@127.0.0.1:$SS_PORT#node-a"; } | base64 -w0 >"$SUB_BODY"
+  echo >>"$SUB_BODY"
+  # 1) Clash rule-provider（DOMAIN-SUFFIX 标准写法 + 一条 IP-CIDR 应被忽略并计数）
+  cat >"$RS_CLASH_YAML" <<'YAML'
+payload:
+  - DOMAIN-SUFFIX,proxy.test
+  - IP-CIDR,10.0.0.0/8,no-resolve
+YAML
+  # 2) sing-box rule-set JSON v1
+  cat >"$RS_SINGBOX_JSON" <<'JSON'
+{"version":1,"rules":[{"domain_suffix":["direct.test"],"ip_cidr":["10.0.0.0/8"]}]}
+JSON
+  # 3) 纯文本域名列表（裸条目 = suffix；可直接编辑）
+  cat >"$RS_PLAIN_TXT" <<'TXT'
+# 用户自定义：强制直连的域名（裸条目 = suffix）
+plain.test
+TXT
+  cat >"$RS_CONFIG" <<EOF
+# P36：规则集夹具——三种标准格式 + URL 下载（本地 sub_server 提供 /ruleset/*）
+global {
+    tcp_check_url: 'http://10.9.9.2:9999'
+    check_interval: '1s'
+    check_tolerance: '1'
+    rule_set_update_interval: 0   # 测试：每次 reload 都重新拉取
+}
+rule_set {
+    rs_clash: 'http://127.0.0.1:$SUB_PORT/ruleset/clash.yaml'
+    rs_json: 'http://127.0.0.1:$SUB_PORT/ruleset/singbox.json'
+    rs_plain: 'file://$RS_PLAIN_TXT'
+}
+subscription {
+    lab: 'http://127.0.0.1:$SUB_PORT/sub'
+}
+group {
+    proxy {
+        policy: min_moving_avg
+    }
+}
+routing {
+    # 用户自定义分流（规则集引用；顺序 = 优先级）
+    domain(ruleset: rs_clash) -> direct
+    domain(ruleset: rs_json) -> proxy
+    domain(ruleset: rs_plain) -> direct
+    fallback: proxy
+}
+EOF
+  chmod 640 "$RS_CONFIG"
+  SUB_ROUTES_SPEC="/ruleset/clash.yaml=$RS_CLASH_YAML,/ruleset/singbox.json=$RS_SINGBOX_JSON" \
+    USE_CONFIG="$RS_CONFIG" USE_FAKE_DNS=1 USE_DNS_UPSTREAM="127.0.0.1:$FAKE_DNS_PORT" \
+    USE_SS=1 USE_SS_METHOD="$meth" USE_SS_PASSWORD="$pass" USE_SUB_SERVER=1 USE_RELAY_IDLE=600 up
+}
+
+test_ruleset() {
+  require_root
+  echo "== P36：规则集（Clash YAML / sing-box JSON / 纯文本 + URL 下载/刷新）=="
+  local name ip out spec
+  for spec in "proxy.test:10.9.10.3" "direct.test:10.9.10.4" "plain.test:10.9.10.5"; do
+    name="${spec%%:*}"; ip="${spec##*:}"
+    out="$(ip netns exec "$CLIENT_NS" timeout 8 python3 "$HERE/dns_probe.py" 9.9.9.9 "$name" 2>&1 || true)"
+    printf '%s\n' "$out" | grep -q "^answer=$ip" || { echo "FAIL: $name 未解析到 $ip"; echo "$out"; exit 1; }
+  done
+  # 规则集判定（带 relay：代理 = 新增 RELAY <ip>:9999 日志行；直连 = 无新增且能回显）
+  local n0 n1
+  relay_hits() { grep -ac "RELAY $1:9999 established" "$LOG" 2>/dev/null || true; }
+  # clash → direct（回退为 proxy，能直连即证明规则集生效）
+  n0="$(relay_hits 10.9.10.3)"
+  out="$(ip netns exec "$CLIENT_NS" timeout 6 python3 "$HERE/client_probe.py" 10.9.10.3 9999 2>&1 || true)"
+  echo "$out" | grep -q "wan-echo-ok" || { echo "FAIL: rs_clash 域未到达 WAN"; echo "$out"; exit 1; }
+  n1="$(relay_hits 10.9.10.3)"
+  [ "$n0" = "$n1" ] || { echo "FAIL: rs_clash 域走了代理（应为规则集直连）"; exit 1; }
+  # json → proxy（新增 RELAY 日志行）
+  n0="$(relay_hits 10.9.10.4)"
+  out="$(ip netns exec "$CLIENT_NS" timeout 6 python3 "$HERE/client_probe.py" 10.9.10.4 9999 2>&1 || true)"
+  echo "$out" | grep -q "wan-echo-ok" || { echo "FAIL: rs_json 域未到达 WAN"; echo "$out"; exit 1; }
+  n1="$(relay_hits 10.9.10.4)"
+  [ "$n1" -gt "$n0" ] || { echo "FAIL: rs_json(sing-box) 域未走代理（无 RELAY 日志）"; exit 1; }
+  # plain → direct
+  n0="$(relay_hits 10.9.10.5)"
+  out="$(ip netns exec "$CLIENT_NS" timeout 6 python3 "$HERE/client_probe.py" 10.9.10.5 9999 2>&1 || true)"
+  echo "$out" | grep -q "wan-echo-ok" || { echo "FAIL: rs_plain 域未到达 WAN"; echo "$out"; exit 1; }
+  n1="$(relay_hits 10.9.10.5)"
+  [ "$n0" = "$n1" ] || { echo "FAIL: rs_plain(纯文本) 域走了代理（应为直连）"; exit 1; }
+  echo "PASS: 三种格式规则集分流全部生效（代理=RELAY 日志，直连=无）"
+  grep -q "规则集 rs_clash: 1 条域名" "$LOG" || { echo "FAIL: 日志无 rs_clash 计数"; tail -5 "$LOG"; exit 1; }
+  "$LOADER" status --socket "$STATUS_SOCK" --json >/tmp/sodama-status.json
+  python3 - /tmp/sodama-status.json <<'PY'
+import json, sys
+v = json.load(open(sys.argv[1]))
+rs = {r["tag"]: r for r in v.get("rule_sets") or []}
+assert set(rs) == {"rs_clash", "rs_json", "rs_plain"}, rs
+assert rs["rs_clash"]["suffix"] == 1 and rs["rs_clash"]["ignored"] == 1, rs["rs_clash"]
+assert rs["rs_json"]["suffix"] == 1 and rs["rs_json"]["ignored"] == 1, rs["rs_json"]
+assert rs["rs_plain"]["suffix"] == 1, rs["rs_plain"]
+print("rule_sets: " + ", ".join("%s(entries=%d ignored=%d)" % (r["tag"], r["entries"], r["ignored"]) for r in rs.values()))
+PY
+
+  echo "-- 更新规则集 URL 内容（sing-box JSON 增加 plain.test→proxy）+ SIGHUP --"
+  cat >"$RS_SINGBOX_JSON" <<'JSON'
+{"version":1,"rules":[{"domain_suffix":["direct.test","plain.test"]}]}
+JSON
+  kill -HUP "$(cat "$PID_FILE")"
+  sleep 2
+  n0="$(relay_hits 10.9.10.5)"
+  out="$(ip netns exec "$CLIENT_NS" timeout 6 python3 "$HERE/client_probe.py" 10.9.10.5 9999 2>&1 || true)"
+  echo "$out" | grep -q "wan-echo-ok" || { echo "FAIL: 规则集刷新后 plain.test 未到达 WAN"; echo "$out"; exit 1; }
+  n1="$(relay_hits 10.9.10.5)"
+  [ "$n1" -gt "$n0" ] || { echo "FAIL: 规则集刷新后 plain.test 未改判代理"; exit 1; }
+  echo "PASS: 规则集 URL 更新（interval=0 热刷新）后分流改判"
+
+  echo "-- 引用未知规则集：reload 应失败并保留旧槽 --"
+  python3 - "$RS_CONFIG" <<'PY'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+i = s.rstrip().rfind("}")
+s = s[:i] + "    domain(ruleset: nope) -> direct\n" + s[i:]
+open(p, "w").write(s)
+PY
+  kill -HUP "$(cat "$PID_FILE")"
+  sleep 2
+  "$LOADER" status --socket "$STATUS_SOCK" --json >/tmp/sodama-status.json
+  python3 - /tmp/sodama-status.json <<'PY'
+import json, sys
+v = json.load(open(sys.argv[1]))
+r = v.get("reload") or {}
+assert r.get("ok") is False, r
+print("reload ok=False（未知规则集）:", (r.get("error") or "")[:90])
+PY
+  n0="$(relay_hits 10.9.10.3)"
+  out="$(ip netns exec "$CLIENT_NS" timeout 6 python3 "$HERE/client_probe.py" 10.9.10.3 9999 2>&1 || true)"
+  echo "$out" | grep -q "wan-echo-ok" || { echo "FAIL: 失败 reload 后旧槽规则未保持"; echo "$out"; exit 1; }
+  n1="$(relay_hits 10.9.10.3)"
+  [ "$n0" = "$n1" ] || { echo "FAIL: 失败 reload 后判定发生变化"; exit 1; }
+  echo "PASS: 未知规则集硬失败且旧槽保留"
+}
+
 # P18e：SS2022——跨实现验证（shadowsocks-rust ssserver，SIP022）。
 ss2022_up() {
   require_root
@@ -3575,12 +3728,14 @@ case "${1:-}" in
     USE_CONFIG="$HERE/real-user.dae" USE_GEODATA_DIR=/tmp/sodama-geodata up ;;
   subscribe-up) subscribe_up ;;
   sub-order-up) sub_order_up ;;  # P34：订阅顺序回退（pacman 风格，多源）
+  ruleset-up) ruleset_up ;;  # P36：规则集（标准格式 + URL 下载）
   sub-reload-up) subscribe_up ;;  # P18e：热更新测试的前置（与 subscribe-up 相同）
   test-sub-reload) test_sub_reload ;;
   groups-up) groups_up ;;  # P19：多组分派（proxy→A / alt→B）
   test-groups) test_groups ;;
   test-subscribe) test_subscribe ;;
   test-sub-order) test_sub_order ;;  # P34：顺序回退（首源标死 → 切次源）
+  test-ruleset) test_ruleset ;;  # P36：三种标准格式规则集 + URL 刷新 + 未知集硬失败
   v6-up) USE_RULES="$HERE/rules.v6.dae" USE_SS=1 USE_SS_METHOD=chacha20-ietf-poly1305 \
     USE_SS_PASSWORD=testpass USE_DIALER="ss://chacha20-ietf-poly1305:testpass@127.0.0.1:$SS_PORT" \
     USE_FAKE_DNS=1 USE_DNS_UPSTREAM="127.0.0.1:$FAKE_DNS_PORT" USE_RELAY_IDLE=600 up ;;  # P22：+假 DNS（v6 DNS 接管用）
@@ -3744,5 +3899,5 @@ test-dns-udp) test_dns_udp ;;  # 显式 udp:// 上游（仅 UDP）
   status) status ;;
   trace) trace ;;
   down) down ;;
-  *) echo "usage: $0 {build|up|dual-up|config-up|forward-up|dns-up|dot-up|doh-up|doh-h2-up|doh-h3-up|doq-up|dnsroute-up|dnsopts-up|ecscache-up|dns-udp-up|dns-tcpup-up|geo-up|pname-up|regex-up|relay-up|offload-up|udp-up|ss-up|ss2022-up|http-up|groups-up|ss-udp-up|trojan-up|vless-up|vless-tls-up|vless-udp-up|vmess-up|vmess-tls-up|vmess-udp-up|tuic-up|tuic-udp-up|hy2-up|hy2-udp-up|hy2-obfs-up|hy2-obfs-udp-up|hy2-brutal-up|hy2-hop-up|juicity-up|juicity-udp-up|ssr-up|shadowtls-up|shadowtls-v2-up|shadowtls-v1-up|ops-up|naive-up|test-naive|naive-h3-up|test-naive-h3|ops-reload-up|bench-up|test-proxy|test-direct|test-block|test-host-proxy|test-reload|test-rebind|test-status|test-config|test-forward|test-domain|test-dns-cache|test-dns-tcp|test-dns-reload|test-domain-regex|test-dns-edns|test-dot|test-doh|test-doh-h2|test-doh-h3|test-doq|test-dnsroute|test-dns-options|test-ecs-cache|test-dns-udp|test-dns-tcpup|test-geo|test-pname|test-v6|test-relay|test-relay-idle|test-relay-offload|test-offload-lifecycle|test-udp-relay|test-quic-sniff|test-udp-idle|test-ss|test-ss2022|test-http|test-groups|test-trojan|test-ss-udp|test-vless|test-vless-udp|test-vmess|test-vmess-udp|test-tuic|test-tuic-udp|test-juicity|test-juicity-udp|test-ssr|test-shadowtls|test-shadowtls-v2|test-shadowtls-v1|test-hy2|test-hy2-udp|test-hy2-obfs|test-hy2-obfs-udp|test-hy2-brutal|test-hy2-hop|test-ops|test-config-reload|test-fault-reload|test-fault-kill|reload|verify|status|trace|down|sniff-punt-up|test-sniff-punt|subscribe-up|test-subscribe|sub-order-up|test-sub-order}"; exit 2 ;;
+  *) echo "usage: $0 {build|up|dual-up|config-up|forward-up|dns-up|dot-up|doh-up|doh-h2-up|doh-h3-up|doq-up|dnsroute-up|dnsopts-up|ecscache-up|dns-udp-up|dns-tcpup-up|geo-up|pname-up|regex-up|relay-up|offload-up|udp-up|ss-up|ss2022-up|http-up|groups-up|ss-udp-up|trojan-up|vless-up|vless-tls-up|vless-udp-up|vmess-up|vmess-tls-up|vmess-udp-up|tuic-up|tuic-udp-up|hy2-up|hy2-udp-up|hy2-obfs-up|hy2-obfs-udp-up|hy2-brutal-up|hy2-hop-up|juicity-up|juicity-udp-up|ssr-up|shadowtls-up|shadowtls-v2-up|shadowtls-v1-up|ops-up|naive-up|test-naive|naive-h3-up|test-naive-h3|ops-reload-up|bench-up|test-proxy|test-direct|test-block|test-host-proxy|test-reload|test-rebind|test-status|test-config|test-forward|test-domain|test-dns-cache|test-dns-tcp|test-dns-reload|test-domain-regex|test-dns-edns|test-dot|test-doh|test-doh-h2|test-doh-h3|test-doq|test-dnsroute|test-dns-options|test-ecs-cache|test-dns-udp|test-dns-tcpup|test-geo|test-pname|test-v6|test-relay|test-relay-idle|test-relay-offload|test-offload-lifecycle|test-udp-relay|test-quic-sniff|test-udp-idle|test-ss|test-ss2022|test-http|test-groups|test-trojan|test-ss-udp|test-vless|test-vless-udp|test-vmess|test-vmess-udp|test-tuic|test-tuic-udp|test-juicity|test-juicity-udp|test-ssr|test-shadowtls|test-shadowtls-v2|test-shadowtls-v1|test-hy2|test-hy2-udp|test-hy2-obfs|test-hy2-obfs-udp|test-hy2-brutal|test-hy2-hop|test-ops|test-config-reload|test-fault-reload|test-fault-kill|reload|verify|status|trace|down|sniff-punt-up|test-sniff-punt|subscribe-up|test-subscribe|sub-order-up|test-sub-order|ruleset-up|test-ruleset}"; exit 2 ;;
 esac

@@ -1,66 +1,55 @@
-# P18 真网关配置（--config 模式）：分流转发纪律同 rules.gateway.dae，
-# 外加：宿主机 DNS 进入控制面 → 加密上游（DoH，可切 DoQ）+ dns.routing（广告域 reject）。
+# =============================================================================
+#  sodama 真网关配置（i3wm 风格：从上往下读，# 即注释）
 #
-# 用法：
-#   sudo lab/gateway.sh up --config lab/gateway.dae --geodata-dir /usr/share/v2ray \
-#        --subscribe /tmp/sodama-sub.url
-#   （--dns <URL> 可显式覆盖上游；缺省用本文件 dns.upstream/dns.routing）
+#  顺序约定：① 订阅（顺序 = 优先级）   ② 规则集（标准格式分流规则文件）
+#            ③ 用户分流（最先生效）     ④ 默认分流
+#            ⑤ DNS                     ⑥ 运行参数（一般不用改）
 #
-# 注意（对照 rules.gateway.dae 的踩坑注释）：
-# - 与 rules.gateway.dae 的唯一策略差异：**去掉** `dport(53) -> direct(must)`，
-#   让宿主机 DNS 查询进控制面，由本文件 dns.upstream/dns.routing 决定去向。
-# - 不要再加回 dport(53) 的 must 规则，否则 DNS 回到直连、本文件 dns 段不参与。
-# - 别写任何 `sip(...)` 规则（宿主机模式下源地址都是本机地址）。
-# - DoH 上游用 IP 字面量 + `?sni=`：避免“解析上游域名又需要 DNS”的鸡生蛋
-#   （不依赖 bootstrap_resolver）；`quic://` DoQ 用域名（启动时经系统解析一次）。
-# - geosite 需要 `--geodata-dir`（或 DAE_LOCATION_ASSET）指向 v2ray .dat 目录。
-# - 控制面自己的上游查询走 marked socket（SO_MARK），不会回流数据面。
+#  * 改完保存即生效（inotify 热驱动，毫秒级）；坏配置保留旧规则，不会断网。
+#  * 行为参数以本文件为准（P35）；命令行只留给进程级参数（接口/netns/socket/日志）
+#    与调试覆盖。
+#  * 注意权限：本文件与同目录订阅/名单文件需 ≤0640（同组不可写、其他不可读）。
+#
+#  真网关踩坑（勿改坏）：
+#  - 别加回 `dport(53) -> direct(must)`：宿主机 DNS 必须进控制面，由 dns 段决定去向。
+#  - 别写任何 `sip(...)` 规则：宿主机模式下源地址都是本机地址。
+#  - DoH 上游用 IP 字面量 + `?sni=`：避免“解析上游域名又需要 DNS”的鸡生蛋；
+#    控制面自己的上游查询走 marked socket（SO_MARK），不会回流数据面。
+#  - geosite 需要 geodata 目录（global.geodata_dir 或 --geodata-dir / DAE_LOCATION_ASSET）。
+# =============================================================================
 
-global {
-    dial_mode: 'domain'
-    # P35：配置即唯一事实来源——拨号/嗅探/健康/热驱动均可写在这里（gateway.sh 不再注入）。
-    dial_timeout: 15
-    sniffing_timeout: '100ms'
-    # 配置热驱动：inotify 事件驱动（毫秒级）+ <秒> 兜底扫描；改文件即生效（fast reload，
-    # 订阅节点走缓存，改顺序/开关源秒级生效）。也可用 GATEWAY_WATCH_CONFIG 环境变量覆盖。
-    watch_config: 10
-    # geodata_dir: '/usr/share/v2ray'   # 未用 --geodata-dir 时，写在这里
-    # log_file: '/var/log/sodama-gateway.log'
-    # status_socket: '/tmp/sodama-gw.sock'
+# ---- ① 订阅：声明顺序 = 优先级（pacman 镜像风格） ---------------------------
+# 首个「有活节点」的源生效；该源节点全部被标死后自动切下一个源。
+# 值可以是 URL、相对路径（按本文件目录解析）、或单行 URL 文件（如 sub2.url）。
+subscription {
+    # main: 'sub2.url'
+    # backup: 'sub1.url'
 }
 
-dns {
-    upstream {
-        # 主：AliDNS DoH（TCP 443，IP 字面量 + SNI，公网证书校验）
-        alidns: 'https://223.5.5.5/dns-query?sni=dns.alidns.com'
-        # 同上 + ECS（sodama 扩展：auto = 按查询发起方地址归整 v4 /24、v6 /56）——
-        # 国内域用它，让 CDN 解析落到本地视角（不再依赖路由器明文）
-        alidns_ecs: 'https://223.5.5.5/dns-query?sni=dns.alidns.com&ecs=auto'
-        # 备选其一：DoQ（RFC 9250，UDP 853，本网络实测可用；IP 字面量 + SNI，
-        # 同 DoH：不依赖自身 DNS 解析）
-        ali_quic: 'quic://223.5.5.5?sni=dns.alidns.com'
-        # 备选：本地路由器明文（调试对照；也可作为 geosite:cn 的出口）
-        router: 'udp://192.0.2.1:53'
-    }
-    routing {
-        request {
-            # 1) 广告/跟踪域：geosite 数据集
-            qname(geosite:category-ads-all) -> reject
-            # 2) 自定义拦截名单（每行一条；相对路径按本文件目录解析）
-            qname(file: 'blocklist.txt') -> reject
-            # 3) 国内域：DoH + ECS（客户端子网），CDN 解析准；
-            #   想改回本地明文路由器就换成 router
-            qname(geosite:cn) -> alidns_ecs
-            # 4) 其余（海外）走普通 DoH；想全局 DoQ 就把下面换成 ali_quic
-            fallback: alidns
-        }
-        response {
-            fallback: accept
-        }
-    }
+# ---- ② 规则集：标准格式分流规则文件（可远程 URL，自动下载/缓存） ------------
+# 支持三种标准格式（按内容自动识别）：
+#   * Clash rule-provider YAML：payload: 下的 DOMAIN, / DOMAIN-SUFFIX, /
+#     DOMAIN-KEYWORD, / DOMAIN-REGEX,（classical 三列写法同样支持）；
+#   * sing-box rule-set JSON v1：{"rules":[{"domain":[…],"domain_suffix":[…],…}]}；
+#   * 纯文本域名列表：每行一个，# 注释；裸条目 = suffix，可加
+#     full:/suffix:/keyword:/regex: 前缀。
+# 非域名条目（IP-CIDR 等）会被计数上报（status.rule_sets.ignored），不静默丢。
+# 远程 URL 按 global.rule_set_update_interval（缺省 86400 秒）刷新；0 = 每次 reload。
+rule_set {
+    user_proxy: 'rules/user_proxy.txt'    # 强制走代理的域名（自己加/删）
+    user_direct: 'rules/user_direct.txt'  # 强制直连（eBPF real-direct，不过内核回退）
+    # 远程规则集示例（首次使用会下载到缓存目录，之后按间隔刷新）：
+    # cn_site: 'https://example.com/geosite-cn.yaml'
 }
 
+# ---- ③+④ 分流：自上而下，先命中先用 ----------------------------------------
 routing {
+    # ③ 用户自定义（最高优先）——直接编辑 rules/user_proxy.txt / user_direct.txt
+    domain(ruleset: user_proxy) -> proxy
+    domain(ruleset: user_direct) -> direct
+    # 也可内联（临时调试用）：domain(suffix: 'a.com, b.com') -> proxy
+
+    # ④ 默认分流 ---------------------------------------------------------------
     # --- 私网/特殊地址（目的）：直连 ---
     dip(192.168.0.0/16) -> direct
     dip(10.0.0.0/8) -> direct
@@ -83,6 +72,53 @@ routing {
     pname(curl) -> direct
     pname(python3) -> direct
 
-    # --- 兜底：全部 TCP 走代理（--config 模式的 routing 段用 `key: value` 形式） ---
+    # --- 兜底：全部 TCP 走代理 ---
     fallback: proxy
+}
+
+# ---- ⑤ DNS ------------------------------------------------------------------
+dns {
+    upstream {
+        # 主：AliDNS DoH（TCP 443，IP 字面量 + SNI，公网证书校验）
+        alidns: 'https://223.5.5.5/dns-query?sni=dns.alidns.com'
+        # 同上 + ECS（sodama 扩展：auto = 按查询发起方地址归整 v4 /24、v6 /56）——
+        # 国内域用它，让 CDN 解析落到本地视角（不再依赖路由器明文）
+        alidns_ecs: 'https://223.5.5.5/dns-query?sni=dns.alidns.com&ecs=auto'
+        # 备选其一：DoQ（RFC 9250，UDP 853；IP 字面量 + SNI，不依赖自身 DNS 解析）
+        ali_quic: 'quic://223.5.5.5?sni=dns.alidns.com'
+        # 备选：本地路由器明文（调试对照；也可作为 geosite:cn 的出口）
+        router: 'udp://192.0.2.1:53'
+    }
+    routing {
+        request {
+            # 1) 广告/跟踪域：geosite 数据集
+            qname(geosite:category-ads-all) -> reject
+            # 2) 自定义拦截名单（每行一条；相对路径按本文件目录解析）
+            qname(file: 'blocklist.txt') -> reject
+            # 3) 国内域：DoH + ECS（客户端子网），CDN 解析准
+            qname(geosite:cn) -> alidns_ecs
+            # 4) 其余（海外）走普通 DoH；想全局 DoQ 就把下面换成 ali_quic
+            fallback: alidns
+        }
+        response {
+            fallback: accept
+        }
+    }
+}
+
+# ---- ⑥ 运行参数（一般不用改） ------------------------------------------------
+global {
+    # 拨号/嗅探
+    dial_mode: 'domain'
+    dial_timeout: 15
+    sniffing_timeout: '100ms'
+    # 配置热驱动：inotify 事件驱动（毫秒级）+ <秒> 兜底扫描；改文件即生效
+    watch_config: 10
+    # 规则集更新间隔（秒；0 = 每次 reload 都刷新；也可设 rule_set_cache_dir）
+    rule_set_update_interval: 86400
+    # geodata 目录（geoip.dat/geosite.dat；也可用 --geodata-dir / DAE_LOCATION_ASSET）
+    # geodata_dir: '/usr/share/v2ray'
+    # 进程级路径也可写在这里（P35；命令行显式值仍可覆盖）：
+    # log_file: '/var/log/sodama-gateway.log'
+    # status_socket: '/tmp/sodama-gw.sock'
 }

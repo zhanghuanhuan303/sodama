@@ -67,6 +67,7 @@ mod quicvarint;
 mod reactor;
 mod reality;
 mod rules;
+mod ruleset;
 mod shadowtls;
 mod sniffer;
 mod socks5;
@@ -198,6 +199,10 @@ static SUB_CACHE_TTL_SECS: AtomicU64 = AtomicU64::new(60);
 static SUB_NODE_CACHE: OnceLock<
     Mutex<std::collections::HashMap<String, (Instant, std::sync::Arc<Vec<subscribe::ParsedNode>>)>>,
 > = OnceLock::new();
+/// P36：规则集仓库（`rule_set` 段加载结果；状态面可查）。
+static RULESET_STORE: OnceLock<Mutex<ruleset::RuleSetStore>> = OnceLock::new();
+/// P36：本地规则集文件（加入 inotify 监听——编辑用户名单文件即热生效）。
+static RULESET_FILES: Mutex<Vec<std::path::PathBuf>> = Mutex::new(Vec::new());
 
 // ---- P14：嗅探 / dial_mode（远端域名解析）----
 /// 0=ip（默认，不嗅探）| 1=domain | 2=domain+（当前同 domain）。
@@ -1133,7 +1138,11 @@ fn usage() -> ! {
          运行中收到 SIGHUP 会重读 --rules/--config 并热重载（非活跃槽 → 切换 active），
          同时清除 suspend 状态并 reopen --log-file（对照 dae reload）；SIGUSR2 = suspend。
          P33：reload/SIGHUP 同时热更新运行时参数（relay/udp idle、dial_timeout、max_conns、
-         dial_mode、sniffing_timeout、sniff-punt）；--watch-config 启用配置变更自动触发。"
+         dial_mode、sniffing_timeout、sniff-punt）；--watch-config 启用配置变更自动触发。
+         P36：分流规则可独立成文件——config `rule_set {{ tag: 'url|路径' }}` 支持标准格式
+         （Clash rule-provider YAML / sing-box rule-set JSON / 纯文本域名列表），URL 自动
+         下载并缓存（global.rule_set_update_interval 秒，0=每次 reload 刷新；
+         rule_set_cache_dir 可指定缓存目录）；routing 用 domain(ruleset: tag) 引用。"
     );
     std::process::exit(2);
 }
@@ -3143,8 +3152,48 @@ fn reload_rules(args: &Args, ebpf: &mut Ebpf) -> Result<usize, Box<dyn std::erro
         .as_ref()
         .and_then(|p| config::load(std::path::Path::new(p)).ok());
     let groups = group_index_map(cfg.as_ref());
-    let compiled = rules::parse_and_compile_with_groups(&text, Some(&geo), &groups)
-        .map_err(|e| format!("compile rules: {e}"))?;
+    // P36：规则集（`rule_set` 段）——远程 URL 带缓存（interval 内直接用；0=每次刷新），
+    // 失败硬错（保留旧槽，不静默丢规则）；无 config 时为空仓库。
+    let store = match cfg.as_ref() {
+        Some(c) => {
+            let interval = config::global_value(c, "rule_set_update_interval")
+                .and_then(|v| parse_duration_secs(&v))
+                .unwrap_or(86400);
+            let cache_dir = config::global_value(c, "rule_set_cache_dir");
+            ruleset::RuleSetStore::load(
+                c,
+                args.config.as_deref().map(Path::new),
+                interval,
+                cache_dir.as_deref(),
+            )
+            .map_err(|e| format!("规则集加载失败: {e}"))?
+        }
+        None => ruleset::RuleSetStore::empty(),
+    };
+    // 本地规则集文件加入 inotify 监听集合（改名单文件即热生效）
+    let local_files: Vec<std::path::PathBuf> = store
+        .iter()
+        .filter_map(|rs| rs.local_path.clone())
+        .collect();
+    if let Ok(mut g) = RULESET_FILES.lock() {
+        *g = local_files;
+    }
+    {
+        let lock = RULESET_STORE.get_or_init(|| Mutex::new(ruleset::RuleSetStore::empty()));
+        match lock.lock() {
+            Ok(mut g) => *g = store,
+            Err(p) => *p.into_inner() = store,
+        }
+    }
+    let compiled = {
+        let lock = RULESET_STORE.get().expect("ruleset store 已初始化");
+        let guard = match lock.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        rules::parse_and_compile_full(&text, Some(&geo), &groups, Some(&guard))
+            .map_err(|e| format!("compile rules: {e}"))?
+    };
     for n in &compiled.notes {
         log(&format!("geoexp: {n}"));
     }
@@ -3933,6 +3982,9 @@ fn config_watch_loop(extra: Vec<std::path::PathBuf>, tx: std::sync::mpsc::Sender
         if let Some((c, _)) = CONFIG_STATE.lock().ok().and_then(|g| g.clone()) {
             paths.extend(c.files.iter().cloned());
         }
+        if let Ok(g) = RULESET_FILES.lock() {
+            paths.extend(g.iter().cloned());
+        }
         paths.sort();
         paths.dedup();
         if paths.is_empty() {
@@ -4022,6 +4074,9 @@ fn config_watch_loop(extra: Vec<std::path::PathBuf>, tx: std::sync::mpsc::Sender
         let mut paths2 = extra.clone();
         if let Some((c, _)) = CONFIG_STATE.lock().ok().and_then(|g| g.clone()) {
             paths2.extend(c.files.iter().cloned());
+        }
+        if let Ok(g) = RULESET_FILES.lock() {
+            paths2.extend(g.iter().cloned());
         }
         paths2.sort();
         paths2.dedup();
@@ -6526,6 +6581,36 @@ fn group_json(g: &group::GroupRuntime, index: usize, default: bool) -> serde_jso
     })
 }
 
+/// P36：规则集状态（tag/计数/缓存年龄；URL 不外显，避免 token 泄露）。
+fn rule_sets_json() -> serde_json::Value {
+    let Some(lock) = RULESET_STORE.get() else {
+        return serde_json::Value::Array(Vec::new());
+    };
+    let g = match lock.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    let mut arr: Vec<serde_json::Value> = g
+        .iter()
+        .map(|rs| {
+            json!({
+                "tag": rs.tag,
+                "remote": rs.remote,
+                "from_cache": rs.from_cache,
+                "updated_secs_ago": rs.updated_secs_ago,
+                "entries": rs.data.total(),
+                "full": rs.data.full.len(),
+                "suffix": rs.data.suffix.len(),
+                "keyword": rs.data.keyword.len(),
+                "regex": rs.data.regex.len(),
+                "ignored": rs.data.ignored,
+            })
+        })
+        .collect();
+    arr.sort_by(|a, b| a["tag"].as_str().cmp(&b["tag"].as_str()));
+    serde_json::Value::Array(arr)
+}
+
 /// P6：状态面主查询体（status / metrics 共用数据源）。
 fn status_json(ebpf: &mut Ebpf) -> serde_json::Value {
     let rules_state = LAST_RULES.lock().ok().and_then(|g| g.clone());
@@ -6609,6 +6694,7 @@ fn status_json(ebpf: &mut Ebpf) -> serde_json::Value {
             "debounce_ms": crate::watch::DEBOUNCE.as_millis() as u64,
             "sub_cache_ttl_secs": SUB_CACHE_TTL_SECS.load(Ordering::Relaxed),
         },
+        "rule_sets": rule_sets_json(),
         "dialer": match OUTBOUND.get() {
             Some(o) => o.name(),
             None => "none".to_string(),

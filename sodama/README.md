@@ -14,7 +14,8 @@ P28（ECS 回填 / ecs_cache）、P29（optimistic 后台刷新）、P30（SSR o
 P31（shadow-tls v1/v2/v3，ss 插件）、P32（ECH 边界：已评估不实现）、
 P33（运行时参数热更新 + `--watch-config` 配置热驱动）、
 P34（多订阅按声明顺序回退 + 默认配置目录 `~/.config/sodama`）、
-P35（inotify 毫秒级热驱动 + 配置即唯一事实来源 + 无 home 兜底）与
+P35（inotify 毫秒级热驱动 + 配置即唯一事实来源 + 无 home 兜底）、
+P36（用户分流名单 + 标准格式规则集（URL 自动更新）+ 订阅置顶的可读配置）与
 P6（suspend/reload/metrics/sysdump/日志轮转/整配置热重载）已完成**；P9+ 已删除 C 数据面，
 `ebpf-rs` 的 Rust 对象是**唯一数据面**（ADR-0025）。
 
@@ -226,6 +227,16 @@ P6（suspend/reload/metrics/sysdump/日志轮转/整配置热重载）已完成*
   跳时换新本地 socket 并对 quinn 谎报逻辑地址；`HopSocket`）；链接支持
   `obfs=salamander&obfs-password=…`、`cc_override=bbr|brutal|bbr3`、端口并集自动生效；
   服务端侧 `hy2-server -obfs-password/-hop-ports` 同步支持（见 ADR-0020）
+- **P36 用户分流名单 + 标准格式规则集（类 Clash/sing-box）**：config `rule_set { tag: 'url|路径' }`
+  ——自动识别 **Clash rule-provider YAML**（`payload:` 下 DOMAIN/DOMAIN-SUFFIX/DOMAIN-KEYWORD/
+  DOMAIN-REGEX；classical 三列同解析）、**sing-box rule-set JSON v1**、**纯文本域名列表**
+  （`#` 注释；`full:`/`suffix:`/`keyword:`/`regex:` 前缀；裸条目=suffix）；非域名条目
+  （IP-CIDR 等）计数上报（`status.rule_sets[].ignored`）；远程 URL **自动下载 + 本地缓存**
+  （`rule_set_cache_dir`，按 `rule_set_update_interval` 刷新，0=每次 reload；失败回退旧缓存，
+  无缓存硬失败）；路由用 `domain(ruleset: tag)` 引用（空名单=永不匹配哨兵，不会打断 reload）。
+  **用户名单文件** `rules/user_{proxy,direct}.txt`：强制走代理 / 强制直连（eBPF real-direct），
+  **加入 inotify 监听——编辑名单文件即毫秒级生效**；配置模板重排为 i3wm 风格（订阅置顶）
+  （ADR-0063、NOTES §11.51）
 - **P6 运维面**：信号面 `SIGHUP=reload` / `SIGUSR2=suspend`（eBPF `control_flags_map` →
   no-load/fail-open，reload 恢复）；状态面从只读扩展为 `status/rules/config/maps/metrics/
   reload/suspend/resume`（控制命令仍经主循环串行执行）；CLI 新增 `reload/suspend/resume/
@@ -560,6 +571,12 @@ sudo env USE_CONFIG=/tmp/sodama-watch.dae USE_WATCH_CONFIG=2 USE_DIALER=direct l
 # P35：行为参数全部写进 config（唯一事实来源）：dial_mode/dial_timeout/sniffing_timeout/
 #   watch_config/sub_cache_ttl/geodata_dir/log_file/status_socket/…；命令行仅进程级参数与调试覆盖
 sudo lab/lab.sh sub-order-up && sudo lab/lab.sh test-sub-order   # 顺序回退 + 重排 2s 内生效（inotify+缓存）端到端
+# P36：用户分流名单 + 标准格式规则集（独立文件/URL 自动更新，ADR-0063）
+#   config `rule_set { tag: 'url|路径' }` → routing `domain(ruleset: tag) -> proxy|direct`
+#   纯文本名单（编辑即热生效）；Clash YAML / sing-box JSON 自动识别；远程按
+#   rule_set_update_interval 刷新（0=每次 reload）；status.rule_sets 可查计数
+sudo lab/lab.sh ruleset-up && sudo lab/lab.sh test-ruleset  # 三格式 + URL 刷新 + 未知集硬失败
+# 真网关用户名单（编辑保存即生效）：~/.config/sodama/rules/user_{proxy,direct}.txt
 # 真网关零行为参数启动（只读 config）：sudo lab/gateway.sh up
 # P7 工具链：
 lab/bench.sh build                 # 编译 C 基准端点（gcc）

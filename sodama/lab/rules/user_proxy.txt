@@ -1,0 +1,16 @@
+# 用户自定义：强制走代理的域名（最高优先级，覆盖默认分流）
+#
+# 语法（标准纯文本列表，按内容自动识别）：
+#   裸条目           = suffix（apex 与子域都匹配）
+#   full:exact.com   = 全等
+#   keyword:foo      = 子串
+#   regex:^api\d+\.  = 正则
+#   # 注释、空行忽略
+#
+# 例（取消注释即可用）：
+#   openai.com
+#   anthropic.com
+#   full:chatgpt.com
+#   keyword:claude
+#
+# 保存即生效（inotify 热驱动，毫秒级）；无需重启，也不会断网。

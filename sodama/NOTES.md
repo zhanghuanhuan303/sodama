@@ -1613,3 +1613,21 @@ lab 夹具 `http_connect_server.py` + `sub_server.py` 每次重读。）
   `sudo lab/gateway.sh up` 零参数启动（66/66、active_tag=main、test PASS）；配置追加/还原注释
   各 **0.5s 内**完成 fast reload + 缓存命中；`env -u HOME -u XDG_CONFIG_HOME` root 运行选中
   `/etc/sodama/config.dae`，普通用户不误选不可读的 /etc。
+
+### 11.51 P36（用户分流名单 + 标准格式规则集 + 订阅置顶可读配置，ADR-0063）已验收的行为
+
+- **`rule_set { tag: 'url|路径' }`**（config 新 section）：格式自动识别——Clash rule-provider
+  YAML（`payload:` 下 DOMAIN/DOMAIN-SUFFIX/DOMAIN-KEYWORD/DOMAIN-REGEX；classical 三列同解析）、
+  sing-box rule-set JSON v1（`domain/domain_suffix/domain_keyword/domain_regex`）、纯文本域名
+  列表（`#`/`//` 注释；`full:/suffix:/keyword:/regex:` 前缀；裸条目=suffix）；非域名条目
+  （IP-CIDR/GEOIP…）计数上报；远程 URL 自动下载 + 缓存（`rule_set_cache_dir`；
+  `rule_set_update_interval` 缺省 86400s，0=每次 reload 刷新；失败回退旧缓存，无缓存硬失败）。
+- **路由引用** `domain(ruleset: tag)`（编译期展开为域名集合；空名单→永不匹配哨兵
+  `sodama-empty.invalid` 并记 note）；规则集文件（本地）纳入 inotify 监听，**编辑名单即热生效**。
+- **配置重排**：模板/用户配置为 i3wm 风格六段、订阅置顶；真网关零行为参数启动。
+- 实测：`cargo test` **264/264**；lab `ruleset-up`/`test-ruleset`：三格式端到端（clash→direct
+  到 WAN、json→proxy 有 `RELAY <ip>:9999`、plain→direct）、`status.rule_sets` 计数与 ignored
+  断言、URL 内容更新（interval=0+SIGHUP）后判定翻转、未知规则集 `ok=false` 且旧槽保留；
+  真网关：向 `~/.config/sodama/rules/user_proxy.txt` 追加 `openai.com` 1s 内生效
+  （`检测到配置变更（inotify）`+`规则集 user_proxy: 1 条域名`+geoexp 展开），删除同样生效；
+  单实例 `gateway.sh up` 零行为参数 + `test` PASS。

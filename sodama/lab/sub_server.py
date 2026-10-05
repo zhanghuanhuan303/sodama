@@ -4,9 +4,11 @@
 用法：python3 sub_server.py <port> <body-file> [<body-file-2>]
 （内容通常是 base64 节点链接列表；不做压缩/编码处理，保持夹具最小。
  文件按请求重读：P18e 订阅热更新用例会改文件后 SIGHUP。
- P34：给了第二个 body 时，额外在 /sub2 返回它，用于多订阅/顺序回退用例。）
+ P34：给了第二个 body 时，额外在 /sub2 返回它，用于多订阅/顺序回退用例。
+ P36：环境变量 SUB_EXTRA_ROUTES="path=file[,path=file]" 可追加任意路由（规则集用例）。）
 """
 import http.server
+import os
 import sys
 
 
@@ -17,6 +19,12 @@ def main() -> None:
     routes = {"/": body_file, "/sub": body_file}
     if body2_file:
         routes["/sub2"] = body2_file
+    for item in os.environ.get("SUB_EXTRA_ROUTES", "").split(","):
+        item = item.strip()
+        if not item or "=" not in item:
+            continue
+        path, _, f = item.partition("=")
+        routes[path] = f
 
     class Handler(http.server.BaseHTTPRequestHandler):
         def do_GET(self) -> None:  # noqa: N802 (stdlib 命名)

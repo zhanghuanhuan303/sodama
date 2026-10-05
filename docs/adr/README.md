@@ -87,6 +87,7 @@
 | [0060](./ADR-0060-p33-runtime-params-config-watch.md) | P33：运行时参数热更新（reload/SIGHUP 同口径，CLI > config global > 现值：relay/udp idle、dial_timeout、max_conns、dial_mode、sniffing_timeout、sniff-punt）+ `--watch-config <秒>` 配置热驱动（轮询 --config/--rules 及 include，变更即自动 reload，坏配置保留旧槽/旧参数）；gateway.sh `GATEWAY_WATCH_CONFIG`、lab `USE_WATCH_CONFIG`、状态面 `config_watch` | 已采纳 | —（用户决策：内核命令行操控 + 配置文件热驱动） |
 | [0061](./ADR-0061-p34-subscription-order-and-default-config.md) | P34：多订阅按声明顺序回退（pacman 镜像风格；来源顺序 = node → CLI --subscribe → config subscription，alive 中 rank 最小者为活动层，全标死才切下一源；`subscription_failover` 默认开，关=旧池化；状态面 `active_tag`）+ 默认配置目录 `~/.config/sodama/config.dae`（XDG；相对订阅路径按配置目录解析；单行 http(s) URL 文件自动按 URL 抓取）+ gateway.sh 默认用该配置 | 已采纳 | —（用户决策：配置文件切换订阅/默认放 ~/.config/sodama） |
 | [0062](./ADR-0062-p35-inotify-fast-reload-config-source-of-truth.md) | P35：inotify 目录事件 + 100ms 去抖 + 事件名过滤 + 快照复核（`--watch-config`/`watch_config` 退化为兜底扫描）+ `reload-fast` 订阅节点缓存（`sub_cache_ttl` 默认 60s；手动 reload 仍强制重拉）+ config 即唯一事实来源（新增 `watch_config/sub_cache_ttl/log_file/status_socket/geodata_dir`，gateway.sh 零行为参数）+ 无 home 兜底（XDG → ~/.config → `/etc/sodama/config.dae`，/etc 需可读） | 已采纳 | —（用户决策：内核级快速生效/配置唯一来源/无 home） |
+| [0063](./ADR-0063-p36-rule-sets-user-lists.md) | P36：用户分流名单（`rule_set` + `rules/user_{proxy,direct}.txt`，编辑即热生效）+ 标准格式规则集（Clash rule-provider YAML / sing-box rule-set JSON / 纯文本；非域名条目计数上报；URL 自动下载缓存，`rule_set_update_interval`（0=每次刷新），无缓存硬失败）+ 配置重排（订阅置顶、i3wm 风格六段）+ `domain(ruleset: tag)` 编译展开（空名单哨兵） | 已采纳 | —（用户决策：可读配置/自定域名/独立规则文件+更新地址） |
 
 ## 新增一条 ADR
 

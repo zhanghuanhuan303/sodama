@@ -1,0 +1,10 @@
+# 用户自定义：强制直连的域名（eBPF real-direct，不进代理）
+#
+# 语法同 user_proxy.txt：裸条目 = suffix；可加 full:/keyword:/regex: 前缀。
+#
+# 例：
+#   qq.com
+#   full:internal.corp
+#   keyword:lan
+#
+# 适合：默认分流（国内直连等）覆盖不到的、但确实不该走代理的域名。

@@ -1152,6 +1152,9 @@ const GLOBAL_KEYS: &[&str] = &[
     "log_file",
     "status_socket",
     "geodata_dir",
+    // P36：规则集（片格式分流规则文件）的更新/缓存
+    "rule_set_update_interval",
+    "rule_set_cache_dir",
 ];
 
 const DNS_KEYS: &[&str] = &[
@@ -1180,6 +1183,7 @@ const KNOWN_SECTIONS: &[&str] = &[
     "include",
     "global",
     "subscription",
+    "rule_set",
     "node",
     "group",
     "routing",
@@ -1307,6 +1311,49 @@ pub fn validate(cfg: &Config) -> Vec<Diag> {
                         )),
                         Item::Rule(r) => {
                             out.push(err_at(cfg, &r.loc, format!("{} 不支持规则", sec.name)))
+                        }
+                    }
+                }
+            }
+            // P36：规则集——tag: 'url|路径'（tag 不重复；值不能是函数调用）
+            "rule_set" => {
+                let mut tags: std::collections::HashSet<String> = std::collections::HashSet::new();
+                for item in &sec.items {
+                    match item {
+                        Item::Param(p) => {
+                            if p.funcs.is_some() || p.val.is_none() {
+                                let mut d = p_loc(cfg, p);
+                                d.msg = "rule_set 只接受 tag: 'url|路径' 字符串值".to_string();
+                                out.push(d);
+                                continue;
+                            }
+                            if let Some(k) = p.key.as_deref() {
+                                if k.is_empty()
+                                    || !k.chars().all(|c| {
+                                        c.is_ascii_alphanumeric()
+                                            || c == '_'
+                                            || c == '-'
+                                            || c == '.'
+                                    })
+                                {
+                                    let mut d = p_loc(cfg, p);
+                                    d.msg =
+                                        format!("rule_set tag 非法: {k}（仅限字母/数字/_/-/.）");
+                                    out.push(d);
+                                } else if !tags.insert(k.to_string()) {
+                                    let mut d = p_loc(cfg, p);
+                                    d.msg = format!("rule_set tag 重复: {k}");
+                                    out.push(d);
+                                }
+                            }
+                        }
+                        Item::Section(s) => out.push(err_at(
+                            cfg,
+                            &s.loc,
+                            format!("rule_set 不支持子 section：{}", s.name),
+                        )),
+                        Item::Rule(r) => {
+                            out.push(err_at(cfg, &r.loc, "rule_set 不支持规则".to_string()))
                         }
                     }
                 }
@@ -1888,6 +1935,13 @@ fn translate_function(f: &Function, parts: &mut Vec<String>) -> Result<(), Strin
                         }
                         vec![("ext".into(), v)]
                     }
+                    // P36：规则集（config `rule_set` 段；编译期展开为域名参数）
+                    "ruleset" => {
+                        if v.is_empty() {
+                            return Err("domain(ruleset:) 缺少 tag".into());
+                        }
+                        vec![("ruleset".into(), v)]
+                    }
                     other => return Err(format!("domain 不认识的 key: {other}")),
                 };
                 for (k, val) in emit {
@@ -1976,6 +2030,23 @@ pub fn subscriptions(cfg: &Config) -> Vec<SubSpec> {
             if let Item::Param(p) = item {
                 if let (Some(tag), Some(url)) = (p.key.clone(), p.val.clone()) {
                     out.push(SubSpec { tag, url });
+                }
+            }
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------- P36：规则集提取
+
+/// 规则集条目（`rule_set { tag: 'url|路径' }`，声明顺序保留）。
+pub fn rule_sets(cfg: &Config) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for sec in cfg.sections.iter().filter(|s| s.name == "rule_set") {
+        for item in &sec.items {
+            if let Item::Param(p) = item {
+                if let (Some(tag), Some(val)) = (p.key.clone(), p.val.clone()) {
+                    out.push((tag, val));
                 }
             }
         }

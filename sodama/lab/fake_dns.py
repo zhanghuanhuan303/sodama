@@ -68,6 +68,8 @@ TABLE = {
     # P28：ECS 回填/ecs_cache 夹具（回显 scope；窄 scope 语义由单测覆盖）
     "ecs0.test": "10.9.10.81",
     "ecs16.test": "10.9.10.82",
+    # P36：规则集夹具（plain.test → 10.9.10.5，wanpeer 已配该地址）
+    "plain.test": "10.9.10.5",
 }
 
 # P28：这些域名在应答里带回显 ECS（值 = scope prefix）：

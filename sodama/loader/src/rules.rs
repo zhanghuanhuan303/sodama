@@ -616,6 +616,7 @@ fn parse_port_range(s: &str) -> Result<(u16, u16), String> {
 fn expand_func(
     f: &Func,
     geo: Option<&Geodata>,
+    rulesets: Option<&crate::ruleset::RuleSetStore>,
     notes: &mut Vec<String>,
 ) -> Result<Vec<Partial>, String> {
     if f.args.is_empty() && f.name != "fallback" {
@@ -820,9 +821,57 @@ fn expand_func(
                             );
                         }
                     }
+                    // P36：规则集（标准格式分流规则文件；config `rule_set` 段）
+                    Some("ruleset") => {
+                        let store = rulesets.ok_or_else(|| {
+                            format!("domain(ruleset:{}) 需要规则集支持（编译入口未提供）", a.val)
+                        })?;
+                        let rs = store.get(&a.val).ok_or_else(|| {
+                            format!(
+                                "未知规则集 '{}'（config rule_set 段未定义？可用：{:?}）",
+                                a.val,
+                                store.tags()
+                            )
+                        })?;
+                        notes.push(format!(
+                            "domain(ruleset:{}) → {} 条域名（full/suffix/keyword/regex = {}/{}/{}/{}）",
+                            a.val,
+                            rs.data.total(),
+                            rs.data.full.len(),
+                            rs.data.suffix.len(),
+                            rs.data.keyword.len(),
+                            rs.data.regex.len()
+                        ));
+                        if rs.data.total() == 0 {
+                            // 空名单（如用户刚建、只有注释）：规则不匹配任何域，
+                            // 但不能让整个规则展开为空（那会硬失败）——插入一条
+                            // 永不匹配的哨兵（RFC 2606 保留 .invalid），用户加条目即生效。
+                            notes.push(format!(
+                                "domain(ruleset:{}) 为空（规则不匹配任何域；列表文件只有注释？）",
+                                a.val
+                            ));
+                            group_put(
+                                &mut order,
+                                &mut grouped,
+                                &mut seen,
+                                "suffix",
+                                "sodama-empty.invalid".to_string(),
+                            );
+                        }
+                        for (key, list) in [
+                            ("full", &rs.data.full),
+                            ("suffix", &rs.data.suffix),
+                            ("keyword", &rs.data.keyword),
+                            ("regex", &rs.data.regex),
+                        ] {
+                            for v in list {
+                                group_put(&mut order, &mut grouped, &mut seen, key, v.clone());
+                            }
+                        }
+                    }
                     Some(other) => {
                         return Err(format!(
-                            "domain(…) 不认识的 key: {other}（可用 suffix/full/keyword/regex/geosite/ext）"
+                            "domain(…) 不认识的 key: {other}（可用 suffix/full/keyword/regex/geosite/ext/ruleset）"
                         ))
                     }
                 }
@@ -927,6 +976,7 @@ fn resolve_outbound_id(name: &str, builtin: u8, groups: &HashMap<String, u8>) ->
 fn compile_rule(
     rule: &Rule,
     geo: Option<&Geodata>,
+    rulesets: Option<&crate::ruleset::RuleSetStore>,
     notes: &mut Vec<String>,
     groups: &HashMap<String, u8>,
 ) -> Result<CompiledRules, String> {
@@ -934,7 +984,7 @@ fn compile_rule(
     let mut flat: Vec<(Partial, usize, usize)> = Vec::new();
     let mut func_lens: Vec<usize> = Vec::new();
     for (fi, f) in rule.funcs.iter().enumerate() {
-        let partials = expand_func(f, geo, notes)?;
+        let partials = expand_func(f, geo, rulesets, notes)?;
         func_lens.push(partials.len());
         for (pi, p) in partials.into_iter().enumerate() {
             flat.push((p, fi, pi));
@@ -1026,6 +1076,16 @@ pub fn parse_and_compile_with_groups(
     geo: Option<&Geodata>,
     groups: &HashMap<String, u8>,
 ) -> Result<CompiledRules, String> {
+    parse_and_compile_full(text, geo, groups, None)
+}
+
+/// P36：完整编译入口（额外携带规则集：`domain(ruleset:tag)` 展开）。
+pub fn parse_and_compile_full(
+    text: &str,
+    geo: Option<&Geodata>,
+    groups: &HashMap<String, u8>,
+    rulesets: Option<&crate::ruleset::RuleSetStore>,
+) -> Result<CompiledRules, String> {
     let mut all = CompiledRules::default();
     for (lineno, raw) in text.lines().enumerate() {
         let line = raw.trim();
@@ -1038,7 +1098,7 @@ pub fn parse_and_compile_with_groups(
             .parse_rule()
             .map_err(|e| format!("第 {} 行: {e}", lineno + 1))?;
         let mut rule_notes = Vec::new();
-        let compiled = compile_rule(&rule, geo, &mut rule_notes, groups)
+        let compiled = compile_rule(&rule, geo, rulesets, &mut rule_notes, groups)
             .map_err(|e| format!("第 {} 行: {e}", lineno + 1))?;
         all.notes.extend(rule_notes);
 
