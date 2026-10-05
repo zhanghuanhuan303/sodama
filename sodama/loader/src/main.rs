@@ -186,6 +186,8 @@ static SPLICE_FALLBACK_LOGGED: AtomicBool = AtomicBool::new(false);
 static RELAY_DIAL_TIMEOUT_MS: AtomicU64 = AtomicU64::new(5000);
 /// P4b：UDP NAT 会话空闲阈值（秒）。
 static UDP_IDLE_SECS: AtomicU64 = AtomicU64::new(60);
+/// P33：配置文件热驱动轮询间隔（秒，0=关）。
+static CONFIG_WATCH_INTERVAL: AtomicU64 = AtomicU64::new(0);
 
 // ---- P14：嗅探 / dial_mode（远端域名解析）----
 /// 0=ip（默认，不嗅探）| 1=domain | 2=domain+（当前同 domain）。
@@ -1007,6 +1009,8 @@ struct Args {
     proxy_dsts: Vec<u32>,
     /// P6：日志文件（默认 stdout/stderr；SIGHUP 时 reopen，适合 logrotate）
     log_file: Option<String>,
+    /// P33：轮询 --config/--rules 及其 include 文件，变更时自动 reload（秒；缺省关）
+    watch_config: Option<u64>,
 }
 
 fn log(msg: &str) {
@@ -1089,6 +1093,8 @@ fn usage() -> ! {
            --ktls                M2：尝试 kTLS（内核 TLS，实验；需 TLS1.3）\n\
            --max-conns <N>       P18e：relay 并发上限（0=不限；超限直接关闭并计数）\n\
            --dns-upstream <url>  P3a：DNS 上游（host:port 或 udp://host:port）\n\
+           --watch-config <秒>    P33：轮询 --config/--rules 及其 include 文件，变更即自动 reload（0=关；
+                                 等价于自动 SIGHUP，便于无人值守/只读场景）
            --dump                打印编译出的 match_set / LPM 内容\n\
            --compile-dump <path> 只编译规则并按对拍格式打印（不加载 eBPF，不需要 root）\n\
            --proxy <ipv4>        无 --rules 时加入「走代理」的目的 IP，可重复\n\
@@ -1104,8 +1110,10 @@ fn usage() -> ! {
            sodama sysdump [--socket <path>] [--out <file>] P6：状态+规则+系统网络信息归档\n\
            sodama trace [--seconds N]           P6：过滤 sodama 的 ftrace 输出（需 root）\n\
          \n\
-         运行中收到 SIGHUP 会重读 --rules/--config 并热重载（非活跃槽 → 切换 active），\n\
-         同时清除 suspend 状态并 reopen --log-file（对照 dae reload）；SIGUSR2 = suspend。"
+         运行中收到 SIGHUP 会重读 --rules/--config 并热重载（非活跃槽 → 切换 active），
+         同时清除 suspend 状态并 reopen --log-file（对照 dae reload）；SIGUSR2 = suspend。
+         P33：reload/SIGHUP 同时热更新运行时参数（relay/udp idle、dial_timeout、max_conns、
+         dial_mode、sniffing_timeout、sniff-punt）；--watch-config 启用配置变更自动触发。"
     );
     std::process::exit(2);
 }
@@ -1147,6 +1155,7 @@ fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
         compile_dump: None,
         proxy_dsts: Vec::new(),
         log_file: None,
+        watch_config: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
@@ -1172,6 +1181,7 @@ fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
             "--strict-config" => args.strict_config = true,
             "--status-socket" => args.status_socket = Some(next()?),
             "--log-file" => args.log_file = Some(next()?),
+            "--watch-config" => args.watch_config = Some(next()?.parse()?),
             "--dialer" => args.dialer = Some(next()?),
             "--relay-idle-timeout" => args.relay_idle_timeout = Some(next()?.parse()?),
             "--dial-timeout" => args.dial_timeout = Some(next()?.parse()?),
@@ -3131,15 +3141,17 @@ fn do_reload(args: &Args, ebpf: &mut Ebpf, startup: bool) -> ReloadOutcome {
     if !startup {
         crate::sticky::reset();
     }
-    // P23：bootstrap resolver 跟随配置热更新（组/上游重建前生效）。
-    if let Some(cfg_path) = &args.config {
-        if let Ok(cfg) = config::load(std::path::Path::new(cfg_path)) {
-            let boot = config::global_value(&cfg, "bootstrap_resolver");
-            if let Err(e) = bootstrap::configure(boot.as_deref()) {
-                log(&format!("bootstrap resolver 热更新失败（保留旧值）: {e}"));
-            }
-            apply_dns_options(Some(&cfg)); // P23：dns 段选项热更新
+    // P23/P33：配置解析一次，供 bootstrap / DNS 选项 / 运行时参数热更新共用。
+    let cfg_loaded = args
+        .config
+        .as_ref()
+        .and_then(|p| config::load(std::path::Path::new(p)).ok());
+    if let Some(cfg) = &cfg_loaded {
+        let boot = config::global_value(cfg, "bootstrap_resolver");
+        if let Err(e) = bootstrap::configure(boot.as_deref()) {
+            log(&format!("bootstrap resolver 热更新失败（保留旧值）: {e}"));
         }
+        apply_dns_options(Some(cfg)); // P23：dns 段选项热更新
     }
     if SUSPENDED.load(Ordering::SeqCst) {
         match set_suspend(ebpf, false) {
@@ -3201,6 +3213,10 @@ fn do_reload(args: &Args, ebpf: &mut Ebpf, startup: bool) -> ReloadOutcome {
                 reload_group_members(args);
             }
             log(&format!("热重载完成（{n} 条 match_set）"));
+            // P33：运行时参数热更新（CLI > config > 现值；仅变更时记日志）。
+            if !startup {
+                apply_runtime_params(args, cfg_loaded.as_ref());
+            }
             // I6：热重载会重新编译规则/重建投影，同样回收一次分配器空闲页。
             trim_allocator();
             ReloadOutcome {
@@ -3585,6 +3601,168 @@ fn parse_duration_secs(v: &str) -> Option<u64> {
     t.parse().ok()
 }
 
+/// P33：带单位毫秒解析（"150ms" / "1s" / 裸数字=ms）。
+fn parse_ms(v: &str) -> Option<u64> {
+    let t = v.trim();
+    if let Some(x) = t.strip_suffix("ms") {
+        return x.trim().parse().ok();
+    }
+    if let Some(x) = t.strip_suffix('s') {
+        return x.trim().parse::<u64>().ok().map(|s| s.saturating_mul(1000));
+    }
+    t.parse().ok()
+}
+
+/// P33：运行时参数热更新（reload/SIGHUP 时调用）。
+/// 优先级与启动一致：CLI 显式值 > config global > 保持现值；仅变更时记日志。
+fn apply_runtime_params(args: &Args, cfg: Option<&config::Config>) {
+    let g = |k: &str| cfg.and_then(|c| config::global_value(c, k));
+
+    let apply_secs = |key: &str, cli: Option<u64>, cur: &AtomicU64| {
+        if let Some(v) = cli.or_else(|| g(key).and_then(|s| parse_duration_secs(&s))) {
+            let old = cur.swap(v, Ordering::SeqCst);
+            if old != v {
+                log(&format!("热更新: {key} {old}s -> {v}s"));
+            }
+        }
+    };
+    apply_secs(
+        "relay_idle_timeout",
+        args.relay_idle_timeout,
+        &RELAY_IDLE_SECS,
+    );
+    apply_secs("udp_idle_timeout", args.udp_idle_timeout, &UDP_IDLE_SECS);
+
+    if let Some(v) = args
+        .dial_timeout
+        .or_else(|| g("dial_timeout").and_then(|s| parse_duration_secs(&s)))
+    {
+        let ms = v.saturating_mul(1000);
+        let old = RELAY_DIAL_TIMEOUT_MS.swap(ms, Ordering::SeqCst);
+        if old != ms {
+            log(&format!("热更新: dial_timeout {}s -> {v}s", old / 1000));
+        }
+    }
+    if let Some(v) = args
+        .max_conns
+        .or_else(|| g("max_conns").and_then(|s| s.trim().parse().ok()))
+    {
+        let old = RELAY_MAX_CONNS.swap(v, Ordering::SeqCst);
+        if old != v {
+            log(&format!("热更新: max_conns {old} -> {v}"));
+        }
+    }
+    if let Some(m) = args.dial_mode.clone().or_else(|| g("dial_mode")) {
+        let b = match m.as_str() {
+            "domain" => 1u8,
+            "domain+" | "domain++" => 2,
+            _ => 0,
+        };
+        let old = DIAL_MODE.swap(b, Ordering::SeqCst);
+        if old != b {
+            log(&format!("热更新: dial_mode {} -> {m}", dial_mode_name(old)));
+        }
+    }
+    if let Some(ms) = args
+        .sniffing_timeout_ms
+        .or_else(|| g("sniffing_timeout").and_then(|s| parse_ms(&s)))
+    {
+        let old = SNIFF_TIMEOUT_MS.swap(ms, Ordering::SeqCst);
+        if old != ms {
+            log(&format!("热更新: sniffing_timeout {old}ms -> {ms}ms"));
+        }
+    }
+    let punt = args.sniff_punt
+        || g("auto_sniff_punt")
+            .map(|v| matches!(v.as_str(), "true" | "1" | "yes" | "on"))
+            .unwrap_or(false);
+    let old = SNIFF_PUNT.swap(punt, Ordering::SeqCst);
+    if old != punt {
+        log(&format!("热更新: sniff-punt {old} -> {punt}"));
+    }
+}
+
+/// P33：配置观察线程——轮询 --config/--rules 及其 include 文件（mtime+size），
+/// 变化则经状态面通道向主循环发 reload（同步等结果并记日志）。
+fn config_watch_loop(
+    extra: Vec<std::path::PathBuf>,
+    secs: u64,
+    tx: std::sync::mpsc::Sender<status::MainMsg>,
+) {
+    type Snap = Vec<(std::path::PathBuf, Option<std::time::SystemTime>, u64)>;
+    let snap = |paths: &[std::path::PathBuf]| -> Snap {
+        paths
+            .iter()
+            .map(|p| {
+                let md = std::fs::metadata(p).ok();
+                (
+                    p.clone(),
+                    md.as_ref().and_then(|m| m.modified().ok()),
+                    md.map(|m| m.len()).unwrap_or(0),
+                )
+            })
+            .collect()
+    };
+    let mut prev: Snap = Vec::new();
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(secs.max(1)));
+        let mut paths = extra.clone();
+        if let Some((c, _)) = CONFIG_STATE.lock().ok().and_then(|g| g.clone()) {
+            paths.extend(c.files.iter().cloned());
+        }
+        paths.sort();
+        paths.dedup();
+        if paths.is_empty() {
+            continue;
+        }
+        let cur = snap(&paths);
+        if !prev.is_empty() && cur != prev {
+            log(&format!(
+                "config-watch: 检测到 {} 个配置文件变更 → 自动 reload",
+                paths.len()
+            ));
+            let (rtx, rrx) = std::sync::mpsc::channel();
+            if tx
+                .send(status::MainMsg::Query {
+                    cmd: "reload".into(),
+                    reply: rtx,
+                })
+                .is_err()
+            {
+                log("config-watch: 主循环已退出，观察线程结束");
+                return;
+            }
+            match rrx.recv_timeout(std::time::Duration::from_secs(60)) {
+                Ok(resp) => {
+                    let brief = serde_json::from_str::<serde_json::Value>(&resp)
+                        .ok()
+                        .map(|v| {
+                            format!(
+                                "ok={} match_sets={} error={}",
+                                v.get("ok")
+                                    .map(|x| x.to_string())
+                                    .unwrap_or_else(|| "-".into()),
+                                v.get("match_sets")
+                                    .map(|x| x.to_string())
+                                    .unwrap_or_else(|| "-".into()),
+                                v.get("error")
+                                    .map(|x| x.to_string())
+                                    .unwrap_or_else(|| "null".into()),
+                            )
+                        })
+                        .unwrap_or_else(|| resp.chars().take(120).collect());
+                    log(&format!("config-watch: 自动 reload 完成（{brief}）"));
+                }
+                Err(_) => log("config-watch: 自动 reload 超时（60s）"),
+            }
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            prev = snap(&paths);
+        } else {
+            prev = cur;
+        }
+    }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // K3 子命令（不加载 eBPF、不需要 root）
     let argv: Vec<String> = std::env::args().collect();
@@ -3625,16 +3803,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         log(&format!("relay dialer: {}", dialer.name()));
         let _ = OUTBOUND.set(dialer);
     }
-    if let Some(s) = args.relay_idle_timeout {
+    // P33：运行参数可由 config global 提供（CLI 显式值优先）；
+    // reload/SIGHUP 时以同口径热更新（见 apply_runtime_params）。
+    let cfg_boot = args
+        .config
+        .as_ref()
+        .and_then(|p| config::load(std::path::Path::new(p)).ok());
+    let cfg_boot_val = |k: &str| cfg_boot.as_ref().and_then(|c| config::global_value(c, k));
+    if let Some(s) = args
+        .relay_idle_timeout
+        .or_else(|| cfg_boot_val("relay_idle_timeout").and_then(|v| parse_duration_secs(&v)))
+    {
         RELAY_IDLE_SECS.store(s, Ordering::SeqCst);
     }
-    if let Some(n) = args.max_conns {
+    if let Some(n) = args
+        .max_conns
+        .or_else(|| cfg_boot_val("max_conns").and_then(|v| v.trim().parse().ok()))
+    {
         RELAY_MAX_CONNS.store(n, Ordering::SeqCst);
     }
-    if let Some(s) = args.dial_timeout {
+    if let Some(s) = args
+        .dial_timeout
+        .or_else(|| cfg_boot_val("dial_timeout").and_then(|v| parse_duration_secs(&v)))
+    {
         RELAY_DIAL_TIMEOUT_MS.store(s.saturating_mul(1000), Ordering::SeqCst);
     }
-    if let Some(s) = args.udp_idle_timeout {
+    if let Some(s) = args
+        .udp_idle_timeout
+        .or_else(|| cfg_boot_val("udp_idle_timeout").and_then(|v| parse_duration_secs(&v)))
+    {
         UDP_IDLE_SECS.store(s, Ordering::SeqCst);
     }
     RELAY_SPLICE.store(args.splice, Ordering::SeqCst);
@@ -4005,6 +4202,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(sock) = &args.status_socket {
         status::serve(Path::new(sock), status_tx.clone())?;
         log(&format!("status socket（只读）: {sock}"));
+    }
+    // P33：配置文件热驱动（可选）——轮询 --config/--rules 及其 include 文件，
+    // 变更即向主循环发 reload（等价自动 SIGHUP）。
+    if let Some(secs) = args.watch_config.filter(|s| *s > 0) {
+        CONFIG_WATCH_INTERVAL.store(secs, Ordering::SeqCst);
+        let mut extra: Vec<std::path::PathBuf> = Vec::new();
+        if let Some(p) = &args.config {
+            extra.push(std::path::PathBuf::from(p));
+        }
+        if let Some(p) = &args.rules {
+            extra.push(std::path::PathBuf::from(p));
+        }
+        let wtx = status_tx.clone();
+        std::thread::spawn(move || config_watch_loop(extra, secs, wtx));
+        log(&format!(
+            "config-watch: 已启用（每 {secs}s 检查 --config/--rules 及其 include，变更即自动 reload）"
+        ));
     }
     let _keep_tx = status_tx;
 
@@ -6088,6 +6302,10 @@ fn status_json(ebpf: &mut Ebpf) -> serde_json::Value {
             "ok": r.ok, "match_sets": r.match_sets, "slot": r.slot,
             "error": r.error, "at_sec": r.at_sec,
         })),
+        "config_watch": {
+            "enabled": CONFIG_WATCH_INTERVAL.load(Ordering::Relaxed) > 0,
+            "interval_secs": CONFIG_WATCH_INTERVAL.load(Ordering::Relaxed),
+        },
         "dialer": match OUTBOUND.get() {
             Some(o) => o.name(),
             None => "none".to_string(),

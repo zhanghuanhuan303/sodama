@@ -232,6 +232,12 @@ sodama validate <config.dae>            # 无需 root / socket
 重载走 `systemctl reload`（SIGHUP），状态看 `journalctl`；需要子命令就在 drop-in 里加
 `--status-socket`（建议 `/run/sodama/status.sock` + `RuntimeDirectory=sodama`）。
 
+配置热驱动（P33，可选，适合无人值守）：drop-in 的启动参数加 `--watch-config 10`（秒），
+loader 会轮询 `--config`/`--rules` 及其 include 文件，变更即自动 reload（等价 `systemctl reload`）；
+坏配置不会切槽（保留旧规则/旧参数）。reload 同时热更新运行参数（relay/udp idle、dial_timeout、
+`max_conns`、dial_mode、sniffing_timeout、sniff-punt），优先级：CLI 显式值 > config `global` > 现值。
+真机 `gateway.sh` 方式用环境变量开启：`sudo env GATEWAY_WATCH_CONFIG=10 lab/gateway.sh up …`（默认 0=关）。
+
 ## 9. 升级 / 回滚
 
 升级：

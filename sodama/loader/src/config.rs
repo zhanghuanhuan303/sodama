@@ -1139,6 +1139,11 @@ const GLOBAL_KEYS: &[&str] = &[
     "bandwidth_max_rx",
     "udphop_interval",
     "bpf_conn_state_map_size",
+    // P33：运行参数（reload/SIGHUP 热更新；值可用 "300s"/"300" 形式）
+    "relay_idle_timeout",
+    "udp_idle_timeout",
+    "dial_timeout",
+    "max_conns",
 ];
 
 const DNS_KEYS: &[&str] = &[

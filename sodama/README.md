@@ -11,7 +11,8 @@ P20（QUIC Initial SNI 嗅探）、P21（sniff-punt）、P22（UDP over IPv6 全
 P23（sticky IP / DoH h2 / bootstrap / DNS 选项）、P24（uTLS Chrome-120 / Vision splice / TUIC 0-RTT）、
 P25（naive / HTTP-2 CONNECT）、P26（HTTP/3：DoH h3 / naive+quic）、P27（juicity v0）、
 P28（ECS 回填 / ecs_cache）、P29（optimistic 后台刷新）、P30（SSR origin+plain）、
-P31（shadow-tls v1/v2/v3，ss 插件）、P32（ECH 边界：已评估不实现）与
+P31（shadow-tls v1/v2/v3，ss 插件）、P32（ECH 边界：已评估不实现）、
+P33（运行时参数热更新 + `--watch-config` 配置热驱动）与
 P6（suspend/reload/metrics/sysdump/日志轮转/整配置热重载）已完成**；P9+ 已删除 C 数据面，
 `ebpf-rs` 的 Rust 对象是**唯一数据面**（ADR-0025）。
 
@@ -223,7 +224,11 @@ P6（suspend/reload/metrics/sysdump/日志轮转/整配置热重载）已完成*
   no-load/fail-open，reload 恢复）；状态面从只读扩展为 `status/rules/config/maps/metrics/
   reload/suspend/resume`（控制命令仍经主循环串行执行）；CLI 新增 `reload/suspend/resume/
   metrics/sysdump/trace`；`--log-file` + SIGHUP reopen（轮转友好）；`--config` 整配置热重载
-  （失败不切槽 = 回滚，DNS 上游热切换）；`metrics` 输出 Prometheus 文本（daed GraphQL 不做，
+  （失败不切槽 = 回滚，DNS 上游热切换；**P33**：reload/SIGHUP 同时热更新运行参数
+  ——relay/udp idle、dial_timeout、max_conns、dial_mode、sniffing_timeout、sniff-punt，
+  优先级 CLI 显式值 > config global > 现值）；**`--watch-config <秒>` 配置热驱动**（轮询
+  `--config`/`--rules` 及其 include 文件，变更即自动 reload = 自动 SIGHUP；坏配置保留
+  旧槽/旧参数）；`metrics` 输出 Prometheus 文本（daed GraphQL 不做，
   见 ADR-0021）
 - **P7 收敛**：C 基准端点（`lab/bench_io.c` + `lab/bench.sh`）六路径剖面（口径如实：perf 不可用，
   墙钟 + 状态面 counters + `/proc` CPU/RSS）；**offload 生命周期修复**（半关闭超时 10s 兜底、
@@ -534,6 +539,10 @@ target/release/sodama reload|suspend|resume [--socket <path>]
 target/release/sodama metrics [--socket <path>]
 target/release/sodama sysdump [--socket <path>] [--out <file>]
 target/release/sodama trace [--seconds N]
+# P33：配置热驱动（--watch-config <秒>；编辑 --config/--rules 及其 include → 自动 reload，见 ADR-0060）
+target/release/sodama reload --socket /tmp/sodama-status.sock   # 手动线：等价 SIGHUP（同步等结果，热更新运行参数）
+sudo env USE_CONFIG=/tmp/sodama-watch.dae USE_WATCH_CONFIG=2 USE_DIALER=direct lab/lab.sh up  # lab 自动线
+# 真网关：sudo env GATEWAY_WATCH_CONFIG=10 lab/gateway.sh up …（默认 0=关）
 # P7 工具链：
 lab/bench.sh build                 # 编译 C 基准端点（gcc）
 lab/bench.sh all                   # 六路径性能表（root；自动起/停会话：direct relay offload ss udp-direct udp-nat）

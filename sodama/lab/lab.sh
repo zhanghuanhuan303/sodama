@@ -870,6 +870,8 @@ up() {
   # M2：kTLS 实验（内核 TLS；成功则加解密下沉内核，TLS 上可再 splice）
   [ -n "${USE_KTLS:-}" ] && extra_args+=(--ktls)
   [ -n "${USE_LOG_FILE:-}" ] && extra_args+=(--log-file "$OPS_LOG")
+  # P33：配置文件热驱动冒烟（轮询 --config/--rules 及 include，变更自动 reload）
+  [ -n "${USE_WATCH_CONFIG:-}" ] && extra_args+=(--watch-config "$USE_WATCH_CONFIG")
   if [ -n "${USE_DNS_UPSTREAM:-}" ]; then
     dns_args=(--dns-upstream "$USE_DNS_UPSTREAM")
   else

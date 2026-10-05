@@ -68,6 +68,8 @@ WATCH_FAILS="${GATEWAY_WATCH_FAILS:-4}"
 WATCH_TIMEOUT="${GATEWAY_WATCH_TIMEOUT:-6}"
 # P19：up 启动自检的最长等待（秒）；0 = 不等（旧行为）
 WAIT_SECS="${GATEWAY_WAIT_SECS:-75}"
+# P33：配置文件热驱动（秒；0=关）——轮询 --config/--rules 及 include，变更即自动 reload
+WATCH_CONFIG="${GATEWAY_WATCH_CONFIG:-0}"
 
 die() { echo "错误：$*" >&2; exit 1; }
 info() { echo "== $* =="; }
@@ -104,6 +106,9 @@ usage() {
 日志（持久）：默认 /var/log/sodama-gateway.log（SODAMA_GW_LOG 可改；不可写回退 /tmp）。
 启动自检（P19）：loader 起来后等「节点组就绪 + 代理路径 204」（默认最长 75s，
 --wait/--no-wait 可调）；超时自动 down 回滚直连，不会把机器瞬在断网态。
+
+配置文件热驱动（P33）：GATEWAY_WATCH_CONFIG=<秒>（默认 0=关）。>0 时 loader
+轮询 --config/--rules 及其 include 文件，变更即自动 reload（等价自动 SIGHUP）。
 EOF
 }
 
@@ -315,7 +320,10 @@ up() {
     echo "   已临时关闭 $IFACE 的 IPv6（down 时恢复）"
   fi
 
-  info "启动 loader（log=$LOG）"
+  # P33：配置文件热驱动（可选；GATEWAY_WATCH_CONFIG=<秒> 启用）
+  local watch_args=()
+  [ "${WATCH_CONFIG:-0}" -gt 0 ] 2>/dev/null && watch_args=(--watch-config "$WATCH_CONFIG")
+  info "启动 loader（log=$LOG${watch_args:+，watch-config=${WATCH_CONFIG}s}）"
   local dial_args=()
   if [ -n "$sub_url" ]; then
     dial_args=(--subscribe "$sub_url")
@@ -325,7 +333,7 @@ up() {
   fi
   if [ "$DRY_RUN" -eq 1 ]; then
     echo -n "  + nohup $LOADER --ebpf $OBJ --lan none --wan $IFACE --dae0 $DAE0 --dae0peer $DAE0PEER --daens $DAE_NS"
-    printf ' %q' "${rules_args[@]}" "${dial_args[@]}" "${geo_args[@]}" "${dns_args[@]}" --dial-timeout 15 \
+    printf ' %q' "${rules_args[@]}" "${dial_args[@]}" "${geo_args[@]}" "${dns_args[@]}" "${watch_args[@]}" --dial-timeout 15 \
       --dial-mode "$DIAL_MODE" --sniffing-timeout-ms "$SNIFF_TIMEOUT_MS" --status-socket "$STATUS_SOCK" --log-file "$LOG"
     echo " >>$LOG 2>&1 &"
     echo "（dry-run：未执行任何变更）"
@@ -334,7 +342,7 @@ up() {
   prepare_log
   nohup "$LOADER" --ebpf "$OBJ" --lan none --wan "$IFACE" \
     --dae0 "$DAE0" --dae0peer "$DAE0PEER" --daens "$DAE_NS" \
-    "${rules_args[@]}" "${dial_args[@]}" "${geo_args[@]}" "${dns_args[@]}" --dial-timeout 15 \
+    "${rules_args[@]}" "${dial_args[@]}" "${geo_args[@]}" "${dns_args[@]}" "${watch_args[@]}" --dial-timeout 15 \
     --dial-mode "$DIAL_MODE" --sniffing-timeout-ms "$SNIFF_TIMEOUT_MS" \
     --status-socket "$STATUS_SOCK" --log-file "$LOG" >>"$LOG" 2>&1 &
   echo $! >"$PID_FILE"
