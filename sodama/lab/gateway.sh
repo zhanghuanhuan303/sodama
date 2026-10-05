@@ -41,10 +41,12 @@ DAE_NS=gwdae
 DAE0=dae0gw
 DAE0PEER=dae0gwpeer
 
-LOG=/tmp/sodama-gw.log
+# 日志默认持久化（/var/log，重启/清 /tmp 后仍可回溯）；不可写时回退 /tmp
+LOG="${SODAMA_GW_LOG:-/var/log/sodama-gateway.log}"
 PID_FILE=/tmp/sodama-gw.pid
 STATUS_SOCK=/tmp/sodama-gw.sock
 STATE_FILE=/tmp/sodama-gw.state
+WATCHDOG_PID_FILE=/run/sodama-gateway.watchdog.pid
 DEFAULT_NODE_FILE=/tmp/sodama-node.url
 
 IFACE=""
@@ -59,6 +61,11 @@ DIAL_MODE="domain"
 SNIFF_TIMEOUT_MS=100
 NO_IPV6=0
 DRY_RUN=0
+# I7：节点看护（watchdog）开关与参数（env 可覆盖；up --no-watchdog 关闭）
+WATCH=1
+WATCH_INTERVAL="${GATEWAY_WATCH_INTERVAL:-15}"
+WATCH_FAILS="${GATEWAY_WATCH_FAILS:-4}"
+WATCH_TIMEOUT="${GATEWAY_WATCH_TIMEOUT:-6}"
 # P19：up 启动自检的最长等待（秒）；0 = 不等（旧行为）
 WAIT_SECS="${GATEWAY_WAIT_SECS:-75}"
 
@@ -78,7 +85,26 @@ run() {
 }
 
 usage() {
-  sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'
+  cat <<'EOF'
+用法：
+  sudo lab/gateway.sh up [--iface wlan0] [--node <文件|URL> | --subscribe <文件|URL>] [--group <名>]
+                        [--rules <文件> | --config <文件>] [--dns <上游URL>] [--geodata-dir <目录>]
+                        [--no-ipv6] [--dial-mode ip|domain] [--wait <秒>|--no-wait] [--no-watchdog]
+  sudo lab/gateway.sh down          # 停止并恢复（幂等；同时停掉看护）
+  sudo lab/gateway.sh status        # 进程/钩子/看护/日志尾部
+  lab/gateway.sh test                 # 连通性快检（可直接用当前用户跑）
+  sudo lab/gateway.sh up --dry-run    # 只打印将要执行的命令
+
+看护（watchdog，默认开启）：
+  每 GATEWAY_WATCH_INTERVAL（默认 15s）经代理路径探测三目标：
+  gstatic / cp.cloudflare / bing（wget，不经 pname 直连规则）+ LAN 对照。
+  连续 GATEWAY_WATCH_FAILS（默认 4）次失败 → SIGHUP 热刷新订阅组，仍失败则
+  自动 down 回退直连（fail-open）并写日志（避免“网挂了只能重启”）。
+
+日志（持久）：默认 /var/log/sodama-gateway.log（SODAMA_GW_LOG 可改；不可写回退 /tmp）。
+启动自检（P19）：loader 起来后等「节点组就绪 + 代理路径 204」（默认最长 75s，
+--wait/--no-wait 可调）；超时自动 down 回滚直连，不会把机器瞬在断网态。
+EOF
 }
 
 detect_iface() {
@@ -120,12 +146,23 @@ cleanup() {
     echo "  + （dry-run）停止旧实例、删 netns $DAE_NS / veth $DAE0"
     return 0
   fi
+  # I7：先停看护，避免它在 down 过程中重新拉起或误报
+  if [ -f "$WATCHDOG_PID_FILE" ]; then
+    local wpid
+    wpid="$(cat "$WATCHDOG_PID_FILE" 2>/dev/null || true)"
+    if [ -n "$wpid" ] && kill -0 "$wpid" 2>/dev/null; then
+      kill "$wpid" 2>/dev/null || true
+    fi
+    rm -f "$WATCHDOG_PID_FILE"
+  fi
   local pid=""
   if [ -f "$PID_FILE" ]; then
     pid="$(cat "$PID_FILE" 2>/dev/null || true)"
   fi
   if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
     info "停止 sodama（pid $pid）"
+    # I7：先 SIGCONT——假死（SIGSTOP）的进程先复位，TERM/KILL 才能生效
+    kill -CONT "$pid" 2>/dev/null || true
     kill "$pid" 2>/dev/null || true
     for _ in $(seq 1 30); do
       kill -0 "$pid" 2>/dev/null || break
@@ -294,7 +331,7 @@ up() {
     echo "（dry-run：未执行任何变更）"
     return 0
   fi
-  : >"$LOG"
+  prepare_log
   nohup "$LOADER" --ebpf "$OBJ" --lan none --wan "$IFACE" \
     --dae0 "$DAE0" --dae0peer "$DAE0PEER" --daens "$DAE_NS" \
     "${rules_args[@]}" "${dial_args[@]}" "${geo_args[@]}" "${dns_args[@]}" --dial-timeout 15 \
@@ -326,6 +363,20 @@ up() {
     echo "   已按 --no-ipv6 关闭 $IFACE 的 IPv6；数据面仅 IPv4。"
   elif ip -6 route show default 2>/dev/null | grep -q .; then
     echo "   IPv6 数据面已启用（v6 流量一并透明代理；如需关闭网卡 IPv6 可用 --no-ipv6）。"
+  fi
+  # I7：节点看护（fail-open）——探针必须经代理路径，故用 wget（curl/python3 在
+  # rules.gateway.dae 里是 pname->direct 调试规则，会测到直连）。
+  if [ "$WATCH" -eq 1 ]; then
+    if command -v wget >/dev/null 2>&1; then
+      SODAMA_GW_LOG="$LOG" \
+        GATEWAY_WATCH_INTERVAL="$WATCH_INTERVAL" \
+        GATEWAY_WATCH_FAILS="$WATCH_FAILS" \
+        GATEWAY_WATCH_TIMEOUT="$WATCH_TIMEOUT" \
+        setsid "$0" watchdog >>"$LOG" 2>&1 </dev/null &
+      echo "   节点看护已启动（watchdog：${WATCH_INTERVAL}s/次，连续 ${WATCH_FAILS} 次失败自动回退直连）"
+    else
+      echo "   未找到 wget，跳过节点看护（无法探测代理路径）"
+    fi
   fi
   echo "完成：浏览器直接访问即可，无需任何代理设置。"
   echo "   sudo $0 test    # 连通性快检   sudo $0 down    # 停止并恢复"
@@ -413,6 +464,15 @@ status() {
   else
     echo "  未安装 bpftool"
   fi
+  info "节点看护（watchdog）"
+  local wpid=""
+  [ -f "$WATCHDOG_PID_FILE" ] && wpid="$(cat "$WATCHDOG_PID_FILE" 2>/dev/null || true)"
+  if [ -n "$wpid" ] && kill -0 "$wpid" 2>/dev/null; then
+    echo "  运行中（pid $wpid，interval=${WATCH_INTERVAL}s fails=${WATCH_FAILS}）"
+    grep -a "watchdog:" "$LOG" 2>/dev/null | tail -n 5 | sed 's/^/  /'
+  else
+    echo "  未运行（--no-watchdog 或已退出；日志：$LOG）"
+  fi
   info "日志尾部（$LOG）"
   tail -n 8 "$LOG" 2>/dev/null || echo "  无日志"
 }
@@ -448,6 +508,145 @@ test_conn() {
   fi
 }
 
+# ---------------------------------------------------------------- I7：节点看护
+
+# 带时间戳追加到持久日志。
+glog() { printf '[%s] %s\n' "$(date '+%F %T')" "$*" >>"$LOG"; }
+
+# 准备持久日志（不可写回退 /tmp；>5MB 轮转一次）。
+prepare_log() {
+  local dir
+  dir="$(dirname "$LOG")"
+  if ! { mkdir -p "$dir" 2>/dev/null && : >>"$LOG" 2>/dev/null; }; then
+    LOG=/tmp/sodama-gw.log
+    : >>"$LOG" 2>/dev/null || true
+  fi
+  local sz
+  sz="$(stat -c%s "$LOG" 2>/dev/null || echo 0)"
+  if [ "$sz" -gt 5242880 ]; then
+    mv -f "$LOG" "$LOG.1" 2>/dev/null || true
+  fi
+  glog "===== gateway up（看护=$WATCH interval=${WATCH_INTERVAL}s fails=$WATCH_FAILS timeout=${WATCH_TIMEOUT}s）====="
+}
+
+# 经代理路径的三目标探针（wget 不在 pname->direct 调试规则里）；≥2 成功视为通。
+# 三目标并行 + --tries=1（失败不重试）：最坏耗时 ≈ WATCH_TIMEOUT，避免看护反应被重试拖慢。
+canary_once() {
+  local dir
+  dir="$(mktemp -d /tmp/sodama-canary.XXXXXX 2>/dev/null || echo /tmp)"
+  local urls=(http://cp.cloudflare.com/generate_204 https://www.gstatic.com/generate_204 https://www.bing.com/)
+  local pids=() i=0
+  for u in "${urls[@]}"; do
+    (
+      # KILL 硬超时：假死代理下 DNS/多地址尝试可能拖长，直接强杀
+      timeout -s KILL $((WATCH_TIMEOUT + 1)) wget -q -O /dev/null --tries=1 \
+        --timeout="$WATCH_TIMEOUT" "$u" 2>/dev/null && : >"$dir/ok.$i"
+    ) &
+    pids+=($!)
+    i=$((i + 1))
+  done
+  # 硬 deadline 等待：无论子进程状态如何，函数在 WATCH_TIMEOUT+3 内返回
+  local deadline=$((SECONDS + WATCH_TIMEOUT + 3)) p
+  for p in "${pids[@]}"; do
+    while kill -0 "$p" 2>/dev/null && [ "$SECONDS" -lt "$deadline" ]; do
+      sleep 0.2
+    done
+    kill -9 "$p" 2>/dev/null || true
+    wait "$p" 2>/dev/null || true
+  done
+  local ok=0
+  for f in "$dir"/ok.*; do
+    [ -e "$f" ] && ok=$((ok + 1))
+  done
+  rm -rf "$dir" 2>/dev/null || true
+  [ "$ok" -ge 2 ]
+}
+
+# LAN 对照：默认网关可达（区分“本地上游不亮”与“代理层故障”）。
+lan_ok() {
+  local gw
+  gw="$(ip route show default 2>/dev/null | awk '/default/{print $3; exit}')"
+  [ -n "$gw" ] && ping -c1 -W1 "$gw" >/dev/null 2>&1
+}
+
+# 状态快照：每组 alive/成员、探测计数、延迟中位。
+health_snapshot() {
+  timeout 10 "$LOADER" status --socket "$STATUS_SOCK" --json 2>/dev/null | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    print("status 不可读")
+    raise SystemExit
+gs = d.get("groups") or ([d["group"]] if d.get("group") else [])
+for g in gs:
+    if not isinstance(g, dict):
+        continue
+    lats = sorted(
+        n.get("ema_ms") or n.get("last_ms") or 0
+        for n in (g.get("nodes") or []) if n.get("alive")
+    )
+    med = lats[len(lats) // 2] if lats else None
+    print("组[{}] alive={}/{} probe={}/{} failover={} 延迟中位={}ms".format(
+        g.get("name"), g.get("alive"), g.get("members"),
+        g.get("probes_ok"), g.get("probes_fail"), g.get("failovers"), med))
+' 2>/dev/null || echo "status 快照失败"
+}
+
+# 看护主循环：失败累计 → SIGHUP 刷订阅组 → 仍失败 → fail-open 回直连。
+watchdog_loop() {
+  echo $$ >"$WATCHDOG_PID_FILE"
+  glog "watchdog: 启动（pid $$，interval=${WATCH_INTERVAL}s fails=${WATCH_FAILS} timeout=${WATCH_TIMEOUT}s）"
+  local fails=0 snap_t=0
+  while :; do
+    sleep "$WATCH_INTERVAL"
+    local pid=""
+    [ -f "$PID_FILE" ] && pid="$(cat "$PID_FILE" 2>/dev/null || true)"
+    if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then
+      glog "watchdog: loader 不在，退出"
+      break
+    fi
+    if canary_once; then
+      [ "$fails" -gt 0 ] && glog "watchdog: 连通恢复（此前连续失败 ${fails} 次）"
+      fails=0
+    else
+      fails=$((fails + 1))
+      if lan_ok; then
+        glog "watchdog: 探针失败 ${fails}/${WATCH_FAILS}（LAN 正常，疑节点/订阅侧）"
+      else
+        glog "watchdog: 探针失败 ${fails}/${WATCH_FAILS}（LAN 也异常，优先排查本地上游）"
+      fi
+    fi
+    snap_t=$((snap_t + WATCH_INTERVAL))
+    if [ "$snap_t" -ge 300 ]; then
+      snap_t=0
+      glog "watchdog: 健康快照 | $(health_snapshot | tr '\n' ' ')"
+    fi
+    if [ "$fails" -ge "$WATCH_FAILS" ]; then
+      glog "watchdog: 连续 ${fails} 次失败 → SIGHUP 热刷新订阅/组"
+      kill -HUP "$pid" 2>/dev/null || true
+      local i=0
+      while [ "$i" -lt 2 ]; do
+        sleep "$WATCH_INTERVAL"
+        i=$((i + 1))
+        glog "watchdog: 刷新后复检（第 ${i}/2 次）"
+        canary_once && break
+      done
+      if canary_once; then
+        glog "watchdog: 刷新后恢复正常"
+        fails=0
+        continue
+      fi
+      glog "watchdog: 刷新无效 → fail-open 切回直连（快照：$(health_snapshot | tr '\n' ' ')）"
+      command -v notify-send >/dev/null 2>&1 \
+        && notify-send -u critical "sodama 网关" "代理层连续失败，已自动切回直连（详见 $LOG）" || true
+      "$0" down >>"$LOG" 2>&1 || true
+      break
+    fi
+  done
+  rm -f "$WATCHDOG_PID_FILE"
+}
+
 cmd="${1:-}"
 [ $# -gt 0 ] && shift || true
 while [ $# -gt 0 ]; do
@@ -464,6 +663,7 @@ while [ $# -gt 0 ]; do
   --wait) WAIT_SECS="$2"; shift 2 ;;
   --no-wait) WAIT_SECS=0; shift ;;
   --no-ipv6) NO_IPV6=1; shift ;;
+  --no-watchdog) WATCH=0; shift ;;
   --dry-run) DRY_RUN=1; shift ;;
   -h | --help) usage; exit 0 ;;
   *) die "未知参数：$1" ;;
@@ -472,6 +672,7 @@ done
 
 case "$cmd" in
 up) up ;;
+watchdog) require_root watchdog; watchdog_loop ;;
 down) down ;;
 status) status ;;
 test) test_conn ;;

@@ -317,7 +317,7 @@ lab/dnsroute.dae     P18c dns.routing 夹具（双上游 up1/up2 + 请求/应答
 lab/rules.regex.dae  P3b-2a regex 域分流规则（api[0-9]+.regex.test 命中）
 lab/rules.udp.dae    P4b UDP NAT 规则（所有 UDP:9998 判 proxy，验证 mark 防自环）
 lab/lab.sh           建/拆 netns 拓扑（标准 + 单臂）、跑测试、热重载、故障注入
-lab/gateway.sh       P13：真网关模式一键脚本（up/down/status/test/--dry-run；宿主流量透明接管；P15 支持 --subscribe/--group；P18c 支持 --config/--dns/--geodata-dir；P19 启动自检 + 失败自动回滚，--wait/--no-wait）
+lab/gateway.sh       P13：真网关模式一键脚本（up/down/status/test/watchdog/--dry-run；宿主流量透明接管；P15 支持 --subscribe/--group；P18c 支持 --config/--dns/--geodata-dir；P19 启动自检 + 失败自动回滚，--wait/--no-wait；I7 节点看护 + 持久日志）
 lab/quic_probe.py     P20：QUIC Initial 探针（Python 独立实现 RFC 9001 加密，造带 SNI 的 1200B 首包）
 lab/sub_server.py    P15：订阅服务器夹具（GET /sub 返回指定文件内容；P18e 起按请求重读）
 lab/http_connect_server.py P18e：独立实现的 HTTP CONNECT 代理（可选 Basic；ss/代理跨实现验证用）
@@ -467,11 +467,16 @@ sudo lab/lab.sh test-shadowtls-v1
 # target/release/sodama --listen-socks 127.0.0.1:11080 --dialer 'anytls://…' --dial-timeout 15
 # 浏览器：SOCKS5 127.0.0.1:11080（Firefox 勾“SOCKS v5 时代理 DNS”）；停止：pkill -f listen-socks
 # P13：真网关模式（宿主流量透明接管；浏览器零配置）——需 root：
-#   节点 URL 写入 /tmp/sodama-node.url（chmod 600），或 --node <文件|URL>：
 #   sudo lab/gateway.sh up                      # 默认接口 = 默认路由网卡（如 wlan0）
 #   lab/gateway.sh test                         # 204 / 出口 IP（代理路径）/ DNS 快检
-#   sudo lab/gateway.sh down                    # 停止并恢复（幂等）
+#   sudo lab/gateway.sh down                    # 停止并恢复（幂等；同时停掉看护）
 #   sudo lab/gateway.sh up --dry-run            # 只预览命令，零副作用
+#
+# I7 节点看护（默认开启，--no-watchdog 关）：每 15s 经代理路径探测三目标
+# （gstatic / cp.cloudflare / bing，wget 走 fallback→proxy，≥2 成即通）；连续 4 次失败
+# → SIGHUP 热刷新订阅组，仍失败 → 自动 down 回退直连（fail-open）+ 桌面通知。
+# 日志持久化：/var/log/sodama-gateway.log（SODAMA_GW_LOG 可改；重启后可回溯）。
+# 实测（故障演练：SIGSTOP loader 模拟假死）：默认参数 ~2–3 分钟自动切回直连。
 #   （P16 起 IPv6 TCP 也会被透明代理；--no-ipv6 仍可临时关闭网卡 IPv6，down 时恢复）
 # P18c：真网关 + 加密 DNS（宿主机 DNS 进控制面 → DoH/DoQ + dns.routing 广告拦截）：
 #   sudo lab/gateway.sh up --config lab/gateway.dae --geodata-dir /usr/share/v2ray \
