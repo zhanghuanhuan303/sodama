@@ -26,5 +26,13 @@ __pycache__/
 .DS_Store
 nohup.out
 
+# panel（控制台）构建产物
+/panel/target/
+/panel/frontend/dist/
+/panel/dist/
+
+# panel 含真实节点/订阅信息的原始截图（脱敏后再入库，见 panel/docs）
+/panel/docs/private/
+
 # OpenWrt 预编译产物（由 lab/build-openwrt.sh 生成，随 SDK 使用，不入库）
 /sodama/install/openwrt/prebuilt/

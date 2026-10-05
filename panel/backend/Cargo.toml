@@ -1,0 +1,17 @@
+[package]
+name = "backend"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+shared = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+axum = { version = "0.8", default-features = false, features = ["tokio", "http1", "json", "query"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "time", "fs", "net"] }
+# 可选 HTTPS（tls = 1 时启用；rustls + ring 便于 musl 交叉编译）
+hyper-util = { version = "0.1", features = ["server-auto", "service", "tokio"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+rustls-pemfile = "2"
+rcgen = { version = "0.13", default-features = false, features = ["pem", "ring"] }
