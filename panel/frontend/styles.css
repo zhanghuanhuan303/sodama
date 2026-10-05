@@ -540,6 +540,36 @@ body {
 .addr-cell { max-width: 190px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .card-value-sm { font-size: 15px; }
 
+/* ---------------------------------------------------------------- 内核参数表单
+   行 = 发丝线；控件右对齐；「已改」用强调色 + 左侧细标记（只编码数据，不做装饰）。 */
+
+.params { padding: 2px 0 0; }
+.param-group {
+  margin: 16px 0 2px;
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--fg-dim);
+}
+.param-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 16px;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--rule-2);
+}
+.param-main { flex: 1; min-width: 0; }
+.param-label { font-size: 12.5px; color: var(--fg-dim); }
+.param-def { margin-left: 8px; font-family: var(--mono); font-size: 10px; color: var(--fg-mute); }
+.param-help { margin-top: 2px; font-size: 11px; color: var(--fg-mute); }
+.param-ctl { display: flex; align-items: center; gap: 8px; flex: 0 0 auto; }
+.param-inp { width: 10rem; text-align: right; border-bottom-color: rgba(233, 233, 230, 0.22); }
+/* 表达式（节点 filter 等）要看得全：宽输入 + 左对齐 */
+.param-inp-expr { width: 24rem; text-align: left; }
+.param-unit { font-family: var(--mono); font-size: 10.5px; }
+.param-on .param-label { color: var(--fg); padding-left: 8px; box-shadow: inset 2px 0 0 var(--data); }
+
 /* ---------------------------------------------------------------- 手机适配
    原则：1) 信息不删只管搬（次要列收进「点行看详情」）；
    2) 触摸没有 hover —— 行内动作常显、点击目标加大；
@@ -589,6 +619,10 @@ body {
 
   /* 配置页行（tag + URL + 动作）允许换行 */
   .node-row, .entry-row { flex-wrap: wrap; gap: 6px 10px; }
+  /* 内核参数：窄屏改上下布局，控件占满 */
+  .param-row { flex-direction: column; gap: 6px; }
+  .param-ctl { width: 100%; flex-wrap: wrap; }
+  .param-inp { width: 100%; text-align: left; }
   .grow { min-width: 140px; }
   .ta-mini { font-size: 13px; }
   .bulk-actions { flex-direction: row; gap: 10px; }

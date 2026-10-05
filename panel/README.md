@@ -37,6 +37,7 @@
 | **批量导入** | 一个文本框每行一个（`tag url` 或只写 url，自动起名 sub2/sub3…），**N 个不限**；「解析全部」逐个预览，「全部导入并生效」只校验/落盘/热重载一次 |
 | **配置页·规则集** | 本地/远程规则集列表（条数、是否被 `routing` 引用）；添加远程 URL 或本地路径；删除 |
 | **配置页·分流条目** | 本地规则文件直接增删条目（去重、URL 自动归一化为域名、支持 `full:`/`suffix:`/`keyword:`/`regex:` 前缀）、过滤查看、单条删除 |
+| **配置页·内核参数** | 把引擎可设置的能力（`global`/`dns`/`group` 白名单，36 项）做成表单：分组（转发/探测/DNS/性能/日志）+ 每项默认值与一行说明；开关/枚举用下拉、时长/int/文本用输入框；**改了写回 config.dae → validate 护栏 → 热重载回执**，空值 = 恢复引擎默认；已改项用强调色标出 |
 | **HTTPS** | 可选（`tls = 1`）：首次启动自动生成自签证书（key 0600），HTTP/HTTPS 并存 |
 | 鉴权 | 可选 token 会话（HttpOnly Cookie）；**默认关闭**（`token` 留空 = LAN 免认证） |
 | **手机适配** | 窄屏单列：节点表收起次要列（UDP/地址/来源/延迟分布/最近，点行看详情），配置页宽表横向滑动，弹窗全屏；触摸设备行内动作常显（无 hover）、点击目标加大 |
@@ -83,6 +84,7 @@ PASS=xxx scripts/deploy.sh                   # 停服务→推送→procd 重启
 | POST | `/api/v1/files/content` | 保存（validate → 落盘 → 等热重载回执） |
 | POST | `/api/v1/actions/{reload,suspend,resume}` | 控制（需 `enable_actions = 1`） |
 | POST | `/api/v1/config/inspect` | **订阅解析预览**（只读，调引擎 `sub-parse`） |
+| GET \| POST | `/api/v1/config/params` | **内核参数**：GET 回显配置文件里显式写了的键；POST `{section,key,value}` 写回（空值 = 删键回默认），类型化校验 + 热重载回执 |
 | POST | `/api/v1/config/subs` \| `/subs/remove` \| `/subs/move` \| `/subs/bulk` | 订阅增/改/删/上移下移/**批量导入**（改 `config.dae` + validate 护栏 + 等热重载） |
 | POST | `/api/v1/config/group/policy` | **手动切节点**：`{policy:"fixed", node:"节点名"}` 锁定 / `{policy:"auto"}` 恢复自动（写 `group.<name>.policy`，reload 即时生效） |
 | POST | `/api/v1/config/rulesets` \| `/rulesets/remove` | 规则集增/改/删 |

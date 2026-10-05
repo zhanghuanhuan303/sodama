@@ -4,7 +4,9 @@
 //! 面板这边只做「改文本 → validate 护栏 → 落盘 → 等 reload 回执」。
 
 use leptos::prelude::*;
-use shared::{DomainFileView, DomainsView, InspectView, SaveResult, SourcesView};
+use shared::{
+    DomainFileView, DomainsView, InspectView, ParamKind, ParamsView, SaveResult, SourcesView,
+};
 
 use crate::{fmt_bytes, get_json, post_json};
 
@@ -66,6 +68,163 @@ fn run_action(
         }));
         refresh_cfg(token, sources, rules);
     });
+}
+
+/// 内核参数区块：把引擎可设置的能力（`global`/`dns`/`group` 白名单）做成表单。
+/// 口径同订阅/规则集：改文本 → validate 护栏 → 落盘 → 等热重载回执；空值 = 回引擎默认。
+#[component]
+fn ParamsSection(
+    token: RwSignal<Option<String>>,
+    msg: RwSignal<Option<(bool, String)>>,
+    busy: RwSignal<bool>,
+) -> impl IntoView {
+    let values = RwSignal::new(std::collections::BTreeMap::<String, String>::new());
+
+    let reload = move || {
+        let tok = token.get_untracked();
+        leptos::task::spawn_local(async move {
+            if let Ok(v) = get_json::<ParamsView>("/api/v1/config/params", tok.as_deref()).await {
+                values.set(v.values);
+            }
+        });
+    };
+    reload();
+
+    let save = move |section: &'static str, key: &'static str, value: String| {
+        let tok = token.get_untracked();
+        busy.set(true);
+        msg.set(Some((true, "正在写入配置…".into())));
+        leptos::task::spawn_local(async move {
+            let body = serde_json::json!({ "section": section, "key": key, "value": value });
+            let r =
+                post_json::<_, SaveResult>("/api/v1/config/params", &body, tok.as_deref()).await;
+            busy.set(false);
+            msg.set(Some(match r {
+                Ok(v) => {
+                    let tail = match v.reload_ok {
+                        Some(true) => " · 热重载 ✓",
+                        Some(false) => " · 热重载未确认",
+                        None => "",
+                    };
+                    (v.ok, format!("{}{tail}", v.message))
+                }
+                Err(e) => (false, e),
+            }));
+            if let Ok(v) = get_json::<ParamsView>("/api/v1/config/params", tok.as_deref()).await {
+                values.set(v.values);
+            }
+        });
+    };
+
+    view! {
+        <section class="panel">
+            <div class="panel-head">
+                <span class="panel-title">"内核参数"</span>
+                <span class="panel-meta">"写回 config.dae → 校验 → 热重载（无需重启）；未设置 = 引擎默认"</span>
+                {move || {
+                    let n = values.get().len();
+                    (n > 0).then(|| view! { <span class="chip chip-use">{format!("已改 {n} 项")}</span> })
+                }}
+            </div>
+            <div class="params">
+                {move || {
+                    let cur = values.get();
+                    let mut out: Vec<AnyView> = Vec::new();
+                    let mut last = "";
+                    for p in shared::PARAMS {
+                        if p.group != last {
+                            last = p.group;
+                            out.push(view! { <div class="param-group">{p.group}</div> }.into_any());
+                        }
+                        let now = cur.get(&format!("{}.{}", p.section, p.key)).cloned();
+                        out.push(param_row(p, now, busy, save).into_any());
+                    }
+                    out
+                }}
+            </div>
+        </section>
+    }
+}
+
+/// 单行参数：标签/说明（左）+ 控件（右）+ 恢复默认；已改的项用强调色标出。
+fn param_row(
+    p: &'static shared::ParamSpec,
+    now: Option<String>,
+    busy: RwSignal<bool>,
+    save: impl Fn(&'static str, &'static str, String) + Copy + 'static,
+) -> impl IntoView {
+    let is_set = now.is_some();
+    let val = now.unwrap_or_default();
+    let section = p.section;
+    let key = p.key;
+    let label = p.label;
+    let help = p.help;
+    let unit = p.unit;
+    let def = p.default;
+    let kind = p.kind;
+    let opts = p.options;
+    let v2 = val.clone();
+    let ctl = match kind {
+        ParamKind::Bool => view! {
+            <select class="inp sel sel-mini" prop:value=v2.clone()
+                on:change=move |ev| save(section, key, event_target_value(&ev))>
+                <option value="">"引擎默认"</option>
+                <option value="true">"开"</option>
+                <option value="false">"关"</option>
+            </select>
+        }
+        .into_any(),
+        ParamKind::Enum => view! {
+            <select class="inp sel sel-mini" prop:value=v2.clone()
+                on:change=move |ev| save(section, key, event_target_value(&ev))>
+                {opts
+                    .iter()
+                    .map(|o| {
+                        view! {
+                            <option value=*o>
+                                {if o.is_empty() { "引擎默认".to_string() } else { (*o).to_string() }}
+                            </option>
+                        }
+                    })
+                    .collect_view()}
+            </select>
+        }
+        .into_any(),
+        _ => {
+            let cls = if kind == ParamKind::Expr {
+                "inp param-inp param-inp-expr"
+            } else {
+                "inp param-inp"
+            };
+            view! {
+                <input class=cls prop:value=v2.clone()
+                    on:change=move |ev| save(section, key, event_target_value(&ev)) />
+            }
+            .into_any()
+        }
+    };
+    view! {
+        <div class=if is_set { "param-row param-on" } else { "param-row" }>
+            <div class="param-main">
+                <div class="param-label">
+                    {label}
+                    {(!def.is_empty())
+                        .then(|| view! { <span class="param-def">{format!("默认 {def}")}</span> })}</div>
+                <div class="param-help">{help}</div>
+            </div>
+            <div class="param-ctl">
+                {ctl}
+                {(!unit.is_empty()).then(|| view! { <span class="param-unit dim">{unit}</span> })}
+                {is_set
+                    .then(|| {
+                        view! {
+                            <button class="btn btn-mini" disabled=move || busy.get()
+                                on:click=move |_| save(section, key, String::new())>"恢复默认"</button>
+                        }
+                    })}
+            </div>
+        </div>
+    }
 }
 
 #[component]
@@ -438,6 +597,8 @@ pub fn ConfigPage(token: RwSignal<Option<String>>) -> impl IntoView {
                     })
                 }}
             </section>
+
+            <ParamsSection token=token msg=msg busy=busy />
 
             <section class="panel">
                 <div class="panel-head">

@@ -14,7 +14,10 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 
-use shared::{DomainFileView, DomainsView, InspectView, ProtoCount, SaveResult, SubNode};
+use shared::{
+    DomainFileView, DomainsView, InspectView, ParamKind, ParamSetReq, ParamsView, ProtoCount,
+    SaveResult, SubNode, PARAMS,
+};
 
 use crate::{
     apply_config_text, auth, block_kv, current_reload_at, err_json, redact, require_actions,
@@ -23,6 +26,7 @@ use crate::{
 
 pub fn routes() -> Router<Ctx> {
     Router::new()
+        .route("/api/v1/config/params", get(api_params).post(api_param_set))
         .route("/api/v1/config/inspect", post(api_inspect))
         .route("/api/v1/config/subs", post(api_sub_add))
         .route("/api/v1/config/subs/bulk", post(api_sub_bulk))
@@ -1112,4 +1116,230 @@ mod tests {
         assert!(norm_entry("a b").is_err());
         assert!(norm_entry("").is_err());
     }
+}
+
+// ---------------------------------------------------------------- 内核参数（可视化）
+
+/// 段内编辑范围（行号含起止）：`group` 取**第一个组的内层块**，其余取段块本身。
+fn param_scope(text: &str, section: &str) -> Option<(usize, usize)> {
+    let (s, e) = find_block(text, section)?;
+    if section != "group" || s == e {
+        return Some((s, e));
+    }
+    let name = first_group_name(text)?;
+    let all: Vec<&str> = text.lines().collect();
+    for (i, line) in all.iter().enumerate().take(e + 1).skip(s + 1) {
+        let t = line.trim();
+        if t.starts_with('#') {
+            continue;
+        }
+        if let Some(rest) = t.strip_prefix(name.as_str()) {
+            if rest.trim_start().starts_with('{') {
+                return Some((i, e));
+            }
+        }
+    }
+    None
+}
+
+/// 读段内 `key: value`（只回显显式写了的键；值去掉引号/行尾注释）。
+fn read_param(text: &str, section: &str, key: &str) -> Option<String> {
+    let (s, e) = param_scope(text, section)?;
+    let all: Vec<&str> = text.lines().collect();
+    for line in all.iter().take(e).skip(s + 1) {
+        let t = line.trim();
+        if t.starts_with('#') {
+            continue;
+        }
+        if let Some(rest) = t.strip_prefix(key) {
+            if rest.trim_start().starts_with(':') {
+                let v = rest.trim_start()[1..]
+                    .split('#')
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .trim_matches(['\'', '"'])
+                    .trim();
+                if !v.is_empty() {
+                    return Some(v.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// 写/删段内 `key: value`（`value = None` → 删行 = 回到引擎默认；键不存在则插到段首）。
+fn edit_param(text: &str, section: &str, key: &str, value: Option<&str>) -> Result<String, String> {
+    let (s, e) = param_scope(text, section).ok_or(format!("配置里找不到 {section} 段"))?;
+    let all: Vec<&str> = text.lines().collect();
+    let indent_of = |l: &str| l[..l.len() - l.trim_start().len()].to_string();
+    let mut found: Option<usize> = None;
+    for (i, line) in all.iter().enumerate().take(e).skip(s + 1) {
+        let t = line.trim();
+        if t.starts_with('#') {
+            continue;
+        }
+        if let Some(rest) = t.strip_prefix(key) {
+            if rest.trim_start().starts_with(':') {
+                found = Some(i);
+                break;
+            }
+        }
+    }
+    let tail_nl = text.ends_with('\n');
+    let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+    match (found, value) {
+        (Some(i), Some(v)) => lines[i] = format!("{}{key}: {v}", indent_of(all[i])),
+        (Some(i), None) => {
+            lines.remove(i);
+        }
+        (None, Some(v)) => {
+            let child = all[s + 1..e]
+                .iter()
+                .find(|l| !l.trim().is_empty() && !l.trim().starts_with('#'))
+                .map(|l| indent_of(l))
+                .unwrap_or_else(|| format!("{}    ", indent_of(all[s])));
+            lines.insert(s + 1, format!("{child}{key}: {v}"));
+        }
+        (None, None) => {} // 删不存在的键 = no-op
+    }
+    let mut out = lines.join("\n");
+    if tail_nl {
+        out.push('\n');
+    }
+    Ok(out)
+}
+
+/// 值的书写形式：数字/布尔/时长裸写，含特殊字符的（URL、路径）加引号。
+/// 注意：`Expr`（如节点 filter）一律**原样裸写**——里面引号是语法的一部分。
+fn param_literal(kind: ParamKind, v: &str) -> String {
+    let t = v.trim();
+    if kind == ParamKind::Expr {
+        return t.to_string();
+    }
+    let bare = t.parse::<f64>().is_ok()
+        || matches!(t, "true" | "false")
+        || (t
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '+' | ':'))
+            && !t.contains("://"));
+    if bare {
+        t.to_string()
+    } else {
+        format!("'{t}'")
+    }
+}
+
+/// 轻量类型校验（最终仍由引擎 `validate` 兜底）；返回规范化后的值。
+fn norm_param_value(spec: &shared::ParamSpec, raw: &str) -> Result<String, String> {
+    let v = raw.trim();
+    if v.is_empty() {
+        return Ok(String::new()); // 空 = 恢复默认
+    }
+    if v.contains(['\n', '\r', '{', '}']) {
+        return Err("值里不能有换行/花括号".into());
+    }
+    if spec.kind != ParamKind::Expr && v.contains(['\'', '"']) {
+        return Err("值里不能有引号".into());
+    }
+    match spec.kind {
+        ParamKind::Bool => {
+            let lv = v.to_ascii_lowercase();
+            match lv.as_str() {
+                "true" | "on" | "1" | "yes" => Ok("true".into()),
+                "false" | "off" | "0" | "no" => Ok("false".into()),
+                _ => Err(format!("{} 需要 true/false", spec.label)),
+            }
+        }
+        ParamKind::Int => v
+            .parse::<i64>()
+            .map(|n| n.to_string())
+            .map_err(|_| format!("{} 需要整数", spec.label)),
+        ParamKind::Duration => {
+            // 接受 300 / 300s / 5min / 2h（引擎同样两种都认）
+            let digits = v.trim_end_matches(|c: char| c.is_ascii_alphabetic());
+            let unit = &v[digits.len()..];
+            if digits.is_empty() || digits.parse::<u64>().is_err() {
+                return Err(format!("{} 需要秒数（如 300 或 5min）", spec.label));
+            }
+            if matches!(unit, "" | "s" | "ms" | "min" | "m" | "h") {
+                Ok(v.to_string())
+            } else {
+                Err(format!("{} 的单位只支持 s/ms/min/h", spec.label))
+            }
+        }
+        ParamKind::Enum => {
+            if spec.options.contains(&v) {
+                Ok(v.to_string())
+            } else {
+                Err(format!(
+                    "{} 只接受：{}",
+                    spec.label,
+                    spec.options[1..].join(" / ")
+                ))
+            }
+        }
+        ParamKind::Str => Ok(v.to_string()),
+        // 表达式：只拒绝换行/花括号（已在上方统一校验），原样返回
+        ParamKind::Expr => Ok(v.to_string()),
+    }
+}
+
+/// 读参数当前值（只回显配置文件里显式写了的键）。
+async fn api_params(State(ctx): State<Ctx>, headers: HeaderMap, uri: Uri) -> Response {
+    if let Err(r) = auth(&ctx, &headers, &uri) {
+        return r;
+    }
+    let engine = ctx.engine.clone();
+    let text = read_text(&engine.engine_config);
+    let mut values = std::collections::BTreeMap::new();
+    for p in PARAMS {
+        if let Some(v) = read_param(&text, p.section, p.key) {
+            values.insert(format!("{}.{}", p.section, p.key), v);
+        }
+    }
+    Json(ParamsView { values }).into_response()
+}
+
+/// 写参数：空值 = 从配置移除（回到引擎默认）。走统一「validate → 落盘 → 等热重载回执」。
+async fn api_param_set(
+    State(ctx): State<Ctx>,
+    headers: HeaderMap,
+    uri: Uri,
+    Json(req): Json<ParamSetReq>,
+) -> Response {
+    if let Err(r) = require_actions(&ctx, &headers, &uri) {
+        return r;
+    }
+    let Some(spec) = PARAMS
+        .iter()
+        .find(|p| p.section == req.section && p.key == req.key)
+    else {
+        return err_json(
+            StatusCode::BAD_REQUEST,
+            format!("未知参数 {}.{}", req.section, req.key),
+        );
+    };
+    let value = match norm_param_value(spec, &req.value) {
+        Ok(v) => v,
+        Err(e) => return err_json(StatusCode::BAD_REQUEST, e),
+    };
+    let engine = ctx.engine.clone();
+    let text = read_text(&engine.engine_config);
+    let literal = if value.is_empty() {
+        None
+    } else {
+        Some(param_literal(spec.kind, &value))
+    };
+    let new_text = match edit_param(&text, spec.section, spec.key, literal.as_deref()) {
+        Ok(t) => t,
+        Err(e) => return err_json(StatusCode::BAD_REQUEST, e),
+    };
+    let msg = if value.is_empty() {
+        format!("{} 已恢复引擎默认", spec.label)
+    } else {
+        format!("{} = {}", spec.label, value)
+    };
+    apply_config_text(&ctx, &engine, &new_text, msg).await
 }

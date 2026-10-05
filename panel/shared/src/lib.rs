@@ -423,3 +423,461 @@ pub struct SaveResult {
     /// 保存后引擎热重载是否成功（等待 inotify/reload 回执）
     pub reload_ok: Option<bool>,
 }
+
+// ---------------------------------------------------------------- 内核参数（配置页「参数」区）
+
+/// 参数控件类型（前端据此选控件）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ParamKind {
+    /// 开关（true/false）
+    Bool,
+    /// 整数（可带单位，单位见 `unit`）
+    Int,
+    /// 自由文本
+    Str,
+    /// 枚举（候选项见 `options`，首项常为「引擎默认」）
+    Enum,
+    /// 时长（秒；也接受 `300s` / `5min` 写法）
+    Duration,
+    /// 表达式（如节点 filter：`!name(keyword: 'x') && name(subtag: y)`）——
+    /// **原样写回**（内含引号是语法的一部分，不能整体加引号）
+    Expr,
+}
+
+/// 一条可视化内核参数：位置（段/键）+ 展示元信息 + 默认值。
+#[derive(Debug, Clone, Copy)]
+pub struct ParamSpec {
+    /// `global` / `dns` / `group`
+    pub section: &'static str,
+    pub key: &'static str,
+    /// UI 分组标题
+    pub group: &'static str,
+    pub label: &'static str,
+    /// 一行说明（怎么理解 / 什么时候要改）
+    pub help: &'static str,
+    pub kind: ParamKind,
+    /// 引擎默认值（空 = 未注明；UI 只显示「未设置 = 引擎默认」）
+    pub default: &'static str,
+    /// 单位（`s` / `ms` / `个` / `字节` …）
+    pub unit: &'static str,
+    /// `kind = Enum` 时的候选项（第一项为「未设置」）
+    pub options: &'static [&'static str],
+}
+
+/// 面板可视化的内核参数清单（与引擎 `config.rs` 的 KEY 白名单一致）。
+///
+/// 设计口径：
+/// - 只收录**用户真会动**的旋钮；调试类（utls/pprof 等）不进首版；
+/// - `default` 仅在与引擎代码核对过时填写，宁缺毋滥；
+/// - 段内平铺键（`global`/`dns`）；`group` 段写入第一个组。
+pub const PARAMS: &[ParamSpec] = &[
+    // ---- 转发与连接 ----
+    ParamSpec {
+        section: "global",
+        key: "max_conns",
+        group: "转发与连接",
+        label: "并发连接上限",
+        help: "0 = 不限；超限的新连接直接关闭并计数",
+        kind: ParamKind::Int,
+        default: "0",
+        unit: "条",
+        options: &[],
+    },
+    ParamSpec {
+        section: "global",
+        key: "dial_timeout",
+        group: "转发与连接",
+        label: "拨号超时",
+        help: "拨上游节点的最长等待（超时即失败切换）",
+        kind: ParamKind::Duration,
+        default: "5s",
+        unit: "",
+        options: &[],
+    },
+    ParamSpec {
+        section: "global",
+        key: "relay_idle_timeout",
+        group: "转发与连接",
+        label: "TCP 空闲回收",
+        help: "转发会话空闲超时后强制回收（含长连接；客户端会自动重连）",
+        kind: ParamKind::Duration,
+        default: "300s",
+        unit: "",
+        options: &[],
+    },
+    ParamSpec {
+        section: "global",
+        key: "udp_idle_timeout",
+        group: "转发与连接",
+        label: "UDP 会话回收",
+        help: "UDP NAT 会话空闲多久回收",
+        kind: ParamKind::Duration,
+        default: "60s",
+        unit: "",
+        options: &[],
+    },
+    ParamSpec {
+        section: "global",
+        key: "dial_mode",
+        group: "转发与连接",
+        label: "域名解析位置",
+        help: "domain+ = 尽量把域名交给节点远端解析（绕 DNS 污染）",
+        kind: ParamKind::Enum,
+        default: "",
+        unit: "",
+        options: &["", "ip", "domain", "domain+", "domain++"],
+    },
+    ParamSpec {
+        section: "global",
+        key: "sniffing_timeout",
+        group: "转发与连接",
+        label: "嗅探等待",
+        help: "首包等待 TLS SNI / HTTP Host 的时间（超时按 IP 走）",
+        kind: ParamKind::Int,
+        default: "100",
+        unit: "ms",
+        options: &[],
+    },
+    ParamSpec {
+        section: "global",
+        key: "auto_sniff_punt",
+        group: "转发与连接",
+        label: "嗅探后重判出口",
+        help: "嗅探到域名后按规则重选出口（direct/block/组）",
+        kind: ParamKind::Bool,
+        default: "",
+        unit: "",
+        options: &[],
+    },
+    // ---- 探测与选路 ----
+    ParamSpec {
+        section: "group",
+        key: "policy",
+        group: "探测与选路",
+        label: "选路策略",
+        help: "新连接优先走哪个节点；可被面板「锁定节点」覆盖",
+        kind: ParamKind::Enum,
+        default: "min_moving_avg",
+        unit: "",
+        options: &["", "min", "min_moving_avg", "min_avg10", "random", "fixed"],
+    },
+    ParamSpec {
+        section: "group",
+        key: "check_interval",
+        group: "探测与选路",
+        label: "健康探测间隔",
+        help: "有人看面板/有流量时按此间隔探测；空闲会指数退避",
+        kind: ParamKind::Int,
+        default: "30",
+        unit: "s",
+        options: &[],
+    },
+    ParamSpec {
+        section: "group",
+        key: "check_tolerance",
+        group: "探测与选路",
+        label: "失败容忍",
+        help: "连续失败几次才把节点标死（切换需谨慎，太小会抖）",
+        kind: ParamKind::Int,
+        default: "1",
+        unit: "次",
+        options: &[],
+    },
+    ParamSpec {
+        section: "group",
+        key: "tcp_check_url",
+        group: "探测与选路",
+        label: "TCP 探测地址",
+        help: "健康检查用的 URL（建议默认，别指向自己的规则集域名）",
+        kind: ParamKind::Str,
+        default: "http://cp.cloudflare.com",
+        unit: "",
+        options: &[],
+    },
+    ParamSpec {
+        section: "group",
+        key: "udp_check_dns",
+        group: "探测与选路",
+        label: "UDP 探测 DNS",
+        help: "UDP 连通性探测用的 DNS（域名:端口；留空则不做 UDP 检查）",
+        kind: ParamKind::Str,
+        default: "",
+        unit: "",
+        options: &[],
+    },
+    ParamSpec {
+        section: "group",
+        key: "filter",
+        group: "探测与选路",
+        label: "节点筛选",
+        help: "keyword:/regex:/subtag: 等；只留想用的节点参与选路（表达式原样写回）",
+        kind: ParamKind::Expr,
+        default: "",
+        unit: "",
+        options: &[],
+    },
+    // ---- 订阅与规则集 ----
+    ParamSpec {
+        section: "global",
+        key: "subscription_failover",
+        group: "订阅与规则集",
+        label: "订阅顺序回退",
+        help: "开 = 按声明顺序优先，首源全死才切下一源（pacman 镜像风格）",
+        kind: ParamKind::Bool,
+        default: "true",
+        unit: "",
+        options: &[],
+    },
+    ParamSpec {
+        section: "global",
+        key: "sub_cache_ttl",
+        group: "订阅与规则集",
+        label: "订阅缓存 TTL",
+        help: "reload 时多久内不重复拉订阅（省流量、加快重载）",
+        kind: ParamKind::Duration,
+        default: "60s",
+        unit: "",
+        options: &[],
+    },
+    ParamSpec {
+        section: "global",
+        key: "rule_set_update_interval",
+        group: "订阅与规则集",
+        label: "规则集刷新间隔",
+        help: "远程规则集多久自动拉一次（0 = 每次 reload 都拉）",
+        kind: ParamKind::Duration,
+        default: "",
+        unit: "",
+        options: &[],
+    },
+    ParamSpec {
+        section: "global",
+        key: "rule_set_cache_dir",
+        group: "订阅与规则集",
+        label: "规则集缓存目录",
+        help: "远程规则集落盘位置（重启后可直接用缓存）",
+        kind: ParamKind::Str,
+        default: "",
+        unit: "",
+        options: &[],
+    },
+    // ---- 性能与内核 ----
+    ParamSpec {
+        section: "global",
+        key: "probe_idle_cap",
+        group: "性能与内核",
+        label: "空闲探测上限",
+        help: "无人看面板且无流量时，探测间隔指数退避到此上限（0 = 不退避）",
+        kind: ParamKind::Duration,
+        default: "600s",
+        unit: "",
+        options: &[],
+    },
+    ParamSpec {
+        section: "global",
+        key: "disable_thp",
+        group: "性能与内核",
+        label: "禁用透明大页",
+        help: "THP 会让 RSS 虚高、回收变慢；路由器上建议关闭",
+        kind: ParamKind::Bool,
+        default: "",
+        unit: "",
+        options: &[],
+    },
+    ParamSpec {
+        section: "global",
+        key: "tproxy_port",
+        group: "性能与内核",
+        label: "tproxy 端口",
+        help: "透明代理监听端口（改错会导致断网，改后确认）",
+        kind: ParamKind::Int,
+        default: "",
+        unit: "",
+        options: &[],
+    },
+    ParamSpec {
+        section: "global",
+        key: "enable_local_tcp_fast_redirect",
+        group: "性能与内核",
+        label: "本机 TCP 快速重定向",
+        help: "宿主自身流量的快速路径（真网关模式建议开）",
+        kind: ParamKind::Bool,
+        default: "",
+        unit: "",
+        options: &[],
+    },
+    ParamSpec {
+        section: "global",
+        key: "auto_config_kernel_parameter",
+        group: "性能与内核",
+        label: "自动配置内核参数",
+        help: "启动时按需写 sysctl（转发/缓冲/拥塞）",
+        kind: ParamKind::Bool,
+        default: "",
+        unit: "",
+        options: &[],
+    },
+    ParamSpec {
+        section: "global",
+        key: "auto_config_firewall_rule",
+        group: "性能与内核",
+        label: "自动配置防火墙",
+        help: "启动时插入所需 nftables/iptables 规则",
+        kind: ParamKind::Bool,
+        default: "",
+        unit: "",
+        options: &[],
+    },
+    ParamSpec {
+        section: "global",
+        key: "bpf_conn_state_map_size",
+        group: "性能与内核",
+        label: "连接状态表容量",
+        help: "eBPF conn_state map 上限（万级并发才需要调）",
+        kind: ParamKind::Int,
+        default: "",
+        unit: "条",
+        options: &[],
+    },
+    ParamSpec {
+        section: "global",
+        key: "bandwidth_max_tx",
+        group: "性能与内核",
+        label: "上行带宽上限",
+        help: "如 100 mbps；用于 brutal/QUIC 类协议的带宽声明",
+        kind: ParamKind::Str,
+        default: "",
+        unit: "",
+        options: &[],
+    },
+    ParamSpec {
+        section: "global",
+        key: "bandwidth_max_rx",
+        group: "性能与内核",
+        label: "下行带宽上限",
+        help: "如 500 mbps；同上",
+        kind: ParamKind::Str,
+        default: "",
+        unit: "",
+        options: &[],
+    },
+    // ---- DNS ----
+    ParamSpec {
+        section: "dns",
+        key: "ipversion_prefer",
+        group: "DNS",
+        label: "首选 IP 版本",
+        help: "双栈域名优先解析 v4 还是 v6",
+        kind: ParamKind::Enum,
+        default: "",
+        unit: "",
+        options: &["", "4", "6"],
+    },
+    ParamSpec {
+        section: "dns",
+        key: "bind",
+        group: "DNS",
+        label: "DNS 监听",
+        help: "接管 DNS 的监听地址（默认 0.0.0.0:53）",
+        kind: ParamKind::Str,
+        default: "",
+        unit: "",
+        options: &[],
+    },
+    ParamSpec {
+        section: "dns",
+        key: "max_cache_size",
+        group: "DNS",
+        label: "缓存条数上限",
+        help: "DNS 缓存最多存多少条",
+        kind: ParamKind::Int,
+        default: "",
+        unit: "条",
+        options: &[],
+    },
+    ParamSpec {
+        section: "dns",
+        key: "fixed_domain_ttl",
+        group: "DNS",
+        label: "固定 TTL",
+        help: "非零时所有域名缓存统一用该 TTL（秒）",
+        kind: ParamKind::Int,
+        default: "",
+        unit: "s",
+        options: &[],
+    },
+    ParamSpec {
+        section: "dns",
+        key: "optimistic_cache",
+        group: "DNS",
+        label: "乐观缓存",
+        help: "缓存过期先回旧值再后台刷新（更快，可能短暂陈旧）",
+        kind: ParamKind::Bool,
+        default: "",
+        unit: "",
+        options: &[],
+    },
+    ParamSpec {
+        section: "dns",
+        key: "optimistic_cache_ttl",
+        group: "DNS",
+        label: "乐观缓存窗口",
+        help: "过期后仍可回旧值的时间窗",
+        kind: ParamKind::Duration,
+        default: "",
+        unit: "",
+        options: &[],
+    },
+    ParamSpec {
+        section: "dns",
+        key: "optimistic_stale_reply_ttl",
+        group: "DNS",
+        label: "陈旧应答 TTL",
+        help: "乐观缓存回包时告诉客户端的 TTL（秒）",
+        kind: ParamKind::Int,
+        default: "",
+        unit: "s",
+        options: &[],
+    },
+    // ---- 日志与调试 ----
+    ParamSpec {
+        section: "global",
+        key: "log_level",
+        group: "日志与调试",
+        label: "日志级别",
+        help: "debug 会明显增加日志量与 CPU（排障后调回 info）",
+        kind: ParamKind::Enum,
+        default: "",
+        unit: "",
+        options: &["", "error", "warn", "info", "debug"],
+    },
+    ParamSpec {
+        section: "global",
+        key: "log_file",
+        group: "日志与调试",
+        label: "日志文件",
+        help: "留空 = 交给 procd/日志系统；SIGHUP 会 reopen（配合 logrotate）",
+        kind: ParamKind::Str,
+        default: "",
+        unit: "",
+        options: &[],
+    },
+];
+
+/// 参数当前值（只回传**配置文件里显式写了**的键；未设置 = 引擎默认）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ParamsView {
+    /// `"<section>.<key>"` → 原文值
+    pub values: std::collections::BTreeMap<String, String>,
+}
+
+/// 写参数请求：`value` 为空 = 从配置里移除该键（回到引擎默认）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ParamSetReq {
+    pub section: String,
+    pub key: String,
+    pub value: String,
+}
