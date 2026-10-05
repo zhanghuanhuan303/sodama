@@ -16,6 +16,7 @@
 #   sudo lab/perf/mem-system.sh down
 # 环境：
 #   POINTS="100 500 1000 2000 5000 10000 20000" HOLD_SECS=6 RESULTS=/tmp/mem-system.tsv
+#   SETUP_MAX=1500（建连等待上限，×0.2s；万级连接建连需数十秒）
 #   IMPL=sodama|dae|singbox MODE=impl|control
 set -euo pipefail
 ulimit -n 1048576 2>/dev/null || true
@@ -34,6 +35,9 @@ VLESS_UUID=b831381d-6324-4d53-ad4f-8cda48b30811
 POINTS="${POINTS:-100 500 1000 2000 5000 10000 20000}"
 HOLD_SECS="${HOLD_SECS:-6}"
 RESULTS="${RESULTS:-/tmp/mem-system.tsv}"
+# 建连等待上限（×0.2s）；万级连接建连需数十秒（实测 35k ≈ 79s、444 conn/s），
+# 默认 60s 会把「建立成功但慢」误判为失败。
+SETUP_MAX="${SETUP_MAX:-300}"
 IMPL="${IMPL:-sodama}"
 DIR=/tmp/mem-system-lab
 PID_FILE=$DIR/impl.pid
@@ -257,9 +261,11 @@ run_sweep() {
       echo "N=$n max_fds=$max" >>"$DIR/peak-fds.tsv"
     ) &
     local ppid=$!
-    if ! wait_setup "$log" 300; then
-      echo "!! N=$n 建立失败：$(tail -1 "$log")"
+    if ! wait_setup "$log" "$SETUP_MAX"; then
+      echo "!! N=$n 建立失败（$((SETUP_MAX / 5))s 内未完成）：$(tail -1 "$log")"
+      # 夹具是 `in_client` 函数背景运行，$hpid 只是壳；按进程名在 ns 内杀干净
       kill "$hpid" 2>/dev/null || true
+      in_client pkill -x conn_scale 2>/dev/null || true
       wait "$ppid" 2>/dev/null || true
       continue
     fi
@@ -267,6 +273,7 @@ run_sweep() {
     echo "== N=$n（活跃）=="
     snapshot "${lbl}N=$n/active"
     wait "$hpid" 2>/dev/null || true
+    in_client pkill -x conn_scale 2>/dev/null || true
     wait "$ppid" 2>/dev/null || true
     sleep 2
     echo "== N=$n（释放后 2s）=="
