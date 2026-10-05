@@ -13,7 +13,8 @@ P25（naive / HTTP-2 CONNECT）、P26（HTTP/3：DoH h3 / naive+quic）、P27（
 P28（ECS 回填 / ecs_cache）、P29（optimistic 后台刷新）、P30（SSR origin+plain）、
 P31（shadow-tls v1/v2/v3，ss 插件）、P32（ECH 边界：已评估不实现）、
 P33（运行时参数热更新 + `--watch-config` 配置热驱动）、
-P34（多订阅按声明顺序回退 + 默认配置目录 `~/.config/sodama`）与
+P34（多订阅按声明顺序回退 + 默认配置目录 `~/.config/sodama`）、
+P35（inotify 毫秒级热驱动 + 配置即唯一事实来源 + 无 home 兜底）与
 P6（suspend/reload/metrics/sysdump/日志轮转/整配置热重载）已完成**；P9+ 已删除 C 数据面，
 `ebpf-rs` 的 Rust 对象是**唯一数据面**（ADR-0025）。
 
@@ -231,9 +232,11 @@ P6（suspend/reload/metrics/sysdump/日志轮转/整配置热重载）已完成*
   metrics/sysdump/trace`；`--log-file` + SIGHUP reopen（轮转友好）；`--config` 整配置热重载
   （失败不切槽 = 回滚，DNS 上游热切换；**P33**：reload/SIGHUP 同时热更新运行参数
   ——relay/udp idle、dial_timeout、max_conns、dial_mode、sniffing_timeout、sniff-punt，
-  优先级 CLI 显式值 > config global > 现值）；**`--watch-config <秒>` 配置热驱动**（轮询
-  `--config`/`--rules` 及其 include 文件，变更即自动 reload = 自动 SIGHUP；坏配置保留
-  旧槽/旧参数）；`metrics` 输出 Prometheus 文本（daed GraphQL 不做，
+  优先级 CLI 显式值 > config global > 现值）；**配置热驱动（P33/P35）**：`--watch-config <秒>`
+  或 config `global { watch_config: 10 }`——inotify 目录事件驱动（毫秒级 + 100ms 去抖，事件名
+  过滤 + 快照复核；<秒> = 无 inotify 时的兜底扫描），变更自动 `reload-fast`（订阅节点走
+  `sub_cache_ttl` 缓存，默认 60s；手动 reload/SIGHUP 仍强制重拉）；坏配置保留旧槽/旧参数；
+  状态面 `config_watch {transport, debounce_ms, ...}`；`metrics` 输出 Prometheus 文本（daed GraphQL 不做，
   见 ADR-0021）
 - **P7 收敛**：C 基准端点（`lab/bench_io.c` + `lab/bench.sh`）六路径剖面（口径如实：perf 不可用，
   墙钟 + 状态面 counters + `/proc` CPU/RSS）；**offload 生命周期修复**（半关闭超时 10s 兜底、
@@ -544,15 +547,20 @@ target/release/sodama reload|suspend|resume [--socket <path>]
 target/release/sodama metrics [--socket <path>]
 target/release/sodama sysdump [--socket <path>] [--out <file>]
 target/release/sodama trace [--seconds N]
-# P33：配置热驱动（--watch-config <秒>；编辑 --config/--rules 及其 include → 自动 reload，见 ADR-0060）
-target/release/sodama reload --socket /tmp/sodama-status.sock   # 手动线：等价 SIGHUP（同步等结果，热更新运行参数）
+# P33/P35：配置热驱动（inotify 事件驱动，毫秒级 + 100ms 去抖；<秒> = 兜底扫描；见 ADR-0060/0062）
+#   config `global { watch_config: 10 }`（或 --watch-config 10）；变更自动 fast reload
+#   （订阅节点缓存 sub_cache_ttl，默认 60s）——改配置保存即生效
+target/release/sodama reload --socket /tmp/sodama-status.sock   # 手动线：等价 SIGHUP（同步等结果，强制重拉订阅）
 sudo env USE_CONFIG=/tmp/sodama-watch.dae USE_WATCH_CONFIG=2 USE_DIALER=direct lab/lab.sh up  # lab 自动线
-# 真网关：sudo env GATEWAY_WATCH_CONFIG=10 lab/gateway.sh up …（默认 0=关）
-# P34：多订阅顺序回退（pacman 风格）与默认配置目录（ADR-0061）
+# P34/P35：多订阅顺序回退（pacman 风格）与默认配置发现（ADR-0061）
 #   config `subscription { 主: 'url1'; 备: 'url2' }`：声明顺序 = 优先级，首个有活节点的源生效；
-#   `global { subscription_failover: false }` 关回退（池化）。默认配置：
-#   ~/.config/sodama/config.dae（未给 --config/--rules 且存在时自动使用；配 --watch-config 保存即切换）
-sudo lab/lab.sh sub-order-up && sudo lab/lab.sh test-sub-order   # 首源标死 → 4s 内切次源（状态面/日志/端到端）
+#   `global { subscription_failover: false }` 关回退（池化）
+#   默认配置候选：$XDG_CONFIG_HOME/sodama/config.dae → ~/.config/sodama/config.dae
+#   → /etc/sodama/config.dae（无 home 的软路由/OpenWrt 可用系统目录）
+# P35：行为参数全部写进 config（唯一事实来源）：dial_mode/dial_timeout/sniffing_timeout/
+#   watch_config/sub_cache_ttl/geodata_dir/log_file/status_socket/…；命令行仅进程级参数与调试覆盖
+sudo lab/lab.sh sub-order-up && sudo lab/lab.sh test-sub-order   # 顺序回退 + 重排 2s 内生效（inotify+缓存）端到端
+# 真网关零行为参数启动（只读 config）：sudo lab/gateway.sh up
 # P7 工具链：
 lab/bench.sh build                 # 编译 C 基准端点（gcc）
 lab/bench.sh all                   # 六路径性能表（root；自动起/停会话：direct relay offload ss udp-direct udp-nat）

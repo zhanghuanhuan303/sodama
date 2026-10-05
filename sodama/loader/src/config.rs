@@ -1146,6 +1146,12 @@ const GLOBAL_KEYS: &[&str] = &[
     "max_conns",
     // P34：订阅顺序回退（pacman 风格；默认开）= 按声明顺序优先，全部活节点死才切下一源
     "subscription_failover",
+    // P35：配置即唯一事实来源——行为参数可直接写在 global（CLI 显式值仅作调试覆盖）
+    "watch_config",
+    "sub_cache_ttl",
+    "log_file",
+    "status_socket",
+    "geodata_dir",
 ];
 
 const DNS_KEYS: &[&str] = &[

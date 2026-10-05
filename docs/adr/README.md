@@ -86,6 +86,7 @@
 | [0059](./ADR-0059-i6-zero-thread-handshake.md) | I6：会话建立零线程（in-worker prelude 取代短命线程；首读即完成 + 部分写排队 + 残留数据交 level-trigger）+ 启动/重载即 `malloc_trim`（空闲 26.7→11.1–11.7 MB）+ 入口线程 1 MiB 栈与 spawn 失败降级（不再 panic 打死分发）；实测 churn 线程峰值 46→35、VLESS 吞吐/延迟不回退、fd 维持 4.0/连接 | 已采纳 | —（第三方评审 A5 落地；I6 执行） |
 | [0060](./ADR-0060-p33-runtime-params-config-watch.md) | P33：运行时参数热更新（reload/SIGHUP 同口径，CLI > config global > 现值：relay/udp idle、dial_timeout、max_conns、dial_mode、sniffing_timeout、sniff-punt）+ `--watch-config <秒>` 配置热驱动（轮询 --config/--rules 及 include，变更即自动 reload，坏配置保留旧槽/旧参数）；gateway.sh `GATEWAY_WATCH_CONFIG`、lab `USE_WATCH_CONFIG`、状态面 `config_watch` | 已采纳 | —（用户决策：内核命令行操控 + 配置文件热驱动） |
 | [0061](./ADR-0061-p34-subscription-order-and-default-config.md) | P34：多订阅按声明顺序回退（pacman 镜像风格；来源顺序 = node → CLI --subscribe → config subscription，alive 中 rank 最小者为活动层，全标死才切下一源；`subscription_failover` 默认开，关=旧池化；状态面 `active_tag`）+ 默认配置目录 `~/.config/sodama/config.dae`（XDG；相对订阅路径按配置目录解析；单行 http(s) URL 文件自动按 URL 抓取）+ gateway.sh 默认用该配置 | 已采纳 | —（用户决策：配置文件切换订阅/默认放 ~/.config/sodama） |
+| [0062](./ADR-0062-p35-inotify-fast-reload-config-source-of-truth.md) | P35：inotify 目录事件 + 100ms 去抖 + 事件名过滤 + 快照复核（`--watch-config`/`watch_config` 退化为兜底扫描）+ `reload-fast` 订阅节点缓存（`sub_cache_ttl` 默认 60s；手动 reload 仍强制重拉）+ config 即唯一事实来源（新增 `watch_config/sub_cache_ttl/log_file/status_socket/geodata_dir`，gateway.sh 零行为参数）+ 无 home 兜底（XDG → ~/.config → `/etc/sodama/config.dae`，/etc 需可读） | 已采纳 | —（用户决策：内核级快速生效/配置唯一来源/无 home） |
 
 ## 新增一条 ADR
 

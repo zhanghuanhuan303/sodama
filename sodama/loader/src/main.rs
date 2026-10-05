@@ -85,6 +85,7 @@ mod tuic;
 mod vision;
 mod vless;
 mod vmess;
+mod watch;
 mod ws;
 
 /// dae 给控制面自己的 socket 打的内部 mark（对照 so_mark_from_dae / dae_socket_mark）。
@@ -186,8 +187,17 @@ static SPLICE_FALLBACK_LOGGED: AtomicBool = AtomicBool::new(false);
 static RELAY_DIAL_TIMEOUT_MS: AtomicU64 = AtomicU64::new(5000);
 /// P4b：UDP NAT 会话空闲阈值（秒）。
 static UDP_IDLE_SECS: AtomicU64 = AtomicU64::new(60);
-/// P33：配置文件热驱动轮询间隔（秒，0=关）。
+/// P33/P35：配置热驱动——`--watch-config`/`watch_config` 的值：inotify 不可用时的
+/// 兜底扫描秒数（0=关）；inotify 事件驱动本身是毫秒级（见 `watch` 模块）。
 static CONFIG_WATCH_INTERVAL: AtomicU64 = AtomicU64::new(0);
+/// P35：热驱动传输方式（true=inotify 已启用，false=纯兜底轮询）。
+static CONFIG_WATCH_INOTIFY: AtomicBool = AtomicBool::new(false);
+/// P35：订阅节点缓存 TTL（秒；watch 触发的 fast reload 复用，0=关）。
+static SUB_CACHE_TTL_SECS: AtomicU64 = AtomicU64::new(60);
+/// P35：订阅节点缓存（url → (抓取时刻, 节点)）——「改订阅顺序」这类 reload 不再重走网络。
+static SUB_NODE_CACHE: OnceLock<
+    Mutex<std::collections::HashMap<String, (Instant, std::sync::Arc<Vec<subscribe::ParsedNode>>)>>,
+> = OnceLock::new();
 
 // ---- P14：嗅探 / dial_mode（远端域名解析）----
 /// 0=ip（默认，不嗅探）| 1=domain | 2=domain+（当前同 domain）。
@@ -1073,10 +1083,12 @@ fn usage() -> ! {
            --daens <name>        dae netns 名字（默认 daens）\n\
            --tproxy-port <port>  tproxy 监听端口（默认 12345）\n\
            --rules <path>        路由规则文件（sodama 语法，缺省时由 --proxy 生成）
-           --config <path>       完整 dae .dae 配置（含 include；优先于 --rules；
-                                 未给 --config/--rules 时默认 $XDG_CONFIG_HOME/sodama/config.dae）\n\
+           --config <path>       完整 dae .dae 配置（含 include；优先于 --rules；未给时依次找
+                                 $XDG_CONFIG_HOME/sodama/config.dae → ~/.config/sodama/config.dae
+                                 → /etc/sodama/config.dae）\n\
            --strict-config       配置中有规则无法编译时直接报错（默认列 deferred 后继续）\n\
-           --status-socket <path> 状态面：Unix socket 上的 JSON（status/rules/config/maps + 控制命令）\n\
+           --status-socket <path> 状态面：Unix socket 上的 JSON（status/rules/config/maps + 控制命令；
+                                 也可 config global.status_socket）\n\
            --log-file <path>     P6：日志写文件（默认 stdout；SIGHUP 时 reopen，轮转友好）\n\
            --dialer <url>        P4：代理出口拨号器（direct 或 socks5://host:port）\n\
            --relay-idle-timeout <s> P4：relay 空闲回收秒数（默认 300）
@@ -1087,7 +1099,8 @@ fn usage() -> ! {
            --subscribe <url>        P15：订阅（可重复；config subscription 段同源），与 --group 搭配；
                                      P34：多源默认按顺序回退（pacman 风格，subscription_failover）
            --group <name>           P15：选用 config 中的组（默认 proxy / 唯一组）
-           --geodata-dir <dir>      P17a：geoip.dat/geosite.dat 搜索目录（可重复；优先于 DAE_LOCATION_ASSET）
+           --geodata-dir <dir>      P17a：geoip.dat/geosite.dat 搜索目录（可重复；也可 config
+                                 global.geodata_dir（逗号分隔）；优先于 DAE_LOCATION_ASSET）
            --listen-socks <addr>    P12：本地 SOCKS5 入口（浏览器测试用；不加载 eBPF、不需 root）\n\
            --udp-idle-timeout <s>   P4：UDP NAT 会话空闲秒数（默认 60）\n\
            --forward <url>       旧写法：等价于 --dialer socks5://host:port\n\
@@ -1097,8 +1110,11 @@ fn usage() -> ! {
            --ktls                M2：尝试 kTLS（内核 TLS，实验；需 TLS1.3）\n\
            --max-conns <N>       P18e：relay 并发上限（0=不限；超限直接关闭并计数）\n\
            --dns-upstream <url>  P3a：DNS 上游（host:port 或 udp://host:port）\n\
-           --watch-config <秒>    P33：轮询 --config/--rules 及其 include 文件，变更即自动 reload（0=关；
-                                 等价于自动 SIGHUP，便于无人值守/只读场景）
+           --watch-config <秒>    P33/P35：配置热驱动（0=关）。inotify 目录事件驱动为主（毫秒级 +
+                                 100ms 去抖），<秒> 为无 inotify 时的兜底扫描间隔；变更自动 reload，
+                                 且订阅节点走缓存（sub_cache_ttl，默认 60s）秒级生效
+           --log-file <path>     P6/P35：日志写文件（默认 stdout；SIGHUP 时 reopen，轮转友好；
+                                 可用 config global.log_file 代替）
            --dump                打印编译出的 match_set / LPM 内容\n\
            --compile-dump <path> 只编译规则并按对拍格式打印（不加载 eBPF，不需要 root）\n\
            --proxy <ipv4>        无 --rules 时加入「走代理」的目的 IP，可重复\n\
@@ -1242,17 +1258,42 @@ fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
     Ok(args)
 }
 
-/// P34：默认配置文件路径——`$XDG_CONFIG_HOME/sodama/config.dae`
-/// （缺省 `~/.config/sodama/config.dae`），仅在文件存在时返回。
+/// P34/P35：默认配置候选（顺序即优先级）——`$XDG_CONFIG_HOME/sodama/config.dae` →
+/// `~/.config/sodama/config.dae` → `/etc/sodama/config.dae`（无 home 的软路由/OpenWrt 兜底）。
+fn default_config_candidates(xdg: Option<&str>, home: Option<&str>) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    if let Some(x) = xdg.filter(|s| !s.is_empty()) {
+        out.push(std::path::Path::new(x).join("sodama").join("config.dae"));
+    }
+    if let Some(h) = home.filter(|s| !s.is_empty()) {
+        out.push(
+            std::path::Path::new(h)
+                .join(".config")
+                .join("sodama")
+                .join("config.dae"),
+        );
+    }
+    out.push(std::path::PathBuf::from("/etc/sodama/config.dae"));
+    out
+}
+
+/// 按候选顺序返回第一个存在（且可读）的配置文件；无 home / 无 XDG 时落到 /etc/sodama。
+/// `/etc` 候选额外要求可读：非 root 用户读到 640 root:root 的系统配置时当作不存在，
+/// 避免普通用户被系统文件权限挡死（root/软路由/OpenWrt 场景不受影响）。
 fn default_config_path() -> Option<std::path::PathBuf> {
-    let base = std::env::var_os("XDG_CONFIG_HOME")
-        .filter(|v| !v.is_empty())
-        .map(std::path::PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config"))
-        })?;
-    let p = base.join("sodama").join("config.dae");
-    p.is_file().then_some(p)
+    let xdg = std::env::var("XDG_CONFIG_HOME").ok();
+    let home = std::env::var("HOME").ok();
+    default_config_candidates(xdg.as_deref(), home.as_deref())
+        .into_iter()
+        .find(|p| {
+            if !p.is_file() {
+                return false;
+            }
+            if p.starts_with("/etc") && std::fs::File::open(p).is_err() {
+                return false;
+            }
+            true
+        })
 }
 
 fn if_nametoindex(name: &str) -> Result<u32, Box<dyn std::error::Error>> {
@@ -3161,7 +3202,7 @@ fn set_suspend(ebpf: &mut Ebpf, on: bool) -> Result<(), Box<dyn std::error::Erro
 /// P6：一次完整热重载（对照 dae `dae reload`）：清除 suspend → 重编译/切槽 →
 /// 重建域位图 → 记录结果；失败时保留旧规则（回滚等价于不切槽，reload_rules 内部先写非活跃槽）。
 /// `startup=true` = 启动期初始下发（P19：跳过订阅重拉，见下）。
-fn do_reload(args: &Args, ebpf: &mut Ebpf, startup: bool) -> ReloadOutcome {
+fn do_reload(args: &Args, ebpf: &mut Ebpf, startup: bool, fast: bool) -> ReloadOutcome {
     // P23：reload 重置粘滞 IP 状态（对照 dae ResetGlobalProxyStateForReload：
     // 新一代替换代际前不继承上一代可能已污染的代理 IP/失败状态）。
     if !startup {
@@ -3236,7 +3277,7 @@ fn do_reload(args: &Args, ebpf: &mut Ebpf, startup: bool) -> ReloadOutcome {
             // 监听线程尚未启动，重拉时解析节点域名会被自己的数据面拦截并自我阻塞
             // （getaddrinfo 超时卡死启动，钩子空挂 → 断网；重启后 DNS 缓存为空必现）。
             if !startup {
-                reload_group_members(args);
+                reload_group_members(args, fast);
             }
             log(&format!("热重载完成（{n} 条 match_set）"));
             // P33：运行时参数热更新（CLI > config > 现值；仅变更时记日志）。
@@ -3344,7 +3385,7 @@ fn build_groups(args: &Args) -> Option<outbound::Outbound> {
         return None;
     }
 
-    let nodes = fetch_nodes(cfg.as_ref(), args);
+    let nodes = fetch_nodes(cfg.as_ref(), args, false);
     if nodes.is_empty() {
         log("未获得任何可用节点，组不启用");
         return None;
@@ -3513,8 +3554,72 @@ fn resolve_sub_url(cfg_dir: Option<&Path>, url: &str) -> String {
     expanded
 }
 
+/// P35：订阅节点缓存查询（fast reload 专用）——命中则回一份副本并覆写 tag/rank。
+fn cache_get_sub(url: &str, tag: &str, rank: u32) -> Option<Vec<subscribe::ParsedNode>> {
+    let ttl = SUB_CACHE_TTL_SECS.load(Ordering::Relaxed);
+    if ttl == 0 {
+        return None;
+    }
+    let cache = SUB_NODE_CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+    let hit = match cache.lock() {
+        Ok(m) => m.get(url).cloned(),
+        Err(p) => p.into_inner().get(url).cloned(),
+    }?;
+    let (at, nodes) = hit;
+    let age = at.elapsed();
+    if age > Duration::from_secs(ttl) {
+        return None;
+    }
+    let mut ns = (*nodes).clone();
+    for n in &mut ns {
+        n.tag = tag.to_string();
+        n.rank = rank;
+    }
+    log(&format!(
+        "订阅 {tag}: 命中缓存（{:.1}s 前抓取，{} 个节点，顺序 #{rank}）",
+        age.as_secs_f32(),
+        ns.len()
+    ));
+    Some(ns)
+}
+
+fn cache_put_sub(url: &str, nodes: &[subscribe::ParsedNode]) {
+    let cache = SUB_NODE_CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+    let mut m = match cache.lock() {
+        Ok(m) => m,
+        Err(p) => p.into_inner(),
+    };
+    // 上限 32 条（tag/url 组合很少超过这个量级），按抓取时刻淘汰最旧
+    if m.len() >= 32 && !m.contains_key(url) {
+        if let Some(k) = m
+            .iter()
+            .min_by_key(|(_, (at, _))| *at)
+            .map(|(k, _)| k.clone())
+        {
+            m.remove(&k);
+        }
+    }
+    m.insert(
+        url.to_string(),
+        (Instant::now(), std::sync::Arc::new(nodes.to_vec())),
+    );
+}
+
 /// P34：拉取单个订阅并解析（失败记日志返回空；rank = 来源顺序）。
-fn fetch_one_sub(tag: &str, url: &str, rank: u32, timeout: Duration) -> Vec<subscribe::ParsedNode> {
+/// P35：`fast`（watch 触发的自动 reload）命中缓存时不重走网络——改订阅顺序/开关源秒级生效；
+/// 手动 reload/SIGHUP 传 `fast=false` 强制重拉（P18e 语义）。
+fn fetch_one_sub(
+    tag: &str,
+    url: &str,
+    rank: u32,
+    timeout: Duration,
+    fast: bool,
+) -> Vec<subscribe::ParsedNode> {
+    if fast {
+        if let Some(ns) = cache_get_sub(url, tag, rank) {
+            return ns;
+        }
+    }
     match subscribe::fetch(url, timeout).and_then(|b| subscribe::decode_body(&b)) {
         Ok(text) => {
             let (mut ns, errs) = subscribe::parse_subscription(&text, tag);
@@ -3531,6 +3636,7 @@ fn fetch_one_sub(tag: &str, url: &str, rank: u32, timeout: Duration) -> Vec<subs
                 "订阅 {tag}: 拉取成功，{} 个节点（来源顺序 #{rank}）",
                 ns.len()
             ));
+            cache_put_sub(url, &ns);
             ns
         }
         Err(e) => {
@@ -3544,7 +3650,12 @@ fn fetch_one_sub(tag: &str, url: &str, rank: u32, timeout: Duration) -> Vec<subs
 /// 组构建与 SIGHUP 订阅热更新共用。
 /// P34：来源顺序 = 内联 node(0) → CLI --subscribe(1..) → config subscription(声明顺序)；
 /// 顺序回退（pacman 风格，`subscription_failover` 默认开）：前面来源有活节点就用它。
-fn fetch_nodes(cfg: Option<&config::Config>, args: &Args) -> Vec<subscribe::ParsedNode> {
+/// P35：`fast` 见 `fetch_one_sub`（watch 自动 reload 走缓存）。
+fn fetch_nodes(
+    cfg: Option<&config::Config>,
+    args: &Args,
+    fast: bool,
+) -> Vec<subscribe::ParsedNode> {
     let node_specs = cfg.map(config::inline_nodes).unwrap_or_default();
     let sub_specs = cfg.map(config::subscriptions).unwrap_or_default();
     let mut nodes: Vec<subscribe::ParsedNode> = Vec::new();
@@ -3569,13 +3680,13 @@ fn fetch_nodes(cfg: Option<&config::Config>, args: &Args) -> Vec<subscribe::Pars
     for (i, raw) in args.subscribe.iter().enumerate() {
         let tag = format!("cli{}", i + 1);
         let url = resolve_sub_url(None, raw);
-        let mut ns = fetch_one_sub(&tag, &url, rank, timeout);
+        let mut ns = fetch_one_sub(&tag, &url, rank, timeout, fast);
         nodes.append(&mut ns);
         rank += 1;
     }
     for s in &sub_specs {
         let url = resolve_sub_url(cfg_dir, &s.url);
-        let mut ns = fetch_one_sub(&s.tag, &url, rank, timeout);
+        let mut ns = fetch_one_sub(&s.tag, &url, rank, timeout, fast);
         nodes.append(&mut ns);
         rank += 1;
     }
@@ -3584,7 +3695,7 @@ fn fetch_nodes(cfg: Option<&config::Config>, args: &Args) -> Vec<subscribe::Pars
 
 /// P18e/P19：SIGHUP 订阅热更新——重拉订阅，按组 filter 替换成员（同名继承健康）。
 /// 组名集合变化（config 编辑）时整体重建（不做健康继承，日志明示）。
-fn reload_group_members(args: &Args) {
+fn reload_group_members(args: &Args, fast: bool) {
     let Some(lock) = GROUP_SET.get() else {
         return;
     };
@@ -3595,7 +3706,7 @@ fn reload_group_members(args: &Args) {
             })
             .ok()
     });
-    let nodes = fetch_nodes(cfg.as_ref(), args);
+    let nodes = fetch_nodes(cfg.as_ref(), args, fast);
     if nodes.is_empty() {
         log("订阅热更新：未获得任何节点，保留旧成员");
         return;
@@ -3757,15 +3868,30 @@ fn apply_runtime_params(args: &Args, cfg: Option<&config::Config>) {
     if old != punt {
         log(&format!("热更新: sniff-punt {old} -> {punt}"));
     }
+    // P35：热驱动兜底扫描间隔 / 订阅缓存 TTL（watch 线程常驻，读静态值）。
+    if let Some(s) = args
+        .watch_config
+        .or_else(|| g("watch_config").and_then(|v| parse_duration_secs(&v)))
+    {
+        let old = CONFIG_WATCH_INTERVAL.swap(s, Ordering::SeqCst);
+        if old != s {
+            log(&format!("热更新: watch_config {old}s -> {s}s（兜底扫描）"));
+        }
+    }
+    if let Some(s) = g("sub_cache_ttl").and_then(|v| parse_duration_secs(&v)) {
+        let old = SUB_CACHE_TTL_SECS.swap(s, Ordering::SeqCst);
+        if old != s {
+            log(&format!("热更新: sub_cache_ttl {old}s -> {s}s"));
+        }
+    }
 }
 
 /// P33：配置观察线程——轮询 --config/--rules 及其 include 文件（mtime+size），
 /// 变化则经状态面通道向主循环发 reload（同步等结果并记日志）。
-fn config_watch_loop(
-    extra: Vec<std::path::PathBuf>,
-    secs: u64,
-    tx: std::sync::mpsc::Sender<status::MainMsg>,
-) {
+/// P35：配置观察线程——inotify 目录级事件（毫秒级，事件名过滤 + 去抖）为主，
+/// 慢速兜底扫描（`CONFIG_WATCH_INTERVAL`，网络 FS 无 inotify 时）为辅；
+/// 快照 (mtime,size) 复核后发 **fast reload**（订阅节点走缓存，改顺序/开关源秒级生效）。
+fn config_watch_loop(extra: Vec<std::path::PathBuf>, tx: std::sync::mpsc::Sender<status::MainMsg>) {
     type Snap = Vec<(std::path::PathBuf, Option<std::time::SystemTime>, u64)>;
     let snap = |paths: &[std::path::PathBuf]| -> Snap {
         paths
@@ -3780,9 +3906,29 @@ fn config_watch_loop(
             })
             .collect()
     };
+    let sweep_secs = || CONFIG_WATCH_INTERVAL.load(Ordering::Relaxed).max(1);
+    let mut watcher = match watch::DirWatcher::new() {
+        Ok(w) => {
+            CONFIG_WATCH_INOTIFY.store(true, Ordering::Relaxed);
+            log(&format!(
+                "config-watch: inotify 已启用（目录级事件 + {}ms 去抖；兜底扫描 {}s）",
+                watch::DEBOUNCE.as_millis(),
+                sweep_secs()
+            ));
+            Some(w)
+        }
+        Err(e) => {
+            log(&format!(
+                "config-watch: inotify 不可用（{e}），降级为 {}s 轮询",
+                sweep_secs()
+            ));
+            None
+        }
+    };
     let mut prev: Snap = Vec::new();
+    let mut prev_paths: Vec<std::path::PathBuf> = Vec::new();
+    let mut warned = false;
     loop {
-        std::thread::sleep(std::time::Duration::from_secs(secs.max(1)));
         let mut paths = extra.clone();
         if let Some((c, _)) = CONFIG_STATE.lock().ok().and_then(|g| g.clone()) {
             paths.extend(c.files.iter().cloned());
@@ -3790,53 +3936,97 @@ fn config_watch_loop(
         paths.sort();
         paths.dedup();
         if paths.is_empty() {
+            std::thread::sleep(std::time::Duration::from_secs(sweep_secs()));
             continue;
         }
-        let cur = snap(&paths);
-        if !prev.is_empty() && cur != prev {
-            log(&format!(
-                "config-watch: 检测到 {} 个配置文件变更 → 自动 reload",
-                paths.len()
-            ));
-            let (rtx, rrx) = std::sync::mpsc::channel();
-            if tx
-                .send(status::MainMsg::Query {
-                    cmd: "reload".into(),
-                    reply: rtx,
-                })
-                .is_err()
-            {
-                log("config-watch: 主循环已退出，观察线程结束");
-                return;
-            }
-            match rrx.recv_timeout(std::time::Duration::from_secs(60)) {
-                Ok(resp) => {
-                    let brief = serde_json::from_str::<serde_json::Value>(&resp)
-                        .ok()
-                        .map(|v| {
-                            format!(
-                                "ok={} match_sets={} error={}",
-                                v.get("ok")
-                                    .map(|x| x.to_string())
-                                    .unwrap_or_else(|| "-".into()),
-                                v.get("match_sets")
-                                    .map(|x| x.to_string())
-                                    .unwrap_or_else(|| "-".into()),
-                                v.get("error")
-                                    .map(|x| x.to_string())
-                                    .unwrap_or_else(|| "null".into()),
-                            )
-                        })
-                        .unwrap_or_else(|| resp.chars().take(120).collect());
-                    log(&format!("config-watch: 自动 reload 完成（{brief}）"));
+        let paths_changed = paths != prev_paths;
+        // 每轮重建监听集合（include 集合随配置变化）：目录 → 关心的文件名
+        if let Some(w) = watcher.as_mut() {
+            let mut targets: std::collections::HashMap<
+                std::path::PathBuf,
+                std::collections::HashSet<Vec<u8>>,
+            > = std::collections::HashMap::new();
+            for p in &paths {
+                if let (Some(d), Some(n)) = (p.parent(), p.file_name()) {
+                    targets
+                        .entry(d.to_path_buf())
+                        .or_default()
+                        .insert(n.as_encoded_bytes().to_vec());
                 }
-                Err(_) => log("config-watch: 自动 reload 超时（60s）"),
             }
-            std::thread::sleep(std::time::Duration::from_secs(1));
-            prev = snap(&paths);
-        } else {
-            prev = cur;
+            w.set_targets(&targets);
+            if w.watched_dirs() == 0 && !warned {
+                log("config-watch: inotify 无可用 watch（max_user_watches 上限？），仅靠兜底扫描");
+                warned = true;
+            }
         }
+        // 等事件（inotify）或兜底间隔；事件先经去抖静默窗口合并。
+        let mut via_event = false;
+        match watcher.as_mut() {
+            Some(w) => {
+                if w.wait(Some(std::time::Duration::from_secs(sweep_secs()))) {
+                    w.settle();
+                    via_event = true;
+                }
+            }
+            None => std::thread::sleep(std::time::Duration::from_secs(sweep_secs())),
+        }
+        let cur = snap(&paths);
+        // 路径集合变化（新 include / reload 改写）或首轮：只重建基线；
+        // 其余情况与上次快照比对——inotify 只是加速器，正确性由快照保证。
+        let changed = !paths_changed && !prev.is_empty() && cur != prev;
+        prev = cur;
+        prev_paths = paths.clone();
+        if !changed {
+            continue;
+        }
+        log(&format!(
+            "config-watch: 检测到配置变更（{}）→ 自动 reload",
+            if via_event { "inotify" } else { "兜底扫描" }
+        ));
+        let (rtx, rrx) = std::sync::mpsc::channel();
+        if tx
+            .send(status::MainMsg::Query {
+                cmd: "reload-fast".into(),
+                reply: rtx,
+            })
+            .is_err()
+        {
+            log("config-watch: 主循环已退出，观察线程结束");
+            return;
+        }
+        match rrx.recv_timeout(std::time::Duration::from_secs(60)) {
+            Ok(resp) => {
+                let brief = serde_json::from_str::<serde_json::Value>(&resp)
+                    .ok()
+                    .map(|v| {
+                        format!(
+                            "ok={} match_sets={} error={}",
+                            v.get("ok")
+                                .map(|x| x.to_string())
+                                .unwrap_or_else(|| "-".into()),
+                            v.get("match_sets")
+                                .map(|x| x.to_string())
+                                .unwrap_or_else(|| "-".into()),
+                            v.get("error")
+                                .map(|x| x.to_string())
+                                .unwrap_or_else(|| "null".into()),
+                        )
+                    })
+                    .unwrap_or_else(|| resp.chars().take(120).collect());
+                log(&format!("config-watch: 自动 reload 完成（{brief}）"));
+            }
+            Err(_) => log("config-watch: 自动 reload 超时（60s）"),
+        }
+        // reload 可能更新 include 集合：重取快照基线（避免 reload 自身触发循环）
+        let mut paths2 = extra.clone();
+        if let Some((c, _)) = CONFIG_STATE.lock().ok().and_then(|g| g.clone()) {
+            paths2.extend(c.files.iter().cloned());
+        }
+        paths2.sort();
+        paths2.dedup();
+        prev = snap(&paths2);
+        prev_paths = paths2;
     }
 }
 
@@ -3863,7 +4053,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     // I2：尽早提升 fd 上限（router/高并发场景；子命令路径不需要）
     raise_nofile_limit();
-    let args = parse_args()?;
+    let mut args = parse_args()?;
+    // P35：配置是行为参数的唯一事实来源——先把 config global 回填到未显式给出的 CLI 项，
+    // 再打开日志/建状态面（log_file/status_socket/watch_config/geodata_dir 均可写进 config）。
+    let cfg_boot = args
+        .config
+        .as_ref()
+        .and_then(|p| config::load(std::path::Path::new(p)).ok());
+    let cfg_boot_val = |k: &str| cfg_boot.as_ref().and_then(|c| config::global_value(c, k));
+    if args.log_file.is_none() {
+        args.log_file = cfg_boot_val("log_file");
+    }
+    if args.status_socket.is_none() {
+        args.status_socket = cfg_boot_val("status_socket");
+    }
+    if args.watch_config.is_none() {
+        args.watch_config = cfg_boot_val("watch_config").and_then(|v| parse_duration_secs(&v));
+    }
+    if args.geodata_dir.is_empty() {
+        if let Some(v) = cfg_boot_val("geodata_dir") {
+            args.geodata_dir = v
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+        }
+    }
     if let Some(path) = &args.log_file {
         if open_log_file(path) {
             let _ = LOG_PATH.set(path.clone());
@@ -3889,11 +4104,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     // P33：运行参数可由 config global 提供（CLI 显式值优先）；
     // reload/SIGHUP 时以同口径热更新（见 apply_runtime_params）。
-    let cfg_boot = args
-        .config
-        .as_ref()
-        .and_then(|p| config::load(std::path::Path::new(p)).ok());
-    let cfg_boot_val = |k: &str| cfg_boot.as_ref().and_then(|c| config::global_value(c, k));
     if let Some(s) = args
         .relay_idle_timeout
         .or_else(|| cfg_boot_val("relay_idle_timeout").and_then(|v| parse_duration_secs(&v)))
@@ -3941,7 +4151,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         };
         DIAL_MODE.store(m, Ordering::SeqCst);
-        if let Some(ms) = args.sniffing_timeout_ms {
+        if let Some(ms) = args
+            .sniffing_timeout_ms
+            .or_else(|| cfg_boot_val("sniffing_timeout").and_then(|v| parse_ms(&v)))
+        {
             SNIFF_TIMEOUT_MS.store(ms, Ordering::SeqCst);
         }
         // P21：sniff-punt 开关（CLI --sniff-punt > config global.auto_sniff_punt > 关）。
@@ -4266,7 +4479,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         dae0peer_mac
     ));
 
-    let initial = do_reload(&args, &mut ebpf, true);
+    let initial = do_reload(&args, &mut ebpf, true, false);
     if !initial.ok {
         return Err(format!("初始规则下发失败: {}", initial.error.unwrap_or_default()).into());
     }
@@ -4299,9 +4512,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             extra.push(std::path::PathBuf::from(p));
         }
         let wtx = status_tx.clone();
-        std::thread::spawn(move || config_watch_loop(extra, secs, wtx));
+        std::thread::spawn(move || config_watch_loop(extra, wtx));
         log(&format!(
-            "config-watch: 已启用（每 {secs}s 检查 --config/--rules 及其 include，变更即自动 reload）"
+            "config-watch: 已启用（inotify 事件驱动 + {}s 兜底；变更即 fast reload）",
+            secs
         ));
     }
     let _keep_tx = status_tx;
@@ -4411,7 +4625,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         if RELOAD.swap(false, Ordering::SeqCst) {
             reopen_log();
-            do_reload(&args, &mut ebpf, false);
+            do_reload(&args, &mut ebpf, false, false);
         }
         ticks += 1;
         if ticks % janitor_ticks == 0 {
@@ -6391,6 +6605,9 @@ fn status_json(ebpf: &mut Ebpf) -> serde_json::Value {
         "config_watch": {
             "enabled": CONFIG_WATCH_INTERVAL.load(Ordering::Relaxed) > 0,
             "interval_secs": CONFIG_WATCH_INTERVAL.load(Ordering::Relaxed),
+            "transport": if CONFIG_WATCH_INOTIFY.load(Ordering::Relaxed) { "inotify" } else { "poll" },
+            "debounce_ms": crate::watch::DEBOUNCE.as_millis() as u64,
+            "sub_cache_ttl_secs": SUB_CACHE_TTL_SECS.load(Ordering::Relaxed),
         },
         "dialer": match OUTBOUND.get() {
             Some(o) => o.name(),
@@ -6803,8 +7020,10 @@ fn metrics_text(v: &serde_json::Value) -> String {
 fn handle_status_query(cmd: &str, ebpf: &mut Ebpf, args: &Args) -> String {
     match cmd {
         "status" => status_json(ebpf).to_string(),
-        "reload" => {
-            let out = do_reload(args, ebpf, false);
+        "reload" | "reload-fast" => {
+            // P35：reload-fast（watch 触发的自动 reload）订阅节点走缓存；
+            // 手动 reload/SIGHUP 始终强制重拉（P18e 语义）。
+            let out = do_reload(args, ebpf, false, cmd == "reload-fast");
             json!({
                 "ok": out.ok,
                 "match_sets": out.match_sets,
@@ -6900,6 +7119,22 @@ fn handle_status_query(cmd: &str, ebpf: &mut Ebpf, args: &Args) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_config_candidates_order_and_no_home_fallback() {
+        let c = default_config_candidates(Some("/xdg"), Some("/home/u"));
+        assert_eq!(c[0], std::path::PathBuf::from("/xdg/sodama/config.dae"));
+        assert_eq!(
+            c[1],
+            std::path::PathBuf::from("/home/u/.config/sodama/config.dae")
+        );
+        assert_eq!(c[2], std::path::PathBuf::from("/etc/sodama/config.dae"));
+        // 无 home/XDG（软路由/OpenWrt）：仍能落到 /etc/sodama
+        let c = default_config_candidates(None, None);
+        assert_eq!(c, vec![std::path::PathBuf::from("/etc/sodama/config.dae")]);
+        let c = default_config_candidates(Some(""), Some(""));
+        assert_eq!(c, vec![std::path::PathBuf::from("/etc/sodama/config.dae")]);
+    }
 
     /// O7：会话表分片——同 key 始终同片，不同 key 能铺开（避免单锁竞争）。
     #[test]

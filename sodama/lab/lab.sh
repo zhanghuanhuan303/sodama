@@ -2408,6 +2408,8 @@ global {
     tcp_check_url: 'http://10.9.9.2:9999'
     check_interval: '1s'
     check_tolerance: '1'
+    # P35：inotify 事件驱动（兜底扫描 30s——重排断言必须在 2s 内生效，证明走的是事件）
+    watch_config: 30
 }
 subscription {
     sub1: 'http://127.0.0.1:$SUB_PORT/sub'
@@ -2448,6 +2450,38 @@ assert g.get("active_tag") == "sub1", ("初始活动层应为 sub1", g.get("acti
 print("active_tag=%s members=%d alive=%d" % (g["active_tag"], g["members"], g["alive"]))
 ' || { echo "FAIL: 初始活动订阅应为 sub1"; exit 1; }
   echo "PASS: 初始活动订阅 = sub1（声明顺序第一）"
+
+  echo "-- 配置重排：sub2 提到前面（inotify 热驱动 + 订阅缓存，无 kill）--"
+  sed -i "s|sub1: 'http://127.0.0.1:$SUB_PORT/sub'|TMP_LINE|; \
+          s|sub2: 'sodama-sub2.url'|sub1: 'http://127.0.0.1:$SUB_PORT/sub'|; \
+          s|TMP_LINE|sub2: 'sodama-sub2.url'|" "$SUB_ORDER_CONFIG"
+  sleep 2
+  json="$("$LOADER" status --socket "$STATUS_SOCK" --json 2>/dev/null || true)"
+  echo "$json" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+g = d.get("group") or {}
+assert g.get("active_tag") == "sub2", ("重排后活动层应为 sub2", g.get("active_tag"))
+print("active_tag=%s（重排后）" % g["active_tag"])
+' || { echo "FAIL: 配置重排未在 2s 内生效"; grep -a config-watch "$LOG" | tail -3; exit 1; }
+  grep -q "检测到配置变更（inotify）" "$LOG" || { echo "FAIL: 未走 inotify 事件"; grep -a config-watch "$LOG" | tail -3; exit 1; }
+  grep -q "命中缓存" "$LOG" || { echo "FAIL: fast reload 未走订阅缓存"; grep -a '订阅 sub' "$LOG" | tail -3; exit 1; }
+  echo "PASS: 配置重排 2s 内生效（inotify + 订阅节点缓存 fast reload）"
+
+  echo "-- 重排回 sub1 在前（双向验证）--"
+  sed -i "s|sub1: 'http://127.0.0.1:$SUB_PORT/sub'|TMP_LINE|; \
+          s|sub2: 'sodama-sub2.url'|sub1: 'http://127.0.0.1:$SUB_PORT/sub'|; \
+          s|TMP_LINE|sub2: 'sodama-sub2.url'|" "$SUB_ORDER_CONFIG"
+  sleep 2
+  json="$("$LOADER" status --socket "$STATUS_SOCK" --json 2>/dev/null || true)"
+  echo "$json" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+g = d.get("group") or {}
+assert g.get("active_tag") == "sub1", ("重排回后活动层应为 sub1", g.get("active_tag"))
+print("active_tag=%s（换回后）" % g["active_tag"])
+' || { echo "FAIL: 重排回未生效"; exit 1; }
+  echo "PASS: 重排回 sub1 也 2s 内生效"
 
   echo "-- kill 第一源节点（ss A），等健康检查标死（interval=1s tolerance=1）--"
   kill "$(cat "$SS_PID_FILE")" 2>/dev/null || true

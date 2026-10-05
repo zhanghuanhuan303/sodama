@@ -13,6 +13,7 @@ use base64::Engine as _;
 use crate::outbound;
 
 /// 一条订阅/内联节点解析结果。
+#[derive(Clone)]
 pub struct ParsedNode {
     pub name: String,
     pub tag: String,

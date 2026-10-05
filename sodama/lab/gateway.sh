@@ -52,6 +52,7 @@ DEFAULT_NODE_FILE=/tmp/sodama-node.url
 IFACE=""
 RULES="$HERE/rules.gateway.dae"
 RULES_GIVEN=0
+DIAL_MODE_GIVEN=0
 CONFIG=""
 DNS=""
 GEODATA_DIR=""
@@ -111,9 +112,12 @@ usage() {
 配置文件热驱动（P33）：GATEWAY_WATCH_CONFIG=<秒>（默认 0=关）。>0 时 loader
 轮询 --config/--rules 及其 include 文件，变更即自动 reload（等价自动 SIGHUP）。
 
-配置文件（P34）：未显式给 --rules/--config 时，默认用 ~/.config/sodama/config.dae
-（存在时；配置里的 subscription 段按声明顺序回退，首源有活节点就不看后面的源，
-pacman 镜像风格；改顺序/注释即切换，配合 GATEWAY_WATCH_CONFIG 免重启生效）。
+配置文件（P34）：未显式给 --rules/--config 时，默认按序查找：
+  GATEWAY_USER_CONFIG > $XDG_CONFIG_HOME/sodama/config.dae > ~/.config/sodama/config.dae
+  > /etc/sodama/config.dae（无 home 的软路由可用系统目录）
+配置里的 subscription 段按声明顺序回退（pacman 镜像风格）；行为参数（拨号/嗅探/
+健康/热驱动）建议全部写进 config（P35：config 为唯一事实来源），命令行仅保留进程级
+参数（接口/netns/socket/日志）与调试覆盖（--dial-mode 等）。
 EOF
 }
 
@@ -197,15 +201,24 @@ up() {
   [ "$DRY_RUN" -eq 1 ] || require_root up
   [ -x "$LOADER" ] || die "缺 loader：$LOADER（先 lab/lab.sh build）"
   [ -f "$OBJ" ] || die "缺 eBPF 对象：$OBJ（先 lab/build-ebpf-rs.sh）"
-  # P34：默认配置目录——未显式给 --config/--rules 时，存在 ~/.config/sodama/config.dae 就用它
-  # （订阅列表/切换顺序写在里面；GATEWAY_USER_CONFIG 可改路径；sudo 下取 SUDO_USER 家目录）
-  local user_home="${HOME:-/root}"
+  # P34/P35：默认配置发现（未显式给 --config/--rules）——无 home 的软路由也能用：
+  #   GATEWAY_USER_CONFIG > $XDG_CONFIG_HOME/sodama/config.dae > ~/.config/sodama/config.dae
+  #   > /etc/sodama/config.dae
+  local user_home="${HOME:-}"
   if [ -n "${SUDO_USER:-}" ]; then
-    user_home="$(getent passwd "$SUDO_USER" | cut -d: -f6)"
-    [ -n "$user_home" ] || user_home="${HOME:-/root}"
+    local h
+    h="$(getent passwd "$SUDO_USER" | cut -d: -f6)"
+    [ -n "$h" ] && user_home="$h"
   fi
-  local user_config="${GATEWAY_USER_CONFIG:-$user_home/.config/sodama/config.dae}"
-  if [ -z "$CONFIG" ] && [ "$RULES_GIVEN" -eq 0 ] && [ -f "$user_config" ]; then
+  local user_config=""
+  local c
+  for c in ${GATEWAY_USER_CONFIG:+"$GATEWAY_USER_CONFIG"} \
+    ${XDG_CONFIG_HOME:+"$XDG_CONFIG_HOME/sodama/config.dae"} \
+    ${user_home:+"$user_home/.config/sodama/config.dae"} \
+    /etc/sodama/config.dae; do
+    if [ -f "$c" ]; then user_config="$c"; break; fi
+  done
+  if [ -z "$CONFIG" ] && [ "$RULES_GIVEN" -eq 0 ] && [ -n "$user_config" ]; then
     CONFIG="$user_config"
   fi
   # 只用 config 时无需仓库 rules 文件
@@ -349,10 +362,18 @@ up() {
   elif [ -n "$node_url" ]; then
     dial_args=(--dialer "$node_url")
   fi
+  # P35：配置是行为参数的唯一事实来源——用 config 时不再从命令行注入 dial/嗅探参数
+  # （仅当用户显式给 --dial-mode 时作为调试覆盖）。rules 模式下保持旧默认。
+  local behavior_args=()
+  if [ -z "$CONFIG" ] || [ "$DIAL_MODE_GIVEN" -eq 1 ]; then
+    behavior_args+=(--dial-mode "$DIAL_MODE")
+  fi
+  if [ -z "$CONFIG" ]; then
+    behavior_args+=(--dial-timeout 15 --sniffing-timeout-ms "$SNIFF_TIMEOUT_MS")
+  fi
   if [ "$DRY_RUN" -eq 1 ]; then
     echo -n "  + nohup $LOADER --ebpf $OBJ --lan none --wan $IFACE --dae0 $DAE0 --dae0peer $DAE0PEER --daens $DAE_NS"
-    printf ' %q' "${rules_args[@]}" "${dial_args[@]}" "${geo_args[@]}" "${dns_args[@]}" "${watch_args[@]}" --dial-timeout 15 \
-      --dial-mode "$DIAL_MODE" --sniffing-timeout-ms "$SNIFF_TIMEOUT_MS" --status-socket "$STATUS_SOCK" --log-file "$LOG"
+    printf ' %q' "${rules_args[@]}" "${dial_args[@]}" "${geo_args[@]}" "${dns_args[@]}" "${watch_args[@]}" "${behavior_args[@]}" --status-socket "$STATUS_SOCK" --log-file "$LOG"
     echo " >>$LOG 2>&1 &"
     echo "（dry-run：未执行任何变更）"
     return 0
@@ -360,8 +381,7 @@ up() {
   prepare_log
   nohup "$LOADER" --ebpf "$OBJ" --lan none --wan "$IFACE" \
     --dae0 "$DAE0" --dae0peer "$DAE0PEER" --daens "$DAE_NS" \
-    "${rules_args[@]}" "${dial_args[@]}" "${geo_args[@]}" "${dns_args[@]}" "${watch_args[@]}" --dial-timeout 15 \
-    --dial-mode "$DIAL_MODE" --sniffing-timeout-ms "$SNIFF_TIMEOUT_MS" \
+    "${rules_args[@]}" "${dial_args[@]}" "${geo_args[@]}" "${dns_args[@]}" "${watch_args[@]}" "${behavior_args[@]}" \
     --status-socket "$STATUS_SOCK" --log-file "$LOG" >>"$LOG" 2>&1 &
   echo $! >"$PID_FILE"
   sleep 1.2
@@ -685,7 +705,7 @@ while [ $# -gt 0 ]; do
   --config) CONFIG="$2"; shift 2 ;;
   --dns) DNS="$2"; shift 2 ;;
   --geodata-dir) GEODATA_DIR="$2"; shift 2 ;;
-  --dial-mode) DIAL_MODE="$2"; shift 2 ;;
+  --dial-mode) DIAL_MODE="$2"; DIAL_MODE_GIVEN=1; shift 2 ;;
   --wait) WAIT_SECS="$2"; shift 2 ;;
   --no-wait) WAIT_SECS=0; shift ;;
   --no-ipv6) NO_IPV6=1; shift ;;

@@ -232,19 +232,20 @@ sodama validate <config.dae>            # 无需 root / socket
 重载走 `systemctl reload`（SIGHUP），状态看 `journalctl`；需要子命令就在 drop-in 里加
 `--status-socket`（建议 `/run/sodama/status.sock` + `RuntimeDirectory=sodama`）。
 
-配置热驱动（P33，可选，适合无人值守）：drop-in 的启动参数加 `--watch-config 10`（秒），
-loader 会轮询 `--config`/`--rules` 及其 include 文件，变更即自动 reload（等价 `systemctl reload`）；
-坏配置不会切槽（保留旧规则/旧参数）。reload 同时热更新运行参数（relay/udp idle、dial_timeout、
-`max_conns`、dial_mode、sniffing_timeout、sniff-punt），优先级：CLI 显式值 > config `global` > 现值。
-真机 `gateway.sh` 方式用环境变量开启：`sudo env GATEWAY_WATCH_CONFIG=10 lab/gateway.sh up …`（默认 0=关）。
+配置热驱动（P35）：inotify 事件驱动为默认（毫秒级 + 100ms 去抖；事件名过滤 + 快照复核），
+`global { watch_config: 10 }` 或 `--watch-config 10` 启用（值 = 无 inotify 时的兜底扫描秒数）；
+自动 reload 走订阅节点缓存（`sub_cache_ttl`，默认 60s；手动 `reload`/`systemctl reload` 仍强制重拉）。
+行为参数可全部写进 `global`（`dial_mode/dial_timeout/sniffing_timeout/watch_config/sub_cache_ttl/
+geodata_dir/log_file/status_socket` 等）——**配置文件即唯一事实来源**，CLI 仅作调试覆盖。
 
-多订阅与默认配置目录（P34）：config `subscription` 段按**声明顺序回退**（pacman 镜像风格）——
+多订阅与默认配置目录（P34/P35）：config `subscription` 段按**声明顺序回退**（pacman 镜像风格）——
 首个有 alive 节点的源生效，全部标死才切下一源；`global { subscription_failover: false }`
 关闭回退（旧池化语义），状态面 `group.active_tag` 可查当前活动源。loader 未给
-`--config/--rules` 且 `$XDG_CONFIG_HOME/sodama/config.dae`（缺省 `~/.config/sodama/config.dae`）
-存在时自动使用它；config 内相对订阅路径按配置目录解析，单行 http(s) URL 文件（如 `subN.url`）
-自动按 URL 抓取。systemd 场景 `HOME` 常为 `/`，建议 drop-in 显式 `--config /etc/sodama/config.dae`，
-不依赖默认路径。
+`--config/--rules` 时按以下顺序自动选择：`$XDG_CONFIG_HOME/sodama/config.dae` →
+`~/.config/sodama/config.dae` → `/etc/sodama/config.dae`（无 home / 无 XDG 的软路由/OpenWrt
+落到系统目录；`/etc` 候选需可读，非 root 读到 640 root:root 时视为不存在）；config 内相对
+订阅路径按配置目录解析，单行 http(s) URL 文件（如 `subN.url`）自动按 URL 抓取。systemd 场景
+建议 drop-in 显式 `--config /etc/sodama/config.dae`（更直观，且 `HOME` 常为 `/`）。
 
 ## 9. 升级 / 回滚
 

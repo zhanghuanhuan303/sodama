@@ -18,6 +18,15 @@
 
 global {
     dial_mode: 'domain'
+    # P35：配置即唯一事实来源——拨号/嗅探/健康/热驱动均可写在这里（gateway.sh 不再注入）。
+    dial_timeout: 15
+    sniffing_timeout: '100ms'
+    # 配置热驱动：inotify 事件驱动（毫秒级）+ <秒> 兜底扫描；改文件即生效（fast reload，
+    # 订阅节点走缓存，改顺序/开关源秒级生效）。也可用 GATEWAY_WATCH_CONFIG 环境变量覆盖。
+    watch_config: 10
+    # geodata_dir: '/usr/share/v2ray'   # 未用 --geodata-dir 时，写在这里
+    # log_file: '/var/log/sodama-gateway.log'
+    # status_socket: '/tmp/sodama-gw.sock'
 }
 
 dns {

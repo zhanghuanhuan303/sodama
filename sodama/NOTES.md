@@ -1592,3 +1592,24 @@ lab 夹具 `http_connect_server.py` + `sub_server.py` 每次重读。）
   （sub1/sub2 双源；`sub2` 用相对路径 URL 文件）：初始 active_tag=sub1，kill 第一源 4s 内
   active_tag=sub2 + 日志可见 + 切换后端到端 204；真网关以 `~/.config/sodama/config.dae`
   （`main: 'sub2.url'`）启动：66/66 alive、active_tag=main、watch=10s、`gateway.sh test` PASS。
+
+### 11.50 P35（inotify 毫秒级热驱动 + 配置即唯一事实来源 + 无 home 兜底，ADR-0062）已验收的行为
+
+- **inotify 事件层**（新模块 `loader/src/watch.rs`）：监听配置/include 的**父目录**，事件名过滤
+  （只关心目标文件名）+ 100ms 去抖 + `(mtime,size)` 快照复核（inotify 只是加速器）；
+  `IN_Q_OVERFLOW`/目录被删改名 = 可疑事件；`--watch-config`/`watch_config` 退化为**慢速兜底
+  扫描**间隔（网络 FS 无 inotify 时）；初始化失败自动降级纯轮询并在日志/状态面如实标注。
+- **fast reload**：watch 线程发状态面命令 `reload-fast`；`SUB_NODE_CACHE`（url → 抓取时刻+节点）
+  在 `sub_cache_ttl`（默认 60s）内直接复用（改订阅顺序/开关源毫秒级）；手动 `reload`/SIGHUP
+  仍强制重拉（P18e 语义不变）。
+- **配置即唯一事实来源**：`global` 新增 `watch_config/sub_cache_ttl/log_file/status_socket/geodata_dir`；
+  启动时回填到未显式给出的 CLI 项（CLI 降级为调试覆盖）；`gateway.sh` 不再注入
+  dial/嗅探/geodata/watch 参数，真网关可 `sudo lab/gateway.sh up` 零行为参数启动。
+- **无 home 兜底**：默认配置候选 `$XDG_CONFIG_HOME` → `~/.config/sodama/config.dae` →
+  `/etc/sodama/config.dae`（需可读；非 root 读到 640 root:root 视为不存在）；gateway.sh 同序查找。
+- 实测：`cargo test` **261/261**（watch 目录事件/过滤/rename、默认配置候选/无 home）；
+  lab `test-sub-order`：`watch_config: 30` 写进 config，重排主/备源顺序 **2s 内双向生效**
+  （日志 `检测到配置变更（inotify）` + `命中缓存`），kill 首源仍 4s 内故障切换；真网关
+  `sudo lab/gateway.sh up` 零参数启动（66/66、active_tag=main、test PASS）；配置追加/还原注释
+  各 **0.5s 内**完成 fast reload + 缓存命中；`env -u HOME -u XDG_CONFIG_HOME` root 运行选中
+  `/etc/sodama/config.dae`，普通用户不误选不可读的 /etc。
