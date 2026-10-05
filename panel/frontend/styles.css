@@ -145,7 +145,7 @@ body {
 
 .panel-meta { font-family: var(--mono); font-size: 10.5px; color: var(--fg-mute); }
 
-.cols { display: grid; grid-template-columns: repeat(auto-fit, minmax(420px, 1fr)); gap: 0 34px; }
+.cols { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(420px, 100%), 1fr)); gap: 0 34px; }
 .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 18px 26px; }
 .grid-4 { grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); }
 
@@ -244,6 +244,7 @@ body {
   font-family: var(--mono);
   font-size: 10.5px;
   letter-spacing: 0.06em;
+  white-space: nowrap;   /* 按钮文案不折行（手机窄列会把行高撑爆） */
   color: var(--fg-dim);
   background: none;
   border: 1px solid transparent;
@@ -361,7 +362,7 @@ body {
 
 .charts {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(min(300px, 100%), 1fr));
   gap: 30px;
   margin: 0 0 8px;
 }
@@ -376,6 +377,8 @@ body {
 }
 .chart-hint { font-family: var(--mono); font-size: 10px; color: var(--fg-mute); }
 .chart-svg { width: 100%; height: 58px; display: block; margin: 6px 0 3px; }
+/* 紧凑型（运行时卡片里的第二条曲线） */
+.chart-svg-sm { height: 40px; margin-top: 4px; }
 .chart-foot { display: flex; justify-content: space-between; font-size: 11px; color: var(--fg-dim); }
 .charts-foot { display: flex; align-items: center; gap: 16px; margin: 0 0 24px; flex-wrap: wrap; }
 .chart-embed { padding: 4px 0 0; }
@@ -536,3 +539,79 @@ body {
 .ok-mark { color: var(--data); }
 .addr-cell { max-width: 190px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .card-value-sm { font-size: 15px; }
+
+/* ---------------------------------------------------------------- 手机适配
+   原则：1) 信息不删只管搬（次要列收进「点行看详情」）；
+   2) 触摸没有 hover —— 行内动作常显、点击目标加大；
+   3) 首屏保持「一眼看活没活」：新鲜度 + 活跃连接曲线不能挤出视野。 */
+
+/* 触摸设备：行内动作常显（无 hover），点击目标加大到可点 */
+@media (hover: none), (pointer: coarse) {
+  .tbl tbody tr .act-cell { opacity: 1; }
+  .btn { padding: 7px 10px; }
+  .btn-mini { padding: 6px 9px; font-size: 10.5px; }
+  .nav-item { padding: 8px 2px; }
+  .inp, .sel { padding: 7px 2px; }
+  .file-item { padding: 10px 14px; }
+}
+
+@media (max-width: 760px) {
+  .top { flex-wrap: wrap; gap: 8px 14px; padding: 10px 14px; }
+  .top-right { gap: 10px; }
+  .meta-hide-sm { display: none; }
+  .wrap { padding: 4px 14px 44px; }
+  .panel { padding: 12px 0 20px; margin-bottom: 20px; }
+  .panel-head { gap: 6px 12px; }
+
+  .runtime-body { grid-template-columns: 1fr; gap: 16px; }
+  .rt-hero-value { font-size: 34px; }
+  .rt-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px 16px; }
+  .rt-head-right { flex-wrap: wrap; gap: 8px; margin-left: 0; }
+
+  .charts { grid-template-columns: 1fr; gap: 20px; }
+
+  /* 节点表：只留 点/节点/协议/EMA/最近/动作（其余进详情页） */
+  .col-opt, .col-addr, .col-tag, .col-bar, .col-last { display: none; }
+  .tbl th, .tbl td { padding: 7px 8px; }
+  .node-cell { max-width: 40vw; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .tbl tbody tr .act-cell { opacity: 1; }
+
+  /* 三线表：保留全部指标，允许横向滑动（报表不拆列） */
+  .t3-wrap { margin: 0 -14px 18px; }
+  .tbl-3line { min-width: 760px; }
+  .tbl-3line th, .tbl-3line td { padding-left: 12px; padding-right: 12px; }
+  .tbl-3line .t3-values td { font-size: 17px; }
+  .tbl-3line .t3-notes td { font-size: 9.5px; }
+
+  /* 配置页表格：窄屏可横向滑动（表头不挤压成「类 型」） */
+  .tbl-wrap { overflow-x: auto; margin: 0 -14px; }
+  .tbl-wrap .tbl { min-width: 720px; }
+
+  /* 配置页行（tag + URL + 动作）允许换行 */
+  .node-row, .entry-row { flex-wrap: wrap; gap: 6px 10px; }
+  .grow { min-width: 140px; }
+  .ta-mini { font-size: 13px; }
+  .bulk-actions { flex-direction: row; gap: 10px; }
+
+  /* 弹窗全屏化：手机上不保留「容器感」 */
+  .modal { width: 100vw; height: 100dvh; border: none; }
+  .modal-narrow { width: 100vw; max-height: 100dvh; }
+  .modal-body { flex-direction: column; }
+  .file-list {
+    display: flex;
+    flex-wrap: wrap;
+    width: 100%;
+    max-height: 26vh;
+    border-right: none;
+    border-bottom: 1px solid var(--rule-2);
+  }
+  .modal-head { padding: 10px 14px; }
+
+  .log-body { max-height: 240px; font-size: 10px; }
+  .foot { gap: 10px 18px; }
+}
+
+@media (max-width: 420px) {
+  .brand-sub { display: none; }
+  .rt-hero-value { font-size: 30px; }
+}

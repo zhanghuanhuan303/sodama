@@ -287,6 +287,7 @@ pub fn ConfigPage(token: RwSignal<Option<String>>) -> impl IntoView {
                     <span class="panel-title">"订阅源 · 声明顺序 = 优先级（首个有活节点的生效）"</span>
                     <span class="panel-meta">"导入前可先「解析预览」，确认节点与协议再落盘"</span>
                 </div>
+                <div class="tbl-wrap">
                 <table class="tbl">
                     <thead>
                         <tr>
@@ -333,6 +334,7 @@ pub fn ConfigPage(token: RwSignal<Option<String>>) -> impl IntoView {
                              }/>
                     </tbody>
                 </table>
+                </div>
 
                 <div class="cfg-form pad">
                     <span class="panel-title">"导入新订阅"</span>
@@ -442,6 +444,7 @@ pub fn ConfigPage(token: RwSignal<Option<String>>) -> impl IntoView {
                     <span class="panel-title">"规则集（routing 里 `domain(ruleset: tag)` 引用才生效）"</span>
                     <span class="panel-meta">"本地文件可直接改条目；远程由引擎按间隔刷新"</span>
                 </div>
+                <div class="tbl-wrap">
                 <table class="tbl">
                     <thead>
                         <tr>
@@ -487,6 +490,7 @@ pub fn ConfigPage(token: RwSignal<Option<String>>) -> impl IntoView {
                              }/>
                     </tbody>
                 </table>
+                </div>
                 <div class="cfg-form pad">
                     <span class="panel-title">"添加规则集"</span>
                     <input class="inp" style="width:9rem" placeholder="tag（如 cn_site）" prop:value=move || rs_tag.get()

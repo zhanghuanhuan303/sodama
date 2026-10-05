@@ -133,8 +133,11 @@ impl NodeStore {
 }
 
 fn arg_value(args: &[String], key: &str) -> Option<String> {
+    // 兼容两种写法：`--status_cmd`（键原样）与 `--status-cmd`（连字符）。
+    // 脚本里习惯写连字符（见 scripts/dev-local.sh），不再因拼写差异被静默忽略。
+    let dashed = key.replace('_', "-");
     args.iter()
-        .position(|a| a == key)
+        .position(|a| a == key || a == &dashed)
         .and_then(|i| args.get(i + 1))
         .cloned()
 }

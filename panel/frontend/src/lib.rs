@@ -282,6 +282,10 @@ fn App() -> impl IntoView {
     let token_input = RwSignal::new(load_token().unwrap_or_default());
     let editor = RwSignal::new(EditorState::default());
     let page = RwSignal::new(Page::Overview);
+    // 数据新鲜度：last_ok_ms = 上一次成功取数的时间戳（ms），data_age = 距今秒数。
+    // 它同时覆盖「浏览器↔面板」与「面板↔引擎」两类失联——涨上去就是真停更。
+    let last_ok_ms = RwSignal::new(0.0f64);
+    let data_age = RwSignal::new(Option::<u64>::None);
 
     // 鉴权模式（进入时拉一次）
     {
@@ -307,6 +311,7 @@ fn App() -> impl IntoView {
                         status.set(Some(s));
                         error.set(None);
                         authed.set(true);
+                        last_ok_ms.set(js_sys::Date::now());
                     }
                     Err(e) => {
                         if e.contains("需要登录") {
@@ -316,6 +321,14 @@ fn App() -> impl IntoView {
                         }
                     }
                 }
+                // 每轮都重算新鲜度（请求失败时年龄照样增长）
+                let now = js_sys::Date::now();
+                let last = last_ok_ms.get_untracked();
+                data_age.set(if last <= 0.0 {
+                    None
+                } else {
+                    Some(((now - last) / 1000.0).max(0.0) as u64)
+                });
                 if tick % 2 == 0 {
                     if let Ok(l) =
                         get_json::<LogsView>("/api/v1/logs?tail=200", tok.as_deref()).await
@@ -392,7 +405,7 @@ fn App() -> impl IntoView {
                     on:click=move |_| page.set(Page::Config)>"配置"</button>
             </nav>
             <div class="top-right">
-                <span class="meta">{num(|s| format!("v{} · {}", s.version, s.kernel))}</span>
+                <span class="meta meta-hide-sm">{num(|s| format!("v{} · {}", s.version, s.kernel))}</span>
                 <span class="meta">{num(|s| format!("UP {}", fmt_uptime(s.uptime_sec)))}</span>
                 <span class="meta">{move || if paused.get() { "已暂停".to_string() } else { format!("自动刷新 {}s", REFRESH_MS / 1000) }}</span>
                 <button class="btn" on:click=move |_| open_editor(editor, token)>"编辑配置"</button>
@@ -454,7 +467,10 @@ fn App() -> impl IntoView {
         <main class="wrap">
         {move || match page.get() {
             Page::Overview => view! {
-            <RuntimeCard status=status series=series token=token msg=action_msg />
+            <RuntimeCard status=status series=series
+                data_age=Signal::derive(move || data_age.get())
+                paused=Signal::derive(move || paused.get())
+                token=token msg=action_msg />
             <MetricsTable status=status />
             <TrendRow status=status series=series />
 
@@ -494,7 +510,7 @@ fn App() -> impl IntoView {
                 <table class="tbl">
                     <thead>
                         <tr>
-                            <th></th><th>"节点"</th><th>"协议"</th><th class="udp-col">"UDP"</th><th>"地址"</th><th>"来源"</th><th class="num">"EMA(ms)"</th><th>"延迟分布"</th><th class="num">"最近"</th><th></th>
+                            <th></th><th>"节点"</th><th class="col-proto">"协议"</th><th class="udp-col col-opt">"UDP"</th><th class="col-addr">"地址"</th><th class="col-tag">"来源"</th><th class="num">"EMA(ms)"</th><th class="col-bar">"延迟分布"</th><th class="num col-last">"最近"</th><th></th>
                         </tr>
                     </thead>
                     <tbody>
@@ -526,12 +542,12 @@ fn App() -> impl IntoView {
                             view! {
                                 <tr class=row_cls on:click=move |_| load_node(node_detail, token, tag.clone(), name.clone())>
                                     <td class="dot-cell"><span class=dot_cls></span></td>
-                                    <td class="mono">
+                                    <td class="mono node-cell">
                                         {n.name.clone()}
                                         {move || is_cur.get().then(|| view! { <span class="chip chip-use">"使用中"</span> })}
                                         {move || is_pinned.get().then(|| view! { <span class="chip">"已锁定"</span> })}
                                     </td>
-                                    <td class="mono" title=format!("{} · {} · {}", n.protocol, n.transport, n.security)>
+                                    <td class="mono col-proto" title=format!("{} · {} · {}", n.protocol, n.transport, n.security)>
                                         {n.protocol.clone()}
                                         {(!matches!(n.security.as_str(), "" | "none" | "—")).then(|| view! {
                                             <span class="dim">{format!("·{}", n.security)}</span>
@@ -540,18 +556,18 @@ fn App() -> impl IntoView {
                                             <span class="dim">{format!("·{}", n.transport)}</span>
                                         })}
                                     </td>
-                                    <td class="mono udp-col">
+                                    <td class="mono udp-col col-opt">
                                         {if n.udp {
                                             view! { <span class="ok-mark">"✓"</span> }.into_any()
                                         } else {
                                             view! { <span class="dim">"·"</span> }.into_any()
                                         }}
                                     </td>
-                                    <td class="mono dim addr-cell">{n.addr.clone()}</td>
-                                    <td class="mono dim">{n.tag.clone()}</td>
+                                    <td class="mono dim addr-cell col-addr">{n.addr.clone()}</td>
+                                    <td class="mono dim col-tag">{n.tag.clone()}</td>
                                     <td class="mono num">{format!("{ema:.0}")}</td>
-                                    <td class="bar-cell"><div class="bar" style=format!("width:{width:.0}%")></div></td>
-                                    <td class="mono num dim">{n.last_ms.to_string()}</td>
+                                    <td class="bar-cell col-bar"><div class="bar" style=format!("width:{width:.0}%")></div></td>
+                                    <td class="mono num dim col-last">{n.last_ms.to_string()}</td>
                                     <td class="act-cell">
                                         <button class="btn btn-mini" disabled=move || is_pinned.get()
                                             on:click=move |ev| {

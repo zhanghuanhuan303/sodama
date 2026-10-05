@@ -31,6 +31,27 @@ fn fmt_clock(secs: f64) -> String {
     format!("{}:{:02}:{:02}", s / 3600, (s % 3600) / 60, s % 60)
 }
 
+/// 秒 → 跨度短标签（`90s` / `10min` / `2h`）——曲线窗口时长用。
+fn fmt_span(secs: u64) -> String {
+    if secs < 120 {
+        format!("{secs}s")
+    } else if secs < 7200 {
+        format!("{}min", secs / 60)
+    } else {
+        format!("{}h", secs / 3600)
+    }
+}
+
+/// 窗口统计：`(min, max, 首值, 末值)`（不足两点返回 None）。
+fn win_stats(vals: &[f64]) -> Option<(f64, f64, f64, f64)> {
+    if vals.len() < 2 {
+        return None;
+    }
+    let min = vals.iter().cloned().fold(f64::MAX, f64::min);
+    let max = vals.iter().cloned().fold(f64::MIN, f64::max);
+    Some((min, max, vals[0], vals[vals.len() - 1]))
+}
+
 #[component]
 fn Stat(label: &'static str, value: Signal<String>, hint: Signal<String>) -> impl IntoView {
     view! {
@@ -42,11 +63,15 @@ fn Stat(label: &'static str, value: Signal<String>, hint: Signal<String>) -> imp
     }
 }
 
-/// 引擎运行时：左侧大号 RSS + 内存曲线 + 右侧专业参数 + 控制动作。
+/// 引擎运行时：左侧大号 RSS + 内存曲线 + 活跃连接曲线 + 右侧专业参数 + 控制动作。
 #[component]
 pub fn RuntimeCard(
     status: RwSignal<Option<StatusView>>,
     series: RwSignal<Option<SeriesView>>,
+    /// 距上一次成功取数的秒数（面板数据新鲜度；None = 还没拿到过）
+    data_age: Signal<Option<u64>>,
+    /// 用户手动暂停自动刷新：此时"停更"是预期的，不报黄。
+    paused: Signal<bool>,
     token: RwSignal<Option<String>>,
     msg: RwSignal<Option<(bool, String)>>,
 ) -> impl IntoView {
@@ -59,6 +84,27 @@ pub fn RuntimeCard(
                     .iter()
                     .map(|p: &Sample| p.rss_kb as f64 / 1024.0)
                     .collect::<Vec<f64>>()
+            })
+            .unwrap_or_default()
+    };
+    let conn_vals = move || {
+        series
+            .get()
+            .map(|s| {
+                s.points
+                    .iter()
+                    .map(|p: &Sample| p.conns_active as f64)
+                    .collect::<Vec<f64>>()
+            })
+            .unwrap_or_default()
+    };
+    // 窗口时长（点数 × 步长）——标注 Δ 的区间用。
+    let win_label = move || {
+        series
+            .get()
+            .map(|s| {
+                let n = s.points.len().max(1) as u64;
+                fmt_span(n.saturating_sub(1) * s.step_secs.max(1))
             })
             .unwrap_or_default()
     };
@@ -76,6 +122,17 @@ pub fn RuntimeCard(
                     )).unwrap_or_default()}
                 </span>
                 <span class="rt-head-right">
+                    // 数据新鲜度：一眼分清「面板/引擎卡住」与「指标本来就稳」。
+                    {move || {
+                        let (cls, label) = match (paused.get(), data_age.get()) {
+                            (true, _) => ("pill pill-dim", "已暂停".to_string()),
+                            (false, Some(0)) => ("pill pill-dim", "数据 <1s 前".to_string()),
+                            (false, Some(a)) if a <= 12 => ("pill pill-dim", format!("数据 {a}s 前")),
+                            (false, Some(a)) => ("pill pill-warn", format!("数据 {a}s 前 · 已停更")),
+                            (false, None) => ("pill pill-dim", "等待数据".to_string()),
+                        };
+                        view! { <span class=cls><span class="pill-dot"></span>{label}</span> }
+                    }}
                     {move || {
                         let (cls, label) = match status.get() {
                             Some(s) if s.suspended => ("pill pill-warn", "SUSPENDED"),
@@ -108,15 +165,43 @@ pub fn RuntimeCard(
                     </div>
                 </div>
                 <div class="rt-spark">
+                    // 内存：窗口区间 + Δ 是「稳」的正面证据（平不代表挂）。
                     <Chart
                         title="内存曲线（RSS）"
                         hint=Signal::derive(move || {
-                            let peak = rss_vals().iter().cloned().fold(f64::MIN, f64::max);
-                            if peak > 0.0 { format!("窗口峰值 {peak:.1} MB") } else { String::new() }
+                            match win_stats(&rss_vals()) {
+                                Some((_, _, first, last)) => {
+                                    format!("Δ {:+.1} MB / {}", last - first, win_label())
+                                }
+                                None => String::new(),
+                            }
                         })
                         values=Signal::derive(rss_vals)
                         color="#29ffa4"
                         unit=" MB"
+                        foot_mid=Signal::derive(move || {
+                            match win_stats(&rss_vals()) {
+                                Some((min, max, _, _)) => format!("窗口 {min:.1}–{max:.1} MB"),
+                                None => String::new(),
+                            }
+                        })
+                    />
+                    // 同窗口的活跃连接：内存不动时，它动 = 引擎在干活。
+                    <Chart
+                        title="活跃连接（同窗口）"
+                        hint=Signal::derive(move || {
+                            let v = conn_vals();
+                            match (v.last().copied(), v.iter().cloned().fold(f64::MIN, f64::max)) {
+                                (Some(last), peak) if !v.is_empty() => {
+                                    format!("当前 {last:.0} · 窗口峰值 {peak:.0}")
+                                }
+                                _ => String::new(),
+                            }
+                        })
+                        values=Signal::derive(conn_vals)
+                        color="#3c73ff"
+                        unit=""
+                        compact=true
                     />
                 </div>
                 <div class="rt-stats">

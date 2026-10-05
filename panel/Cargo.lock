@@ -462,6 +462,7 @@ dependencies = [
  "gloo-net 0.7.0",
  "gloo-storage",
  "gloo-timers",
+ "js-sys",
  "leptos",
  "serde",
  "serde_json",
