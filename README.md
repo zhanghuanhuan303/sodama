@@ -19,17 +19,21 @@ byte-exact parity tests against dae's Go rule compiler and a netns test lab.*
   双内核矩阵（宿主 + QEMU 第二内核）；**本地 SOCKS5 入口**（`--listen-socks`，零 root/零 eBPF，
   浏览器可直接指向验证真实节点，ADR-0028）；**真网关模式**（`lab/gateway.sh`，物理网卡不移动、
   eBPF 透明接管宿主流量，ADR-0029）。
+- **控制台（Web）**：Rust 后端（axum）+ Rust→WASM 前端（Leptos）的**单文件 musl 二进制**，
+  跑在软路由上（~3 MB RSS）：总览（运行时/曲线/节点表）+ 配置页（订阅/规则集/分流条目在线改，
+  validate 护栏 + 热重载回执），**引擎零改动**（见 [`panel/`](./panel/README.md)）。
 
-最新一轮完整回归（唯一 Rust 数据面，2026-10-04）：
+最新一轮完整回归（唯一 Rust 数据面，2026-10-06）：
 
 | 项 | 结果 |
 |---|---|
+| 单元测试 `cargo test --release` | **268/268**（7 ignored） |
+| 转发面核心回归（真实转发 / janitor 回收 / **泵线程泄漏回归**） | 3/3（新用例双向验证：修复版 PASS、回退旧语义 FAIL） |
 | `verify`（标准 / 单臂拓扑） | 9/9 · 9/9 |
 | DNS 专项（domain/cache/tcp/reload/edns/regex） | 6/6 |
 | 转发面专项（relay/idle/offload/lifecycle/udp） | 6/6 |
 | K3 + 运维（config/status/forward/整配置热重载/ops） | 5/5 |
 | 协议梯（ss/trojan/vless/vmess/tuic/hysteria2 全变体） | 15 会话、17/17 |
-| 单元测试 `cargo test --release` | 121/121 |
 | 规则对拍 vs dae Go 编译器 | 5/5 逐字节一致 |
 | soak（tcp 60s / ss 30s / udp 30s） | 无失败轮、无泄漏 |
 | 内核矩阵（6.18.54-lts 宿主 + 7.2.8 QEMU） | 9/9 · 9/9 |
@@ -42,16 +46,26 @@ byte-exact parity tests against dae's Go rule compiler and a netns test lab.*
 >
 > **性能对比**：sodama vs dae v2.1.1 vs sing-box 1.14.2 vs v2ray 5.52 的同机同拓扑结果与方法见
 > [`docs/perf-report.md`](docs/perf-report.md)（direct 30.0/29.7/28.0/18.1 Gbps；ss 2.20/1.93/2.76/0.54 Gbps；复现：`sudo lab/perf/run.sh all`）。
+>
+> **内存边界**：RSS/内核侧/系统总内存的四层终测（含 FD 治理、转发原语、长稳）见
+> [`docs/memory-report-v2.html`](docs/memory-report-v2.html)（v1 存档见 [`docs/memory-report.html`](docs/memory-report.html)）。
 
 ## 仓库结构
 
 ```
-docs/                        决策与架构文档
+docs/                        决策、架构与报告
 ├── architecture-decision.html   主决策档案（自包含 HTML，可离线打开）
-├── adr/                         ADR-0001..0031（背景/决策/后果/验证方式）
-└── modules/                     协议字节级规格（tuic-v5 / hysteria2）
+├── README.md                    文档索引与证据分级约定
+├── adr/                         ADR-0001..0063（背景/决策/后果/验证方式）
+├── modules/                     协议字节级规格（tuic-v5 / hysteria2）
+├── reviews/                     第三方评审原文存档 + 工程方采纳提案（I1–I5）
+├── memory-report-v2.html        内存终测 v2.1（四层模型；v1 存档 memory-report.html）
+├── project-summary.html         工程总结报告
+├── perf-report.md               四方性能对拍（dae / sing-box / v2ray）
+├── parity-status.md             对标进度：dae（Go）↔ sodama（全 Rust）分域覆盖度
+└── notes/                       本地工程笔记（**不入库**：含真实订阅/节点信息，见 .git/info/exclude）
 
-sodama/                    可运行工程（构建、实验、测试都在这里）
+sodama/                    引擎（构建、实验、测试都在这里）
 ├── loader/                    Rust 用户态：加载器 / 规则编译 / DNS / relay / 协议栈 / 状态面
 ├── ebpf-rs/                   Rust eBPF 数据面（aya-ebpf，bpfel-unknown-none + BTF maps）
 ├── lab/                       netns 实验环境与全部测试脚本
@@ -66,8 +80,35 @@ sodama/                    可运行工程（构建、实验、测试都在这�
 ├── README.md                  实验手册：构建、拓扑、会话、实测输出
 └── NOTES.md                   数据面/协议栈的源码级笔记（带行号与坑清单）
 
+panel/                     控制台（Web）：控制平面，只读引擎契约（见下节）
+├── backend/                   axum：REST / CSV / 状态采样（直连 unix socket，不 fork）
+├── frontend/                  Leptos CSR → WASM（Tufte 式极简暗色）
+├── shared/                    前后端共享 DTO（serde）
+├── deploy/                    panel.conf 模板 + procd init
+└── scripts/                   build-router / deploy / dev-local（密码经 PASS 环境变量传入）
+
+install/                    OpenWrt 打包（Makefile / kernel fragment / procd 服务）
 dae/                         上游 dae clone（不入库；对拍工具按需在仓库同级 clone，见下）
 ```
+
+## 控制台（`panel/`）
+
+**后端 axum + 前端 Leptos→WASM**，编译为单文件 musl 静态二进制，跑在 OpenWrt 软路由上：
+二进制 ~2.6 MB + 静态资源 ~940 KB，常驻 **~3 MB RSS / 3 线程**（无浏览器访问时不采样）。
+
+![总览](panel/docs/screenshot-overview.png)
+
+| | |
+|---|---|
+| ![配置页](panel/docs/screenshot-config.png) | ![节点详情](panel/docs/screenshot-node.png) |
+
+- **总览**：引擎运行时卡片（RSS / 峰值 / 虚拟内存 / 线程 / FD / CPU / 连接 / 重载槽位 + 内存曲线）、
+  运行指标三线表、曲线（连接/吞吐/最优节点延迟）、CSV 按需导出、节点表
+  （协议·传输·安全 / UDP / 地址 / 来源 / EMA / 延迟分布；当前节点高亮、**手动锁定节点**）。
+- **配置页**：订阅增删排序与**批量导入**（导入前调引擎 `sub-parse` 解析预览）、规则集、
+  本地规则文件条目编辑；写入一律「validate 护栏 → 落盘 → 等热重载回执」。
+- 与引擎的交互全走既有契约（unix socket 状态面 / metrics / inotify 热重载）——**引擎零改动**，
+  配置即唯一事实来源；详见 [`panel/README.md`](./panel/README.md)。
 
 ## 快速开始
 
@@ -95,11 +136,15 @@ sudo lab/lab.sh down
 - [`docs/architecture-decision.html`](./docs/architecture-decision.html) — 主决策档案：
   上游 dae 的模块/规模分析、Rust 重写的收益与风险、部署形态（Rust worker + eBPF 分流）、
   决策点 D1–D8 与迁移路线（K0–K3、P3–P18）。
-- [`docs/adr/`](./docs/adr/) — 36 条已采纳 ADR：每个决策的背景、选项、理由、后果、
+- [`docs/adr/`](./docs/adr/) — 63 条已采纳 ADR（ADR-0001..0063）：每个决策的背景、选项、理由、后果、
   **实测验证方式**与修订条件。重要节点：0002（eBPF 程序语言：先 C 后迁）、
   0023/0024/0025（数据面 Rust 全量迁移 → C 对象退场）、0029（真网关模式）、
   0030（嗅探 + dial_mode）、0031（订阅/节点组/健康检查）、0032（IPv6 数据面 TCP 全链）、
-  0033（geoip/geosite 展开 + pname）、0034/0035/0036（DoT/DoH/DoQ 上游 + dns.routing 分流）。
+  0033（geoip/geosite 展开 + pname）、0034/0035/0036（DoT/DoH/DoQ 上游 + dns.routing 分流）、
+  0037–0057（DNS 黑名单/ECS/sip/REALITY-Vision、多组调度、QUIC SNI 嗅探、naive、h3、juicity、
+  SSR、shadow-tls、ECH 边界等协议细节）、0058（M4 reactor：每连接 0 线程）、0059（I6 零线程握手）、
+  0060–0062（运行时参数热更新 / 订阅顺序与默认配置 / inotify 配置即事实来源）、0063（规则集与用户分流名单）。
+- [`docs/reviews/`](./docs/reviews/) — 第三方评审原文存档（内存终测 A/B）+ 工程方采纳提案（I1–I5）。
 - [`docs/parity-status.md`](./docs/parity-status.md) — 对标进度：dae（Go）↔ sodama（全 Rust）
   分域覆盖度对照（15 域 + 汇总 + Top 缺口 + 优势项，逐行附证据锚点）。
 - [`docs/modules/`](./docs/modules/) — tuic v5 / hysteria2 的字节级客户端规格。
