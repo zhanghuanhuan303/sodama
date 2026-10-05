@@ -304,8 +304,14 @@ static NOFILE_SOFT: AtomicU64 = AtomicU64::new(0);
 static FD_HIGH: AtomicBool = AtomicBool::new(false);
 static FD_LAST_CHECK_NS: AtomicU64 = AtomicU64::new(0);
 
-/// 启动时把 RLIMIT_NOFILE 的 soft 提到 hard（提高并发上限；失败仅记录）。
+/// 启动时提升 RLIMIT_NOFILE。
+///
+/// 历史行为只把 soft 提到 hard —— 在 procd/OpenWrt 下 hard 默认 4096，于是
+/// 并发上限被卡在 ~1000 连接（每连接 2 socket + 活跃时 2 pipe ≈ 4 fd）。
+/// root（CAP_SYS_RESOURCE）可以一并抬高 hard：目标 `min(/proc/sys/fs/nr_open, 262144)`，
+/// 失败（非 root / 内核不允）则退回原行为，仅记日志。
 fn raise_nofile_limit() {
+    const CAP: u64 = 1 << 18; // 262144：够 6 万+ 连接，避免无意义地放大 fd 表
     unsafe {
         let mut rl = libc::rlimit {
             rlim_cur: 0,
@@ -314,11 +320,19 @@ fn raise_nofile_limit() {
         if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) != 0 {
             return;
         }
-        let old = rl.rlim_cur;
-        if rl.rlim_max > rl.rlim_cur {
-            rl.rlim_cur = rl.rlim_max;
-            let _ = libc::setrlimit(libc::RLIMIT_NOFILE, &rl);
+        let (old_soft, old_hard) = (rl.rlim_cur, rl.rlim_max);
+        let nr_open = std::fs::read_to_string("/proc/sys/fs/nr_open")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(CAP);
+        let want = nr_open.min(CAP);
+        if rl.rlim_max < want {
+            rl.rlim_max = want; // 无权限则下面的 setrlimit 整体失败，保持原值
         }
+        if rl.rlim_cur < rl.rlim_max {
+            rl.rlim_cur = rl.rlim_max;
+        }
+        let _ = libc::setrlimit(libc::RLIMIT_NOFILE, &rl);
         let mut now = libc::rlimit {
             rlim_cur: 0,
             rlim_max: 0,
@@ -326,7 +340,7 @@ fn raise_nofile_limit() {
         let _ = libc::getrlimit(libc::RLIMIT_NOFILE, &mut now);
         NOFILE_SOFT.store(now.rlim_cur, Ordering::Relaxed);
         log(&format!(
-            "nofile: soft {old} -> {}（hard {})（I2）",
+            "nofile: soft {old_soft} -> {}，hard {old_hard} -> {}（I2）",
             now.rlim_cur, now.rlim_max
         ));
     }

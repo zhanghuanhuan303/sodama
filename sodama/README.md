@@ -387,6 +387,12 @@ lab/matrix/SUMMARY.md 矩阵执行结果与未覆盖项
 loader 构建、`cargo test --release` 与 eBPF 对象构建（`.github/workflows/ci.yml`，
 固定 nightly-2026-09-29 + bpf-linker 0.11.1；fmt/clippy 刻意不入 CI，见文件内注释）。
 
+**并发上限与 RLIMIT_NOFILE（I2）**：转发每连接约 4 fd（2 socket + 活跃时 2 pipe），
+所以 fd 上限就是并发天花板。引擎启动时把 soft 提到 hard；**以 root（CAP_SYS_RESOURCE）
+运行时同时抬高 hard** 到 `min(/proc/sys/fs/nr_open, 262144)`。OpenWrt/procd 默认
+hard=4096（≈1000 连接）——不抬 hard 会把并发卡在四位数；抬后上限约 6.5 万连接，
+实际瓶颈转移到内核 socket 内存与 CPU。状态面 `relay.fds_soft_limit` 可核对生效值。
+
 ## 快速开始
 
 ```bash
