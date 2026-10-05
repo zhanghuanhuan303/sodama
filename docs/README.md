@@ -14,6 +14,7 @@ docs/
 ├── memory-report.html            # 内存终测报告（五方对照：sodama/dae/sing-box/v2ray/mihomo，自包含 HTML）
 ├── project-summary.html          # 项目总结报告（整体工程：历程/架构/对标/性能/路线，自包含 HTML）
 ├── openwrt.md                    # OpenWrt 支持（musl 构建/内核 fragment/ipk/procd/QEMU 冒烟）
+├── reviews/                      # 第三方评审存档（原文）+ 工程方采纳提案（I1–I5）
 ├── optimization-roadmap.md       # 优化方向（数据驱动，O1–O10 优先级与验收）
 ├── adr/                          # 已采纳决策记录（ADR-0001..0031）
 ├── modules/                      # 模块级规格（tuic-v5-client-spec.md / hysteria2-client-spec.md，由源码研究产出）
@@ -29,6 +30,7 @@ docs/
 | VLESS 提案 | `vless-proposal.html` | VLESS（明文/TLS）四方实测 + perf 剖面 + 分阶段优化提案（自包含，可离线打开） |
 | 内存终测 | `memory-report.html` | 五方（sodama/dae/sing-box/v2ray/mihomo）五阶段内存对照 + sodama 规模/UDP/回收专项（自包含，可离线打开） |
 | 项目总结 | `project-summary.html` | 整体工程总结：阶段历程/架构总览/对标完成度/性能与内存汇总/工程质量/部署生态/后续路线（自包含，可离线打开） |
+| 第三方评审 | `reviews/` | 评审原文存档（内存终测 A/B）+ 工程方采纳提案（事实核对、逐条判定、I1–I5 计划） |
 | OpenWrt | `openwrt.md` | musl 交叉构建、内核 fragment（NAMESPACES/NET_NS 关键项）、ipk/procd/uci、拓扑集成与 QEMU 冒烟 |
 | 数据面核心笔记 | `sodama/NOTES.md` | eBPF 分流/tproxy/回程机制的源码级笔记（带行号） |
 | 实验手册 | `sodama/README.md` | sodama 的构建、拓扑、测试与实测输出 |

@@ -136,6 +136,12 @@ churn 后仍 ≤31.2 MB（对手 92.7–494.8 MB）；UDP 29.2 MB（对手 55.7�
   <li><b>样本</b>：五方 × 两遍独立全程（<code>/tmp/mem-results.tsv</code> / <code>/tmp/mem-results2.tsv</code>）；负载均由客户端侧验证（hold 2000/2000 全成功，churn ≈26 228 条/10s，吞吐 verify=ok）。</li>
   <li><b>已知偏差</b>：dae 的 load 轮出现尾读截断（512 传 / 502 收，verify=ok），峰值采样仍有效；v2ray 的 recovery 两遍差异大（190 / 318 MB），与其 GC 时机相关；RSS 为进程视角，不含内核侧内存（五方共用同一内核路径，可比）。</li>
 </ul>
+<div class="note warn">
+<b>口径与边界（第三方评审后更新，2026-10-05）：</b>本报告为<b>进程 VmRSS</b> 口径，不含内核侧（slab/socket/pipe/skb/eBPF map）
+与系统总内存。事实核对初测显示空闲 hold 的内核侧 slab 增量可达 ≈46 KB/连接（可能大于用户态 ≈15 KB/连接），
+因此「内存最低」的结论仅限用户态口径。系统内存四层模型基准（Process → Kernel → Total → Resource/连接）
+与 FD 架构治理已列入下一版：见 <code>docs/reviews/2026-10-05-adoption-proposal.md</code>（I1–I5）。
+</div>
 </section>
 
 <section>

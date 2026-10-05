@@ -98,6 +98,21 @@ G1 同机 + 真实节点口径均已交付。以下为余项。
 | H2 | 用户手册（配置参考 + Go dae → sodama 迁移指南） | 散在 README/NOTES | 独立章节：逐项差异表（配置/CLI/部署） |
 | H3 | 基准报告 | bench.sh 有输出 | `docs/bench.md` 固化方法与结果 |
 
+## I. 资源/系统内存专项（第三方评审采纳，2026-10-05）
+
+来源：`docs/reviews/2026-10-05-memory-final-review-{a,b}.md` 与工程方提案
+`docs/reviews/2026-10-05-adoption-proposal.md`。
+
+| # | 事项 | 现状 | 验收标准 |
+|---|---|---|---|
+| I1 | **系统内存基准（四层模型）** | 已完成事实核对：fd 拓扑 4 socket + 4 pipe≈8/连接（来自 RelayHandle 克隆×2 + 每 session 2×pipe）；`F_SETPIPE_SZ=1MiB`（页按需）；空闲 hold 内核侧 slab 初测 ≈46KB/连接（>用户态 ≈15KB） | `lab/perf/mem-system.sh`：连接扫描 100–20k ×（空闲/小流量）+ UDP/churn，记录 userspace+slab+sockstat+bpftool map 增量与 per-conn 分解；至少对 dae/sing-box 一方同口径对照 |
+| I2 | **FD 架构治理** | 8/连接（4 socket + 4 pipe）；未自提升 rlimit、无 fd 预算回退 | (a) 去 RelayHandle socket 克隆（−2）；(b) pipe 懒建/空闲释放（空闲 2–4/连接）；(c) worker-local pipe cache；(d) setrlimit 自提升 + status 上报 + fd>80% 新连接回退 copy-pump。验收：hold 2000 ≤4/连接、10k 默认 limit 可跑、吞吐/CPU 不回退 >3% |
+| I3 | **转发原语对照** | splice vs copy 已有（M1：+38%/−84%）；io_uring 已否（ADR-0058） | splice/copy/io_uring（复测）/MSG_ZEROCOPY 四路径×三档（fd 高压/低延迟/高吞吐）：吞吐、CPU、p99、RSS、fd、内核对端内存；给出选型与默认值 |
+| I4 | **长稳曲线化（bounded-memory）** | soak 已有但未曲线化/未含 kernel | 24/48/72h（微量 churn+长连接+周期负载）曲线：RSS/FD/Slab/SUnreclaim/sockstat/CPU/latency/fail；72h 漂移 ≤5% 且 fail 不增长 |
+| I5 | **报告口径与措辞** | memory-report v1.0 仅有 RSS 口径与局限声明 | v1.1：新增「口径与边界」（RSS-only；kernel/system 见 I1）、链 `docs/reviews/`、去“唯一解/遥遥领先/顶级”类措辞；后续对外统一四层模型与 predictable resource consumption 定位 |
+
+执行顺序建议：**I1 → I2 → I5 → I4 → I3**（先拿证据、再改架构、同步口径；soak 与 I3 可并行）。
+
 ## 明确不在范围（永久）
 
 - **daed Web UI / GraphQL / 鉴权**：daemon 是独立项目，sodama 只做本体 + 状态面；
