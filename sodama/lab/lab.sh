@@ -26,6 +26,8 @@
 #   sudo lab/lab.sh relay-up     # P4：TCP relay（--dialer direct）+ 短 idle 回收
 #   sudo lab/lab.sh test-relay        # 真实转发 + 512KB 完整性 + 状态面
 #   sudo lab/lab.sh test-relay-idle   # janitor 回收空闲连接
+#   sudo lab/lab.sh relay-thread-up   # O9：线程泵路径会话（SODAMA_NO_REACTOR=1 + --no-splice）
+#   sudo lab/lab.sh test-relay-thread-leak # 回归：上游先关 + 客户端保持 → 泵线程不泄漏
 #   sudo lab/lab.sh offload-up   # P4c：relay + TCP offload（fast_sock/sk_skb）
 #   sudo lab/lab.sh test-relay-offload # 内核拼接证据（用户态字节数远小于总传输）
 #   sudo lab/lab.sh test-offload-lifecycle # P7：半关闭超时后回收连接与 fast_sock 键
@@ -87,6 +89,11 @@
 #   lab/proto-check/run.sh vless|vmess [tls]   # 真实 Go 客户端（outbound fork）↔ Python 服务端
 #
 # 拓扑（全部在独立 netns 里，不碰宿主机网络）：
+#
+#   ⚠ 注意：landae/wan/single 这几个宿主侧接口会带上 10.0.0.0/24、10.9.9.0/24 等地址。
+#   若你当前所在真实网络与这些网段重叠（例如软路由网关就是 10.0.0.1），启动 lab 会把
+#   真实网关拉进实验拓扑 → 表现是“断网/面板失联”（像路由器故障）。up/dual-up 已加
+#   预检直接报错；万不得已可设 LAB_ALLOW_LAN_COLLISION=1 跳过。
 #
 #   [client ns]                                    [wan ns]
 #     lanclient 10.0.0.2 ──veth── landae 10.0.0.1    wanpeer 10.9.9.2
@@ -272,6 +279,44 @@ require_root() {
   [ "$(id -u)" = 0 ] || die "需要 root：sudo $0 $*"
 }
 
+# 按线程名汇总 loader 的 OS 线程数（排障/线程泄漏回归共用）。
+threads_by_comm() {
+  local pid="$1" f
+  for f in /proc/"$pid"/task/*/comm; do
+    [ -r "$f" ] || continue
+    cat "$f" 2>/dev/null || true
+  done | sort | uniq -c | sort -rn
+}
+
+# relay 泵线程数（comm=relay：会话 handler + 其 spawn 的无名 sibling 都叫 relay）。
+count_relay_threads() {
+  local pid="$1" c name n=0
+  while read -r c name; do
+    [ "$name" = relay ] || continue
+    n="$c"
+  done < <(threads_by_comm "$pid" || true)
+  echo "$n"
+}
+
+# lab 的 LAN/WAN 网段会配到宿主机 root ns（landae/wan/single）。若与真实网络同网段，
+# 启动 lab 会把真实网关/DNS 拉进实验拓扑 → 典型症状是“断网”（面板/SSH/网关全失联），
+# 看起来像路由器坏了。启动前硬失败；确需在重叠网络里跑可设 LAB_ALLOW_LAN_COLLISION=1。
+check_lan_collision() {
+  [ -z "${LAB_ALLOW_LAN_COLLISION:-}" ] || return 0
+  local n hit=""
+  for n in 10.0.0.0/24 10.9.9.0/24 10.9.10.0/24; do
+    if ip route show "$n" 2>/dev/null | grep -vqE 'dev (landae|wan|single)\b'; then
+      hit+=" $n"
+    fi
+  done
+  if [ -n "$hit" ]; then
+    die "真实网络与 lab 网段重叠:$hit
+  lab 要把 10.0.0.0/24 等配到宿主机接口（landae/wan）做“路由器”角色，继续会把同网段
+  的真实流量吸入实验拓扑 —— 症状：网关/面板/DNS 失联（像“路由器坏了”）。
+  处理：换一张不重叠的网络（如手机热点），或设 LAB_ALLOW_LAN_COLLISION=1 自行承担。"
+  fi
+}
+
 # 以调用者身份构建，避免 root 污染 target/
 as_user() {
   if [ -n "${SUDO_USER:-}" ] && [ "${SUDO_USER}" != root ]; then
@@ -436,6 +481,7 @@ cleanup() {
 up() {
   require_root
   [ -f "$OBJ" ] && [ -x "$LOADER" ] || die "先运行 $0 build"
+  check_lan_collision
   cleanup
 
   echo "== 建立 netns 与 veth =="
@@ -886,6 +932,8 @@ up() {
   [ -n "${USE_SNIFF_PUNT:-}" ] && extra_args+=(--sniff-punt)
   [ -n "${USE_UDP_IDLE:-}" ] && extra_args+=(--udp-idle-timeout "$USE_UDP_IDLE")
   [ -n "${USE_OFFLOAD:-}" ] && extra_args+=(--offload)
+  # O9：强制经典线程泵路径（关 reactor 用 SODAMA_NO_REACTOR=1 环境变量）
+  [ -n "${USE_NO_SPLICE:-}" ] && extra_args+=(--no-splice)
   # M2：kTLS 实验（内核 TLS；成功则加解密下沉内核，TLS 上可再 splice）
   [ -n "${USE_KTLS:-}" ] && extra_args+=(--ktls)
   [ -n "${USE_LOG_FILE:-}" ] && extra_args+=(--log-file "$OPS_LOG")
@@ -924,6 +972,7 @@ up() {
 dual_up() {
   require_root
   [ -f "$OBJ" ] && [ -x "$LOADER" ] || die "先运行 $0 build"
+  check_lan_collision
   cleanup
   LAN_IFACE=single
 
@@ -1943,6 +1992,83 @@ PY
   echo "$out" | grep -qE "after-idle: (closed|timeout/reset)" || { echo "FAIL: 空闲连接未被回收"; exit 1; }
   "$LOADER" status --socket "$STATUS_SOCK" --json | python3 -c 'import json,sys;v=json.load(sys.stdin);assert v["relay"]["evicted"]>=1, v["relay"];print("relay evicted:", v["relay"]["evicted"])'
   echo "PASS: relay janitor 回收空闲连接"
+}
+
+# O9 回归：relay 泵线程泄漏。
+# 姿态：「上游先关 + 客户端保持静默」（wan_echo:8083 应答后即关）。旧行为是
+# 先结束的泵（上游→客户端）调 relay_finish 把会话从 RELAY_CONNS 摘除，另一个
+# 卡在 recv 的泵此后既不会被 janitor 看见（不回收），也不再计入账目 —— 线程、
+# 64KB 缓冲与 fd 永久泄漏（路由器现场：54+ 泵线程）。修复后由「最后一个泵」
+# 收尾，会话留在注册表里等 janitor 强制 shutdown，泵退出、线程回落。
+# 须用 relay-thread-up 会话启动（reactor 路径每连接 0 线程，测不到该缺陷）。
+test_relay_thread_leak() {
+  require_root
+  echo "== O9 回归：relay 泵线程泄漏（half-close）=="
+  [ -f "$PID_FILE" ] || die "先运行 $0 relay-thread-up"
+  local pid; pid="$(cat "$PID_FILE")"
+  kill -0 "$pid" 2>/dev/null || die "sodama 未运行（pid $pid）"
+  local n=16 hold=45 wait_s=15 relay_margin=4 thread_margin=6
+  local log_dir=/tmp/sodama-halfclose
+  rm -rf "$log_dir"; mkdir -p "$log_dir"
+
+  local before_threads before_relay before_evicted
+  before_threads="$(ls "/proc/$pid/task" | wc -l)"
+  before_relay="$(count_relay_threads "$pid")"
+  before_evicted="$("$LOADER" status --socket "$STATUS_SOCK" --json \
+    | python3 -c 'import json,sys;print(json.load(sys.stdin)["relay"]["evicted"])')"
+  echo "baseline: threads=$before_threads relay=$before_relay evicted=$before_evicted"
+
+  # 1) 起 N 条半开连接：读到应答后客户端静默保持（不读/不写/不关）
+  local pids=() i
+  for i in $(seq 1 "$n"); do
+    ip netns exec "$CLIENT_NS" python3 "$HERE/halfclose_hold.py" "$PROXY_DST" 8083 "$hold" "$i" \
+      >"$log_dir/$i.log" 2>&1 &
+    pids+=("$!")
+  done
+  # 2) 建连必须全部成功，否则断言会跑在空跑道上假通过
+  local ok=0
+  for _ in $(seq 1 60); do
+    ok="$(grep -l 'halfclose-ok' "$log_dir"/*.log 2>/dev/null | wc -l || true)"
+    # 注：&&/|| 包裹避免 pipefail 把「暂无命中」当成脚本失败
+    if [ "$ok" = "$n" ]; then break; fi
+    sleep 0.25
+  done
+  if [ "$ok" != "$n" ]; then
+    cat "$log_dir"/*.log || true
+    kill "${pids[@]}" 2>/dev/null || true
+    die "半开连接仅建立 $ok/$n 条（8083 夹具/规则未生效？）"
+  fi
+  echo "保持中: relay 泵线程合计=$(count_relay_threads "$pid")（每条会话剩 1 个卡在 recv 的泵）"
+
+  # 3) 等 janitor（tick 5s；--relay-idle-timeout=2）回收半开连接
+  sleep "$wait_s"
+  local after_threads after_relay after_evicted
+  after_threads="$(ls "/proc/$pid/task" | wc -l)"
+  after_relay="$(count_relay_threads "$pid")"
+  after_evicted="$("$LOADER" status --socket "$STATUS_SOCK" --json \
+    | python3 -c 'import json,sys;print(json.load(sys.stdin)["relay"]["evicted"])')"
+  echo "after ${wait_s}s: threads=$after_threads relay=$after_relay evicted=$after_evicted"
+
+  # 4) 先收尾探针（客户端关闭），再断言——断言窗口内连接必须仍在保持
+  kill "${pids[@]}" 2>/dev/null || true
+  wait "${pids[@]}" 2>/dev/null || true
+
+  # 断言 1：janitor 回收了全部 N 条（修复前注册表被先结束的泵摘掉，evicted 不增）
+  python3 - "$n" "$before_evicted" "$after_evicted" <<'PY'
+import sys
+n, before, after = int(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3])
+delta = after - before
+assert delta >= n, f"evicted 增量 {delta} < {n}：janitor 看不到半开连接（泵先摘了注册表？）"
+print(f"evicted += {delta}")
+PY
+  # 断言 2：relay 泵线程回落到基线（修复前每连接残留 1 个永久阻塞的泵线程）
+  if [ "$after_relay" -gt $((before_relay + relay_margin)) ] \
+    || [ "$after_threads" -gt $((before_threads + thread_margin)) ]; then
+    echo "线程名汇总（泄漏现场）："
+    threads_by_comm "$pid" || true
+    die "泵线程未回落：relay $before_relay→$after_relay，总线程 $before_threads→$after_threads"
+  fi
+  echo "PASS: relay 泵线程不泄漏（relay $before_relay→$after_relay，总线程 $before_threads→$after_threads，evicted += $((after_evicted - before_evicted))）"
 }
 
 # P4b：UDP NAT——真实转发、3 报文复用 1 会话、回包源地址为原始目的地址。
@@ -3778,6 +3904,8 @@ test-dns-udp) test_dns_udp ;;  # 显式 udp:// 上游（仅 UDP）
   test-geo) test_geo ;;
   regex-up) USE_RULES="$HERE/rules.regex.dae" USE_DNS_UPSTREAM="127.0.0.1:$FAKE_DNS_PORT" USE_FAKE_DNS=1 up ;;
   relay-up) USE_RULES="$HERE/rules.dae" USE_DIALER=direct USE_RELAY_IDLE=2 USE_UDP_IDLE=2 up ;;
+  relay-thread-up) SODAMA_NO_REACTOR=1 USE_NO_SPLICE=1 \
+    USE_RULES="$HERE/rules.dae" USE_DIALER=direct USE_RELAY_IDLE=2 USE_UDP_IDLE=2 up ;;  # O9：线程泵泄漏回归会话
   offload-up) USE_RULES="$HERE/rules.dae" USE_DIALER=direct USE_OFFLOAD=1 USE_RELAY_IDLE=600 up ;;
   udp-up) USE_RULES="$HERE/rules.udp.dae" USE_UDP_IDLE=2 up ;;
   ss-up) USE_RULES="$HERE/rules.dae" USE_SS=1 USE_SS_METHOD=chacha20-ietf-poly1305 USE_SS_PASSWORD=testpass \
@@ -3858,6 +3986,7 @@ test-dns-udp) test_dns_udp ;;  # 显式 udp:// 上游（仅 UDP）
   test-dnsroute) test_dnsroute ;;
   test-relay) test_relay ;;
   test-relay-idle) test_relay_idle ;;
+  test-relay-thread-leak) test_relay_thread_leak ;;  # O9：泵线程泄漏回归
   test-udp-relay) test_udp_relay ;;
   test-quic-sniff) test_quic_sniff ;;  # P20：QUIC Initial SNI 嗅探
   sniff-punt-up) chmod 640 "$HERE/sniffpunt.dae"; \
