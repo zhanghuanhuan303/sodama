@@ -11,7 +11,8 @@ docs/
 ├── parity-status.md              # 对标进度：dae（Go）↔ sodama（全 Rust）分域覆盖度
 ├── perf-report.md                # 性能对比报告（四方对拍 / 并发扩展 / perf 剖面 / 夹具校准）
 ├── vless-proposal.html           # VLESS 性能实测与优化提案（自包含 HTML，可离线打开）
-├── memory-report.html            # 内存终测报告（五方对照：sodama/dae/sing-box/v2ray/mihomo，自包含 HTML）
+├── memory-report.html            # 内存终测报告 v1.0（五方 RSS 对照；历史存档，页顶链 v2）
+├── memory-report-v2.html         # 系统内存与资源边界终测报告 v2.0（四层模型 + dae 同口径 + FD 治理 + 长稳；送审版，自包含可离线打开）
 ├── project-summary.html          # 项目总结报告（整体工程：历程/架构/对标/性能/路线，自包含 HTML）
 ├── openwrt.md                    # OpenWrt 支持（musl 构建/内核 fragment/ipk/procd/QEMU 冒烟）
 ├── reviews/                      # 第三方评审存档（原文）+ 工程方采纳提案（I1–I5）
@@ -28,9 +29,9 @@ docs/
 | 决策记录（ADR） | `adr/` | 已采纳决策的背景/选项/后果/验证方式，共 30 条（D1–D8；0007 被 0009 取代，0010–0015 记录 K2/K3/P3/P4 口径，0016 = P5-G1，0017 = P5-G2，0018 = P5-G3a，0019 = P5-G3b，0020 = P5-G3b+，0021 = P6，0022 = P7，0023 = P8，0024 = P9，0025 = 移除 C 数据面，**0026 = P10 vless-ws，0027 = P11 anytls，0028 = P12 socks 入口，0029 = P13 真网关模式，0030 = P14 嗅探 + dial_mode，0031 = P15 订阅/节点组/健康检查**） |
 | 对标进度 | `parity-status.md` | dae（Go）↔ sodama（全 Rust）分域覆盖度对照（15 域 + 汇总 + Top 缺口 + 优势项，附证据锚点） |
 | VLESS 提案 | `vless-proposal.html` | VLESS（明文/TLS）四方实测 + perf 剖面 + 分阶段优化提案（自包含，可离线打开） |
-| 内存终测 | `memory-report.html` | 五方（sodama/dae/sing-box/v2ray/mihomo）五阶段内存对照 + sodama 规模/UDP/回收专项（自包含，可离线打开） |
+| 内存终测 | `memory-report.html` v1 / `memory-report-v2.html` v2 | v1：五方 RSS 对照（存档）；v2：四层模型系统内存（内核侧/Slab 归因/FD 治理/转发原语/长稳），送审版 |
 | 项目总结 | `project-summary.html` | 整体工程总结：阶段历程/架构总览/对标完成度/性能与内存汇总/工程质量/部署生态/后续路线（自包含，可离线打开） |
-| 第三方评审 | `reviews/` | 评审原文存档（内存终测 A/B）+ 工程方采纳提案（事实核对、逐条判定、I1–I5 计划） |
+| 第三方评审 | `reviews/` | 评审原文存档（内存终测 A/B）+ 采纳提案 + I1 系统内存数据 + I3 转发原语对照 |
 | OpenWrt | `openwrt.md` | musl 交叉构建、内核 fragment（NAMESPACES/NET_NS 关键项）、ipk/procd/uci、拓扑集成与 QEMU 冒烟 |
 | 数据面核心笔记 | `sodama/NOTES.md` | eBPF 分流/tproxy/回程机制的源码级笔记（带行号） |
 | 实验手册 | `sodama/README.md` | sodama 的构建、拓扑、测试与实测输出 |
@@ -91,7 +92,8 @@ go mod edit -json | python3 -c "import json,sys; d=json.load(sys.stdin); \
 |---|---|---|
 | `architecture-decision.html` | v2.43 · 2026-10-04 | dae `main@e3fee8f`（tag `nightly`） |
 | `parity-status.md` | v2.10 · 2026-10-04 | 同上（P33.2 性能深挖后清点；覆盖度为功能点粗估，逐行附证据） |
-| `memory-report.html` | v1.0 · 2026-10-05 | 本版内核收口（M1–M4 + O 系列 + G1）五方内存终测 |
+| `memory-report.html` | v1.0 · 2026-10-05 | 本版内核收口（M1–M4 + O 系列 + G1）五方内存终测 · 存档 |
+| `memory-report-v2.html` | v2.0 · 2026-10-05 | 系统内存与资源边界终测（四层模型 + dae 同口径 + FD 治理 + 转发原语 + 长稳）· 送审 |
 | `project-summary.html` | v1.0 · 2026-10-05 | 整体工程总结（main@c669ece 基线；OpenWrt P0 应用侧、自编内核冒烟暂停） |
 | `openwrt.md` | v1.0 · 2026-10-05 | OpenWrt 24.10+（内核 ≥6.6 + fragment）；x86_64/aarch64/armv7 musl 构建 |
 | `adr/ADR-0001..0031` | 已采纳 · 2026-10-04 | 同上；D1–D8 决策（0007 被 0009 取代；0010 = K2；0011 = K3；0012 = P3a；0013 = P3b-1；0014 = P3b-2a；0015 = P4；0016 = P5-G1；0017 = P5-G2；0018 = P5-G3a；0019 = P5-G3b；0020 = P5-G3b+；0021 = P6；0022 = P7；0023 = P8；0024 = P9；0025 = 移除 C 数据面；0026 = P10 vless-ws；0027 = P11 anytls；0028 = P12 本地 SOCKS5 入口；0029 = P13 真网关模式；0030 = P14 嗅探 + dial_mode；0031 = P15 订阅/节点组/健康检查） |

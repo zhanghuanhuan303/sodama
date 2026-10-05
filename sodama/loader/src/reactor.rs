@@ -95,6 +95,76 @@ impl Dir {
     }
 }
 
+// ---- I2：pipe 资源治理 ----
+//
+// 背景（第三方评审）：splice 链路每会话 2 条 pipe（4 fd），且历史实现在会话创建时
+// 立即分配、Drop 时关闭。I2 三项改造：
+//  1) **懒建**：会话注册/空闲时不持有 pipe，首次 fill 才取（`pipe == [-1,-1]` = 未持有）；
+//  2) **worker 本地缓存**：会话收尾时 pipe 回收到所属 worker 的 cache（跨先后会话复用，
+//     消 `pipe()/close()` 系统调用与 slab 抖动；不跨 worker，无锁竞争）；
+//  3) **空闲释放**：`sweep()`（~1s 周期）对「两个方向都无在途字节且空闲超过阈值」的
+//     会话释放 pipe（默认 10s，`SODAMA_PIPE_IDLE_MS=0` 关闭，用于 A/B）。
+
+const PIPE_CACHE_CAP: usize = 8;
+const PIPE_IDLE_DEFAULT_MS: u64 = 10_000;
+
+fn pipe_idle_ns() -> u64 {
+    static V: OnceLock<u64> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("SODAMA_PIPE_IDLE_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(PIPE_IDLE_DEFAULT_MS)
+            .saturating_mul(1_000_000)
+    })
+}
+
+fn new_pipe() -> io::Result<[RawFd; 2]> {
+    let mut fds = [0i32; 2];
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    unsafe {
+        libc::fcntl(fds[1], libc::F_SETPIPE_SZ, PIPE_SZ);
+    }
+    RELAY_STATS.pipe_created.fetch_add(1, Ordering::Relaxed);
+    Ok(fds)
+}
+
+fn take_pipe(cache: &mut Vec<[RawFd; 2]>) -> Option<[RawFd; 2]> {
+    cache.pop().inspect(|_| {
+        RELAY_STATS.pipe_reused.fetch_add(1, Ordering::Relaxed);
+    })
+}
+
+fn put_pipe(cache: &mut Vec<[RawFd; 2]>, p: [RawFd; 2]) {
+    if p[0] < 0 {
+        return;
+    }
+    RELAY_STATS.pipe_released.fetch_add(1, Ordering::Relaxed);
+    if cache.len() < PIPE_CACHE_CAP {
+        cache.push(p);
+    } else {
+        unsafe {
+            libc::close(p[0]);
+            libc::close(p[1]);
+        }
+    }
+}
+
+fn arm_pipe(dir: &mut Dir, cache: &mut Vec<[RawFd; 2]>) -> io::Result<()> {
+    if dir.pipe[1] >= 0 {
+        return Ok(());
+    }
+    dir.pipe = take_pipe(cache)
+        .or_else(|| new_pipe().ok())
+        .unwrap_or([-1, -1]);
+    if dir.pipe[1] < 0 {
+        return Err(io::Error::other("reactor: pipe 分配失败"));
+    }
+    Ok(())
+}
+
 /// 数据面模式：stage 1 字节透明 splice；stage 2 用户态 codec（rustls 等）。
 enum Mode {
     Splice { c2u: Dir, u2c: Dir },
@@ -165,7 +235,7 @@ impl Session {
     /// 关键：`SPLICE_F_NONBLOCK` 只作用于管道端，socket 端是阻塞 fd 时
     /// 第二次 splice 会真的阻塞 worker（实测），因此由 EPOLLIN 水平触发
     /// 驱动「每次搬一车」，不做循环预读。
-    fn fill(&mut self, c2u: bool) -> io::Result<()> {
+    fn fill(&mut self, c2u: bool, cache: &mut Vec<[RawFd; 2]>) -> io::Result<()> {
         let handle = self.handle.clone();
         let nonblock = self.nonblock;
         let mut moved = false;
@@ -180,6 +250,8 @@ impl Session {
                 }
                 Mode::Codec { .. } => return Ok(()),
             };
+            // I2：pipe 懒建/缓存取用（首次有数据才持有）
+            arm_pipe(dir, cache)?;
             loop {
                 if dir.eof || dir.pending >= HIGH_WM {
                     break;
@@ -273,6 +345,14 @@ impl Session {
                 Mode::Codec { .. } => return Ok(()),
             };
             if dir.pending > 0 {
+                if dir.pipe[1] < 0 {
+                    // 不变量：释放仅在 pending==0 时发生；防御性处理
+                    log(&format!(
+                        "reactor: pipe 缺失但 pending={}（异常）",
+                        dir.pending
+                    ));
+                    dir.pending = 0;
+                }
                 loop {
                     let n = unsafe {
                         libc::splice(
@@ -343,7 +423,7 @@ impl Session {
 
     /// 单 fd 事件分派（Splice：splice 泵；Codec：读半/写半状态机）。
     /// 返回 `true` 表示 codec 会话可能仍有内部数据可泵（需自驱补泵）。
-    fn on_event(&mut self, sid: u64, fd: RawFd, revents: u32) -> bool {
+    fn on_event(&mut self, sid: u64, fd: RawFd, revents: u32, cache: &mut Vec<[RawFd; 2]>) -> bool {
         let is_client = fd == self.fd_client();
         let mut err = false;
         let mut more = false;
@@ -353,7 +433,7 @@ impl Session {
                 | revents & (libc::EPOLLHUP as u32 | libc::EPOLLERR as u32)
                 != 0
             {
-                if let Err(e) = self.fill(is_client) {
+                if let Err(e) = self.fill(is_client, cache) {
                     log(&format!("reactor: splice 读失败 #{sid}（{e}）"));
                     err = true;
                 }
@@ -709,6 +789,8 @@ struct Worker {
     fd_index: HashMap<RawFd, u64>,
     /// 预算耗尽的 codec 会话：无内核事件也要自驱补泵（内部缓冲可能已就绪）。
     pending: Vec<u64>,
+    /// I2：worker 本地 pipe 复用缓存（仅本 worker 线程访问，无锁）。
+    pipe_cache: Vec<[RawFd; 2]>,
 }
 
 impl Worker {
@@ -741,6 +823,7 @@ impl Worker {
             sessions: HashMap::new(),
             fd_index: HashMap::new(),
             pending: Vec::new(),
+            pipe_cache: Vec::new(),
         })
     }
 
@@ -811,7 +894,7 @@ impl Worker {
 
     /// 会话收尾：摘 epoll/索引/注册表，统计递减，OwnedFd 随 drop 关闭。
     fn destroy(&mut self, sid: u64) {
-        let Some(sess) = self.sessions.remove(&sid) else {
+        let Some(mut sess) = self.sessions.remove(&sid) else {
             return;
         };
         unsafe {
@@ -837,6 +920,13 @@ impl Worker {
             m.remove(&sid);
         }
         RELAY_STATS.conns_active.fetch_sub(1, Ordering::Relaxed);
+        // I2：pipe 回收到 worker 本地 cache（懒建/复用的回收半边）
+        if let Mode::Splice { c2u, u2c } = &mut sess.mode {
+            for d in [&mut *c2u, &mut *u2c] {
+                let p = std::mem::replace(&mut d.pipe, [-1, -1]);
+                put_pipe(&mut self.pipe_cache, p);
+            }
+        }
     }
 
     fn handle_event(&mut self, fd: RawFd, revents: u32) {
@@ -849,10 +939,15 @@ impl Worker {
             ));
         }
         let (more, finished) = {
-            let Some(sess) = self.sessions.get_mut(&sid) else {
+            let Worker {
+                sessions,
+                pipe_cache,
+                ..
+            } = self;
+            let Some(sess) = sessions.get_mut(&sid) else {
                 return;
             };
-            let more = sess.on_event(sid, fd, revents);
+            let more = sess.on_event(sid, fd, revents, pipe_cache);
             (more, sess.finished())
         };
         if more {
@@ -906,8 +1001,31 @@ impl Worker {
         self.rearm(sid);
     }
 
-    /// 周期检查：被强制 stop（janitor/关停）或注册表已移除的会话收尾。
+    /// 周期检查：被强制 stop（janitor/关停）或注册表已移除的会话收尾；
+    /// I2：同时释放「无在途字节且空闲超阈」会话的 pipe（懒建的另一半）。
     fn sweep(&mut self) {
+        // I2：空闲释放（默认 10s；`SODAMA_PIPE_IDLE_MS=0` 关闭）
+        let idle_ns = pipe_idle_ns();
+        if idle_ns > 0 {
+            let now = monotonic_now_ns();
+            let mut released: Vec<[RawFd; 2]> = Vec::new();
+            for s in self.sessions.values_mut() {
+                let idle = now.saturating_sub(s.handle.last_ns.load(Ordering::Relaxed)) > idle_ns;
+                if !idle {
+                    continue;
+                }
+                if let Mode::Splice { c2u, u2c } = &mut s.mode {
+                    for d in [&mut *c2u, &mut *u2c] {
+                        if d.pending == 0 && d.pipe[0] >= 0 {
+                            released.push(std::mem::replace(&mut d.pipe, [-1, -1]));
+                        }
+                    }
+                }
+            }
+            for p in released {
+                put_pipe(&mut self.pipe_cache, p);
+            }
+        }
         if dbg_on() && !self.sessions.is_empty() {
             let now = std::time::Instant::now();
             let _ = now;
@@ -1216,18 +1334,6 @@ fn new_session(
     handle: Arc<RelayHandle>,
     u2c_paused: bool,
 ) -> Session {
-    fn pipe() -> io::Result<[RawFd; 2]> {
-        let mut fds = [0i32; 2];
-        if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        unsafe {
-            libc::fcntl(fds[1], libc::F_SETPIPE_SZ, PIPE_SZ);
-        }
-        Ok(fds)
-    }
-    let p1 = pipe().unwrap_or([-1, -1]);
-    let p2 = pipe().unwrap_or([-1, -1]);
     let (cfd, ufd) = (client.as_raw_fd(), upstream.as_raw_fd());
     // 无 prelude（Direct 等）时立即切非阻塞，fill/drain 可批量搬运；
     // 有 prelude 时不能提前切（读半与 prelude 共享同一 file description），
@@ -1245,7 +1351,7 @@ fn new_session(
             c2u: Dir {
                 src: cfd,
                 dst: ufd,
-                pipe: p1,
+                pipe: [-1, -1],
                 pending: 0,
                 eof: false,
                 done: false,
@@ -1253,7 +1359,7 @@ fn new_session(
             u2c: Dir {
                 src: ufd,
                 dst: cfd,
-                pipe: p2,
+                pipe: [-1, -1],
                 pending: 0,
                 eof: false,
                 done: false,

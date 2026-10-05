@@ -246,6 +246,12 @@ struct RelayStats {
     /// M1：splice 零拷贝连接数 / 不可用回退次数。
     splice_total: AtomicU64,
     splice_fallbacks: AtomicU64,
+    /// I2：fd 预算压力导致的 splice 降级次数。
+    splice_fd_budget: AtomicU64,
+    /// I2：pipe 懒建/复用/释放计数（worker 本地缓存）。
+    pipe_created: AtomicU64,
+    pipe_reused: AtomicU64,
+    pipe_released: AtomicU64,
     /// P18e：并发上限拒绝数（--max-conns）。
     limit_rejected: AtomicU64,
 }
@@ -260,11 +266,67 @@ static RELAY_STATS: RelayStats = RelayStats {
     offload_failures: AtomicU64::new(0),
     splice_total: AtomicU64::new(0),
     splice_fallbacks: AtomicU64::new(0),
+    splice_fd_budget: AtomicU64::new(0),
+    pipe_created: AtomicU64::new(0),
+    pipe_reused: AtomicU64::new(0),
+    pipe_released: AtomicU64::new(0),
     limit_rejected: AtomicU64::new(0),
 };
 
 /// P18e：relay 并发上限（0 = 不限；对照 dae relay 的并发上限）。
 static RELAY_MAX_CONNS: AtomicU64 = AtomicU64::new(0);
+
+// ---- I2：fd 预算治理 ----
+
+static NOFILE_SOFT: AtomicU64 = AtomicU64::new(0);
+static FD_HIGH: AtomicBool = AtomicBool::new(false);
+static FD_LAST_CHECK_NS: AtomicU64 = AtomicU64::new(0);
+
+/// 启动时把 RLIMIT_NOFILE 的 soft 提到 hard（提高并发上限；失败仅记录）。
+fn raise_nofile_limit() {
+    unsafe {
+        let mut rl = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) != 0 {
+            return;
+        }
+        let old = rl.rlim_cur;
+        if rl.rlim_max > rl.rlim_cur {
+            rl.rlim_cur = rl.rlim_max;
+            let _ = libc::setrlimit(libc::RLIMIT_NOFILE, &rl);
+        }
+        let mut now = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        let _ = libc::getrlimit(libc::RLIMIT_NOFILE, &mut now);
+        NOFILE_SOFT.store(now.rlim_cur, Ordering::Relaxed);
+        log(&format!(
+            "nofile: soft {old} -> {}（hard {})（I2）",
+            now.rlim_cur, now.rlim_max
+        ));
+    }
+}
+
+fn fd_used() -> u64 {
+    std::fs::read_dir("/proc/self/fd")
+        .map(|it| it.count() as u64)
+        .unwrap_or(0)
+}
+
+/// I2：fd 高压判定（使用率 ≥80%；1s 采样缓存，避免每连接 readdir）。
+fn fd_pressure() -> bool {
+    let now = monotonic_now_ns();
+    let last = FD_LAST_CHECK_NS.load(Ordering::Relaxed);
+    if now.saturating_sub(last) > 1_000_000_000 {
+        let soft = NOFILE_SOFT.load(Ordering::Relaxed).max(1);
+        FD_HIGH.store(fd_used() * 100 / soft >= 80, Ordering::Relaxed);
+        FD_LAST_CHECK_NS.store(now, Ordering::Relaxed);
+    }
+    FD_HIGH.load(Ordering::Relaxed)
+}
 
 /// P4c：offload 用的 fast_sock SOCKHASH（从 Ebpf 中取出后由 relay 线程共享写入）。
 static RELAY_OFFLOAD: OnceLock<Mutex<SockHash<MapData, SodaTuple>>> = OnceLock::new();
@@ -360,7 +422,10 @@ struct RelayHandle {
     offloaded: AtomicBool,
     /// P7：offload 看门狗（半关闭/终止检测）置位后，驻留的泵线程退出并回收 socket。
     stop: AtomicBool,
-    client: TcpStream,
+    /// I2：reactor 接管的会话不克隆 socket（看门狗改走 `reactor::kill(id)`），
+    /// 仅 offload/传统线程泵路径保留可 shutdown 的 fd 句柄（各 −2 fd/连接）。
+    reactor_managed: bool,
+    client: Option<TcpStream>,
     /// QUIC 协议（tuic）没有底层 TCP，为 None。
     upstream: Option<TcpStream>,
 }
@@ -2512,8 +2577,13 @@ fn handle_relay_conn(mut client: TcpStream) {
         }
     }
     let offloaded = offload_keys.is_some();
+    // I2：fd 预算压力（>80% soft limit）时新连接降级走用户态泵（保可用性，记账）。
+    let fd_high = fd_pressure();
     // M1：splice 零拷贝（仅未 offload 时；直接拨号/VLESS 明文在拨号层置位）。
-    let splice = wire_splice && !offloaded && RELAY_SPLICE.load(Ordering::Relaxed);
+    let splice = wire_splice && !offloaded && RELAY_SPLICE.load(Ordering::Relaxed) && !fd_high;
+    if fd_high && wire_splice && !offloaded && RELAY_SPLICE.load(Ordering::Relaxed) {
+        RELAY_STATS.splice_fd_budget.fetch_add(1, Ordering::Relaxed);
+    }
     // M4 stage 2：非 splice 的 rustls/明文链路（codec 会话）也可交 reactor——
     // 读半/写半在 worker 内非阻塞驱动（仅对已审计的协议种类开启）。
     let wire_codec = !splice && !offloaded && dialer.codec_reactor_capable();
@@ -2522,25 +2592,42 @@ fn handle_relay_conn(mut client: TcpStream) {
         RELAY_STATS.splice_total.fetch_add(1, Ordering::Relaxed);
     }
     let id = NEXT_RELAY_ID.fetch_add(1, Ordering::Relaxed);
-    // QUIC（tuic）没有底层 TCP：upstream 用 Option（仅 janitor 强制关闭用）。
-    let Ok(client_clone) = client.try_clone() else {
-        let _ = client.shutdown(std::net::Shutdown::Both);
-        return;
-    };
-    let upstream = match socket.as_ref().map(|s| s.try_clone()) {
-        Some(Ok(u)) => Some(u),
-        Some(Err(_)) => {
-            let _ = client.shutdown(std::net::Shutdown::Both);
-            return;
+    // I2：reactor 会话由 worker 持有 socket（看门狗走 reactor::kill(id)），
+    // 不克隆 fd 句柄；仅 offload / 传统线程泵路径保留可 shutdown 的句柄。
+    let reactor_splice = splice && !offloaded && reactor::enabled();
+    let reactor_codec = !splice && !offloaded && wire_codec && reactor::codec_available();
+    let need_fd_handle = !(reactor_splice || reactor_codec);
+    let client_clone = if need_fd_handle {
+        match client.try_clone() {
+            Ok(c) => Some(c),
+            Err(_) => {
+                let _ = client.shutdown(std::net::Shutdown::Both);
+                return;
+            }
         }
-        None => None,
+    } else {
+        None
+    };
+    // QUIC（tuic）没有底层 TCP：upstream 用 Option（仅 janitor 强制关闭用）。
+    let upstream_clone = if need_fd_handle {
+        match socket.as_ref().map(|s| s.try_clone()) {
+            Some(Ok(u)) => Some(u),
+            Some(Err(_)) => {
+                let _ = client.shutdown(std::net::Shutdown::Both);
+                return;
+            }
+            None => None,
+        }
+    } else {
+        None
     };
     let handle = Arc::new(RelayHandle {
         last_ns: AtomicU64::new(monotonic_now_ns()),
         offloaded: AtomicBool::new(offloaded),
         stop: AtomicBool::new(false),
+        reactor_managed: reactor_splice || reactor_codec,
         client: client_clone,
-        upstream,
+        upstream: upstream_clone,
     });
     if let Ok(mut m) = RELAY_CONNS.lock() {
         m.insert(id, handle.clone());
@@ -2549,32 +2636,31 @@ fn handle_relay_conn(mut client: TcpStream) {
     // 半关闭判定/超时回收/fast_sock 注销均在 `offload_watch_loop` 统一完成）。
     if offloaded {
         if let Some(keys) = offload_keys.take() {
-            let up_fd = handle.upstream.as_ref().map(|u| u.as_raw_fd());
-            if let Some(uf) = up_fd {
-                offload_watch_register(OffloadWatchEntry {
-                    id,
-                    client_fd: handle.client.as_raw_fd(),
-                    upstream_fd: uf,
-                    handle: handle.clone(),
-                    keys: Some(keys),
-                    client_closed: false,
-                    upstream_closed: false,
-                    first_close: None,
-                    err_logged: false,
-                });
+            let (Some(cf), Some(uf)) = (handle.client.as_ref(), handle.upstream.as_ref()) else {
+                log("offload: 缺 fd 句柄，放弃内核路径并回收");
+                if let Some(c) = &handle.client {
+                    let _ = c.shutdown(std::net::Shutdown::Both);
+                }
+                offload_watch_cleanup(id, &Some(keys));
                 return;
-            }
-            // offload 必有 upstream socket；防御性兑底：键已取出则直接回收，
-            // 不能落入驻留泵（无看门狗时无从置 stop）。
-            log("offload: 无 upstream socket，放弃内核路径并回收");
-            let _ = handle.client.shutdown(std::net::Shutdown::Both);
-            offload_watch_cleanup(id, &Some(keys));
+            };
+            offload_watch_register(OffloadWatchEntry {
+                id,
+                client_fd: cf.as_raw_fd(),
+                upstream_fd: uf.as_raw_fd(),
+                handle: handle.clone(),
+                keys: Some(keys),
+                client_closed: false,
+                upstream_closed: false,
+                first_close: None,
+                err_logged: false,
+            });
             return;
         }
     }
     // M4：splice 连接的 epoll worker 池（每连接 0 线程）。需要响应头前缀的链路
     // （VLESS）由 prelude 线程用 codec 读半消费后恢复；Direct 直接接管。
-    if splice && !offloaded && reactor::enabled() {
+    if reactor_splice {
         if let Some(up) = socket.take() {
             let prelude: Option<Box<dyn outbound::ReadHalf>> = if wire_prelude {
                 Some(from_remote)
@@ -2589,7 +2675,7 @@ fn handle_relay_conn(mut client: TcpStream) {
         }
     }
     // M4 stage 2：codec 会话（rustls VLESS-TCP / Trojan）交同一 worker 池（每连接 0 线程）。
-    if wire_codec && reactor::codec_available() {
+    if reactor_codec {
         if let Some(up) = socket.take() {
             if reactor::submit_codec(client, up, handle.clone(), id, from_remote, to_remote) {
                 return; // 注册表/统计由 reactor 收尾
@@ -2696,9 +2782,17 @@ fn relay_janitor_loop() {
             Err(_) => continue,
         };
         for (id, h) in dead {
-            let _ = h.client.shutdown(std::net::Shutdown::Both);
-            if let Some(u) = &h.upstream {
-                let _ = u.shutdown(std::net::Shutdown::Both);
+            // I2：reactor 会话由 worker 持有 socket，看门狗经 reactor::kill(id) 收尾；
+            // 其余（offload/线程泵）保留 fd 句柄路径。
+            if h.reactor_managed {
+                reactor::kill(id);
+            } else {
+                if let Some(c) = &h.client {
+                    let _ = c.shutdown(std::net::Shutdown::Both);
+                }
+                if let Some(u) = &h.upstream {
+                    let _ = u.shutdown(std::net::Shutdown::Both);
+                }
             }
             RELAY_STATS.evicted.fetch_add(1, Ordering::Relaxed);
             log(&format!("relay janitor: 回收空闲连接 #{id}"));
@@ -3502,6 +3596,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         return run_subcommand(&argv);
     }
+    // I2：尽早提升 fd 上限（router/高并发场景；子命令路径不需要）
+    raise_nofile_limit();
     let args = parse_args()?;
     if let Some(path) = &args.log_file {
         if open_log_file(path) {
@@ -5990,6 +6086,12 @@ fn status_json(ebpf: &mut Ebpf) -> serde_json::Value {
             "splice_enabled": RELAY_SPLICE.load(Ordering::Relaxed),
             "splice_total": RELAY_STATS.splice_total.load(Ordering::Relaxed),
             "splice_fallbacks": RELAY_STATS.splice_fallbacks.load(Ordering::Relaxed),
+            "splice_fd_budget": RELAY_STATS.splice_fd_budget.load(Ordering::Relaxed),
+            "pipe_created": RELAY_STATS.pipe_created.load(Ordering::Relaxed),
+            "pipe_reused": RELAY_STATS.pipe_reused.load(Ordering::Relaxed),
+            "pipe_released": RELAY_STATS.pipe_released.load(Ordering::Relaxed),
+            "fds_used": fd_used(),
+            "fds_soft_limit": NOFILE_SOFT.load(Ordering::Relaxed),
             "max_conns": RELAY_MAX_CONNS.load(Ordering::Relaxed),
             "limit_rejected": RELAY_STATS.limit_rejected.load(Ordering::Relaxed),
         },

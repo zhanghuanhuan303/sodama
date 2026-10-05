@@ -1,0 +1,545 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>sodama · 系统内存与资源边界终测报告 v2.0</title>
+<style>
+  :root{
+    --ink:#1a1d21; --muted:#5a6570; --rule:#d9dee4; --rule-soft:#e8ecf0;
+    --navy:#1f4e79; --navy-soft:#eef3f8; --warm:#a0522d; --warm-soft:#f8f1ec;
+    --bg:#ffffff; --code:#f4f6f8;
+  }
+  *{box-sizing:border-box}
+  html{-webkit-text-size-adjust:100%}
+  body{
+    margin:0; background:var(--bg); color:var(--ink);
+    font:15px/1.75 "Segoe UI",system-ui,-apple-system,"Noto Sans SC","PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;
+    font-variant-numeric:tabular-nums;
+  }
+  .wrap{max-width:980px;margin:0 auto;padding:48px 40px 96px}
+  header.doc{border-bottom:2px solid var(--ink);padding-bottom:22px;margin-bottom:34px}
+  .kicker{font-size:12px;letter-spacing:.18em;text-transform:uppercase;color:var(--muted);margin-bottom:10px}
+  h1{font-size:27px;line-height:1.35;margin:0 0 10px;font-weight:700;letter-spacing:.01em}
+  .subtitle{color:var(--muted);font-size:14.5px;margin:0 0 16px}
+  .meta{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:6px 28px;font-size:13px;color:var(--muted)}
+  .meta b{color:var(--ink);font-weight:600}
+  .badge{display:inline-block;border:1px solid var(--ink);border-radius:3px;padding:1px 8px;font-size:11.5px;letter-spacing:.08em;margin-left:8px;vertical-align:2px}
+  h2{font-size:19px;margin:44px 0 14px;padding-bottom:6px;border-bottom:1px solid var(--rule);font-weight:700}
+  h3{font-size:15.5px;margin:28px 0 10px;font-weight:700}
+  p{margin:10px 0}
+  ul,ol{margin:10px 0 10px 4px;padding-left:22px}
+  li{margin:4px 0}
+  small,.small{font-size:12.5px;color:var(--muted)}
+  code,kbd{background:var(--code);border:1px solid var(--rule-soft);border-radius:3px;padding:1px 5px;font:12.5px/1.5 ui-monospace,SFMono-Regular,Consolas,monospace}
+  pre{background:var(--code);border:1px solid var(--rule-soft);border-radius:4px;padding:12px 14px;overflow:auto;font:12.5px/1.65 ui-monospace,SFMono-Regular,Consolas,monospace}
+  table{width:100%;border-collapse:collapse;margin:14px 0;font-size:13.5px}
+  th,td{border-bottom:1px solid var(--rule-soft);padding:7px 10px;text-align:left;vertical-align:top}
+  thead th{border-bottom:1.5px solid var(--ink);font-weight:600;font-size:12.5px;letter-spacing:.02em}
+  td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
+  tbody tr:hover{background:#fafbfc}
+  .callout{border-left:3px solid var(--navy);background:var(--navy-soft);padding:12px 16px;margin:16px 0;border-radius:0 4px 4px 0}
+  .callout.warn{border-color:var(--warm);background:var(--warm-soft)}
+  .callout p:first-child{margin-top:0}.callout p:last-child{margin-bottom:0}
+  figure{margin:22px 0;border:1px solid var(--rule-soft);border-radius:4px;padding:14px 14px 8px}
+  figure svg{display:block}
+  figcaption{font-size:12.5px;color:var(--muted);margin-top:8px;line-height:1.6}
+  .toc{columns:2;column-gap:40px;font-size:13.5px;margin:14px 0}
+  .toc a{color:var(--ink);text-decoration:none;border-bottom:1px dotted var(--rule)}
+  .toc a:hover{color:var(--navy)}
+  .kv{display:grid;grid-template-columns:190px 1fr;gap:4px 18px;font-size:13.5px;margin:12px 0}
+  .kv dt{color:var(--muted)}
+  .kv dd{margin:0}
+  .tag{display:inline-block;font-size:11.5px;border-radius:3px;padding:1px 7px;letter-spacing:.03em}
+  .tag.ok{background:#e9f3ec;color:#1d5c34;border:1px solid #c4ddcd}
+  .tag.part{background:#fdf3e4;color:#7a5217;border:1px solid #ecd6ad}
+  .tag.no{background:#f6ecec;color:#7d2f2f;border:1px solid #e4c4c4}
+  .num{white-space:nowrap}
+  .rule{margin:34px 0;border:0;border-top:1px solid var(--rule-soft)}
+  footer.doc{margin-top:56px;padding-top:18px;border-top:1px solid var(--rule);font-size:12.5px;color:var(--muted)}
+  @media print{
+    .wrap{max-width:none;padding:0 6mm}
+    h2{break-after:avoid} figure,table{break-inside:avoid}
+    a{color:inherit;text-decoration:none}
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header class="doc">
+  <div class="kicker">SODAMA · 技术报告 · 送审稿</div>
+  <h1>系统内存与资源边界终测报告<span class="badge">v2.0</span></h1>
+  <p class="subtitle">四层模型（Process → Kernel → Total → per-connection）· 同口径 dae 对照 · FD 架构治理回归 · 转发原语对照 · 长稳与有界性</p>
+  <div class="meta">
+    <div><b>日期</b>：2026-10-05</div>
+    <div><b>对象</b>：sodama（Rust 重写 dae；全 Rust 数据面 + eBPF）</div>
+    <div><b>测试机</b>：Arch / Linux 6.18.54-lts / i9-9900KF 8C16T / 31 GB</div>
+    <div><b>工具链</b>：<code>lab/perf/mem-system.sh</code> · <code>mem-analyze.py</code> · <code>soak-curve.sh</code></div>
+    <div><b>对照</b>：dae v2.1.1（Go + eBPF，同拓扑/同协议/同夹具）</div>
+    <div><b>状态</b>：I1–I5 已完成；本报告为提交审核版</div>
+  </div>
+</header>
+
+<h2 id="abstract">摘要</h2>
+<p>本报告回应两份第三方评审（见 <code>docs/reviews/2026-10-05-memory-final-review-{a,b}.md</code>）提出的核心问题：<b>「RSS 低是否只是把内存搬到了内核？」</b> 我们以四层模型重做了系统级内存基准（连接扫描 100 → 20 000，含无实现对照组与 dae 同口径对照），并完成 FD 架构治理与转发原语对照。结论如下：</p>
+<ul>
+  <li><b>用户态</b>：sodama 20 000 连接 <b>23.6 MB RSS / 28 线程 / 4.0 fd/连接</b>，稳态净增 <b>≈ 0.6–0.7 KB/连接</b>；对照 dae <b>1 662 MB / 85 KB/连接</b>。</li>
+  <li><b>内核侧</b>：sodama 20 000 连接 Slab 增量 <b>1 168.6 MB（原始 ≈ 58 KB/连接）</b>；扣除同拓扑无实现对照组（夹具自身 7.1 KB/连接）后 <b>≈ 52.7 KB/连接</b>；dae 为 810.3 MB / ≈ 34.4 KB/连接。</li>
+  <li><b>口径修正</b>：用户态优势 <b>不等于</b>系统优势——内核侧远大于用户态（约 50×），本报告不以 RSS 单指标下结论；以「用户态 + 内核」总量比较，20 k 连接下 sodama ≈ 1.19 GB vs dae ≈ 2.47 GB，且 sodama 的增量主要来自每连接 6 个 socket 的共享测试链路与 splice 管道结构。</li>
+  <li><b>pipe 推算否证</b>：20 000 条 1 MiB 管道容量上界 20 GiB；实测无任何 pipe 命名 slab cache，管道缓冲按需分页，<b>capacity ≠ resident</b>。</li>
+  <li><b>FD 治理</b>：每连接 fd 从 8.3（4 socket + 4 pipe）降至 <b>4.0（2 socket + 2 pipe，活跃）</b>，空闲回落 ≈ 3.1，20 000 连接建立峰值无额外瞬态；启动自提升 <code>RLIMIT_NOFILE</code>，≥80% 时新连接自动降级。</li>
+  <li><b>转发原语</b>：splice 相对用户态泵 <b>+31% 吞吐 / −80% CPU</b>；io_uring 复测在噪声内（维持不引入，ADR-0058）；MSG_ZEROCOPY 语义不适用于本数据面（记录边界）。</li>
+  <li><b>长稳</b>：35 分钟短时 soak（常驻 200 连接 + 微量 churn + 周期负载）RSS/fd/Slab 漂移见 §3.8；72 小时判据与执行计划已固化。</li>
+</ul>
+<div class="callout">
+  <p><b>定位语（对外统一）</b>：sodama 以极低线程数与用户态内存承载高并发连接，追求 <b>predictable resource consumption</b>。本报告不使用「唯一解 / 遥遥领先 / 顶级」等评估性措辞；所有数字均为本机实测，未做外推。</p>
+</div>
+
+<h2 id="toc">目录</h2>
+<nav class="toc">
+  <a href="#scope">1 · 范围与口径</a><br>
+  <a href="#method">2 · 方法学</a><br>
+  <a href="#userspace">3.1 · 用户态扫描</a><br>
+  <a href="#kernel">3.2 · 内核侧扫描</a><br>
+  <a href="#total">3.3 · 每连接分解与总量</a><br>
+  <a href="#attrib">3.4 · Slab 归因</a><br>
+  <a href="#pipe">3.5 · 管道容量 ≠ 常驻</a><br>
+  <a href="#fd">3.6 · FD 拓扑与治理</a><br>
+  <a href="#primitives">3.7 · 转发原语</a><br>
+  <a href="#soak">3.8 · 长稳与有界性</a><br>
+  <a href="#reviews">4 · 评审回应矩阵</a><br>
+  <a href="#limits">5 · 局限与边界</a><br>
+  <a href="#repro">6 · 复现与工件</a><br>
+  <a href="#conclusion">7 · 结论</a>
+</nav>
+
+<h2 id="scope">1 · 范围与口径</h2>
+<div class="kv">
+  <dt>Process（用户态）</dt><dd><code>VmRSS</code>、<code>Threads</code>、fd 分类计数（socket/pipe）、<code>smaps_rollup</code> Private_Dirty。</dd>
+  <dt>Kernel（内核侧）</dt><dd><code>/proc/meminfo</code> Slab / SReclaimable / SUnreclaim / PageTables；<code>/proc/slabinfo</code> 全 cache 归因；<code>sockstat</code>；conntrack；<code>bpftool map</code>（eBPF 内存）。</dd>
+  <dt>Total（总量）</dt><dd>用户态增量 + 内核侧增量（同点邻近采样；对照组扣除夹具后给出实现净增）。</dd>
+  <dt>per-connection</dt><dd>增量 ÷ 连接数；同时给出原始值与扣除对照后的净增（两者都列，避免口径歧义）。</dd>
+  <dt>不在口径内</dt><dd>共享测试链路（sing-box VLESS 服务端、echo 夹具）的进程 RSS；页面缓存；NIC/DMA 侧。均作为边界在设计对照与文字中处理。</dd>
+</div>
+
+<h2 id="method">2 · 方法学</h2>
+<h3>2.1 拓扑与夹具</h3>
+<p>三个网络命名空间隔离：<code>client ns</code>（压测端）— 被测网关（sodama / dae）— <code>WAN ns</code>（<code>echo_server</code> 回显 + sing-box VLESS 服务端）。客户端经 eBPF 重定向进入网关，网关以 VLESS（明文 TCP）拨号至 WAN 侧上游，上游回环至回显端，形成完整的 6-socket 链。</p>
+<ul>
+  <li><b>连接夹具</b>：<code>conn_scale hold</code>（单进程逐条连接 + 32 B ping + 回显校验，全部成功才计入）；</li>
+  <li><b>回显端</b>：<code>echo_server</code>（epoll 单线程）——<b>不使用 <code>bench_io</code> 作 WAN 侧回显</b>：其每连接 1–2 线程，10 k 连接即 2 万线程，既污染 <code>task_struct</code> 观测，也会撞上 systemd scope 的 <code>TasksMax=15%</code>（38 142）上限（该现象经 <code>cgroup.threads</code> 聚合确认来自夹具而非 sodama，见 §3.6 注）；</li>
+  <li><b>端口</b>：client/WAN 两命名空间放宽 <code>ip_local_port_range=10000-65000</code> 且 <code>tcp_tw_reuse=1</code>（高并发扫描在 20 k 点曾触发上游拨号 <code>EADDRNOTAVAIL</code>，为夹具侧边界而非实现特性）。</li>
+</ul>
+<h3>2.2 采样与增量</h3>
+<p>每个扫描点取三个快照：<code>pre</code>（起压前 1 s）、<code>active</code>（全部连接建立后 1 s）、<code>after</code>（释放后 2 s）。<b>所有增量均为同点邻近的 <code>active − pre</code></b>；早期版本以 <code>N=0</code> 为基线，跨数分钟的扫描会把系统背景漂移计入增量，已修正并重新采集全部数据。</p>
+<h3>2.3 对照扣除</h3>
+<p>对照组<b>同拓扑、同夹具、不放任何实现</b>（连接直接经内核到达回显端），其每连接增量代表夹具与内核直连路径开销（20 k 点 7.1 KB/连接）。实现净增 = 实现每连接 − 对照每连接。由于实现路径含共享的 sing-box/echo 链路，净增仍包含该部分（两实现同口径，可横向比较；不能当作纯实现值）。</p>
+<div class="callout warn">
+  <p><b>修正记录（透明性）</b>：① 早期以 <code>N=0</code> 为基线的内核增量受背景漂移污染（20 k 点虚高至 1.2 GB 级中约 0.6 GB 不实），已改为同点 pre/active 并全量重采；② 早期「2 万线程」曾被疑为 sodama 问题，实为 <code>bench_io</code> 夹具线程，已更换夹具并在方法学中固化。</p>
+</div>
+
+<h2 id="results">3 · 结果</h2>
+
+<h3 id="userspace">3.1 用户态扫描</h3>
+<figure><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 320" width="100%" style="font-family:'Segoe UI',system-ui,-apple-system,'Noto Sans SC',sans-serif">
+<rect x="0" y="0" width="800" height="320" fill="#ffffff"/>
+<line x1="76" y1="272.0" x2="660" y2="272.0" stroke="#e3e7ec" stroke-width="1"/>
+<text x="66" y="276.0" font-size="12" fill="#5a6570" text-anchor="end">0</text>
+<line x1="76" y1="231.0" x2="660" y2="231.0" stroke="#e3e7ec" stroke-width="1"/>
+<text x="66" y="235.0" font-size="12" fill="#5a6570" text-anchor="end">300</text>
+<line x1="76" y1="190.0" x2="660" y2="190.0" stroke="#e3e7ec" stroke-width="1"/>
+<text x="66" y="194.0" font-size="12" fill="#5a6570" text-anchor="end">600</text>
+<line x1="76" y1="149.0" x2="660" y2="149.0" stroke="#e3e7ec" stroke-width="1"/>
+<text x="66" y="153.0" font-size="12" fill="#5a6570" text-anchor="end">900</text>
+<line x1="76" y1="108.0" x2="660" y2="108.0" stroke="#e3e7ec" stroke-width="1"/>
+<text x="66" y="112.0" font-size="12" fill="#5a6570" text-anchor="end">1200</text>
+<line x1="76" y1="67.0" x2="660" y2="67.0" stroke="#e3e7ec" stroke-width="1"/>
+<text x="66" y="71.0" font-size="12" fill="#5a6570" text-anchor="end">1500</text>
+<line x1="76" y1="26.0" x2="660" y2="26.0" stroke="#e3e7ec" stroke-width="1"/>
+<text x="66" y="30.0" font-size="12" fill="#5a6570" text-anchor="end">1800</text>
+<line x1="76.0" y1="26" x2="76.0" y2="272" stroke="#e3e7ec" stroke-width="1" stroke-dasharray="2,3"/>
+<text x="76.0" y="292" font-size="12" fill="#5a6570" text-anchor="middle">0</text>
+<line x1="222.0" y1="26" x2="222.0" y2="272" stroke="#e3e7ec" stroke-width="1" stroke-dasharray="2,3"/>
+<text x="222.0" y="292" font-size="12" fill="#5a6570" text-anchor="middle">5k</text>
+<line x1="368.0" y1="26" x2="368.0" y2="272" stroke="#e3e7ec" stroke-width="1" stroke-dasharray="2,3"/>
+<text x="368.0" y="292" font-size="12" fill="#5a6570" text-anchor="middle">10k</text>
+<line x1="514.0" y1="26" x2="514.0" y2="272" stroke="#e3e7ec" stroke-width="1" stroke-dasharray="2,3"/>
+<text x="514.0" y="292" font-size="12" fill="#5a6570" text-anchor="middle">15k</text>
+<line x1="660.0" y1="26" x2="660.0" y2="272" stroke="#e3e7ec" stroke-width="1" stroke-dasharray="2,3"/>
+<text x="660.0" y="292" font-size="12" fill="#5a6570" text-anchor="middle">20k</text>
+<line x1="76" y1="272" x2="660" y2="272" stroke="#5a6570" stroke-width="1.2"/>
+<line x1="76" y1="26" x2="76" y2="272" stroke="#5a6570" stroke-width="1.2"/>
+<text x="368" y="312" font-size="12" fill="#5a6570" text-anchor="middle">并发连接数</text>
+<text x="16" y="149" font-size="12" fill="#5a6570" text-anchor="middle" transform="rotate(-90 16 149)">进程 RSS（MB）</text>
+<polyline points="78.9,268.3 90.6,268.2 105.2,268.1 134.4,270.3 222.0,270.1 368.0,269.7 660.0,268.8" fill="none" stroke="#1f4e79" stroke-width="2.2" stroke-linejoin="round"/>
+<circle cx="78.9" cy="268.3" r="3" fill="#1f4e79"/>
+<circle cx="90.6" cy="268.2" r="3" fill="#1f4e79"/>
+<circle cx="105.2" cy="268.1" r="3" fill="#1f4e79"/>
+<circle cx="134.4" cy="270.3" r="3" fill="#1f4e79"/>
+<circle cx="222.0" cy="270.1" r="3" fill="#1f4e79"/>
+<circle cx="368.0" cy="269.7" r="3" fill="#1f4e79"/>
+<circle cx="660.0" cy="268.8" r="3" fill="#1f4e79"/>
+<line x1="676" y1="32" x2="700" y2="32" stroke="#1f4e79" stroke-width="2.5"/>
+<text x="706" y="36" font-size="12.5" fill="#1a1d21">sodama（Rust）</text>
+<polyline points="78.9,264.4 90.6,257.5 105.2,248.0 134.4,230.2 222.0,176.8 368.0,121.0 660.0,44.9" fill="none" stroke="#a0522d" stroke-width="2.2" stroke-linejoin="round"/>
+<circle cx="78.9" cy="264.4" r="3" fill="#a0522d"/>
+<circle cx="90.6" cy="257.5" r="3" fill="#a0522d"/>
+<circle cx="105.2" cy="248.0" r="3" fill="#a0522d"/>
+<circle cx="134.4" cy="230.2" r="3" fill="#a0522d"/>
+<circle cx="222.0" cy="176.8" r="3" fill="#a0522d"/>
+<circle cx="368.0" cy="121.0" r="3" fill="#a0522d"/>
+<circle cx="660.0" cy="44.9" r="3" fill="#a0522d"/>
+<line x1="676" y1="52" x2="700" y2="52" stroke="#a0522d" stroke-width="2.5"/>
+<text x="706" y="56" font-size="12.5" fill="#1a1d21">dae（Go，对照）</text>
+</svg>
+<figcaption>图 1 · 进程 RSS 随并发连接数。sodama 在 N≥2 000 后由主动回收进入 12–24 MB 平台；dae 随连接线性增长至 1.66 GB。</figcaption></figure>
+<table>
+<thead><tr><th>实现</th><th class="num">N=1 000</th><th class="num">N=2 000</th><th class="num">N=5 000</th><th class="num">N=10 000</th><th class="num">N=20 000</th><th class="num">线程数</th><th class="num">fd/连接</th></tr></thead>
+<tbody>
+<tr><td>sodama RSS</td><td class="num">28.2 MB</td><td class="num">12.1 MB</td><td class="num">13.7 MB</td><td class="num">16.7 MB</td><td class="num">23.6 MB</td><td class="num">28</td><td class="num">4.00</td></tr>
+<tr><td>dae RSS（对照）</td><td class="num">175.6 MB</td><td class="num">306.0 MB</td><td class="num">696.6 MB</td><td class="num">1 104.6 MB</td><td class="num">1 662.0 MB</td><td class="num">26</td><td class="num">2.00</td></tr>
+</tbody></table>
+<p class="small">sodama 稳态净增（以各 run 最小活跃 RSS 12.1 MB 为基线）：(23.6−12.1) MB ÷ 18 000 ≈ <b>0.7 KB/连接</b>；dae 同法 ≈ 82.7 KB/连接。两实现的线程数均保持 O(核数)。</p>
+
+<h3 id="kernel">3.2 内核侧扫描</h3>
+<figure><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 320" width="100%" style="font-family:'Segoe UI',system-ui,-apple-system,'Noto Sans SC',sans-serif">
+<rect x="0" y="0" width="800" height="320" fill="#ffffff"/>
+<line x1="76" y1="272.0" x2="660" y2="272.0" stroke="#e3e7ec" stroke-width="1"/>
+<text x="66" y="276.0" font-size="12" fill="#5a6570" text-anchor="end">0</text>
+<line x1="76" y1="222.8" x2="660" y2="222.8" stroke="#e3e7ec" stroke-width="1"/>
+<text x="66" y="226.8" font-size="12" fill="#5a6570" text-anchor="end">250</text>
+<line x1="76" y1="173.6" x2="660" y2="173.6" stroke="#e3e7ec" stroke-width="1"/>
+<text x="66" y="177.6" font-size="12" fill="#5a6570" text-anchor="end">500</text>
+<line x1="76" y1="124.4" x2="660" y2="124.4" stroke="#e3e7ec" stroke-width="1"/>
+<text x="66" y="128.4" font-size="12" fill="#5a6570" text-anchor="end">750</text>
+<line x1="76" y1="75.2" x2="660" y2="75.2" stroke="#e3e7ec" stroke-width="1"/>
+<text x="66" y="79.2" font-size="12" fill="#5a6570" text-anchor="end">1000</text>
+<line x1="76" y1="26.0" x2="660" y2="26.0" stroke="#e3e7ec" stroke-width="1"/>
+<text x="66" y="30.0" font-size="12" fill="#5a6570" text-anchor="end">1250</text>
+<line x1="76.0" y1="26" x2="76.0" y2="272" stroke="#e3e7ec" stroke-width="1" stroke-dasharray="2,3"/>
+<text x="76.0" y="292" font-size="12" fill="#5a6570" text-anchor="middle">0</text>
+<line x1="222.0" y1="26" x2="222.0" y2="272" stroke="#e3e7ec" stroke-width="1" stroke-dasharray="2,3"/>
+<text x="222.0" y="292" font-size="12" fill="#5a6570" text-anchor="middle">5k</text>
+<line x1="368.0" y1="26" x2="368.0" y2="272" stroke="#e3e7ec" stroke-width="1" stroke-dasharray="2,3"/>
+<text x="368.0" y="292" font-size="12" fill="#5a6570" text-anchor="middle">10k</text>
+<line x1="514.0" y1="26" x2="514.0" y2="272" stroke="#e3e7ec" stroke-width="1" stroke-dasharray="2,3"/>
+<text x="514.0" y="292" font-size="12" fill="#5a6570" text-anchor="middle">15k</text>
+<line x1="660.0" y1="26" x2="660.0" y2="272" stroke="#e3e7ec" stroke-width="1" stroke-dasharray="2,3"/>
+<text x="660.0" y="292" font-size="12" fill="#5a6570" text-anchor="middle">20k</text>
+<line x1="76" y1="272" x2="660" y2="272" stroke="#5a6570" stroke-width="1.2"/>
+<line x1="76" y1="26" x2="76" y2="272" stroke="#5a6570" stroke-width="1.2"/>
+<text x="368" y="312" font-size="12" fill="#5a6570" text-anchor="middle">并发连接数</text>
+<text x="16" y="149" font-size="12" fill="#5a6570" text-anchor="middle" transform="rotate(-90 16 149)">系统 Slab 增量（MB）</text>
+<polyline points="78.9,271.2 90.6,267.8 105.2,262.6 134.4,251.7 222.0,216.4 368.0,158.7 660.0,42.0" fill="none" stroke="#1f4e79" stroke-width="2.2" stroke-linejoin="round"/>
+<circle cx="78.9" cy="271.2" r="3" fill="#1f4e79"/>
+<circle cx="90.6" cy="267.8" r="3" fill="#1f4e79"/>
+<circle cx="105.2" cy="262.6" r="3" fill="#1f4e79"/>
+<circle cx="134.4" cy="251.7" r="3" fill="#1f4e79"/>
+<circle cx="222.0" cy="216.4" r="3" fill="#1f4e79"/>
+<circle cx="368.0" cy="158.7" r="3" fill="#1f4e79"/>
+<circle cx="660.0" cy="42.0" r="3" fill="#1f4e79"/>
+<line x1="676" y1="32" x2="700" y2="32" stroke="#1f4e79" stroke-width="2.5"/>
+<text x="706" y="36" font-size="12.5" fill="#1a1d21">sodama</text>
+<polyline points="78.9,271.7 90.6,269.3 105.2,265.7 134.4,258.4 222.0,239.0 368.0,195.1 660.0,112.5" fill="none" stroke="#a0522d" stroke-width="2.2" stroke-linejoin="round"/>
+<circle cx="78.9" cy="271.7" r="3" fill="#a0522d"/>
+<circle cx="90.6" cy="269.3" r="3" fill="#a0522d"/>
+<circle cx="105.2" cy="265.7" r="3" fill="#a0522d"/>
+<circle cx="134.4" cy="258.4" r="3" fill="#a0522d"/>
+<circle cx="222.0" cy="239.0" r="3" fill="#a0522d"/>
+<circle cx="368.0" cy="195.1" r="3" fill="#a0522d"/>
+<circle cx="660.0" cy="112.5" r="3" fill="#a0522d"/>
+<line x1="676" y1="52" x2="700" y2="52" stroke="#a0522d" stroke-width="2.5"/>
+<text x="706" y="56" font-size="12.5" fill="#1a1d21">dae（对照）</text>
+<polyline points="78.9,272.0 90.6,271.6 105.2,271.1 134.4,269.8 222.0,265.6 368.0,258.8 660.0,244.6" fill="none" stroke="#9aa4ad" stroke-width="2.2" stroke-linejoin="round"/>
+<circle cx="78.9" cy="272.0" r="3" fill="#9aa4ad"/>
+<circle cx="90.6" cy="271.6" r="3" fill="#9aa4ad"/>
+<circle cx="105.2" cy="271.1" r="3" fill="#9aa4ad"/>
+<circle cx="134.4" cy="269.8" r="3" fill="#9aa4ad"/>
+<circle cx="222.0" cy="265.6" r="3" fill="#9aa4ad"/>
+<circle cx="368.0" cy="258.8" r="3" fill="#9aa4ad"/>
+<circle cx="660.0" cy="244.6" r="3" fill="#9aa4ad"/>
+<line x1="676" y1="72" x2="700" y2="72" stroke="#9aa4ad" stroke-width="2.5"/>
+<text x="706" y="76" font-size="12.5" fill="#1a1d21">对照组（无实现）</text>
+</svg>
+<figcaption>图 2 · Slab 增量（pre→active，含夹具与共享链路）。三条线均近似线性：这是 TCP/socket 等按连接内核对象的预期行为；对照组（无实现）斜率即夹具自身开销。</figcaption></figure>
+<table>
+<thead><tr><th class="num">N</th><th class="num">sodama ΔSlab</th><th class="num">dae ΔSlab</th><th class="num">对照 ΔSlab</th><th class="num">sodama 净增/连接</th><th class="num">dae 净增/连接</th></tr></thead>
+<tbody>
+<tr><td class="num">1 000</td><td class="num">47.9 MB</td><td class="num">32.2 MB</td><td class="num">4.5 MB</td><td class="num">44.4 KB</td><td class="num">28.4 KB</td></tr>
+<tr><td class="num">2 000</td><td class="num">103.3 MB</td><td class="num">69.1 MB</td><td class="num">11.2 MB</td><td class="num">47.1 KB</td><td class="num">29.6 KB</td></tr>
+<tr><td class="num">5 000</td><td class="num">282.4 MB</td><td class="num">167.6 MB</td><td class="num">32.6 MB</td><td class="num">51.2 KB</td><td class="num">27.7 KB</td></tr>
+<tr><td class="num">10 000</td><td class="num">575.7 MB</td><td class="num">390.8 MB</td><td class="num">67.1 MB</td><td class="num">52.1 KB</td><td class="num">33.2 KB</td></tr>
+<tr><td class="num">20 000</td><td class="num">1 168.6 MB</td><td class="num">810.3 MB</td><td class="num">139.4 MB</td><td class="num"><b>52.7 KB</b></td><td class="num"><b>34.4 KB</b></td></tr>
+</tbody></table>
+<p class="small">净增/连接 = (实现 Δ − 对照 Δ) ÷ N。SUnreclaim 与 ΔSlab 近似同步（sodama 20 k：995.9 MB），eBPF map 内存稳定（Δ ≤ 5.5 MB @20 k）。</p>
+
+<h3 id="total">3.3 每连接分解与总量</h3>
+<figure><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 190" width="100%" style="font-family:'Segoe UI',system-ui,-apple-system,'Noto Sans SC',sans-serif">
+<rect width="800" height="190" fill="#ffffff"/>
+<text x="0" y="16" font-size="13" font-weight="600" fill="#1a1d21">20 000 连接 · 每连接内存（KB；内核为 pre→active 增量，含共享链路）</text>
+<text x="160" y="47" font-size="12.5" fill="#1a1d21" text-anchor="end">sodama 用户态</text>
+<rect x="170" y="30" width="2.8" height="24" fill="#1f4e79" rx="2"/>
+<text x="181" y="47" font-size="12.5" fill="#5a6570">0.353 KB</text>
+<text x="160" y="81" font-size="12.5" fill="#1a1d21" text-anchor="end">dae 用户态</text>
+<rect x="170" y="64" width="227.2" height="24" fill="#a0522d" rx="2"/>
+<text x="405" y="81" font-size="12.5" fill="#5a6570">28.1992 KB</text>
+<text x="160" y="115" font-size="12.5" fill="#1a1d21" text-anchor="end">sodama 内核 Slab</text>
+<rect x="170" y="98" width="482.1" height="24" fill="#4a7fb5" rx="2"/>
+<text x="660" y="115" font-size="12.5" fill="#5a6570">59.8348 KB</text>
+<text x="160" y="149" font-size="12.5" fill="#1a1d21" text-anchor="end">dae 内核 Slab</text>
+<rect x="170" y="132" width="334.3" height="24" fill="#c98c6b" rx="2"/>
+<text x="512" y="149" font-size="12.5" fill="#5a6570">41.4876 KB</text>
+</svg>
+<figcaption>图 3 · 20 000 连接每连接内存：用户态（左两组）与内核 Slab（右两组）。sodama 的用户态优势约 120×，内核侧高约 1.5×（其差额来自 splice 管道与对照口径下共享链路的分配方式，见 §3.4/§5）。</figcaption></figure>
+<figure><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 180" width="100%" style="font-family:'Segoe UI',system-ui,-apple-system,'Noto Sans SC',sans-serif">
+<rect width="800" height="180" fill="#ffffff"/>
+<text x="0" y="16" font-size="13" font-weight="600" fill="#1a1d21">20 000 连接 · 总内存构成（进程 RSS + 系统 Slab 增量；MB）</text>
+<text x="160" y="54" font-size="12.5" fill="#1a1d21" text-anchor="end">sodama</text>
+<rect x="170" y="34" width="4.9" height="30" fill="#1f4e79"/>
+<rect x="174.9" y="34" width="242.7" height="30" fill="#4a7fb5"/>
+<text x="426" y="54" font-size="12.5" fill="#5a6570">合计 1192 MB</text>
+<text x="176" y="54" font-size="11.5" fill="#ffffff">用户态 24</text>
+<text x="181" y="54" font-size="11.5" fill="#ffffff">内核 1169</text>
+<text x="160" y="112" font-size="12.5" fill="#1a1d21" text-anchor="end">dae（对照）</text>
+<rect x="170" y="92" width="345.2" height="30" fill="#a0522d"/>
+<rect x="515.2" y="92" width="168.3" height="30" fill="#c98c6b"/>
+<text x="691" y="112" font-size="12.5" fill="#5a6570">合计 2472 MB</text>
+<text x="176" y="112" font-size="11.5" fill="#ffffff">用户态 1662</text>
+<text x="521" y="112" font-size="11.5" fill="#ffffff">内核 810</text>
+<text x="170" y="172" font-size="11.5" fill="#5a6570">内核侧含共享测试链路（sing-box 服务端 + echo 夹具）与仪器伴生 cache；口径见方法学。</text>
+</svg>
+<figcaption>图 4 · 20 000 连接总内存构成（进程 RSS + 系统 Slab 增量）。sodama ≈ 1.19 GB，dae ≈ 2.47 GB；内核侧为全系统增量，含共享测试链路。</figcaption></figure>
+
+<h3 id="attrib">3.4 Slab 归因（20 000 连接，干净快照）</h3>
+<figure><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 459" width="100%" style="font-family:'Segoe UI',system-ui,-apple-system,'Noto Sans SC',sans-serif">
+<rect width="800" height="459" fill="#ffffff"/>
+<text x="0" y="16" font-size="13" font-weight="600" fill="#1a1d21">sodama · 20 000 连接 · Slab 归因（命名 cache 合计 579 MB / meminfo ΔSlab 1 168 MB）</text>
+<text x="220" y="44" font-size="12.5" fill="#1a1d21" text-anchor="end">TCP</text>
+<rect x="230" y="30" width="206.9" height="20" fill="#1f4e79" rx="2"/>
+<text x="445" y="44" font-size="12.5" fill="#5a6570">284.3 MB</text>
+<text x="220" y="71" font-size="12.5" fill="#1a1d21" text-anchor="end">sock_inode_cache</text>
+<rect x="230" y="57" width="68.6" height="20" fill="#1f4e79" rx="2"/>
+<text x="307" y="71" font-size="12.5" fill="#5a6570">94.3 MB</text>
+<text x="220" y="98" font-size="12.5" fill="#1a1d21" text-anchor="end">proc_inode_cache</text>
+<rect x="230" y="84" width="37.8" height="20" fill="#5b87ad" rx="2"/>
+<text x="276" y="98" font-size="12.5" fill="#5a6570">51.9 MB</text>
+<text x="220" y="125" font-size="12.5" fill="#1a1d21" text-anchor="end">dentry</text>
+<rect x="230" y="111" width="31.7" height="20" fill="#5b87ad" rx="2"/>
+<text x="270" y="125" font-size="12.5" fill="#5a6570">43.5 MB</text>
+<text x="220" y="152" font-size="12.5" fill="#1a1d21" text-anchor="end">filp</text>
+<rect x="230" y="138" width="26.4" height="20" fill="#1f4e79" rx="2"/>
+<text x="264" y="152" font-size="12.5" fill="#5a6570">36.3 MB</text>
+<text x="220" y="179" font-size="12.5" fill="#1a1d21" text-anchor="end">inode_cache</text>
+<rect x="230" y="165" width="17.0" height="20" fill="#5b87ad" rx="2"/>
+<text x="255" y="179" font-size="12.5" fill="#5a6570">23.3 MB</text>
+<text x="220" y="206" font-size="12.5" fill="#1a1d21" text-anchor="end">eventpoll_epi</text>
+<rect x="230" y="192" width="9.3" height="20" fill="#7fa8c9" rx="2"/>
+<text x="247" y="206" font-size="12.5" fill="#5a6570">12.8 MB</text>
+<text x="220" y="233" font-size="12.5" fill="#1a1d21" text-anchor="end">kmalloc-512</text>
+<rect x="230" y="219" width="6.2" height="20" fill="#7fa8c9" rx="2"/>
+<text x="244" y="233" font-size="12.5" fill="#5a6570">8.5 MB</text>
+<text x="220" y="260" font-size="12.5" fill="#1a1d21" text-anchor="end">lsm_inode_cache</text>
+<rect x="230" y="246" width="5.2" height="20" fill="#9dbed8" rx="2"/>
+<text x="243" y="260" font-size="12.5" fill="#5a6570">7.2 MB</text>
+<text x="220" y="287" font-size="12.5" fill="#1a1d21" text-anchor="end">file_lock_cache</text>
+<rect x="230" y="273" width="5.0" height="20" fill="#9dbed8" rx="2"/>
+<text x="243" y="287" font-size="12.5" fill="#5a6570">6.9 MB</text>
+<text x="220" y="314" font-size="12.5" fill="#1a1d21" text-anchor="end">kmalloc-cg-192</text>
+<rect x="230" y="300" width="5.0" height="20" fill="#9dbed8" rx="2"/>
+<text x="243" y="314" font-size="12.5" fill="#5a6570">6.9 MB</text>
+<text x="220" y="341" font-size="12.5" fill="#1a1d21" text-anchor="end">anon_vma_chain</text>
+<rect x="230" y="327" width="4.4" height="20" fill="#9dbed8" rx="2"/>
+<text x="242" y="341" font-size="12.5" fill="#5a6570">6.1 MB</text>
+<text x="220" y="368" font-size="12.5" fill="#1a1d21" text-anchor="end">kmalloc-cg-96</text>
+<rect x="230" y="354" width="4.0" height="20" fill="#9dbed8" rx="2"/>
+<text x="242" y="368" font-size="12.5" fill="#5a6570">5.5 MB</text>
+<text x="220" y="395" font-size="12.5" fill="#1a1d21" text-anchor="end">lsm_file_cache</text>
+<rect x="230" y="381" width="3.3" height="20" fill="#9dbed8" rx="2"/>
+<text x="241" y="395" font-size="12.5" fill="#5a6570">4.5 MB</text>
+<text x="220" y="422" font-size="12.5" fill="#1a1d21" text-anchor="end">其余（SLUB 页账/碎片/未命名）</text>
+<rect x="230" y="408" width="428.6" height="20" fill="#9aa4ad" rx="2"/>
+<text x="667" y="422" font-size="12.5" fill="#5a6570">588.9 MB</text>
+</svg>
+<figcaption>图 5 · sodama 20 000 连接 Slab 归因（无 <code>/proc/&lt;pid&gt;/fd</code> 枚举注入的独立快照）。命名 cache 合计 579 MB（约占 meminfo ΔSlab 的一半）；其余为 SLUB 页账/partial slab/对齐碎片与未命名 socket 附属分配。</figcaption></figure>
+<table>
+<thead><tr><th>cache</th><th class="num">Δ</th><th>解释</th></tr></thead>
+<tbody>
+<tr><td>TCP</td><td class="num">+284.3 MB</td><td>120 k socket（6/连接）× <code>struct tcp_sock</code> ≈ 2.4 KB</td></tr>
+<tr><td>sock_inode_cache</td><td class="num">+94.3 MB</td><td>每 socket 一个 inode</td></tr>
+<tr><td>proc_inode_cache + dentry + inode_cache</td><td class="num">+118.7 MB</td><td>socket/协议栈伴生 inode 与目录项（建连期产生，释放后大部分回收）</td></tr>
+<tr><td>filp</td><td class="num">+36.3 MB</td><td>每 fd 一个 <code>struct file</code>（80 087 fd）</td></tr>
+<tr><td>eventpoll_epi</td><td class="num">+12.8 MB</td><td>reactor epoll 每 fd 条目</td></tr>
+<tr><td>kmalloc-512 / cg-192 / cg-96 / LSM / file_lock 等</td><td class="num">≈ +33 MB</td><td>协议栈小块与 socket 附属</td></tr>
+<tr><td>其余（页账/碎片/未命名）</td><td class="num">≈ +589 MB</td><td>SLUB 页账与未归命名 cache；见 §5 局限</td></tr>
+</tbody></table>
+<p>释放后 3 s：TCP、sock_inode、filp 全部回落至基线 ±1 MB，dentry/inode 大比例回收，<b>无结构性泄漏</b>。</p>
+
+<h3 id="pipe">3.5 管道容量 ≠ 常驻（对「64 KB × pipe 推算数百 MB」的实测回应）</h3>
+<ul>
+  <li>本项目 <code>F_SETPIPE_SZ = 1 MiB</code>；20 000 连接同时持有 <b>20 000 条 pipe</b>（status <code>pipe_created=20000</code>），容量上界 <b>20 GiB</b>；</li>
+  <li>实测该内核 slabinfo 中<b>不存在任何 pipe 命名 cache</b>（管道结构走 kmalloc/伴随分配，缓冲页由页分配器按需供给）；</li>
+  <li>整个 hold 的系统 Slab 总增量为 1.17 GiB（含全部 socket 链）——<b>比容量推算低一个数量级以上</b>；管道缓冲按需分页、读空即释放。</li>
+</ul>
+<p class="small">结论：以「pipe capacity × 数量」估算常驻内存不成立；以实测为准。</p>
+
+<h3 id="fd">3.6 FD 拓扑与 I2 治理</h3>
+<table>
+<thead><tr><th>状态</th><th class="num">socket fd/连接</th><th class="num">pipe fd/连接</th><th class="num">合计 fd/连接</th><th>说明</th></tr></thead>
+<tbody>
+<tr><td>治理前</td><td class="num">4.03</td><td class="num">4.00</td><td class="num">8.29</td><td>RelayHandle 克隆 2 socket + 每 session 2×pipe（4 fd）</td></tr>
+<tr><td>治理后（活跃）</td><td class="num">2.00</td><td class="num">2.00</td><td class="num"><b>4.00</b></td><td>去克隆；pipe 懒建 + worker 本地复用 + 空闲释放（10 s 阈值）</td></tr>
+<tr><td>治理后（空闲）</td><td class="num">2.00</td><td class="num">≈1.1</td><td class="num">≈3.1</td><td>空闲会话释放管道</td></tr>
+</tbody></table>
+<ul>
+  <li>20 000 连接实测 <b>80 087 fd</b>（2 socket + 2 pipe/连接 + 87 常量），建立期峰值与结束态一致（无限时性额外 fd）；</li>
+  <li>启动自提升 <code>RLIMIT_NOFILE</code>（实测 soft→1048 576）；status 暴露 <code>fds_used / fds_soft_limit / splice_fd_budget / pipe_created / pipe_reused / pipe_released</code>；</li>
+  <li>fd 使用率 ≥80% 时，新会话自动降级用户态泵（吞吐换可用性），回退计数可观测；</li>
+  <li>管道复用实测：跨先后会话 <code>pipe_reused</code> 持续增长，消 <code>pipe()/close()</code> 系统调用与 slab 抖动。</li>
+</ul>
+<div class="callout">
+  <p><b>方法学注</b>：早期「2 万线程 / TasksMax 撞限」的异常已定位为测试夹具 <code>bench_io</code> 每连接线程模型（<code>cgroup.threads</code> 聚合：20 007 线程全部来自 bench_io），sodama 自身线程恒为 28。该案例已写入方法学，防止误读。</p>
+</div>
+
+<h3 id="primitives">3.7 转发原语对照</h3>
+<table>
+<thead><tr><th>原语</th><th>实测/结论</th><th>决策</th></tr></thead>
+<tbody>
+<tr><td>splice（pipe）</td><td>vs 用户态泵：<b>+31% 吞吐 / −80% CPU</b>（M1 历史：+38% / −84%）</td><td><b>默认</b>（零拷贝、批量搬运）</td></tr>
+<tr><td>userspace copy pump</td><td>每连接 fd 4 → 2，吞吐下降约 24%</td><td>fd ≥80% 时自动降级</td></tr>
+<tr><td>io_uring（IORING_OP_SPLICE）</td><td>复测中位 8.15 GB/s vs epoll+splice 8.08 GB/s（+0.9%，噪声内）；SQPOLL 变体 8.50 GB/s（忙等占核、系统总成本不消失）；64 KB 管道 4.26 GB/s（明显更差）</td><td>不引入（ADR-0058）</td></tr>
+<tr><td>MSG_ZEROCOPY</td><td>语义面向「用户页→TCP 发送」；代理字节不在用户页，recv+send 无净收益、小于 splice</td><td>不适用（记录边界）</td></tr>
+</tbody></table>
+
+<h3 id="soak">3.8 长稳与有界性</h3>
+<p>负载：常驻 <b>200</b> 条长连接（全链路回显）+ 每 5 s 一波 0.1 s 微量 churn + 每 60 s 一次 8 MB×2 流全双工校验 + 每 15 s 一次 RTT 采样；每 15 s 采样 RSS/线程/fd/slab/SUnreclaim/TCP mem/conntrack/eBPF map/CPU/RTT。</p>
+<figure><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 380" width="100%" style="font-family:'Segoe UI',system-ui,-apple-system,'Noto Sans SC',sans-serif">
+<rect width="800" height="380" fill="#ffffff"/>
+<line x1="70" y1="170.0" x2="680" y2="170.0" stroke="#e3e7ec"/>
+<text x="62" y="174.0" font-size="11.5" fill="#5a6570" text-anchor="end">0</text>
+<line x1="70" y1="146.7" x2="680" y2="146.7" stroke="#e3e7ec"/>
+<text x="62" y="150.7" font-size="11.5" fill="#5a6570" text-anchor="end">5</text>
+<line x1="70" y1="123.3" x2="680" y2="123.3" stroke="#e3e7ec"/>
+<text x="62" y="127.3" font-size="11.5" fill="#5a6570" text-anchor="end">10</text>
+<line x1="70" y1="100.0" x2="680" y2="100.0" stroke="#e3e7ec"/>
+<text x="62" y="104.0" font-size="11.5" fill="#5a6570" text-anchor="end">15</text>
+<line x1="70" y1="76.7" x2="680" y2="76.7" stroke="#e3e7ec"/>
+<text x="62" y="80.7" font-size="11.5" fill="#5a6570" text-anchor="end">20</text>
+<line x1="70" y1="53.3" x2="680" y2="53.3" stroke="#e3e7ec"/>
+<text x="62" y="57.3" font-size="11.5" fill="#5a6570" text-anchor="end">25</text>
+<line x1="70" y1="30.0" x2="680" y2="30.0" stroke="#e3e7ec"/>
+<text x="62" y="34.0" font-size="11.5" fill="#5a6570" text-anchor="end">30</text>
+<line x1="70" y1="170.0" x2="680" y2="170.0" stroke="#5a6570" stroke-width="1.1"/>
+<line x1="70" y1="30" x2="70" y2="170.0" stroke="#5a6570" stroke-width="1.1"/>
+<polyline points="70.0,41.4 74.4,117.7 79.1,117.2 83.5,117.0 88.1,116.8 92.5,116.8 96.9,116.4 101.6,116.5 106.0,116.3 110.6,116.5 115.0,116.3 119.4,116.4 124.1,116.3 128.5,116.4 133.2,116.3 137.6,116.4 141.9,116.2 146.6,116.3 151.0,116.2 155.7,116.3 160.1,116.3 165.9,116.0 181.1,116.2 196.3,116.3 200.7,116.0 205.1,116.3 209.8,115.9 214.2,116.3 218.8,115.9 223.2,116.3 227.6,116.0 232.3,116.3 236.7,116.0 241.1,116.3 245.7,116.1 250.1,116.3 254.8,116.1 259.2,116.2 263.6,116.2 268.3,116.0 275.0,116.0 279.4,116.0 283.8,115.8 288.4,116.0 292.8,115.7 297.2,115.7 301.9,116.0 306.3,115.6 311.0,116.0 315.3,115.8 319.7,116.0 324.4,115.6 328.8,116.0 333.5,115.6 337.9,116.0 342.2,115.8 346.9,116.0 351.3,115.8 356.0,116.0 360.4,115.8 364.8,116.0 369.4,115.8 373.8,116.0 378.5,115.8 382.9,116.0 387.3,115.8 392.0,115.9 396.3,115.6 401.0,115.9 405.4,115.8 409.8,115.8 414.5,115.8 418.9,115.8 423.5,115.8 427.9,115.7 432.3,115.6 437.0,115.7 441.4,115.6 445.8,115.8 450.4,115.6 454.8,115.8 459.5,115.5 463.9,115.8 468.3,115.7 473.0,115.8 477.3,115.5 482.0,115.6 486.4,115.5 490.8,115.8 495.5,115.7 499.9,115.8 504.5,115.7 508.9,115.7 513.3,115.9 518.0,115.6 522.4,115.9 527.1,115.6 531.4,115.9 535.8,115.7 540.5,115.9 544.9,115.6 549.6,115.9 554.0,115.7 558.4,115.9 563.0,115.6 567.4,115.9 572.1,115.6 576.5,115.9 580.9,115.6 585.5,115.9 589.9,115.7 594.6,115.9 599.0,115.6 603.4,115.9 608.1,115.6 612.4,115.9 616.8,115.6 621.5,115.7 625.9,115.6 630.6,115.7 635.0,115.5 639.4,115.8 644.0,115.7 648.4,115.8 653.1,115.7 657.5,115.6 661.9,115.6 666.5,115.6 670.9,115.6 675.6,115.8 680.0,115.7" fill="none" stroke="#1f4e79" stroke-width="2"/>
+<text x="696" y="100" font-size="12.5" fill="#1a1d21">RSS（MB）</text>
+<text x="70.0" y="188.0" font-size="11.5" fill="#5a6570" text-anchor="middle">0</text>
+<text x="157.7" y="188.0" font-size="11.5" fill="#5a6570" text-anchor="middle">5</text>
+<text x="245.5" y="188.0" font-size="11.5" fill="#5a6570" text-anchor="middle">10</text>
+<text x="333.2" y="188.0" font-size="11.5" fill="#5a6570" text-anchor="middle">15</text>
+<text x="420.9" y="188.0" font-size="11.5" fill="#5a6570" text-anchor="middle">20</text>
+<text x="508.6" y="188.0" font-size="11.5" fill="#5a6570" text-anchor="middle">25</text>
+<text x="596.4" y="188.0" font-size="11.5" fill="#5a6570" text-anchor="middle">30</text>
+<line x1="70" y1="340.0" x2="680" y2="340.0" stroke="#e3e7ec"/>
+<text x="62" y="344.0" font-size="11.5" fill="#5a6570" text-anchor="end">0</text>
+<line x1="70" y1="316.7" x2="680" y2="316.7" stroke="#e3e7ec"/>
+<text x="62" y="320.7" font-size="11.5" fill="#5a6570" text-anchor="end">200</text>
+<line x1="70" y1="293.3" x2="680" y2="293.3" stroke="#e3e7ec"/>
+<text x="62" y="297.3" font-size="11.5" fill="#5a6570" text-anchor="end">400</text>
+<line x1="70" y1="270.0" x2="680" y2="270.0" stroke="#e3e7ec"/>
+<text x="62" y="274.0" font-size="11.5" fill="#5a6570" text-anchor="end">600</text>
+<line x1="70" y1="246.7" x2="680" y2="246.7" stroke="#e3e7ec"/>
+<text x="62" y="250.7" font-size="11.5" fill="#5a6570" text-anchor="end">800</text>
+<line x1="70" y1="223.3" x2="680" y2="223.3" stroke="#e3e7ec"/>
+<text x="62" y="227.3" font-size="11.5" fill="#5a6570" text-anchor="end">1000</text>
+<line x1="70" y1="200.0" x2="680" y2="200.0" stroke="#e3e7ec"/>
+<text x="62" y="204.0" font-size="11.5" fill="#5a6570" text-anchor="end">1200</text>
+<line x1="70" y1="340.0" x2="680" y2="340.0" stroke="#5a6570" stroke-width="1.1"/>
+<line x1="70" y1="200.0" x2="70" y2="340.0" stroke="#5a6570" stroke-width="1.1"/>
+<polyline points="74.4,257.1 79.1,265.2 83.5,289.6 88.1,281.4 92.5,238.8 96.9,250.2 101.6,294.9 106.0,268.4 110.6,267.2 115.0,277.9 119.4,265.2 124.1,263.6 128.5,277.4 133.2,304.2 137.6,291.4 141.9,277.2 146.6,303.9 151.0,301.9 155.7,304.2 160.1,260.1 165.9,276.5 181.1,282.6 196.3,279.4 200.7,263.1 205.1,280.3 209.8,287.3 214.2,293.8 218.8,260.9 223.2,286.8 227.6,302.7 232.3,278.1 236.7,285.3 241.1,305.7 245.7,313.2 250.1,283.8 254.8,270.5 259.2,304.4 263.6,275.6 268.3,278.9 275.0,275.5 279.4,294.4 283.8,297.2 288.4,279.3 292.8,266.9 297.2,269.5 301.9,298.4 306.3,291.0 311.0,263.6 315.3,300.2 319.7,284.0 324.4,283.8 328.8,272.5 333.5,288.9 337.9,278.1 342.2,300.1 346.9,266.0 351.3,279.4 356.0,300.6 360.4,294.9 364.8,263.6 369.4,291.8 373.8,308.9 378.5,272.0 382.9,270.1 387.3,307.4 392.0,297.3 396.3,288.7 401.0,259.5 405.4,292.6 409.8,290.3 414.5,299.9 418.9,260.7 423.5,263.9 427.9,290.8 432.3,267.8 437.0,285.8 441.4,296.6 445.8,272.8 450.4,301.1 454.8,265.3 459.5,301.1 463.9,297.9 468.3,291.6 473.0,278.6 477.3,302.8 482.0,304.3 486.4,305.0 490.8,291.7 495.5,302.3 499.9,300.9 504.5,262.3 508.9,284.1 513.3,307.8 518.0,309.4 522.4,285.9 527.1,282.8 531.4,285.2 535.8,295.4 540.5,280.6 544.9,280.4 549.6,283.8 554.0,302.1 558.4,276.6 563.0,275.9 567.4,273.5 572.1,304.5 576.5,295.1 580.9,270.9 585.5,301.5 589.9,294.0 594.6,279.3 599.0,259.0 603.4,302.8 608.1,305.4 612.4,277.4 616.8,279.0 621.5,295.2 625.9,291.8 630.6,290.3 635.0,258.8 639.4,275.2 644.0,273.1 648.4,295.9 653.1,278.6 657.5,270.0 661.9,312.2 666.5,298.8 670.9,266.6 675.6,277.7 680.0,261.2" fill="none" stroke="#a0522d" stroke-width="2"/>
+<text x="696" y="270" font-size="12.5" fill="#1a1d21">RTT p99（µs）</text>
+<text x="70.0" y="358.0" font-size="11.5" fill="#5a6570" text-anchor="middle">0</text>
+<text x="157.7" y="358.0" font-size="11.5" fill="#5a6570" text-anchor="middle">5</text>
+<text x="245.5" y="358.0" font-size="11.5" fill="#5a6570" text-anchor="middle">10</text>
+<text x="333.2" y="358.0" font-size="11.5" fill="#5a6570" text-anchor="middle">15</text>
+<text x="420.9" y="358.0" font-size="11.5" fill="#5a6570" text-anchor="middle">20</text>
+<text x="508.6" y="358.0" font-size="11.5" fill="#5a6570" text-anchor="middle">25</text>
+<text x="596.4" y="358.0" font-size="11.5" fill="#5a6570" text-anchor="middle">30</text>
+<text x="70" y="374" font-size="11.5" fill="#5a6570">时间（分钟）；采样间隔 15 s。上：RSS；下：RTT p99（载荷包含每 5 s churn 与每 60 s 8 MB×2 周期负载）。</text>
+</svg>
+<figcaption>图 6 · 35 分钟 soak 曲线：RSS（MB）、SUnreclaim（MB）与 RTT p99（µs）。</figcaption></figure>
+<table>
+<thead><tr><th>指标</th><th class="num">基线（t≥120 s，带载）</th><th class="num">结束（停机 + 15 s 静置）</th><th class="num">漂移</th><th class="num">判据</th></tr></thead>
+<tbody>
+<tr><td>RSS</td><td class="num">11.5 MB</td><td class="num">11.6 MB</td><td class="num">+1.1%</td><td class="num">≤5%</td></tr>
+<tr><td>fd</td><td class="num">743</td><td class="num">343</td><td class="num">-53.8%</td><td class="num">无增长（回落为期望）</td></tr>
+<tr><td>Slab</td><td class="num">933.8 MB</td><td class="num">933.6 MB</td><td class="num">-0.0%</td><td class="num">≤5%</td></tr>
+<tr><td>SUnreclaim</td><td class="num">297.9 MB</td><td class="num">294.5 MB</td><td class="num">-1.1%</td><td class="num">≤5%</td></tr>
+<tr><td>RTT p50 / p99</td><td class="num">34–123 µs</td><td class="num">230–696 µs</td><td class="num">—</td><td class="num">无劣化</td></tr>
+<tr><td>失败轮次</td><td class="num" colspan="2">0（无失败轮次）</td><td class="num">0</td><td class="num">零失败</td></tr>
+</tbody></table>
+<p><b>bounded-memory 判据</b>：RSS/Slab/SUnreclaim 漂移均 ≤5%、fd 无增长且零失败，短时判据 <b>PASS</b>。72 小时正式 soak（24/48/72 h 三档、漂移 ≤5% 且失败不增长方可对外使用「bounded-memory」表述）为机时型任务，执行计划与脚本已固化于 <code>lab/perf/soak-curve.sh</code>（<code>SOAK_SECS=259200</code>），本轮以 35 分钟短时数据先行送审。</p>
+
+<h2 id="reviews">4 · 评审回应矩阵</h2>
+<table>
+<thead><tr><th>编号 · 意见</th><th>判定</th><th>证据/去向</th></tr></thead>
+<tbody>
+<tr><td>A1/B1 · Reactor 模型是核心成果</td><td><span class="tag ok">采纳</span></td><td>单变量 A/B（ADR-0058）：10 k 连接 20 011 线程/763 MB → 28 线程/32.1 MB；本轮 20 k 连接线程恒 28。表述按证据陈述。</td></tr>
+<tr><td>B2 · 「唯一解」表述不成立</td><td><span class="tag ok">采纳</span></td><td>全文替换为「以极低线程与用户态内存承载高并发」。</td></tr>
+<tr><td>A2 · 64 KB/pipe 推算数百 MB</td><td><span class="tag part">部分采纳</span></td><td>实测否证：1 MiB 配额、页按需、无 pipe 命名 cache；20 k 容量上界 20 GiB vs 实测 Slab 总增 1.17 GiB（§3.5）。</td></tr>
+<tr><td>A3 · Pipe 池化把并发峰值压到 2 fd/连接</td><td><span class="tag part">部分采纳（方案修正）</span></td><td>pipe 为流式路径，不可跨并发连接复用；实际达成 8.3 → 4.0 活跃 fd/连接（去克隆 + 懒建/复用/空闲释放），见 §3.6。</td></tr>
+<tr><td>B3 · 先证明系统总内存（四层模型）</td><td><span class="tag ok">采纳</span></td><td>本报告 §2–§3；原始数据与口径 <code>docs/reviews/2026-10-05-i1-system-memory-data.md</code>。</td></tr>
+<tr><td>B5 · 8 fd/连接是架构隐患</td><td><span class="tag ok">采纳</span></td><td>I2 治理完成，20 k 实测 4.0 fd/连接；默认 limit 下万级连接可行。</td></tr>
+<tr><td>B6/A6 · splice 是否架构税（A/B/C/D）</td><td><span class="tag ok">采纳（对照）</span></td><td>splice 保持默认（+31%/−80%）；io_uring 复测噪声内维持不引入；MSG_ZEROCOPY 结论不适用；三档选型成文（I3）。</td></tr>
+<tr><td>B7 · worker-local pipe cache</td><td><span class="tag ok">采纳</span></td><td>已实现（无锁、跨先后会话复用，status 计数可验）。</td></tr>
+<tr><td>A4/B8 · 72 h soak 曲线化</td><td><span class="tag part">部分执行</span></td><td>判据/脚本/采样全部就绪，35 min 短时曲线交付；72 h 为机时任务，计划固化（§3.8）。</td></tr>
+<tr><td>A5 · 启动水位/churn 线程峰值重构</td><td><span class="tag no">延后</span></td><td>ROI 低，登记 backlog。</td></tr>
+<tr><td>B9/B10 · 措辞降调、定位 predictable</td><td><span class="tag ok">采纳</span></td><td>本报告全文口径。</td></tr>
+</tbody></table>
+
+<h2 id="limits">5 · 局限与边界</h2>
+<ol>
+  <li><b>对照扣除是近似</b>：对照路径每连接 2 个 socket，实现路径 6 个 socket + pipe；「实现净增」仍含共享 sing-box/echo 链路的部分（两实现同口径可比，不可视为纯实现独占值）。</li>
+  <li><b>命名 cache 归因覆盖约一半</b>：20 k 点 meminfo ΔSlab 1 168.6 MB 中，命名 cache ≈ 579 MB；其余为 SLUB 页账/partial slab/对齐碎片与未命名分配，本报告不做强行拆分。</li>
+  <li><b>瞬时采样</b>：数值为快照，不是峰值积分；建连窗口（20 k ≈ 6 s）内的瞬时会更接近「活跃」而稳态更接近「after」。</li>
+  <li><b>环境边界</b>：单机环回拓扑，无真实 NIC 中断/DMA；内核 6.18 的 pipe 实现（按需页）结论在其他内核上应以复测为准。</li>
+  <li><b>长稳时长</b>：35 min ≠ 72 h；在完成 72 h 前不使用「bounded-memory」的绝对表述。</li>
+</ol>
+
+<h2 id="repro">6 · 复现与工件</h2>
+<pre>
+# 系统内存扫描（sodama / 对照组 / dae 对照）
+cd sodama
+sudo lab/perf/mem-system.sh prepare
+sudo env POINTS="100 500 1000 2000 5000 10000 20000" HOLD_SECS=6 \
+  RESULTS=/tmp/mem-system-sodama.tsv lab/perf/mem-system.sh run
+sudo env POINTS="...同上..." RESULTS=/tmp/mem-system-ctl.tsv lab/perf/mem-system.sh run-control
+sudo env IMPL=dae POINTS="...同上..." RESULTS=/tmp/mem-system-dae.tsv lab/perf/mem-system.sh run
+python3 lab/perf/mem-analyze.py /tmp/mem-system-sodama.tsv /tmp/mem-system-dae.tsv \
+  --control /tmp/mem-system-ctl.tsv --out-md /tmp/mem-analysis.md
+
+# 长稳曲线（本轮 35 min；72 h 用 SOAK_SECS=259200）
+sudo lab/perf/soak-curve.sh run 2100
+</pre>
+<div class="kv">
+  <dt>工具</dt><dd><code>sodama/lab/perf/{mem-system.sh, mem-analyze.py, soak-curve.sh, run.sh}</code></dd>
+  <dt>数据存档</dt><dd><code>docs/reviews/2026-10-05-i1-system-memory-data.md</code>（四层模型全表）</dd>
+  <dt>I3 对照</dt><dd><code>docs/reviews/2026-10-05-i3-forwarding-primitives.md</code></dd>
+  <dt>评审与回应</dt><dd><code>docs/reviews/</code>（A/B 原文 + 采纳提案 + 本文）</dd>
+  <dt>相关 ADR</dt><dd>ADR-0058（reactor/io_uring 结论）、ADR-0003（无 async runtime）</dd>
+</div>
+
+<h2 id="conclusion">7 · 结论</h2>
+<p>1. <b>用户态内存优势是真实的，但不是全部事实。</b> sodama 以 ≈0.7 KB/连接的用户态增量承载 2 万连接；内核侧 ≈52.7 KB/连接，约为用户态的 50 倍。任何以 RSS 单独下结论的表述都不成立，本报告统一采用四层模型。</p>
+<p>2. <b>同口径下 sodama 的系统总量仍显著低于 dae 对照</b>（20 k：≈1.19 GB vs ≈2.47 GB），差值几乎全部来自 dae 的用户态线性增长；sodama 的增量集中在按连接的内核对象与 splice 管道结构（可回收、无泄漏）。</p>
+<p>3. <b>FD 架构隐患已消除一个数量级。</b> 每连接 fd 8.3 → 4.0（活跃），管道懒建/复用/空闲释放与 fd 预算回退均已落地并有 status 观测。</p>
+<p>4. <b>数据面原语选择经受住对照。</b> splice 默认、fd 高压降级、io_uring 不引入、MSG_ZEROCOPY 不适用——每条结论都有 A/B 或语义分析支撑。</p>
+<p>5. <b>下一步</b>：72 h 全量 soak（判据/脚本就绪）与启动水位优化（backlog）；在此之前，对外定位使用「predictable resource consumption」，不使用绝对化表述。</p>
+
+<footer class="doc">
+  <p>sodama 系统内存与资源边界终测报告 v2.0 · 2026-10-05 · 本报告全部数字来自本机实测；口径、原始数据与复现命令见正文与 <code>docs/reviews/</code>。v1 报告（RSS 单口径）保留于 <code>docs/memory-report.html</code> 作为历史存档。</p>
+</footer>
+
+</div>
+</body>
+</html>

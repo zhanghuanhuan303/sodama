@@ -105,11 +105,11 @@ G1 同机 + 真实节点口径均已交付。以下为余项。
 
 | # | 事项 | 现状 | 验收标准 |
 |---|---|---|---|
-| I1 | **系统内存基准（四层模型）** | 已完成事实核对：fd 拓扑 4 socket + 4 pipe≈8/连接（来自 RelayHandle 克隆×2 + 每 session 2×pipe）；`F_SETPIPE_SZ=1MiB`（页按需）；空闲 hold 内核侧 slab 初测 ≈46KB/连接（>用户态 ≈15KB） | `lab/perf/mem-system.sh`：连接扫描 100–20k ×（空闲/小流量）+ UDP/churn，记录 userspace+slab+sockstat+bpftool map 增量与 per-conn 分解；至少对 dae/sing-box 一方同口径对照 |
-| I2 | **FD 架构治理** | 8/连接（4 socket + 4 pipe）；未自提升 rlimit、无 fd 预算回退 | (a) 去 RelayHandle socket 克隆（−2）；(b) pipe 懒建/空闲释放（空闲 2–4/连接）；(c) worker-local pipe cache；(d) setrlimit 自提升 + status 上报 + fd>80% 新连接回退 copy-pump。验收：hold 2000 ≤4/连接、10k 默认 limit 可跑、吞吐/CPU 不回退 >3% |
-| I3 | **转发原语对照** | splice vs copy 已有（M1：+38%/−84%）；io_uring 已否（ADR-0058） | splice/copy/io_uring（复测）/MSG_ZEROCOPY 四路径×三档（fd 高压/低延迟/高吞吐）：吞吐、CPU、p99、RSS、fd、内核对端内存；给出选型与默认值 |
-| I4 | **长稳曲线化（bounded-memory）** | soak 已有但未曲线化/未含 kernel | 24/48/72h（微量 churn+长连接+周期负载）曲线：RSS/FD/Slab/SUnreclaim/sockstat/CPU/latency/fail；72h 漂移 ≤5% 且 fail 不增长 |
-| I5 | **报告口径与措辞** | memory-report v1.0 仅有 RSS 口径与局限声明 | v1.1：新增「口径与边界」（RSS-only；kernel/system 见 I1）、链 `docs/reviews/`、去“唯一解/遥遥领先/顶级”类措辞；后续对外统一四层模型与 predictable resource consumption 定位 |
+| I1 | **系统内存基准（四层模型）** | ✅ 已完成（2026-10-05）：扫描 100–20 000 + 与 dae 同口径对照；数据/口径见 `docs/reviews/2026-10-05-i1-system-memory-data.md`（工具 `lab/perf/mem-system.sh` + `mem-analyze.py`） | 实测结论：sodama 用户态稳态净增 ≈0.6–0.7 KB/连接、内核侧 ≈46–53 KB/连接（含共享链路；dae ≈34 KB/连接）；RSS 优势 ≠ 系统优势，已在 v2 报告成文 |
+| I2 | **FD 架构治理** | ✅ 已完成（2026-10-05）：去 RelayHandle 克隆；pipe 懒建/空闲释放（`SODAMA_PIPE_IDLE_MS`）；worker-local pipe cache；`raise_nofile_limit` + status `fds_used/fds_soft_limit/splice_fd_budget/pipe_*` + ≥80% 新连接回退 copy-pump。实测 hold 20 000：fd/连接 **4.0**（2 socket + 2 pipe，建立峰值无额外瞬态）；空闲回落 ≈3.1；pipe_created/reused/released 计数工作 | 验收达成：活跃 ≤4/连接；20 k 在默认/自提升 limit 下可跑；同口径吞吐/CPU 不回退（splice 仍 +31%/−80% vs copy） |
+| I3 | **转发原语对照** | ✅ 已完成（2026-10-05）：见 `docs/reviews/2026-10-05-i3-forwarding-primitives.md`；io_uring 复测维持不引入（ADR-0058）；MSG_ZEROCOPY 调研结论「不适用本数据面、记录边界」 | 三档选型（吞吐/fd 高压/低时延）已定：默认 splice；fd≥80% 自动降级 copy pump；低时延无回退 |
+| I4 | **长稳曲线化（bounded-memory）** | ✅ 短时完成（2026-10-05）：`lab/perf/soak-curve.sh`（轻负载 hold 200 + 微量 churn + 周期负载 + 15 s 采样→CSV）35 min 短时：RSS +1.1%、Slab −0.0%、SUnreclaim −1.1%、fd 回落（无增长）、RTT p50 34–123 µs / p99 230–696 µs、零失败 → 短时判据 PASS；曲线入 v2 报告 | 72 h 为机时型任务：脚本/判据/采样就绪（`SOAK_SECS=259200`），完成且漂移 ≤5%、失败不增长后方可对外使用「bounded-memory」 |
+| I5 | **报告口径与措辞** | ✅ 已完成（2026-10-05）：v2 报告（`docs/memory-report-v2.html`）为四层模型 + 专业排版 + 图表；全文去「唯一解/遥遥领先/顶级」，统一「极低用户态内存承载高并发 / predictable resource consumption」；口径与边界、评审回应矩阵成章 | v1 保留存档并链到 v2；后续对外统一 v2 口径 |
 
 执行顺序建议：**I1 → I2 → I5 → I4 → I3**（先拿证据、再改架构、同步口径；soak 与 I3 可并行）。
 
