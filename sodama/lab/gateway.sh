@@ -531,7 +531,11 @@ test_conn() {
   if command -v wget >/dev/null 2>&1; then
     code="$(wget -S -O /dev/null --timeout=20 https://www.gstatic.com/generate_204 2>&1 \
       | awk '/HTTP\//{c=$2} END{print c}' || true)"
-    exitip="$(wget -qO- --timeout=20 https://api.ipify.org 2>/dev/null || true)"
+    # 出口 IP：多个回显端点回退（单一端点可能被部分节点/地区屏蔽，避免误报）
+    for ep in https://api.ipify.org https://ifconfig.me/ip https://ipinfo.io/ip; do
+      exitip="$(wget -qO- --timeout=20 "$ep" 2>/dev/null || true)"
+      [ -n "$exitip" ] && break
+    done
   else
     code="$(env -u http_proxy -u https_proxy -u all_proxy \
       curl -s -o /dev/null -w '%{http_code}' --max-time 20 \
