@@ -282,6 +282,10 @@ fn App() -> impl IntoView {
     let token_input = RwSignal::new(load_token().unwrap_or_default());
     let editor = RwSignal::new(EditorState::default());
     let page = RwSignal::new(Page::Overview);
+    // 节点表：默认只显示前 24 行（当前节点优先）；失败节点往往排在后面 → 额外提供
+    // 「显示全部」与「仅看不可用」，避免失败节点被截断得看不见。
+    let show_all = RwSignal::new(false);
+    let dead_only = RwSignal::new(false);
     // 数据新鲜度：last_ok_ms = 上一次成功取数的时间戳（ms），data_age = 距今秒数。
     // 它同时覆盖「浏览器↔面板」与「面板↔引擎」两类失联——涨上去就是真停更。
     let last_ok_ms = RwSignal::new(0.0f64);
@@ -386,7 +390,12 @@ fn App() -> impl IntoView {
                     .unwrap_or(std::cmp::Ordering::Equal),
             )
         });
-        ns.truncate(24);
+        if dead_only.get() {
+            ns.retain(|n| !n.alive);
+        }
+        if !show_all.get() && !dead_only.get() {
+            ns.truncate(24);
+        }
         ns
     };
 
@@ -506,6 +515,27 @@ fn App() -> impl IntoView {
                             </select>
                         })
                     }}
+                    // 失败节点可见性（默认 24 行截断会把排在后面的失败节点藏掉）
+                    {move || {
+                        let (members, alive) = status
+                            .get()
+                            .map(|s| (s.group.members, s.group.alive))
+                            .unwrap_or((0, 0));
+                        let dead = members.saturating_sub(alive);
+                        view! {
+                            <button class="btn btn-mini"
+                                class:btn-primary=move || dead_only.get()
+                                on:click=move |_| dead_only.update(|v| *v = !*v)>
+                                {format!("仅看不可用（{dead}）")}
+                            </button>
+                            <button class="btn btn-mini"
+                                class:btn-primary=move || show_all.get()
+                                on:click=move |_| show_all.update(|v| *v = !*v)>
+                                {move || if show_all.get() { "收起（只显示前 24）".to_string() }
+                                          else { format!("显示全部（{members}）") }}
+                            </button>
+                        }
+                    }}
                 </div>
                 <table class="tbl">
                     <thead>
@@ -586,6 +616,21 @@ fn App() -> impl IntoView {
                         }/>
                     </tbody>
                 </table>
+                <div class="panel-meta pad">
+                    {move || {
+                        let (members, alive, shown) = status
+                            .get()
+                            .map(|s| (s.group.members, s.group.alive, nodes().len()))
+                            .unwrap_or((0, 0, 0));
+                        format!(
+                            "显示 {} / {} · 存活 {} · 不可用 {}（已标死，仍参与探测；想只看它们点上方「仅看不可用」）",
+                            shown,
+                            members,
+                            alive,
+                            members.saturating_sub(alive)
+                        )
+                    }}
+                </div>
             </section>
 
             <section class="cols">

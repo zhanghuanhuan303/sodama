@@ -314,6 +314,22 @@ pub fn decode_body(body: &[u8]) -> io::Result<String> {
             }
         }
     }
+    // 全是 base64 字母表但解不出来 → 多半是**截断/损坏**的正文（慢链路/半截响应实测遇到）。
+    // 此时绝不能按明文处理：整段会被当成「一行不支持」而静默得到 0 个节点，
+    // 用户看到的现象是「订阅可用但没节点」。直接报错，让上层按失败处理。
+    let looks_b64 = !compact.is_empty()
+        && compact
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'=' | b'-' | b'_'));
+    if looks_b64 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "订阅正文疑似 base64 但解码失败（{} 字节，可能是截断/损坏）",
+                body.len()
+            ),
+        ));
+    }
     String::from_utf8(body.to_vec())
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("订阅正文非 UTF-8: {e}")))
 }
