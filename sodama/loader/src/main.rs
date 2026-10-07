@@ -295,6 +295,154 @@ static RELAY_STATS: RelayStats = RelayStats {
     limit_rejected: AtomicU64::new(0),
 };
 
+// ---- P-AI：按域名统计（面板「AI 流量」卡片的数据源） ------------------------
+/// 每域名累计（仅在连接打开/收尾各取一次锁；数据路径零查表）。
+#[derive(Default)]
+struct DomainStat {
+    conns: AtomicU64,
+    active: AtomicU64,
+    bytes_up: AtomicU64,
+    bytes_down: AtomicU64,
+    last_ns: AtomicU64,
+}
+
+/// 域名表上限：超出后不再为新域名建条目（已有域名照常累计），保持有界。
+const DOMAIN_STATS_MAX: usize = 512;
+
+/// AI 服务域名后缀表（对齐 docs/examples/ai-low-latency.dae；status 读时判定）。
+const AI_DOMAIN_SUFFIXES: &[&str] = &[
+    "openai.com",
+    "chatgpt.com",
+    "oaiusercontent.com",
+    "sora.com",
+    "anthropic.com",
+    "claude.ai",
+    "claudeusercontent.com",
+    "generativelanguage.googleapis.com",
+    "aistudio.google.com",
+    "gemini.google.com",
+    "x.ai",
+    "grok.com",
+    "cursor.com",
+    "cursor.sh",
+    "windsurf.com",
+    "codeium.com",
+    "githubcopilot.com",
+    "copilot.microsoft.com",
+    "perplexity.ai",
+    "poe.com",
+    "openrouter.ai",
+    "groq.com",
+    "replicate.com",
+    "together.ai",
+    "together.xyz",
+    "fireworks.ai",
+    "fal.ai",
+    "deepinfra.com",
+    "cerebras.ai",
+    "mistral.ai",
+    "cohere.com",
+    "cohere.ai",
+    "lambdalabs.com",
+    "sambanova.ai",
+    "midjourney.com",
+    "suno.com",
+    "suno.ai",
+    "elevenlabs.io",
+    "runwayml.com",
+    "pika.art",
+    "lumalabs.ai",
+    "character.ai",
+    "huggingface.co",
+];
+
+fn is_ai_domain(domain: &str) -> bool {
+    let d = domain.trim_end_matches('.').to_ascii_lowercase();
+    AI_DOMAIN_SUFFIXES.iter().any(|s| {
+        d == *s
+            || (d.len() > s.len() && d.ends_with(s) && d.as_bytes()[d.len() - s.len() - 1] == b'.')
+    })
+}
+
+static DOMAIN_STATS: OnceLock<Mutex<std::collections::HashMap<Box<str>, Arc<DomainStat>>>> =
+    OnceLock::new();
+
+fn domain_stats() -> &'static Mutex<std::collections::HashMap<Box<str>, Arc<DomainStat>>> {
+    DOMAIN_STATS.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+/// 连接建立（dial 成功后）计入域名统计。
+fn domain_stat_open(domain: &str) {
+    let Ok(mut m) = domain_stats().lock() else {
+        return;
+    };
+    let st = match m.get(domain) {
+        Some(s) => s.clone(),
+        None => {
+            if m.len() >= DOMAIN_STATS_MAX {
+                return; // 有界：不为新域名建条目
+            }
+            let s = Arc::new(DomainStat::default());
+            m.insert(domain.into(), s.clone());
+            s
+        }
+    };
+    st.conns.fetch_add(1, Ordering::Relaxed);
+    st.active.fetch_add(1, Ordering::Relaxed);
+    st.last_ns.store(monotonic_now_ns(), Ordering::Relaxed);
+}
+
+/// 连接收尾：活跃 -1，累计本连接字节。
+fn domain_stat_close(domain: &str, bytes_up: u64, bytes_down: u64) {
+    let Ok(m) = domain_stats().lock() else {
+        return;
+    };
+    let Some(st) = m.get(domain).cloned() else {
+        return;
+    };
+    let _ = st
+        .active
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+            Some(v.saturating_sub(1))
+        });
+    st.bytes_up.fetch_add(bytes_up, Ordering::Relaxed);
+    st.bytes_down.fetch_add(bytes_down, Ordering::Relaxed);
+    st.last_ns.store(monotonic_now_ns(), Ordering::Relaxed);
+}
+
+/// status 用：Top 域名（按累计字节降序，最多 30 条）。
+fn snapshot_domain_stats() -> serde_json::Value {
+    let mut rows: Vec<(Box<str>, Arc<DomainStat>, u64, u64)> = Vec::new();
+    if let Some(map) = DOMAIN_STATS.get() {
+        if let Ok(m) = map.lock() {
+            for (d, st) in m.iter() {
+                let up = st.bytes_up.load(Ordering::Relaxed);
+                let down = st.bytes_down.load(Ordering::Relaxed);
+                rows.push((d.clone(), st.clone(), up, down));
+            }
+        }
+    }
+    rows.sort_by_key(|(_, _, up, down)| std::cmp::Reverse(up + down));
+    rows.truncate(30);
+    serde_json::Value::Array(
+        rows.iter()
+            .map(|(d, st, up, down)| {
+                serde_json::json!({
+                    "domain": d.as_ref(),
+                    "ai": is_ai_domain(d),
+                    "conns": st.conns.load(Ordering::Relaxed),
+                    "active": st.active.load(Ordering::Relaxed),
+                    "bytes_up": up,
+                    "bytes_down": down,
+                    "last_seen_secs_ago": monotonic_now_ns()
+                        .saturating_sub(st.last_ns.load(Ordering::Relaxed))
+                        / 1_000_000_000,
+                })
+            })
+            .collect(),
+    )
+}
+
 /// P18e：relay 并发上限（0 = 不限；对照 dae relay 的并发上限）。
 static RELAY_MAX_CONNS: AtomicU64 = AtomicU64::new(0);
 
@@ -464,6 +612,11 @@ struct RelayHandle {
     client: Option<TcpStream>,
     /// QUIC 协议（tuic）没有底层 TCP，为 None。
     upstream: Option<TcpStream>,
+    /// P-AI：本连接归属域名（收尾归入域名统计；IP 直连为 None）。
+    domain: Option<Box<str>>,
+    /// P-AI：本连接字节明细（泵双写：全局统计 + 本字段）。
+    bytes_up: AtomicU64,
+    bytes_down: AtomicU64,
 }
 static RELAY_CONNS: std::sync::LazyLock<Mutex<std::collections::HashMap<u64, Arc<RelayHandle>>>> =
     std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
@@ -1735,11 +1888,45 @@ fn handle_tproxy_conn(mut stream: TcpStream) {
 /// 之后的任何 read 结果都不能当断连处理（psock 接管后 read 会返回 EAGAIN，
 /// 实测也可能是其它错误码），一律驻留重试。offload 连接不在本路径驻留：
 /// 看门狗（`offload_watch_loop`）统一判半关闭/超时并收尾（每连接 0 线程）。
+/// P-AI：数据泵的字节去处——全局统计 + 本连接明细（收尾按域名归档）。
+#[derive(Clone, Copy)]
+struct ByteSink<'a> {
+    global: &'a AtomicU64,
+    session: Option<&'a AtomicU64>,
+}
+
+impl<'a> ByteSink<'a> {
+    fn new(global: &'a AtomicU64, session: Option<&'a AtomicU64>) -> Self {
+        Self { global, session }
+    }
+    /// 仅全局统计（offload 排空等无连接明细的旁路）。
+    fn global_only(global: &'a AtomicU64) -> Self {
+        Self {
+            global,
+            session: None,
+        }
+    }
+    /// 单计数器（SOCKS 入口等本地统计；不计入全局/域名归档）。
+    fn single(counter: &'a AtomicU64) -> Self {
+        Self {
+            global: counter,
+            session: None,
+        }
+    }
+    #[inline]
+    fn add(&self, n: u64) {
+        self.global.fetch_add(n, Ordering::Relaxed);
+        if let Some(s) = self.session {
+            s.fetch_add(n, Ordering::Relaxed);
+        }
+    }
+}
+
 fn pump(
     mut r: Box<dyn outbound::ReadHalf>,
     mut w: Box<dyn outbound::WriteHalf>,
     last_ns: &AtomicU64,
-    bytes: &AtomicU64,
+    bytes: ByteSink,
     offloaded: bool,
     stop: Option<&AtomicBool>,
 ) {
@@ -1782,7 +1969,7 @@ fn pump(
             }
             Ok(n) => {
                 last_ns.store(monotonic_now_ns(), Ordering::Relaxed);
-                bytes.fetch_add(n as u64, Ordering::Relaxed);
+                bytes.add(n as u64);
                 if let Err(e) = w.write_all(&buf[..n]) {
                     log(&format!("pump: 写失败（{e}）"));
                     break;
@@ -1870,7 +2057,7 @@ fn splice_pump(
     src: RawFd,
     dst: RawFd,
     last_ns: &AtomicU64,
-    bytes: &AtomicU64,
+    bytes: ByteSink,
 ) -> Result<(), SpliceErr> {
     const CHUNK: usize = 1 << 20;
     let mut fds = [0i32; 2];
@@ -1936,7 +2123,7 @@ fn splice_pump(
             }
             left -= m as usize;
         }
-        bytes.fetch_add(n as u64, Ordering::Relaxed);
+        bytes.add(n as u64);
         last_ns.store(monotonic_now_ns(), Ordering::Relaxed);
     }
     unsafe {
@@ -1952,6 +2139,7 @@ fn pump_or_splice_down(
     mut client: TcpStream,
     upstream_fd: RawFd,
     last_ns: &AtomicU64,
+    sink: ByteSink,
     splice: bool,
     stop: Option<&AtomicBool>,
 ) {
@@ -1968,9 +2156,7 @@ fn pump_or_splice_down(
                     log(&format!("pump: 写失败（{e}）"));
                     return;
                 }
-                RELAY_STATS
-                    .bytes_down
-                    .fetch_add(n as u64, Ordering::Relaxed);
+                sink.add(n as u64);
                 last_ns.store(monotonic_now_ns(), Ordering::Relaxed);
             }
             Err(e) => {
@@ -1994,12 +2180,7 @@ fn pump_or_splice_down(
                     }
                 }
             }
-            match splice_pump(
-                upstream_fd,
-                client.as_raw_fd(),
-                last_ns,
-                &RELAY_STATS.bytes_down,
-            ) {
+            match splice_pump(upstream_fd, client.as_raw_fd(), last_ns, sink) {
                 Err(SpliceErr::Unsupported(e))
                     if e.raw_os_error() == Some(libc::EINVAL) && attempts < 8 =>
                 {
@@ -2023,14 +2204,7 @@ fn pump_or_splice_down(
             }
         }
     }
-    pump(
-        from_remote,
-        Box::new(client),
-        last_ns,
-        &RELAY_STATS.bytes_down,
-        false,
-        stop,
-    );
+    pump(from_remote, Box::new(client), last_ns, sink, false, stop);
 }
 
 /// P7/M4 stage 2：全局 offload 看门狗（单线程，每 offload 连接 0 线程）。
@@ -2362,11 +2536,7 @@ fn offload_guard_remove(key: &SodaTuple) {
 /// 对照 dae newTCPRelayOffloadSession：注册前 drain 内核队列，若仍有 pending 数据
 /// 则拒绝 offload——否则队列里的数据会被用户态泵与内核重定向**双重处理**（C 基准
 /// 实测出重复字节：8MB 流量多出 17B）。
-fn drain_prefix(
-    mut sock: &TcpStream,
-    peer: &mut dyn outbound::WriteHalf,
-    bytes: &AtomicU64,
-) -> bool {
+fn drain_prefix(mut sock: &TcpStream, peer: &mut dyn outbound::WriteHalf, bytes: ByteSink) -> bool {
     if sock.set_nonblocking(true).is_err() {
         return false;
     }
@@ -2376,7 +2546,7 @@ fn drain_prefix(
         match sock.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => {
-                bytes.fetch_add(n as u64, Ordering::Relaxed);
+                bytes.add(n as u64);
                 if peer.write_all(&buf[..n]).is_err() {
                     ok = false;
                     break;
@@ -2498,7 +2668,7 @@ fn handle_socks_conn(mut client: TcpStream) {
             Box::new(c_read),
             to_remote,
             last2.as_ref(),
-            up2.as_ref(),
+            ByteSink::single(up2.as_ref()),
             false,
             None,
         );
@@ -2507,7 +2677,7 @@ fn handle_socks_conn(mut client: TcpStream) {
         from_remote,
         Box::new(client),
         last_ns.as_ref(),
-        down.as_ref(),
+        ByteSink::single(down.as_ref()),
         false,
         None,
     );
@@ -2666,6 +2836,14 @@ fn handle_relay_conn(mut client: TcpStream) {
     RELAY_STATS.conns_total.fetch_add(1, Ordering::Relaxed);
     RELAY_STATS.conns_active.fetch_add(1, Ordering::Relaxed);
     note_traffic();
+    // P-AI：按域名统计（仅域名目标；收尾时归档字节明细）。
+    let handled_domain: Option<Box<str>> = match &target {
+        target::Target::Domain(n, _) => Some(n.as_str().into()),
+        target::Target::Ip(..) => None,
+    };
+    if let Some(d) = &handled_domain {
+        domain_stat_open(d);
+    }
     let outbound::DialedStream {
         from_remote,
         mut to_remote,
@@ -2679,8 +2857,16 @@ fn handle_relay_conn(mut client: TcpStream) {
         // 队列排空且无错才注册；否则退回纯用户态泵（仍正确，只是无 offload）。
         let mut eligible = false;
         if let Some(sock) = socket.as_ref() {
-            let c_ok = drain_prefix(&client, to_remote.as_mut(), &RELAY_STATS.bytes_up);
-            let u_ok = drain_prefix(sock, &mut client, &RELAY_STATS.bytes_down);
+            let c_ok = drain_prefix(
+                &client,
+                to_remote.as_mut(),
+                ByteSink::global_only(&RELAY_STATS.bytes_up),
+            );
+            let u_ok = drain_prefix(
+                sock,
+                &mut client,
+                ByteSink::global_only(&RELAY_STATS.bytes_down),
+            );
             eligible = c_ok && u_ok;
         }
         if eligible {
@@ -2745,6 +2931,9 @@ fn handle_relay_conn(mut client: TcpStream) {
         reactor_managed: reactor_splice || reactor_codec,
         client: client_clone,
         upstream: upstream_clone,
+        domain: handled_domain,
+        bytes_up: AtomicU64::new(0),
+        bytes_down: AtomicU64::new(0),
     });
     if let Ok(mut m) = RELAY_CONNS.lock() {
         m.insert(id, handle.clone());
@@ -2825,7 +3014,12 @@ fn handle_relay_conn(mut client: TcpStream) {
             let mut spliced = false;
             if splice {
                 if let Some(dst) = up_dst {
-                    match splice_pump(c_read.as_raw_fd(), dst, &h2.last_ns, &RELAY_STATS.bytes_up) {
+                    match splice_pump(
+                        c_read.as_raw_fd(),
+                        dst,
+                        &h2.last_ns,
+                        ByteSink::new(&RELAY_STATS.bytes_up, Some(&h2.bytes_up)),
+                    ) {
                         Ok(()) => spliced = true,
                         Err(SpliceErr::Unsupported(e)) => {
                             RELAY_STATS.splice_fallbacks.fetch_add(1, Ordering::Relaxed);
@@ -2845,7 +3039,7 @@ fn handle_relay_conn(mut client: TcpStream) {
                     Box::new(c_read),
                     to_remote,
                     &h2.last_ns,
-                    &RELAY_STATS.bytes_up,
+                    ByteSink::new(&RELAY_STATS.bytes_up, Some(&h2.bytes_up)),
                     offloaded,
                     Some(&h2.stop),
                 );
@@ -2860,6 +3054,7 @@ fn handle_relay_conn(mut client: TcpStream) {
             client,
             src,
             &handle.last_ns,
+            ByteSink::new(&RELAY_STATS.bytes_down, Some(&handle.bytes_down)),
             true,
             Some(&handle.stop),
         ),
@@ -2867,7 +3062,7 @@ fn handle_relay_conn(mut client: TcpStream) {
             from_remote,
             Box::new(client),
             &handle.last_ns,
-            &RELAY_STATS.bytes_down,
+            ByteSink::new(&RELAY_STATS.bytes_down, Some(&handle.bytes_down)),
             offloaded,
             Some(&handle.stop),
         ),
@@ -2890,10 +3085,18 @@ fn handle_relay_conn(mut client: TcpStream) {
 
 /// relay 会话收尾：摘注册表 + 活跃计数递减（线程泵路径与 reactor 共用）。
 fn relay_finish(id: u64) {
-    if let Ok(mut m) = RELAY_CONNS.lock() {
-        m.remove(&id);
-    }
+    let handle = RELAY_CONNS.lock().ok().and_then(|mut m| m.remove(&id));
     RELAY_STATS.conns_active.fetch_sub(1, Ordering::Relaxed);
+    // P-AI：连接收尾 → 域名统计归档（活跃 -1，累计本连接字节）。
+    if let Some(h) = handle {
+        if let Some(d) = &h.domain {
+            domain_stat_close(
+                d,
+                h.bytes_up.load(Ordering::Relaxed),
+                h.bytes_down.load(Ordering::Relaxed),
+            );
+        }
+    }
 }
 
 /// relay janitor：空闲超过 RELAY_IDLE_SECS 的连接强制关闭（两侧 shutdown）。
@@ -6956,6 +7159,7 @@ fn status_json(ebpf: &mut Ebpf) -> serde_json::Value {
             "debounce_ms": crate::watch::DEBOUNCE.as_millis() as u64,
             "sub_cache_ttl_secs": SUB_CACHE_TTL_SECS.load(Ordering::Relaxed),
         },
+        "domain_stats": snapshot_domain_stats(),
         "rule_sets": rule_sets_json(),
         "dialer": match OUTBOUND.get() {
             Some(o) => o.name(),

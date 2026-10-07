@@ -22,9 +22,9 @@ use serde_json::{json, Value};
 mod configapi;
 
 use shared::{
-    ConfigView, DnsView, FileContent, FileInfo, GroupView, LoginReq, LoginResp, MapsView,
-    NodeDetail, NodePoint, NodeView, PnameView, RelayView, ReloadView, RuleSetView, Sample,
-    SaveResult, SeriesView, SniffView, SourceInfo, SourcesView, StatusView, WatchView,
+    ConfigView, DnsView, DomainStatView, FileContent, FileInfo, GroupView, LoginReq, LoginResp,
+    MapsView, NodeDetail, NodePoint, NodeView, PnameView, RelayView, ReloadView, RuleSetView,
+    Sample, SaveResult, SeriesView, SniffView, SourceInfo, SourcesView, StatusView, WatchView,
 };
 
 // ---------------------------------------------------------------- 配置
@@ -505,6 +505,22 @@ fn to_view(root: &Value, engine: &Engine) -> StatusView {
             offload_enabled: bool_of(&root["relay"]["offload_enabled"]),
             offloaded_total: u64_of(&root["relay"]["offloaded_total"]),
         },
+        domain_stats: root["domain_stats"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .map(|d| DomainStatView {
+                        domain: str_of(&d["domain"]),
+                        ai: bool_of(&d["ai"]),
+                        conns: u64_of(&d["conns"]),
+                        active: u64_of(&d["active"]),
+                        bytes_up: u64_of(&d["bytes_up"]),
+                        bytes_down: u64_of(&d["bytes_down"]),
+                        last_seen_secs_ago: u64_of(&d["last_seen_secs_ago"]),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
         dns: DnsView {
             queries: u64_of(&root["dns"]["queries"]),
             responses: u64_of(&root["dns"]["responses"]),

@@ -19,7 +19,7 @@ use gloo_storage::{LocalStorage, Storage};
 use gloo_timers::future::TimeoutFuture;
 use leptos::prelude::*;
 use node::{load_node, NodeModal};
-use runtime::{MetricsTable, RuntimeCard, TrendRow};
+use runtime::{AiTrafficCard, MetricsTable, RuntimeCard, TrendRow};
 use shared::{ActionResult, LogsView, NodeDetail, SeriesView, StatusView};
 use wasm_bindgen::prelude::*;
 
@@ -481,6 +481,7 @@ fn App() -> impl IntoView {
                 paused=Signal::derive(move || paused.get())
                 token=token msg=action_msg />
             <MetricsTable status=status />
+            <AiTrafficCard status=status />
             <TrendRow status=status series=series />
 
             <div class="charts-foot">

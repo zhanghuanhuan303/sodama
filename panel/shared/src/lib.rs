@@ -31,6 +31,8 @@ pub struct StatusView {
     pub maps: MapsView,
     pub pname: PnameView,
     pub config_watch: WatchView,
+    /// P-AI：域名维度统计（「AI 流量」卡片；按流量 Top，最多 30 条）。
+    pub domain_stats: Vec<DomainStatView>,
     /// 进程运行时（面板本地读 `/proc/<pid>`；引擎状态面不提供）
     pub runtime: RuntimeView,
 }
@@ -93,6 +95,22 @@ pub struct RelayView {
     pub splice_fallbacks: u64,
     pub offload_enabled: bool,
     pub offloaded_total: u64,
+}
+
+/// P-AI：单个域名的连接/流量统计（引擎 `status.domain_stats[]`）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DomainStatView {
+    pub domain: String,
+    /// 是否 AI 服务域名（引擎侧后缀表标记）。
+    pub ai: bool,
+    /// 累计连接数 / 当前活跃连接。
+    pub conns: u64,
+    pub active: u64,
+    pub bytes_up: u64,
+    pub bytes_down: u64,
+    /// 最近一次活动距今秒数。
+    pub last_seen_secs_ago: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

@@ -305,6 +305,82 @@ pub fn MetricsTable(status: RwSignal<Option<StatusView>>) -> impl IntoView {
     }
 }
 
+/// P-AI：域名流量卡片（Top 域名 + AI 标记；数据源 `status.domain_stats`）。
+/// 与三线表同构：表头细线 + 数据行，无竖线。
+#[component]
+pub fn AiTrafficCard(status: RwSignal<Option<StatusView>>) -> impl IntoView {
+    let rows = Signal::derive(move || {
+        let mut v = status
+            .get()
+            .map(|s| s.domain_stats.clone())
+            .unwrap_or_default();
+        v.truncate(10);
+        v
+    });
+    view! {
+        <section class="ai-card">
+            <div class="t3-wrap">
+                <table class="tbl-3line">
+                    <thead>
+                        <tr>
+                            <th>"域名（按流量 Top）"</th>
+                            <th>"AI"</th>
+                            <th>"连接 活跃/累计"</th>
+                            <th>"下行"</th>
+                            <th>"上行"</th>
+                            <th>"最近活动"</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {move || {
+                            let rs = rows.get();
+                            if rs.is_empty() {
+                                return view! {
+                                    <tr class="ai-empty">
+                                        <td colspan="6">
+                                            "暂无域名流量（连接产生后出现；IP 直连目标无域名）"
+                                        </td>
+                                    </tr>
+                                }
+                                    .into_any();
+                            }
+                            rs.into_iter()
+                                .map(|d| {
+                                    view! {
+                                        <tr class="ai-row">
+                                            <td class="ai-dom">{d.domain.clone()}</td>
+                                            <td class="ai-mark">
+                                                {if d.ai { "●" } else { "·" }}
+                                            </td>
+                                            <td class="num">
+                                                {format!("{} / {}", d.active, d.conns)}
+                                            </td>
+                                            <td class="num">{fmt_bytes(d.bytes_down)}</td>
+                                            <td class="num">{fmt_bytes(d.bytes_up)}</td>
+                                            <td class="dim">{fmt_ago(d.last_seen_secs_ago)}</td>
+                                        </tr>
+                                    }
+                                })
+                                .collect_view()
+                                .into_any()
+                        }}
+                    </tbody>
+                </table>
+            </div>
+        </section>
+    }
+}
+
+/// 距今秒数 → 人类可读。
+fn fmt_ago(secs: u64) -> String {
+    match secs {
+        0..=2 => "刚刚".to_string(),
+        s if s < 60 => format!("{s}s 前"),
+        s if s < 3600 => format!("{}m 前", s / 60),
+        s => format!("{}h 前", s / 3600),
+    }
+}
+
 /// 曲线行（活跃连接 / 吞吐 / 最优延迟）——与运行时卡片配套。
 #[component]
 pub fn TrendRow(

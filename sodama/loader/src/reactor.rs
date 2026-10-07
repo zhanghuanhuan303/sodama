@@ -314,6 +314,12 @@ impl Session {
                         &RELAY_STATS.bytes_down
                     };
                     c.fetch_add(n as u64, Ordering::Relaxed);
+                    let s = if c2u {
+                        &handle.bytes_up
+                    } else {
+                        &handle.bytes_down
+                    };
+                    s.fetch_add(n as u64, Ordering::Relaxed);
                     if !nonblock {
                         break; // 阻塞 fd：每次事件只搬一车（多搬会阻塞）
                     }
@@ -597,6 +603,9 @@ impl Session {
                     RELAY_STATS
                         .bytes_down
                         .fetch_add(n as u64, Ordering::Relaxed);
+                    self.handle
+                        .bytes_down
+                        .fetch_add(n as u64, Ordering::Relaxed);
                     p.out.extend_from_slice(&buf[..n]);
                     // 与原 prelude 线程「一次 read 即完成」语义一致：首读已消费响应头，
                     // 其余字节留在 socket 由 u2c splice 接管；继续在此循环读会一直
@@ -797,6 +806,12 @@ impl CodecDir {
                 &RELAY_STATS.bytes_down
             };
             c.fetch_add(n as u64, Ordering::Relaxed);
+            let s = if c2u {
+                &handle.bytes_up
+            } else {
+                &handle.bytes_down
+            };
+            s.fetch_add(n as u64, Ordering::Relaxed);
         }
         Ok(total)
     }
