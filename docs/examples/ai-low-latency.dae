@@ -1,0 +1,108 @@
+# =============================================================================
+#  sodama · AI API 低延迟模板（OpenAI / Claude / Gemini / Cursor / Grok …）
+#
+#  为什么给 AI 流量单独建组？
+#    AI API（SSE 逐字流、gRPC）的特征是「低吞吐、长连接、对首包延迟（TTFT）
+#    和帧间抖动极敏感」。对 TTFT 影响最大的杠杆是【选对节点】——把 AI 域名
+#    固定分派到「探测延迟最低」的组，收益是百毫秒级；而 Nagle / 用户态攒批
+#    这类内核路径问题 sodama 已全局关闭（两端 TCP_NODELAY + 零聚合转发，
+#    实测 ss ping-pong 43ms → 微秒级）。
+#
+#  用法（二选一）：
+#    ① 直接作为主配置使用：把 subscription 换成你自己的，其余按需改；
+#    ② 合并进现有 /etc/sodama/config.dae：抄走 group 里的 aifast 段、
+#       routing 里的 AI 域名段、global 里的 relay_idle_timeout 两行，
+#       并保留你自己路由里的兜底规则。
+#    保存即生效（inotify 热重载，毫秒级），无需重启。
+# =============================================================================
+
+# ---- ① 订阅（顺序 = 优先级；首个有活节点者生效） ----------------------------
+subscription {
+    main: 'https://your-subscription-url.example/sub?token=REPLACE_ME'
+}
+
+# ---- ② 组：AI 专用快组 + 常规兜底组 ------------------------------------------
+group {
+    # AI 快组：min = 按最近一次健康探测延迟取最低的节点（对 TTFT 最友好）。
+    # 探测目标默认 http://cp.cloudflare.com（全局默认），想更贴 AI 目标
+    # 可改 tcp_check_url（注意：探测失败会把节点标死，选目标要稳）。
+    aifast {
+        policy: min
+        check_interval: '30s'
+        check_tolerance: '1'
+        # tcp_check_url: 'https://api.openai.com'
+    }
+    # 常规组：平滑移动平均（防抖；日常浏览/下载/视频用）
+    proxy {
+        policy: min_moving_avg
+    }
+}
+
+# ---- ③ 分流：AI 域名 → 快组；其余照旧 ----------------------------------------
+routing {
+    # ---- AI 服务（suffix 自动含子域；按需增删） -----------------------------
+    # OpenAI / Anthropic / Google / xAI
+    domain(suffix: 'openai.com, chatgpt.com, oaiusercontent.com, sora.com') -> aifast
+    domain(suffix: 'anthropic.com, claude.ai, claudeusercontent.com') -> aifast
+    domain(suffix: 'generativelanguage.googleapis.com, aistudio.google.com, gemini.google.com') -> aifast
+    domain(suffix: 'x.ai, grok.com') -> aifast
+    # 开发工具（Cursor / Windsurf / Copilot）
+    domain(suffix: 'cursor.com, cursor.sh, windsurf.com, codeium.com') -> aifast
+    domain(suffix: 'githubcopilot.com, copilot.microsoft.com') -> aifast
+    # 模型平台 / 推理服务
+    domain(suffix: 'perplexity.ai, poe.com, openrouter.ai, groq.com, replicate.com') -> aifast
+    domain(suffix: 'together.ai, together.xyz, fireworks.ai, fal.ai, deepinfra.com, cerebras.ai') -> aifast
+    domain(suffix: 'mistral.ai, cohere.com, cohere.ai, lambdalabs.com, sambanova.ai') -> aifast
+    # 多媒体生成（图片/音乐/视频，大响应体，低延迟选路同样受益）
+    domain(suffix: 'midjourney.com, suno.com, suno.ai, elevenlabs.io, runwayml.com, pika.art, lumalabs.ai') -> aifast
+    # 其他
+    domain(suffix: 'character.ai, huggingface.co') -> aifast
+
+    # ---- 国产 AI：直连更快，已在 geosite:cn 覆盖；如未覆盖请补 direct --------
+    # （deepseek.com / moonshot.cn / bigmodel.cn / dashscope.aliyuncs.com /
+    #   doubao.com / tongyi.aliyun.com 等 → 走下面 domain(geosite:cn) -> direct）
+
+    # ---- 以下照抄你原有的默认路由（示例按真网关形态） ------------------------
+    dip(192.168.0.0/16) -> direct
+    dip(10.0.0.0/8) -> direct
+    dip(172.16.0.0/12) -> direct
+    dip(169.254.0.0/16) -> direct
+    dip(224.0.0.0/4) -> direct
+    dip('fe80::/10') -> direct
+    dip('fc00::/7') -> direct
+    l4proto(udp) && dport(443) -> block
+    l4proto(udp) -> direct
+    dip(geoip:cn) -> direct
+    domain(geosite:cn) -> direct
+    fallback: proxy
+}
+
+# ---- ④ DNS（沿用 DoH + ECS 口径） -------------------------------------------
+dns {
+    upstream {
+        alidns: 'https://223.5.5.5/dns-query?sni=dns.alidns.com'
+        alidns_ecs: 'https://223.5.5.5/dns-query?sni=dns.alidns.com&ecs=auto'
+    }
+    routing {
+        request {
+            qname(geosite:category-ads-all) -> reject
+            qname(geosite:cn) -> alidns_ecs
+            fallback: alidns
+        }
+        response {
+            fallback: accept
+        }
+    }
+}
+
+# ---- ⑤ 运行参数 --------------------------------------------------------------
+global {
+    dial_mode: 'domain'
+    watch_config: 10
+    geodata_dir: '/usr/share/v2ray'
+    # ★ 长思考模型（o1 / deep-research 级）静默期可能超过默认 5 分钟：
+    #   放宽空闲回收，避免「流还在生成但代理先断开」。900s 起步，按需加大。
+    relay_idle_timeout: '900s'
+    # 无人看状态/无流量时探测退避的上限（省 CPU），0 = 不退避
+    probe_idle_cap: '600'
+}
