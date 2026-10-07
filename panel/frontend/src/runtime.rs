@@ -426,6 +426,29 @@ pub fn TrendRow(
                 color="#d0ff00"
                 unit=" ms"
             />
+            <Chart
+                title="全网吞吐（WAN 出口）"
+                hint=Signal::derive(move || {
+                    series
+                        .get()
+                        .map(|s| {
+                            s.points
+                                .last()
+                                .map(|p| {
+                                    format!(
+                                        "↑{} ↓{} · 直连+代理合计",
+                                        fmt_rate(p.wan_up_bps as f64),
+                                        fmt_rate(p.wan_down_bps as f64)
+                                    )
+                                })
+                                .unwrap_or_default()
+                        })
+                        .unwrap_or_default()
+                })
+                values=vals(|s| (s.wan_up_bps + s.wan_down_bps) as f64 / 1024.0)
+                color="#ff9e64"
+                unit=" KB/s"
+            />
         </section>
     }
 }

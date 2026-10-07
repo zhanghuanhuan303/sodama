@@ -370,6 +370,9 @@ pub struct Sample {
     /// 上行/下行速率（B/s，由累计字节差分）
     pub up_bps: u64,
     pub down_bps: u64,
+    /// WAN 接口整机速率（B/s；直连 + 代理合计，面板本地读 `/proc/net/dev`；不可用为 0）
+    pub wan_up_bps: u64,
+    pub wan_down_bps: u64,
     pub alive: u64,
     pub members: u64,
     pub ema_min: f64,

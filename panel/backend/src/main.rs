@@ -83,7 +83,8 @@ struct SeriesStore {
 #[derive(Default)]
 struct SeriesInner {
     points: VecDeque<Sample>,
-    prev: Option<(u64, u64, u64, u64)>, // t, bytes_up, bytes_down, dns_queries
+    // t, bytes_up, bytes_down, dns_queries, wan_rx, wan_tx
+    prev: Option<(u64, u64, u64, u64, u64, u64)>,
 }
 
 impl SeriesStore {
@@ -99,10 +100,10 @@ impl SeriesStore {
         let skip = g.points.len().saturating_sub(n);
         g.points.iter().skip(skip).cloned().collect()
     }
-    fn prev(&self) -> Option<(u64, u64, u64, u64)> {
+    fn prev(&self) -> Option<(u64, u64, u64, u64, u64, u64)> {
         self.inner.lock().unwrap().prev
     }
-    fn set_prev(&self, p: (u64, u64, u64, u64)) {
+    fn set_prev(&self, p: (u64, u64, u64, u64, u64, u64)) {
         self.inner.lock().unwrap().prev = Some(p);
     }
 }
@@ -737,20 +738,68 @@ async fn fetch_view(ctx: &Ctx, engine: &Arc<Engine>) -> Result<StatusView, Strin
 
 // ---------------------------------------------------------------- 采样（M1）
 
-fn make_sample(v: &StatusView, prev: &mut Option<(u64, u64, u64, u64)>) -> Sample {
+/// 读 WAN 接口累计字节（rx, tx；`/proc/net/dev`）。面板与引擎同机时代表整机出口
+/// （直连 + 代理合计）；非 Linux / 无接口时返回 None（速率为 0，优雅降级）。
+fn wan_counters() -> Option<(u64, u64)> {
+    let data = std::fs::read_to_string("/proc/net/dev").ok()?;
+    let iface = default_route_iface().unwrap_or_else(|| "eth0".to_string());
+    for line in data.lines() {
+        let line = line.trim();
+        let Some((name, rest)) = line.split_once(':') else {
+            continue;
+        };
+        if name.trim() != iface {
+            continue;
+        }
+        // rx: bytes packets errs drop fifo frame compressed multicast; tx: bytes ...
+        let nums: Vec<u64> = rest
+            .split_whitespace()
+            .take(9)
+            .filter_map(|s| s.parse().ok())
+            .collect();
+        if nums.len() >= 9 {
+            return Some((nums[0], nums[8]));
+        }
+    }
+    None
+}
+
+/// 默认路由出口接口名（`/proc/net/route`，Destination=00000000）。
+fn default_route_iface() -> Option<String> {
+    let data = std::fs::read_to_string("/proc/net/route").ok()?;
+    for line in data.lines().skip(1) {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        if f.len() >= 2 && f[1] == "00000000" {
+            return Some(f[0].to_string());
+        }
+    }
+    None
+}
+
+fn make_sample(v: &StatusView, prev: &mut Option<(u64, u64, u64, u64, u64, u64)>) -> Sample {
     let (up, down, q) = (v.relay.bytes_up, v.relay.bytes_down, v.dns.queries);
-    let (up_bps, down_bps, dns_qps) = match *prev {
-        Some((pt, pu, pd, pq)) if v.sampled_at > pt => {
+    // WAN 整机计数（读失败沿用旧基线 → 速率为 0，不产生假峰）。
+    let (wan_rx, wan_tx) = match wan_counters() {
+        Some(c) => c,
+        None => match *prev {
+            Some((_, _, _, _, prx, ptx)) => (prx, ptx),
+            None => (0, 0),
+        },
+    };
+    let (up_bps, down_bps, dns_qps, wan_up_bps, wan_down_bps) = match *prev {
+        Some((pt, pu, pd, pq, prx, ptx)) if v.sampled_at > pt => {
             let dt = (v.sampled_at - pt) as f64;
             (
                 (up.saturating_sub(pu) as f64 / dt) as u64,
                 (down.saturating_sub(pd) as f64 / dt) as u64,
                 q.saturating_sub(pq) as f64 / dt,
+                (wan_tx.saturating_sub(ptx) as f64 / dt) as u64,
+                (wan_rx.saturating_sub(prx) as f64 / dt) as u64,
             )
         }
-        _ => (0, 0, 0.0),
+        _ => (0, 0, 0.0, 0, 0),
     };
-    *prev = Some((v.sampled_at, up, down, q));
+    *prev = Some((v.sampled_at, up, down, q, wan_rx, wan_tx));
     let emas: Vec<f64> = v
         .nodes
         .iter()
@@ -768,6 +817,8 @@ fn make_sample(v: &StatusView, prev: &mut Option<(u64, u64, u64, u64)>) -> Sampl
         conns_active: v.relay.conns_active,
         up_bps,
         down_bps,
+        wan_up_bps,
+        wan_down_bps,
         alive: v.group.alive,
         members: v.group.members,
         ema_min: if ema_min == f64::MAX { 0.0 } else { ema_min },
@@ -1344,11 +1395,11 @@ async fn api_series_csv(
         .clamp(10, 20000) as usize;
     let points = engine.series.tail(n);
     let mut csv = String::from(
-        "t,time_utc,conns_active,up_bps,down_bps,up_kBps,down_kBps,alive,members,ema_min_ms,ema_avg_ms,dns_qps,sniff_pct,fds_used,rss_kb,rss_mb,threads,cpu_pct\n",
+        "t,time_utc,conns_active,up_bps,down_bps,up_kBps,down_kBps,alive,members,ema_min_ms,ema_avg_ms,dns_qps,sniff_pct,fds_used,rss_kb,rss_mb,threads,cpu_pct,wan_up_bps,wan_down_kBps\n",
     );
     for p in &points {
         csv.push_str(&format!(
-            "{},{},{},{},{},{:.1},{:.1},{},{},{:.1},{:.1},{:.2},{:.1},{},{},{:.1},{},{:.1}\n",
+            "{},{},{},{},{},{:.1},{:.1},{},{},{:.1},{:.1},{:.2},{:.1},{},{},{:.1},{},{:.1},{},{:.1}\n",
             p.t,
             iso_utc(p.t),
             p.conns_active,
@@ -1366,7 +1417,9 @@ async fn api_series_csv(
             p.rss_kb,
             p.rss_kb as f64 / 1024.0,
             p.threads,
-            p.cpu_pct
+            p.cpu_pct,
+            p.wan_up_bps,
+            p.wan_down_bps as f64 / 1024.0
         ));
     }
     let fname = format!(
