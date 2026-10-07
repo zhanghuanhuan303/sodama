@@ -3486,6 +3486,52 @@ fn sweep_conn_state(ebpf: &mut Ebpf) -> Result<usize, Box<dyn std::error::Error>
     Ok(n)
 }
 
+/// redirect_track 过期清扫（对照 dae control_plane.go:1671 `cleanupRedirectTrackMap`，
+/// `redirectTrackTimeout = 5 * time.Minute`）。回程绑定只由回程流量续租、数据面从不
+/// 主动删除；缺清理时地图单调填满（65536），此后所有进控制面的新流在
+/// `publish_redirect_track` 插入失败处被 TC_ACT_SHOT 丢弃（DNS 与代理一并停摆，
+/// 2026-10-08 生产实锤）。返回 (清理条数, 清理前总条数)。
+fn sweep_redirect_track(ebpf: &mut Ebpf) -> Result<(usize, usize), Box<dyn std::error::Error>> {
+    const REDIRECT_TIMEOUT_NS: u64 = 300 * 1_000_000_000;
+    /// 对照 ebpf-rs/src/maps.rs 的 `redirect_track` max_entries。
+    const REDIRECT_TRACK_CAPACITY: usize = 65536;
+    const CAPACITY_ALERT_PCT: usize = 90;
+    const CAPACITY_ALERT_STEP_S: u64 = 60;
+    static LAST_CAPACITY_ALERT_S: AtomicU64 = AtomicU64::new(0);
+
+    let map = ebpf
+        .map_mut("redirect_track")
+        .ok_or("map redirect_track not found")?;
+    let mut track: HashMap<_, SodaTuple, SodaRedirectEntry> = HashMap::try_from(map)?;
+    let now = monotonic_now_ns();
+    let mut dead: Vec<SodaTuple> = Vec::new();
+    let mut total: usize = 0;
+    for item in track.iter() {
+        if let Ok((k, v)) = item {
+            total += 1;
+            if v.last_seen_ns <= now && now - v.last_seen_ns > REDIRECT_TIMEOUT_NS {
+                dead.push(k);
+            }
+        }
+    }
+    let n = dead.len();
+    for k in &dead {
+        let _ = track.remove(k);
+    }
+    // 容量告警（对照上游 logMapCapacityAlert；60s 节流避免刷屏）。
+    if total * 100 >= REDIRECT_TRACK_CAPACITY * CAPACITY_ALERT_PCT {
+        let now_s = now / 1_000_000_000;
+        let last = LAST_CAPACITY_ALERT_S.load(Ordering::Relaxed);
+        if now_s.saturating_sub(last) >= CAPACITY_ALERT_STEP_S {
+            LAST_CAPACITY_ALERT_S.store(now_s, Ordering::Relaxed);
+            log(&format!(
+                "redirect_track 容量告警：{total}/{REDIRECT_TRACK_CAPACITY}（≥{CAPACITY_ALERT_PCT}%），过期清理未跟上"
+            ));
+        }
+    }
+    Ok((n, total))
+}
+
 /// P15/P19：构建全部节点组（config `group` 段顺序即索引顺序；无配置时为隐式 proxy 组）。
 /// 订阅拉取失败/节点全部不支持时返回 None（回落为无 dialer，保持实验回显语义）。
 fn build_groups(args: &Args) -> Option<outbound::Outbound> {
@@ -4782,6 +4828,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Ok(0) => {}
                 Ok(n) => log(&format!("conn_state janitor: 清理 {n} 条过期状态")),
                 Err(e) => log(&format!("conn_state janitor 失败: {e}")),
+            }
+            match sweep_redirect_track(&mut ebpf) {
+                Ok((0, _)) => {}
+                Ok((n, _)) => log(&format!("redirect_track janitor: 清理 {n} 条过期回程绑定")),
+                Err(e) => log(&format!("redirect_track janitor 失败: {e}")),
             }
             // O8：每 30s 回收分配器空闲页（churn 后 RSS 回落；避免高频 trim 抖动）。
             if (ticks / janitor_ticks) % 6 == 0 {
