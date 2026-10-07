@@ -584,7 +584,14 @@ impl GroupRuntime {
         Err(last_err.unwrap_or_else(|| std::io::Error::other("组内无可用节点")))
     }
 
-    /// 选一个支持 UDP 的成员（按同一顺序），失败切换至多 3 个。
+    /// 选一个支持 UDP 的成员（按延迟顺序遍历；不支持的成员免费跳过，
+    /// 真实拨号失败至多重试 3 个）。
+    ///
+    /// 修复（2026-10-08）：旧实现 `order.iter().take(3)` 只看延迟榜前 3 名——
+    /// 真实订阅里 anytls/reality 常占据前列（前者无 UDP、后者协商不支持），
+    /// 导致即使组内有上百个可用 vless 成员，UDP 也永远回退直连。
+    /// 本遍历成本极低：不支持的成员仅一次能力判定位；`Ok(None)`（如 reality）
+    /// 不产生任何 IO。
     pub fn dial_udp(
         &self,
         target: std::net::SocketAddr,
@@ -595,7 +602,10 @@ impl GroupRuntime {
         let tol = self.check_tolerance;
         let mut last_err: Option<std::io::Error> = None;
         let mut tried = 0usize;
-        for &i in order.iter().take(3.max(1)) {
+        for &i in order.iter() {
+            if tried >= 3 {
+                break;
+            }
             if !inner.members[i].outbound.supports_udp() {
                 continue;
             }

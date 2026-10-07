@@ -6205,14 +6205,20 @@ fn udp_nat_session(
                     .fetch_add(1, Ordering::Relaxed);
                 r
             }
-            Ok(None) => match outbound::Outbound::direct_udp(orig_dst) {
-                Ok(r) => r,
-                Err(e) => {
-                    UDP_NAT_STATS.errors.fetch_add(1, Ordering::Relaxed);
-                    log(&format!("udp nat: 建出口失败: {e}"));
-                    return None;
+            Ok(None) => {
+                // 组内无可用 UDP 出口（成员不支持或协商失败）→ 直连回退（计数）。
+                UDP_NAT_STATS
+                    .direct_fallback
+                    .fetch_add(1, Ordering::Relaxed);
+                match outbound::Outbound::direct_udp(orig_dst) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        UDP_NAT_STATS.errors.fetch_add(1, Ordering::Relaxed);
+                        log(&format!("udp nat: 建出口失败: {e}"));
+                        return None;
+                    }
                 }
-            },
+            }
             Err(e) => {
                 UDP_NAT_STATS.errors.fetch_add(1, Ordering::Relaxed);
                 log(&format!("udp nat: dial_udp {orig_dst} 失败: {e}"));
