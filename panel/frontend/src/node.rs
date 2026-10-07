@@ -3,7 +3,7 @@
 use leptos::prelude::*;
 use shared::NodeDetail;
 
-use crate::charts::Chart;
+use crate::charts::{Chart, CurveSerie};
 use crate::get_json;
 
 /// 拉取某节点详情到 `detail`。
@@ -55,6 +55,7 @@ pub fn NodeModal(detail: RwSignal<Option<NodeDetail>>) -> impl IntoView {
             let (min, max) = if emas.is_empty() { (0.0, 0.0) } else { (min, max) };
             let chart_vals = emas.clone();
             let chart_len = emas.len();
+            let chart_ts: Vec<u64> = d.samples.iter().map(|p| p.t).collect();
             view! {
                 <div class="modal-mask">
                     <div class="modal modal-narrow">
@@ -112,8 +113,9 @@ pub fn NodeModal(detail: RwSignal<Option<NodeDetail>>) -> impl IntoView {
                                 <div class="panel-head"><span class="panel-title">"延迟历史（EMA ms）"</span></div>
                                 <div class="chart-embed">
                                     <Chart title="EMA" hint=Signal::derive(move || format!("{chart_len} 点"))
-                                           values=Signal::derive(move || chart_vals.clone())
-                                           color="#d0ff00" unit=" ms"/>
+                                           ts=Signal::derive(move || chart_ts.clone())
+                                           series=Signal::derive(move || vec![CurveSerie::new("EMA", "#d0ff00", chart_vals.clone())])
+                                           unit=" ms"/>
                                 </div>
                             </div>
                         </div>

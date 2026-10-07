@@ -5,7 +5,7 @@
 use leptos::prelude::*;
 use shared::{Sample, SeriesView, StatusView};
 
-use crate::charts::Chart;
+use crate::charts::{Chart, CurveSerie};
 use crate::{fmt_bytes, fmt_rate, fmt_uptime, pct, ActionButton};
 
 /// KB → (数值, 单位)，用于把数字与单位分开排版。
@@ -176,8 +176,15 @@ pub fn RuntimeCard(
                                 None => String::new(),
                             }
                         })
-                        values=Signal::derive(rss_vals)
-                        color="#29ffa4"
+                        ts=Signal::derive(move || {
+                            series
+                                .get()
+                                .map(|s| s.points.iter().map(|p| p.t).collect::<Vec<u64>>())
+                                .unwrap_or_default()
+                        })
+                        series=Signal::derive(move || {
+                            vec![CurveSerie::new("RSS", "#29ffa4", rss_vals())]
+                        })
                         unit=" MB"
                         foot_mid=Signal::derive(move || {
                             match win_stats(&rss_vals()) {
@@ -198,8 +205,15 @@ pub fn RuntimeCard(
                                 _ => String::new(),
                             }
                         })
-                        values=Signal::derive(conn_vals)
-                        color="#3c73ff"
+                        ts=Signal::derive(move || {
+                            series
+                                .get()
+                                .map(|s| s.points.iter().map(|p| p.t).collect::<Vec<u64>>())
+                                .unwrap_or_default()
+                        })
+                        series=Signal::derive(move || {
+                            vec![CurveSerie::new("连接", "#3c73ff", conn_vals())]
+                        })
                         unit=""
                         compact=true
                     />
@@ -387,47 +401,43 @@ pub fn TrendRow(
     status: RwSignal<Option<StatusView>>,
     series: RwSignal<Option<SeriesView>>,
 ) -> impl IntoView {
-    let vals = move |g: fn(&Sample) -> f64| {
+    let ts_all = Signal::derive(move || {
+        series
+            .get()
+            .map(|s| s.points.iter().map(|p| p.t).collect::<Vec<u64>>())
+            .unwrap_or_default()
+    });
+    // 单序列快捷构造（名称 / 色 / 取值函数）。
+    let one = move |name: &'static str, color: &'static str, g: fn(&Sample) -> f64| {
         Signal::derive(move || {
-            series
-                .get()
-                .map(|s| s.points.iter().map(|p| g(p)).collect::<Vec<f64>>())
-                .unwrap_or_default()
+            vec![CurveSerie::new(
+                name,
+                color,
+                series
+                    .get()
+                    .map(|s| s.points.iter().map(g).collect::<Vec<f64>>())
+                    .unwrap_or_default(),
+            )]
         })
     };
+    // 流量对比：代理（含面积）叠加在全网（WAN）之上——一图看清直连 vs 代理。
+    let flows = Signal::derive(move || {
+        let (mut px, mut wan) = (Vec::new(), Vec::new());
+        if let Some(s) = series.get() {
+            for p in &s.points {
+                px.push((p.up_bps + p.down_bps) as f64 / 1024.0);
+                wan.push((p.wan_up_bps + p.wan_down_bps) as f64 / 1024.0);
+            }
+        }
+        vec![
+            CurveSerie::new("代理", "#3c73ff", px),
+            CurveSerie::new("全网", "#ff9e64", wan),
+        ]
+    });
     view! {
         <section class="charts">
             <Chart
-                title="活跃连接"
-                hint=Signal::derive(move || {
-                    series.get().map(|s| format!("最近 {} 点 · {}s/点", s.points.len(), s.step_secs)).unwrap_or_default()
-                })
-                values=vals(|s| s.conns_active as f64)
-                color="#29ffa4"
-                unit=""
-            />
-            <Chart
-                title="吞吐（上下行合计）"
-                hint=Signal::derive(move || {
-                    series.get()
-                        .map(|s| s.points.last().map(|p| format!("↑{} ↓{}", fmt_rate(p.up_bps as f64), fmt_rate(p.down_bps as f64))).unwrap_or_default())
-                        .unwrap_or_default()
-                })
-                values=vals(|s| (s.up_bps + s.down_bps) as f64 / 1024.0)
-                color="#3c73ff"
-                unit=" KB/s"
-            />
-            <Chart
-                title="最优节点延迟"
-                hint=Signal::derive(move || {
-                    status.get().map(|s| format!("存活 {}/{}", s.group.alive, s.group.members)).unwrap_or_default()
-                })
-                values=vals(|s| s.ema_min)
-                color="#d0ff00"
-                unit=" ms"
-            />
-            <Chart
-                title="全网吞吐（WAN 出口）"
+                title="流量对比（代理 vs 全网）"
                 hint=Signal::derive(move || {
                     series
                         .get()
@@ -436,7 +446,9 @@ pub fn TrendRow(
                                 .last()
                                 .map(|p| {
                                     format!(
-                                        "↑{} ↓{} · 直连+代理合计",
+                                        "代理 ↑{} ↓{} · 全网 ↑{} ↓{}",
+                                        fmt_rate(p.up_bps as f64),
+                                        fmt_rate(p.down_bps as f64),
                                         fmt_rate(p.wan_up_bps as f64),
                                         fmt_rate(p.wan_down_bps as f64)
                                     )
@@ -445,9 +457,27 @@ pub fn TrendRow(
                         })
                         .unwrap_or_default()
                 })
-                values=vals(|s| (s.wan_up_bps + s.wan_down_bps) as f64 / 1024.0)
-                color="#ff9e64"
+                ts=ts_all
+                series=flows
                 unit=" KB/s"
+            />
+            <Chart
+                title="活跃连接"
+                hint=Signal::derive(move || {
+                    series.get().map(|s| format!("最近 {} 点 · {}s/点", s.points.len(), s.step_secs)).unwrap_or_default()
+                })
+                ts=ts_all
+                series=one("连接", "#29ffa4", |s| s.conns_active as f64)
+                unit=""
+            />
+            <Chart
+                title="最优节点延迟"
+                hint=Signal::derive(move || {
+                    status.get().map(|s| format!("存活 {}/{}", s.group.alive, s.group.members)).unwrap_or_default()
+                })
+                ts=ts_all
+                series=one("EMA", "#d0ff00", |s| s.ema_min)
+                unit=" ms"
             />
         </section>
     }
