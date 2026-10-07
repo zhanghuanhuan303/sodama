@@ -1,6 +1,6 @@
 # 对标进度：dae（Go）↔ sodama（全 Rust）
 
-- **版本**：v2.13 · 2026-10-05（M3 Vision-over-TLS：tls/reality 外层 + 双向 XTLS DIRECT、ws/wss 逐字节、真订阅 e2e；ADR-0057）
+- **版本**：v2.14 · 2026-10-08（生产实战轮：redirect_track 泄漏修复（对照上游 `cleanupRedirectTrackMap`，5min TTL + 90% 容量告警）+ sodama-panel 控制台（axum + Leptos→WASM：总览/节点/配置页 36 项内核参数/图表十字光标与流量对比/域名与 AI 流量统计）+ AI 低延迟模板与 SSE/TTFT 基准；P33–P36 见 v2.13）
 - **口径**：「覆盖度」= 该域**功能点覆盖**的粗估（我方可用 ÷ dae 等价能力），
   **不是代码行数、不是性能等价**；数字是判断值，逐行给出证据出处。
   按口径分两档汇总：主链路（日常代理网关）与 dae 全功能面。
@@ -22,7 +22,7 @@
 | 9 | **嗅探与域名策略（dial_mode）** | 内核侧 TLS/HTTP/QUIC 嗅探 → `domain/domain+` 拨号、sniff-punt | 用户态嗅探（TLS SNI / HTTP Host / h2c / QUIC Initial SNI）+ `dial_mode` 远端解析 + **sniff-punt（嗅探域在 relay 侧重判规则：direct/block/组重选）** | **≈90%** | ADR-0030/0044/0045；余 QUIC 观测→拨号、UDP punt |
 | 10 | **IPv6** | 数据面 + 规则 + 协议全支持 | **TCP+UDP 全链**：v6 解析/tproxy（key 2）/UDP（key 3）/全部协议 v6 目标（含 ss UDP ATYP=4）/v6 direct/**DNS over UDP6 接管**/v6 嗅探；余 ICMPv6/分片 | **≈95%** | ADR-0032/0046；lab `test-v6` 四段全过（TCP、direct、UDP 2/2 跨实现、v6 DNS 源地址正确） |
 | 11 | **部署自动化** | netns 自动搭建（移网卡/sysctl/tproxy 规则，`netns_utils.go`）、systemd（`install/dae.service`）、Docker、发行包、shell 补全 | `lab.sh` / `gateway.sh` 脚本级一键；**systemd unit（`install/sodama.service`，capability 最小集 + SIGHUP ExecReload）+ `install/install.sh`（--dry-run/--uninstall）+ `docs/deploy.md`（P18e）**；**OpenWrt：musl 静态交叉构建（x86_64/aarch64/armv7）+ prebuilt ipk 包（procd/uci/数据面对 helper）+ 内核 fragment 与 QEMU 冒烟（`install/openwrt/`、`lab/build-openwrt.sh`、`lab/openwrt-smoke.sh`、`docs/openwrt.md`）**；无 Docker/发行包/shell 补全 | **≈70%** | 真网关一键脚本体验接近（ADR-0029）；ADR-0042；余：Docker/发行包/shell 补全、OpenWrt 真机验证 |
-| 12 | **运维面** | 主线较弱（daed 独立项目提供 GraphQL/Web UI） | SIGHUP/USR2、状态 socket（status/rules/config/maps/metrics/reload/suspend/resume）、Prometheus、sysdump/trace、日志轮转 | **≈90%** | 相对 dae 主线领先；daed 的 UI/鉴权不在范围（ADR-0021） |
+| 12 | **运维面** | 主线较弱（daed 独立项目提供 GraphQL/Web UI） | SIGHUP/USR2、状态 socket（status/rules/config/maps/metrics/reload/suspend/resume）、Prometheus、sysdump/trace、日志轮转；**sodama-panel 控制台（自研，2026-10-06/08）：axum + Leptos→WASM 单文件 musl——总览（运行时卡片/三线表/AI 流量卡片/曲线十字光标/流量对比）/节点详情/配置页（内核参数 36 项可视化 + validate + 热重载回执）/域名流量统计/手机适配** | **≈93%** | 相对 dae 主线领先；daed 的 GraphQL/鉴权不在范围（ADR-0021），自研控制台为其等价替代形态 |
 | 13 | **质量工程** | Go 单测 244 文件/3.9 万行 + CI（bpf-test/build/docker/go-test…）+ fuzz | **240 单测** + verify 9×2 拓扑 + 专项用例（嗅探 punt/UDP v6/DoH-h2/DNS 选项/ECS 回填+刷新/QUIC 嗅探/分组/订阅/naive h2+h3/juicity/ssr/shadow-tls v1-v3/**Vision XTLS DIRECT 状态机**…） + **`lab/vision` Xray 夹具四模式逐字节** + 对拍 5 逐字节 + QEMU 双内核矩阵 + soak + 六路径基准 + `dns-bench` + REALITY e2e + RFC 9001/9000 黄金向量 + CI | **≈84%** | ADR-0010/0022/0025/0042–0057；CI 缺特权内核加载类测试 |
 | 14 | **性能** | 生产级优化（THP/内存上限/连接池/看门狗） | 六路径基准（direct 31Gbps / relay 24.7 / offload 14.6 / ss 2.5）+ **同机四方对比（P33.2，5 次中位）：direct 24.3 / dae 24.2 / sing-box 22.6 / v2ray 13.5 Gbps（4×48MB 受夹具限制），ss 9.49 / 9.36 / **10.6** / 6.29 Gbps；RSS 28.6 vs 54.2/66.8/72.2 MB；64 流 direct 35.2 Gbps** + **VLESS 四方（明文/TLS）与 M1 零拷贝（splice 落地：vless 明文 12.2→16.9 Gbps、CPU 380→60 ms；relay 8 流 15→21.6 Gbps；perf 拷贝/建页消失；`--no-splice` 可关）** + **M2 kTLS（实验）：TLS 48MB×4 11.67→12.32 Gbps / CPU 420→400 ms；memcpy 29.4%→1.6%（达标）；TX+RX 解密错误 0、splice 4/4；8 流受同机夹具（≈12.5 Gbps）与内核 AES-GCM 速度（2.89 GB/s）限制** + **M4 epoll worker 池（ADR-0058）：10k 连接 28 线程 / 32.1 MB、fail=0、风暴 25 606/s；stage 2 codec 全协议面已交付（VLESS 全组合含 reality/vision/ws、Trojan、vmess、ss/ssr/anytls）：vless-tls 2 000 连接 27 线程 / 61 MB（线程模型 4 011 / 222 MB）、vision 夹具四模式逐字节、吞吐 A/B +5~25%；offload 看门狗单线程化——每 offload 连接 0 线程（200 条实测 28→28 线程）且生命周期回收全过；io_uring A/B 结论为不引入（交叉配对中位 8.18 vs 8.11 GB/s，噪声内）；O6：AEAD 方法实测定调（16KB 块 chacha 1.73 vs aes-gcm 1.57 GB/s，保留 chacha、vmess auto→chacha、组内同分优先 chacha）；O7：UDP recvmmsg/sendmmsg + 16 分片会话表 + 4–8MB 转发缓冲，20k pps 0 丢包 CPU 630 ms/40k 包（dae 2140 / sing-box 1580 / v2ray 1780），四方对拍 `lab/perf/udp.sh`；O8：缓冲池（按字节封顶 8MB）+ UDP 槽按需增长 + 有界优雅退出（50 在途连接整机 462ms、无 TC 残留）+ 30s `malloc_trim`（churn 300 条 RSS 无增长），并修复 ss 帧边界 EOF 误报截断；`SODAMA_NO_REACTOR=1` / `SODAMA_REACTOR_CODEC=0` / `SODAMA_UDP_BATCH=0` 可关**；**G1 真实节点/公网口径（2026-10-05）**：sodama/dae/sing-box 共用同一真实 VLESS-REALITY 节点与固定后端、8 MiB×17 轮，客户端 CPU_ms/GB **6 233 vs 8 820 / 8 557**（同后端轮 4 987 vs 8 613 / 10 290），节点限速为共同上限（宿主直连 ≈20.5 Mbps，v2ray 无 REALITY skip）；并发扩展/perf 剖面/优化方向见 `docs/benchmark-report.html`、`docs/optimization-roadmap.md`、`docs/vless-proposal.html` | **≈85%** | 同机同拓扑同上游（ssserver/sing-box vless）+ 全双工夹具 + 异机真实节点；余：kTLS 目标异机重测、relay/offload/UDP 同机对拍、UDP 批量化（O7） |
 | 15 | **真实订阅生态** | 全原生 | 订阅#1（50×vless-ws）✅；订阅#2：anytls ✅、**REALITY+Vision ✅（自实现 TLS 1.3，ADR-0041）** | **≈85%** | ADR-0026/0027/0028/0041；边界外协议可桥接过渡 |
@@ -43,7 +43,7 @@
 4. ~~geoip/geosite/pname~~ **已完成（P17，ADR-0033）**；余项：geosite 对拍覆盖、pname argv basename（CO-RE）、geodata 流式解析；
 5. ~~DoH/DoQ + `dns.routing`~~ **已完成（P18a/b/c）**；~~DoH h2/H3、optimistic cache（含 **RFC 8767 后台刷新**）/`fixed_domain_ttl`/`ipversion_prefer`/bootstrap_resolver~~ **全部完成（P23/P26/P29，ADR-0047/0050/0053）**；~~ECS 注入/响应回填/ecs_cache~~ **已完成（P18/P28，ADR-0038/0052，sodama 扩展，dae 无）**——DNS 域闭环；
 6. ~~协议细节：REALITY/Vision/uTLS~~ **REALITY+Vision（P18d）、ss2022/http（P18e）**；**uTLS Chrome-120 对齐 + Vision 上行 splice + TUIC 0-RTT 已完成（P24，ADR-0048）**；~~naive（HTTP/2 CONNECT）~~ **已完成（P25，ADR-0049）**；~~naive H3/`naive+quic`~~ **已完成（P26，ADR-0050）**；~~juicity~~ **已完成（P27，ADR-0051）**；~~ssr~~ **已完成（P30，ADR-0054，origin+plain 子集）**；~~插件/shadowtls~~ **已完成（P31，ADR-0055，v1/v2/v3 + ss classic；附带修复 CH 严格解析兼容性）**；ECH **已评估为边界（P32，ADR-0056：rustls/quinn 无客户端 ECH，`ech=` 显式报错不静默）**；余：simple-obfs/v2ray-plugin 等其余 SIP003 插件、SSR `auth_*`/`obfs_*` 与 UDP、rustls 路径 uTLS、ML-DSA/gecko；
-7. ~~systemd/打包/daed~~ **systemd/安装脚本/CI 已完成（P18e，ADR-0042）**；余 Docker/发行包/shell 补全；daed（Web UI）不在范围；
+7. ~~systemd/打包/daed~~ **systemd/安装脚本/CI 已完成（P18e，ADR-0042）**；**daed 等价能力由 sodama-panel 自研替代（不在兼容范围）**；余 Docker/发行包/shell 补全；
 8. offload 完整形态（fuse/计费）；~~relay 并发上限~~ **已完成（P18e，`--max-conns`，ADR-0042）**。
 
 ## 优势项（相对 dae 主线）
@@ -53,6 +53,8 @@
 - **用户态嗅探零数据面改动**：MSG_PEEK 只读采集（不消费字节）+ 逐协议域名编码对齐（ADR-0030）；
 - **TCX 生命周期**：进程退出即摘钩，回滚天然安全；
 - **状态面/可观测**：JSON socket + Prometheus + sysdump/trace（dae 主线没有，daed 才有 Web UI）；
+- **控制台（sodama-panel）**：axum + Leptos→WASM 单文件 musl；总览（运行时卡片/三线表/AI 流量卡片/曲线十字光标与流量对比/数据新鲜度）、节点详情、配置页（内核参数 36 项可视化 + validate + 热重载）、订阅源管理；面向路由器与手机的适配（2026-10-06/08）；
+- **生产实战与修复（2026-10-08）**：软路由 30h+ 生产运行暴露 redirect_track 地图泄漏（填满 65 536 → `TC_ACT_SHOT` → DNS/代理全灭、直连与缓存不受影响），对照上游 `cleanupRedirectTrackMap` 补 5min TTL 清扫 + 90% 容量告警；修复后 janitor 实测清理、服务恢复；同批修复订阅正文截断静默 0 节点、并发上限被 procd fd 硬限卡在 ~1000 两项生产问题；
 - **单臂 dual-role 程序**、`--lan none` 一键真网关（ADR-0029）、本地 SOCKS5 入口（ADR-0028）；
 - **IPv6 TCP 全链**（P16，ADR-0032）：v4-mapped 统一五元组 + sockmap key 2 + 协议目标 v6 编码 + v6 嗅探，真机实测通过；
 - **规则语言与 dae 对齐**（P17，ADR-0033）：`.dat` 编译期展开（attr/ext、2M LPT 容量）、cgroup2 pname 采集；对拍 5/5 逐字节（含 geoip/pname）；

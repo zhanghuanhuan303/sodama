@@ -58,7 +58,7 @@ G1 同机 + 真实节点口径均已交付。以下为余项。
 
 | # | 事项 | 现状 | 验收标准 |
 |---|---|---|---|
-| D1 | `include` 展开 | deferred | 与 dae 相同语义（相对路径/循环检测）+ 解析测试 |
+| D1 | `include` 展开 | ✅ 已完成（代码已实现：入口目录相对路径约束 + 循环检测 `circular include is not allowed` + 对照 `config_merger.go` dfsMerge 语义；2026-10-08 文档滞后修正） | — |
 | D2 | 全局健康检查参数全量（间隔/容忍度/策略） | 子集 | 配置→健康循环行为的一对一测试 |
 | D3 | `config_merger` deferred 项收尾 | 显式列出 | deferred 列表清零或标注永久不做 |
 | D4 | 组级 override 细节（组级 dialer 参数覆盖） | 余项 | lab 双组覆盖用例 |

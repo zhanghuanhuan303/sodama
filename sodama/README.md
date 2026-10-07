@@ -1231,10 +1231,11 @@ CONNECT；ss 不支持插件与 2022 版；trojan 不支持 UDP 与域名目标�
   是唯一数据面；两个边界：① `bpf_loop` 不可用（aya-obj 的 PSEUDO_FUNC relocation 缺口），
   规则 VM 用有界循环；② 仍需 `debug = 2` 才能让 bpf-linker 产出 `.BTF`。
   需要 C 对照时从 `dae/` 重建 C 对象并临时切换 `--ebpf`（调试手段，非常规路径）。
-- **真实订阅形态（2026-10-04 普查/更新）**：主流节点形态与我们的实现状态——
+- **真实订阅形态（2026-10-04 普查/更新；2026-10-08 修订）**：主流节点形态与我们的实现状态——
   vless-ws ✅（ADR-0026）、**anytls ✅**（ADR-0027，单 Stream、无 UDP/会话复用）、
-  **vless+REALITY+Vision ❌**（解析期显式拒绝，测试钉住；需要 TLS 握手级控制，
-  属独立档位，需先写 ADR）。边界外协议过渡期可用 SOCKS5 桥接：
+  **vless+REALITY+Vision ✅**（P18d/P24，ADR-0041/0048；自实现最小 TLS 1.3 +
+  ClientHello 对 uTLS Chrome-120 逐项对齐，真机 48 条 REALITY 全健康）——本行原为
+  历史边界描述，已于 2026-10-08 修正。边界外协议过渡期可用 SOCKS5 桥接：
   `--dialer socks5://127.0.0.1:<sing-box/mihomo 的 socks 端口>`（所有协议立即可用）。
 
 分域覆盖度对照（与 dae 原版逐项对标，含 Top 缺口与优先级）见
