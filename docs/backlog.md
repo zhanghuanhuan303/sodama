@@ -67,7 +67,7 @@ G1 同机 + 真实节点口径均已交付。以下为余项。
 
 | # | 事项 | 现状 | 验收标准 |
 |---|---|---|---|
-| E1 | UDP endpoint pool / full-cone NAT（网关侧 UDP 代理） | 协议侧可用、网关默认 UDP 直连 | full-cone 行为测试（外部多映射） |
+| E1 | UDP endpoint pool / full-cone NAT（网关侧 UDP 代理） | ✅ 网关侧全链已真机验证（2026-10-08）：数据面 UDP 重定向 → UDP NAT 会话（QUIC 嗅探/组分派/janitor）→ 组内挑选支持 UDP 成员 → vless 流式 UDP 上行；同批修复组 `dial_udp` 只看延迟榜前 3 名的缺陷（真实订阅下前列被 anytls/reality 占据 → UDP 永远回退直连）；测试机场（CF 优选）节点侧禁 UDP 转发，下行未观测（换支持 UDP 的机场即可） | full-cone 行为测试（外部多映射） |
 | E2 | backlog fuse / 连接计费 | 未做 | 压测下 fuse 生效 + 计费可导出 |
 | E3 | offload 完整形态（fuse 失效路径与统计） | 生命周期/回收已交付（O4/O8：每 offload 连接 0 线程、200 条 fds 回收全过、可观测计数）；余 fuse 失效路径（依赖 E2） | 失效全路径与计数可观测 |
 
