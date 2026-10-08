@@ -7,6 +7,7 @@
 ```
 docs/
 ├── README.md                     # 本文件：索引与约定
+├── sodama-atlas.html             # ★ 开发研究图集（Atlas）：能力地图 + 架构 + 性能边界 + 方法论 + 踩坑档案 + 余项；Tufte 版式，自包含可离线打开
 ├── architecture-decision.html    # 决策档案（主文档，自包含可离线打开）
 ├── parity-status.md              # 对标进度：dae（Go）↔ sodama（全 Rust）分域覆盖度
 ├── benchmark-report.html         # ★ 性能与资源边界报告 v3.0（合并版）：吞吐四方对拍 + 四层内存模型 + FD 治理 + 转发原语 + 五万并发压测 + 长稳
@@ -18,7 +19,7 @@ docs/
 ├── openwrt.md                    # OpenWrt 支持（musl 构建/内核 fragment/ipk/procd/QEMU 冒烟）
 ├── reviews/                      # 第三方评审存档（原文）+ 工程方采纳提案（I1–I5）
 ├── optimization-roadmap.md       # 优化方向（数据驱动，O1–O10 优先级与验收）
-├── adr/                          # 已采纳决策记录（ADR-0001..0031）
+├── adr/                          # 已采纳决策记录（ADR-0001..0063）
 ├── modules/                      # 模块级规格（tuic-v5-client-spec.md / hysteria2-client-spec.md，由源码研究产出）
 └── migration/                    # (待建) 迁移日志与对拍报告
 ```
@@ -32,6 +33,7 @@ docs/
 | VLESS 提案 | `vless-proposal.html` | VLESS（明文/TLS）四方实测 + perf 剖面 + 分阶段优化提案（自包含，可离线打开） |
 | 内存终测 | `memory-report.html` v1 / `memory-report-v2.html` v2.1 | v1：五方 RSS 对照（存档）；v2.1：四层模型系统内存（内核侧/Slab 归因/FD 治理/转发原语/I6 零线程 + 60 min 长稳），送审版 |
 | **性能与资源边界（现行）** | `benchmark-report.html` | **v3.0 合并版**：吞吐四方对拍 + 四层内存模型 + FD 治理 + 转发原语对照 + **五万并发压测** + 长稳；自包含可离线打开（旧三份报告已并入，保留存档） |
+| **开发研究图集（总览入口）** | `sodama-atlas.html` | **Atlas v1.0**：从「为什么重写」到「还剩什么没做」的完整叙事——能力地图（15 域）、架构总览、性能与资源边界（10 张内联 SVG 图）、工程方法论、十二则踩坑档案、A–I 类余项地图、ADR 与数据源索引；Tufte 书卷版式（边注/尾注/书卷表格），自包含可离线打开 |
 | 项目总结 | `project-summary.html` | 整体工程总结：阶段历程/架构总览/对标完成度/性能与内存汇总/工程质量/部署生态/后续路线（自包含，可离线打开） |
 | 第三方评审 | `reviews/` | 评审原文存档（内存终测 A/B）+ 采纳提案 + I1 系统内存数据 + I3 转发原语对照 |
 | OpenWrt | `openwrt.md` | musl 交叉构建、内核 fragment（NAMESPACES/NET_NS 关键项）、ipk/procd/uci、拓扑集成与 QEMU 冒烟 |
@@ -94,6 +96,7 @@ go mod edit -json | python3 -c "import json,sys; d=json.load(sys.stdin); \
 |---|---|---|
 | `architecture-decision.html` | v2.43 · 2026-10-04 | dae `main@e3fee8f`（tag `nightly`） |
 | `parity-status.md` | v2.10 · 2026-10-04 | 同上（P33.2 性能深挖后清点；覆盖度为功能点粗估，逐行附证据） |
+| `sodama-atlas.html` | **v1.0 · 2026-10-08** | **总览入口**：main@d99a349 基线；汇总 parity-status v2.14 / benchmark-report v3.0 / reviews / backlog / ADR-0001..0063，附全部实测数据与口径纪律（§5.3） |
 | `benchmark-report.html` | **v3.0 · 2026-10-06** | **现行合并版**：吞吐四方对拍（perf-report）+ 四层内存模型/FD 治理/转发原语/长稳（memory-report-v2.1）+ 五方 RSS 存档（v1）+ 五万并发压测与 fd 硬限修复（本轮）；由 `sodama/lab/perf/gen-benchmark-report.py` 生成 |
 | `memory-report.html` | v1.0 · 2026-10-05 | 已并入 `benchmark-report.html` §6/附录 A · 存档 |
 | `memory-report-v2.html` | v2.1 · 2026-10-05 | 已并入 `benchmark-report.html` §4/§5/§8/§9 · 存档 |
