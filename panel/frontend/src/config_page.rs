@@ -626,7 +626,10 @@ pub fn ConfigPage(token: RwSignal<Option<String>>) -> impl IntoView {
                                         <td class="mono dim url-cell">{f.target.clone()}</td>
                                         <td class="mono dim">{if f.remote { "远程" } else if f.exists { "本地" } else { "缺失" }}</td>
                                         <td class="mono num">{f.count.to_string()}</td>
-                                        <td>{if f.referenced {
+                                        <td>{if let Some(e) = f.error.clone() {
+                                            // 引擎侧软失败：该集合已置空，但整体 reload 未受影响
+                                            view! { <span class="chip chip-warn" title=e.clone()>"加载失败"</span> }.into_any()
+                                        } else if f.referenced {
                                             view! { <span class="tag-on">"✓"</span> }.into_any()
                                         } else {
                                             view! { <span class="chip chip-warn">"未被引用"</span> }.into_any()

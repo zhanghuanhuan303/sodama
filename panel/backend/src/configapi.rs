@@ -837,6 +837,17 @@ async fn api_rule_files(State(ctx): State<Ctx>, headers: HeaderMap, uri: Uri) ->
     let text = read_text(&engine.engine_config);
     // routing 里被引用的 tag（`domain(ruleset: X)`）
     let routing = routing_text(&text);
+    // 引擎侧的软失败原因（tag → error）。引擎已把「单个规则集失败」降级为软失败，
+    // 这里把它透出到配置页，让用户能看到到底是哪一条拉不到。
+    let errs: std::collections::HashMap<String, String> =
+        match crate::fetch_view(&ctx, &engine).await {
+            Ok(v) => v
+                .rule_sets
+                .into_iter()
+                .filter_map(|r| r.error.map(|e| (r.tag, e)))
+                .collect(),
+            Err(_) => std::collections::HashMap::new(),
+        };
     let mut files = Vec::new();
     for (tag, value) in block_kv(&text, "rule_set") {
         let remote = value.contains("://");
@@ -857,7 +868,7 @@ async fn api_rule_files(State(ctx): State<Ctx>, headers: HeaderMap, uri: Uri) ->
             entries.drain(..entries.len() - 500);
         }
         files.push(DomainFileView {
-            tag,
+            tag: tag.clone(),
             target: redact(&value),
             remote,
             referenced,
@@ -866,6 +877,7 @@ async fn api_rule_files(State(ctx): State<Ctx>, headers: HeaderMap, uri: Uri) ->
             count,
             entries,
             bytes: size,
+            error: errs.get(&tag).cloned(),
         });
     }
     Json(DomainsView { files }).into_response()

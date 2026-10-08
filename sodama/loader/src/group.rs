@@ -182,6 +182,10 @@ pub struct GroupStats {
     pub failovers: AtomicU64,
     pub probes_ok: AtomicU64,
     pub probes_fail: AtomicU64,
+    /// 健康探测中「超时未回、被放弃等待」的成员数累计。
+    /// 生产事故（2026-10-09）：`thread::scope` 等待全部子线程，任一个探测卡死在
+    /// 无超时的 socket 读上即拖垮整轮探测 → 全网零延迟数据。此计数用于持续可见性。
+    pub probes_stragglers: AtomicU64,
     /// P34：活动订阅层（rank+1 编码；0 = 尚未选出/未启用顺序回退）。
     pub active_rank: AtomicU64,
     /// 当前健康探测节奏（秒；空闲退避时变大）——状态面展示用。
@@ -189,6 +193,12 @@ pub struct GroupStats {
     /// 本轮是否处于「活跃探测」（有人看状态或有流量）。
     pub probe_active: AtomicU64,
 }
+
+/// 单个探测批次的等待上限：超时即放弃等待（迟到结果仍会被 `record_probe` 记入）。
+/// 单次探测最坏耗时 = 拨号 5s + 读 3s；整批 24 并发正常远小于该值。
+const PROBE_BATCH_DEADLINE: Duration = Duration::from_secs(30);
+/// 探测线程栈：探测只做小分配，无需默认 8 MiB（大批量时省内存）。
+const PROBE_STACK: usize = 512 * 1024;
 
 /// 状态面用的节点快照（含可公开协议事实，供控制面板列展示）。
 #[derive(Clone)]
@@ -294,6 +304,26 @@ impl GroupRuntime {
 
     pub fn member_count(&self) -> usize {
         self.inner().members.len()
+    }
+
+    /// 组内**全部**成员是否都支持 reactor 的 codec 会话（每连接 0 线程）。
+    ///
+    /// 用于 `Outbound::Group` 的 `codec_reactor_capable()`：组的成员是动态的
+    ///（订阅热更新），因此这里**逐成员实算**而不是缓存。
+    ///
+    /// 语义是**保守放行**：只要有一个成员不跑 reactor 路径（tuic/hysteria2/
+    /// juicity/naive/QUIC，或带 shadow-tls 的 ss），整组就不进 reactor，
+    /// 退回双泵线程路径——慢但正确。真实订阅下组内通常是同质协议
+    ///（如 vless + anytls），因此生产能吃到这个优化。
+    ///
+    /// 空组返回 false（启动早期还没成员时不冒险）。
+    pub fn codec_reactor_capable_all(&self) -> bool {
+        let inner = self.inner();
+        !inner.members.is_empty()
+            && inner
+                .members
+                .iter()
+                .all(|m| m.outbound.codec_reactor_capable())
     }
 
     /// 空闲探测退避上限（秒；0 = 不退避）。
@@ -705,16 +735,52 @@ impl GroupRuntime {
                 let mut i = 0;
                 // P19：并发 24（原 8）——大订阅（66+ 节点）首轮收敛从 ~70s 降到 ~20s，
                 // 缩短网关启动后「健康数据空窗期」的浏览卡顿。
+                //
+                // ⚠ 这里**不用** `std::thread::scope`：scope 会等待批内全部线程结束，
+                // 任一探测卡死在无超时的 socket 读上即拖垮整轮探测。生产实测
+                //（2026-10-09）：探测循环停摆数小时 → `ema_ms` 全空 → MinMovingAvg
+                // 无值可排 → 组退化按索引取成员 → 命中失效入口，拨号失败率 40%。
+                // 改为独立 spawn + 带超时的收集：超时未回的线程被放弃（其迟到结果
+                // 仍经 `record_probe` 记入，不丢），主循环必定继续。
                 while i < n {
                     let end = (i + 24).min(n);
-                    std::thread::scope(|s| {
-                        for j in i..end {
-                            let g = &g;
-                            s.spawn(move || {
-                                let _ = g.probe(j);
-                            });
+                    let (tx, rx) = std::sync::mpsc::channel::<()>();
+                    for j in i..end {
+                        let g = g.clone();
+                        let tx = tx.clone();
+                        let b = std::thread::Builder::new()
+                            .name("probe".into())
+                            .stack_size(PROBE_STACK);
+                        if b.spawn(move || {
+                            let _ = g.probe(j);
+                            let _ = tx.send(());
+                        })
+                        .is_err()
+                        {
+                            crate::log("健康探测: 线程创建失败，跳过该成员本轮");
                         }
-                    });
+                    }
+                    drop(tx);
+                    let deadline = Instant::now() + PROBE_BATCH_DEADLINE;
+                    let mut done = 0usize;
+                    while done < end - i {
+                        let left = deadline.saturating_duration_since(Instant::now());
+                        if left.is_zero() {
+                            let lost = (end - i) - done;
+                            g.stats
+                                .probes_stragglers
+                                .fetch_add(lost as u64, Ordering::Relaxed);
+                            crate::log(&format!(
+                                "健康探测: 本批 {lost} 个成员超过 {}s 未回，放弃等待（探测可能被无超时的读阻塞）",
+                                PROBE_BATCH_DEADLINE.as_secs()
+                            ));
+                            break;
+                        }
+                        // 超时或通道关闭都回到循环重算剩余额度；额度耗尽即 break。
+                        if rx.recv_timeout(left).is_ok() {
+                            done += 1;
+                        }
+                    }
                     i = end;
                 }
                 // P34：探测一轮后刷新活动订阅层（切换在探测周期内记日志，空闲期也可见）
@@ -803,7 +869,15 @@ impl GroupRuntime {
         // 发一个 HTTP/1.0 请求并等任意响应（echo 型目标也会回；QUIC 无底层 socket 时仅计拨号成功）
         let mut ok = true;
         if let Some(sock) = d.socket.as_ref() {
-            let _ = sock.set_read_timeout(Some(Duration::from_secs(3)));
+            // 硬超时：**失败即判探测失败**。旧行为是 `let _ = set_read_timeout(..)`
+            // 丢弃返回值，超时未生效时后面的 read 可永久阻塞（生产事故根因之一）。
+            if let Err(e) = sock.set_read_timeout(Some(Duration::from_secs(3))) {
+                self.record_probe(&inner, i, false, 0);
+                return Err(std::io::Error::other(format!(
+                    "check: 设置读超时失败（{e}），拒绝无限期等待"
+                )));
+            }
+            let _ = sock.set_write_timeout(Some(Duration::from_secs(3)));
             let mut d = d;
             let req = format!("GET /generate_204 HTTP/1.0\r\nHost: {host}\r\n\r\n");
             let mut ok_write = d.to_remote.write_all(req.as_bytes()).is_ok();
@@ -1133,6 +1207,57 @@ mod tests {
         assert_eq!(cur, Some(0), "兜底到池内");
         assert_eq!(pinned.as_deref(), Some("missing"));
         assert!(!ok);
+    }
+
+    #[test]
+    fn group_codec_reactor_capable_requires_all_members() {
+        // 生产实测（2026-10-08）：旧实现漏了 Group，`codec_reactor_capable()` 落
+        // `_ => false`，而生产 dialer 正是 `group:proxy` ⟹ 所有代理连接退回双泵
+        // 线程路径（现场拟合 `线程 = 15.9 + 2.39 × 活跃连接`，Reactor 池空转）。
+        let mk = |o: crate::outbound::Outbound, n: &str| Member {
+            name: n.into(),
+            tag: "t".into(),
+            rank: 0,
+            outbound: o,
+        };
+        // Trojan 代表「已审计 WouldBlock 可重入」的一族（vless/anytls/vmess/ss/ssr/trojan）
+        let capable = || crate::outbound::Outbound::Trojan {
+            server: "1.2.3.4:443".parse().unwrap(),
+            password: "p".into(),
+            sni: "s.example".into(),
+            insecure: false,
+        };
+        // 空组：不放行（订阅尚未到达时不冒险）
+        let empty = GroupRuntime::new("g".into(), Policy::Min, vec![], vec![], 30, 1, None);
+        assert!(!empty.codec_reactor_capable_all(), "空组不放行");
+        // 全为 capable → 放行
+        let all_ok = GroupRuntime::new(
+            "g".into(),
+            Policy::Min,
+            vec![mk(capable(), "a"), mk(capable(), "b")],
+            vec![],
+            30,
+            1,
+            None,
+        );
+        assert!(all_ok.codec_reactor_capable_all(), "全 capable 应放行");
+        // 混入一个不支持的（Direct 代表 tuic/hy2/juicity/naive/QUIC 一族）→ 整组不放行
+        let mixed = GroupRuntime::new(
+            "g".into(),
+            Policy::Min,
+            vec![
+                mk(capable(), "a"),
+                mk(crate::outbound::Outbound::Direct, "b"),
+            ],
+            vec![],
+            30,
+            1,
+            None,
+        );
+        assert!(!mixed.codec_reactor_capable_all(), "混协议应保守不放行");
+        // 订阅热更新把成员换掉后，结论应随之改变（不做缓存）
+        mixed.replace_members(vec![mk(capable(), "a")]);
+        assert!(mixed.codec_reactor_capable_all(), "换成员后应重新判定");
     }
 
     #[test]

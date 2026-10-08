@@ -276,6 +276,9 @@ struct RelayStats {
     pipe_released: AtomicU64,
     /// P18e：并发上限拒绝数（--max-conns）。
     limit_rejected: AtomicU64,
+    /// M4：交给 Reactor 的 codec 会话数（每连接 0 线程）。
+    /// 生产实测（2026-10-08）旧实现下恒为 0：组拨号未声明 reactor 能力。
+    reactor_codec_sessions: AtomicU64,
 }
 static RELAY_STATS: RelayStats = RelayStats {
     conns_total: AtomicU64::new(0),
@@ -293,6 +296,7 @@ static RELAY_STATS: RelayStats = RelayStats {
     pipe_reused: AtomicU64::new(0),
     pipe_released: AtomicU64::new(0),
     limit_rejected: AtomicU64::new(0),
+    reactor_codec_sessions: AtomicU64::new(0),
 };
 
 // ---- P-AI：按域名统计（面板「AI 流量」卡片的数据源） ------------------------
@@ -1199,8 +1203,118 @@ struct Args {
     auto_config: bool,
 }
 
+/// 本地时间戳 `YYYY-MM-DD HH:MM:SS`。
+/// 生产事故取证需要“哪一行是什么时候”，旧日志无时间戳只能靠行号推断。
+///
+/// 时区解析三级兜底（生产踩坑：OpenWrt/musl 上 `TZ` 未设时 `localtime_r` 直接回 UTC，
+/// 日志比本地时间早 8 小时）：
+/// 1. `TZ` 环境变量已设 → 交给 `localtime_r`（两端 libc 都尊重完整 TZ 库）；
+/// 2. 否则读 `/etc/TZ` 的简单形式（OpenWrt 即 `CST-8`）自行算偏移；
+/// 3. 都不可用 → `localtime_r` 兜底（glibc 会读 `/etc/localtime`）。
+fn now_hms() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let tz_env = std::env::var("TZ").ok().filter(|s| !s.is_empty());
+    if tz_env.is_none() {
+        if let Some(off) = std::fs::read_to_string("/etc/TZ")
+            .ok()
+            .as_deref()
+            .and_then(parse_posix_tz)
+        {
+            let (y, mo, d, h, mi, s) = epoch_to_civil(secs + off);
+            return format!("{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02}");
+        }
+    }
+    // 兜底：交给 libc（glibc 会读 /etc/localtime；musl 在 TZ 已设时也正确）
+    let t = secs as libc::time_t;
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    if unsafe { libc::localtime_r(&t, &mut tm) }.is_null() {
+        let (y, mo, d, h, mi, s) = epoch_to_civil(secs);
+        return format!("{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02}");
+    }
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+        tm.tm_year + 1900,
+        tm.tm_mon + 1,
+        tm.tm_mday,
+        tm.tm_hour,
+        tm.tm_min,
+        tm.tm_sec
+    )
+}
+
+/// POSIX TZ 的「名字 + 偏移」简单形式 → 本地相对 UTC 的偏移（秒）。
+/// 例：`CST-8` → +28800（POSIX 语义：值表示“加到本地得 UTC”，符号与直觉相反）；
+/// `UTC0` → 0；`<+08>-8` → +28800；解析不出返回 None。
+fn parse_posix_tz(tz: &str) -> Option<i64> {
+    let tz = tz.trim();
+    let bytes = tz.as_bytes();
+    let mut i = 0;
+    // 名字：字母，或 `<...>` 包起的形式
+    if bytes.first() == Some(&b'<') {
+        i = tz.find('>')? + 1;
+    } else {
+        while i < bytes.len() && bytes[i].is_ascii_alphabetic() {
+            i += 1;
+        }
+    }
+    if i == 0 {
+        return None;
+    }
+    if i >= bytes.len() {
+        return Some(0); // 只有名字（如 `UTC`）
+    }
+    let rest = &tz[i..];
+    let (sign, rest) = match rest.as_bytes().first()? {
+        b'-' => (-1i64, &rest[1..]),
+        b'+' => (1i64, &rest[1..]),
+        _ => (1i64, rest),
+    };
+    let mut parts = rest.split(':');
+    // 取开头的十进制整数：末段可能跟 DST 规则（如 `8CDT-7,M3.2.0,M11.1.0`）
+    let h: i64 = leading_i64(parts.next()?)?;
+    let m: i64 = parts.next().and_then(leading_i64).unwrap_or(0);
+    let s: i64 = parts.next().and_then(leading_i64).unwrap_or(0);
+    Some(-(sign * (h * 3600 + m * 60 + s)))
+}
+
+/// 取字符串开头的十进制整数（后面的 DST 规则等尾部内容忽略）。
+fn leading_i64(s: &str) -> Option<i64> {
+    let n = s.bytes().take_while(|b| b.is_ascii_digit()).count();
+    if n == 0 {
+        return None;
+    }
+    s[..n].parse().ok()
+}
+
+/// epoch 秒 → UTC 日历（Howard Hinnant 的 civil_from_days）。
+fn epoch_to_civil(secs: i64) -> (i64, u32, u32, i64, i64, i64) {
+    let days = secs.div_euclid(86400);
+    let rem = secs.rem_euclid(86400);
+    let z = days + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (
+        y,
+        m as u32,
+        d as u32,
+        rem / 3600,
+        (rem % 3600) / 60,
+        rem % 60,
+    )
+}
+
 fn log(msg: &str) {
-    let line = format!("[sodama] {msg}");
+    let line = format!("[sodama] {} {msg}", now_hms());
     let mut done = false;
     if let Ok(mut g) = LOG_SINK.lock() {
         if let Some(f) = g.as_mut() {
@@ -2984,6 +3098,9 @@ fn handle_relay_conn(mut client: TcpStream) {
     if reactor_codec {
         if let Some(up) = socket.take() {
             if reactor::submit_codec(client, up, handle.clone(), id, from_remote, to_remote) {
+                RELAY_STATS
+                    .reactor_codec_sessions
+                    .fetch_add(1, Ordering::Relaxed);
                 return; // 注册表/统计由 reactor 收尾
             }
             relay_finish(id);
@@ -7036,6 +7153,8 @@ fn group_json(g: &group::GroupRuntime, index: usize, default: bool) -> serde_jso
         "failovers": g.stats.failovers.load(Ordering::Relaxed),
         "probes_ok": g.stats.probes_ok.load(Ordering::Relaxed),
         "probes_fail": g.stats.probes_fail.load(Ordering::Relaxed),
+        "probes_stragglers": g.stats.probes_stragglers.load(Ordering::Relaxed),
+        "codec_reactor_capable": g.codec_reactor_capable_all(),
         "subscription_failover": g.sub_failover_enabled(),
         "active_tag": g.active_tag(),
         "nodes": snap.iter().map(|n| json!({
@@ -7073,6 +7192,8 @@ fn rule_sets_json() -> serde_json::Value {
                 "keyword": rs.data.keyword.len(),
                 "regex": rs.data.regex.len(),
                 "ignored": rs.data.ignored,
+                // 软失败原因（None = 本次加载正常）；面板据此把该条标红。
+                "error": rs.error,
             })
         })
         .collect();
@@ -7184,6 +7305,7 @@ fn status_json(ebpf: &mut Ebpf) -> serde_json::Value {
             "offload_failures": RELAY_STATS.offload_failures.load(Ordering::Relaxed),
             "splice_enabled": RELAY_SPLICE.load(Ordering::Relaxed),
             "splice_total": RELAY_STATS.splice_total.load(Ordering::Relaxed),
+            "reactor_codec_sessions": RELAY_STATS.reactor_codec_sessions.load(Ordering::Relaxed),
             "splice_fallbacks": RELAY_STATS.splice_fallbacks.load(Ordering::Relaxed),
             "splice_fd_budget": RELAY_STATS.splice_fd_budget.load(Ordering::Relaxed),
             "pipe_created": RELAY_STATS.pipe_created.load(Ordering::Relaxed),
@@ -7415,6 +7537,12 @@ fn metrics_text(v: &serde_json::Value) -> String {
         "counter",
         "sodama_relay_splice_total",
         get(v, &["relay", "splice_total"]),
+    );
+    emit(
+        &mut s,
+        "counter",
+        "sodama_relay_reactor_codec_sessions",
+        get(v, &["relay", "reactor_codec_sessions"]),
     );
     emit(
         &mut s,
@@ -7677,6 +7805,37 @@ fn handle_status_query(cmd: &str, ebpf: &mut Ebpf, args: &Args) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn posix_tz_simple_forms() {
+        // OpenWrt 的 /etc/TZ 就是这种形式；生产踩坑：musl 在 TZ 未设时不读它。
+        assert_eq!(parse_posix_tz("CST-8"), Some(8 * 3600));
+        assert_eq!(parse_posix_tz("UTC0"), Some(0));
+        assert_eq!(parse_posix_tz("UTC"), Some(0));
+        assert_eq!(parse_posix_tz("EST5"), Some(-5 * 3600));
+        assert_eq!(parse_posix_tz("<+08>-8"), Some(8 * 3600));
+        assert_eq!(parse_posix_tz("CST-8:30"), Some(8 * 3600 + 30 * 60));
+        assert_eq!(parse_posix_tz(""), None);
+        assert_eq!(parse_posix_tz("8"), None); // 缺名字
+        assert_eq!(parse_posix_tz("CST-x"), None); // 偏移非数字
+                                                   // 带 DST 的完整形式：只取标准时部分（不误解 DST 规则）
+        assert_eq!(parse_posix_tz("CST-8CDT-7,M3.2.0,M11.1.0"), Some(8 * 3600));
+    }
+
+    #[test]
+    fn epoch_to_civil_matches_known_instants() {
+        assert_eq!(epoch_to_civil(0), (1970, 1, 1, 0, 0, 0));
+        // 2026-10-08 16:37:12 UTC（= 北京时间 2026-10-09 00:37:12）
+        assert_eq!(epoch_to_civil(1791477432), (2026, 10, 8, 16, 37, 12));
+        assert_eq!(
+            epoch_to_civil(1791477432 + 8 * 3600),
+            (2026, 10, 9, 0, 37, 12)
+        );
+        // 闰日与跨世纪
+        assert_eq!(epoch_to_civil(951782400), (2000, 2, 29, 0, 0, 0));
+        // 负 epoch（偏移可能把时间拉到之前）
+        assert_eq!(epoch_to_civil(-86400), (1969, 12, 31, 0, 0, 0));
+    }
 
     #[test]
     fn default_config_candidates_order_and_no_home_fallback() {

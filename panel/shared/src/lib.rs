@@ -205,6 +205,9 @@ pub struct RuleSetView {
     pub interval_secs: u64,
     /// 距离下次自动刷新的秒数（0 = 即将/已过）
     pub next_update_secs: u64,
+    /// 本次加载的软失败原因（None = 正常）。
+    /// 引擎侧已改为「单个规则集失败不阻塞整体 reload」，失败者置空并在此上报。
+    pub error: Option<String>,
 }
 
 // ---------------------------------------------------------------- 配置页（订阅导入 / 规则集 / 分流文件）
@@ -262,6 +265,9 @@ pub struct DomainFileView {
     /// 尾部条目（最多 500）
     pub entries: Vec<String>,
     pub bytes: u64,
+    /// 引擎侧本次加载的软失败原因（None = 正常）。
+    /// 引擎改为「单个规则集失败不阻塞整体 reload」后，失败原因经此透出到配置页。
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

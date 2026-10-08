@@ -1002,6 +1002,14 @@ impl Outbound {
             Self::Ssr { .. } => true,
             // anytls：读半 inbuf 帧解析、写半组帧入队（padding 只打散一次）。
             Self::AnyTls { .. } => true,
+            // 组：全部成员都支持才放行（保守；成员随订阅热更新，逐成员实算）。
+            //
+            // 背景（生产实测 2026-10-08）：旧实现漏了 Group，落 `_ => false`，而生产
+            // dialer 正是 `group:proxy` ⟹ `reactor_codec=false` ⟹ 所有代理连接退回
+            // 双泵线程路径。现场斜率拟合：`线程 = 15.9 + 2.39 × 活跃连接`，而 Reactor
+            // 池（2 workers）空转；开 `SODAMA_REACTOR_DEBUG=1` 复测 90s 真实流量，
+            // `reactor-dbg: codec 投递` 行数为 **0**。
+            Self::Group(g) => g.codec_reactor_capable_all(),
             _ => false,
         }
     }

@@ -450,6 +450,7 @@ fn to_view(root: &Value, engine: &Engine) -> StatusView {
                         } else {
                             interval.saturating_sub(ago)
                         },
+                        error: r["error"].as_str().map(str::to_string),
                     }
                 })
                 .collect()
@@ -1648,6 +1649,14 @@ pub(crate) async fn validate_dae(ctx: &Ctx, engine: &Engine, text: &str) -> Resu
 }
 
 /// 配置类改动的统一入口：validate → 落盘 → 等 inotify 热重载回执。
+///
+/// **失败自动回滚**（2026-10-09）：旧实现写盘后不回滚，一个能让 reload 失败的改动
+///（如指向不可达地址的远程规则集）会永久留在 `config.dae` 里，导致之后**每一次**
+/// reload 都失败（自锁），而用户只能到路由器上手工修。现在：
+/// ① 写盘前保留上一版文本；② 若热重载明确失败（`reload_ok == Some(false)`）
+/// 则自动回写上一版并再等一次回执；③ 回报里明说已回滚。
+///
+/// 注：validate 仍先跑（语法级护栏）；回滚只针对“语法能过但跑不起来”的情形。
 pub(crate) async fn apply_config_text(
     ctx: &Ctx,
     engine: &Arc<Engine>,
@@ -1662,11 +1671,40 @@ pub(crate) async fn apply_config_text(
         })
         .into_response();
     }
+    // 回滚用的上一版（读失败则不回滚，保持旧行为）
+    let prev_text = std::fs::read_to_string(&engine.engine_config).ok();
     let prev_at = current_reload_at(ctx, engine).await;
     if let Err(e) = write_preserving(&engine.engine_config, text) {
         return err_json(StatusCode::BAD_GATEWAY, e);
     }
     let reload_ok = wait_reload(ctx, engine, prev_at, 20).await;
+    if reload_ok == Some(false) {
+        if let Some(prev) = prev_text {
+            let at_before_rollback = current_reload_at(ctx, engine).await;
+            if write_preserving(&engine.engine_config, &prev).is_ok() {
+                let rolled = wait_reload(ctx, engine, at_before_rollback, 20).await;
+                return Json(SaveResult {
+                    ok: false,
+                    message: format!(
+                        "{ok_msg} —— 引擎热重载**失败**，已自动回滚到上一版（回滚后重载{}）",
+                        match rolled {
+                            Some(true) => "成功",
+                            Some(false) => "仍失败，请查看引擎日志",
+                            None => "未确认",
+                        }
+                    ),
+                    reload_ok: rolled,
+                })
+                .into_response();
+            }
+        }
+        return Json(SaveResult {
+            ok: false,
+            message: format!("{ok_msg} —— 引擎热重载失败（未能自动回滚，请手工检查）"),
+            reload_ok: Some(false),
+        })
+        .into_response();
+    }
     Json(SaveResult {
         ok: true,
         message: ok_msg,

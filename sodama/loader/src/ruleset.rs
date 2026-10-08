@@ -46,6 +46,12 @@ pub struct RuleSet {
     /// 本地直接读取的文件（P36：加入 inotify 监听，改名单即热生效；远程为 None）。
     pub local_path: Option<PathBuf>,
     pub data: RuleSetData,
+    /// 本集合本次加载的失败原因（软失败：集合置空，但**不阻塞其它集合与整体 reload**）。
+    ///
+    /// 背景（2026-10-09）：旧行为是「远程首拉失败 + 无缓存 → 硬失败」，而面板落盘时
+    /// **不回滚**，一个写错的远程 URL 会永久留在 config.dae 里，导致之后**每一次**
+    /// reload 都失败（自锁）。现改为软失败 + 状态面显式上报。
+    pub error: Option<String>,
 }
 
 #[derive(Default)]
@@ -72,7 +78,11 @@ impl RuleSetStore {
         self.sets.values()
     }
 
-    /// 解析 `config` 的 `rule_set` 段并加载全部规则集（远程带缓存；失败硬错）。
+    /// 解析 `config` 的 `rule_set` 段并加载全部规则集。
+    ///
+    /// 单个集合失败**不再**使整体失败（软失败）：失败者置空并在 `RuleSet::error`
+    /// 上报，其余集合与整体 reload 照常。返回 `Ok` 恒成立，保留 `Result` 形状是为
+    /// 兼容调用点与未来可能的全局错误（如缓存目录完全不可用）。
     pub fn load(
         cfg: &config::Config,
         cfg_path: Option<&Path>,
@@ -83,14 +93,42 @@ impl RuleSetStore {
         let cfg_dir = cfg_path.and_then(|p| p.parent());
         let mut sets = HashMap::new();
         for (tag, src) in specs {
-            let rs = load_one(&tag, &src, cfg_dir, interval_secs, cache_dir)?;
+            let rs = load_one(&tag, &src, cfg_dir, interval_secs, cache_dir);
             sets.insert(tag, rs);
         }
         Ok(Self { sets })
     }
 }
 
+/// 软失败包装：把「单个规则集加载失败」降级为空集合 + `error` 字段。
+/// 旧行为直接 `Err` 向上冒，使整次 reload 失败（并因面板不回滚而自锁）。
 fn load_one(
+    tag: &str,
+    src: &str,
+    cfg_dir: Option<&Path>,
+    interval_secs: u64,
+    cache_dir: Option<&str>,
+) -> RuleSet {
+    match load_one_inner(tag, src, cfg_dir, interval_secs, cache_dir) {
+        Ok(rs) => rs,
+        Err(e) => {
+            crate::log(&format!(
+                "规则集 {tag}: {e} —— 软失败（本集合置空，不阻塞整体 reload；请修正配置或补缓存）"
+            ));
+            RuleSet {
+                tag: tag.to_string(),
+                remote: src.starts_with("http://") || src.starts_with("https://"),
+                from_cache: false,
+                updated_secs_ago: None,
+                local_path: None,
+                data: RuleSetData::default(),
+                error: Some(e),
+            }
+        }
+    }
+}
+
+fn load_one_inner(
     tag: &str,
     src: &str,
     cfg_dir: Option<&Path>,
@@ -190,6 +228,7 @@ fn load_one(
         updated_secs_ago: updated,
         local_path,
         data,
+        error: None,
     };
     crate::log(&format!(
         "规则集 {tag}: {} 条域名（full/suffix/keyword/regex = {}/{}/{}/{}，忽略非域名 {} 条；{}）",
