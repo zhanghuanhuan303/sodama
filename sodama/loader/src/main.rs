@@ -2803,6 +2803,34 @@ fn handle_socks_conn(mut client: TcpStream) {
 }
 
 /// relay 一条连接：按 dialer 拨号到 orig_dst，双向转发（含半关闭）。
+/// 组退化为线程泵路径的告警限流时间戳（秒，单调时钟）。
+static GROUP_NOT_REACTOR_WARN_AT: AtomicU64 = AtomicU64::new(0);
+
+/// 组因含不受支持成员而整体退回线程泵路径时，**限流**地报一次（同一进程 10 分钟最多一条）。
+///
+/// 为什么需要它：`codec_reactor_capable_all()` 是保守放行 —— 订阅里混进任一个
+/// tuic/hysteria2/juicity/naive/QUIC 或带 shadow-tls 的 ss 节点，整组就不再走
+/// Reactor（每连接 2 线程）。这是**正确但昂贵**的降级，且旧行为下完全静默；
+/// 生产上曾因同类静默降级（Group 未声明 reactor 能力）白走了一段线程路径。
+/// 有了这条日志，运维能从日志看出“组里混了不支持的协议”。
+fn warn_group_not_reactor_once(group: &str) {
+    let now = monotonic_now_ns() / 1_000_000_000;
+    let last = GROUP_NOT_REACTOR_WARN_AT.load(Ordering::Relaxed);
+    if now.saturating_sub(last) < 600 {
+        return;
+    }
+    if GROUP_NOT_REACTOR_WARN_AT
+        .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+        .is_err()
+    {
+        return; // 另一线程刚报过
+    }
+    log(&format!(
+        "组 {group}: 含不受 reactor 支持的成员，本组会话走线程泵路径（每连接 2 线程）——\
+         如需零线程，请把组内统一为 vless/anytls/vmess/trojan/ss(非 shadow-tls)/ssr"
+    ));
+}
+
 fn handle_relay_conn(mut client: TcpStream) {
     // P18e：并发上限（--max-conns；0=不限）。超限直接关闭并计数（对照 dae 并发限制）。
     let max = RELAY_MAX_CONNS.load(Ordering::Relaxed);
@@ -3004,6 +3032,16 @@ fn handle_relay_conn(mut client: TcpStream) {
     // M4 stage 2：非 splice 的 rustls/明文链路（codec 会话）也可交 reactor——
     // 读半/写半在 worker 内非阻塞驱动（仅对已审计的协议种类开启）。
     let wire_codec = !splice && !offloaded && dialer.codec_reactor_capable();
+    // 诊断（限流）：组因**含不受支持成员**而整组退回线程泵路径时，说一次。
+    // 保守放行（`codec_reactor_capable_all`）的代价就是这条“性能悬崖”：
+    // 订阅里混进一个 tuic/hy2/juicity/naive 节点，整组就不再走 Reactor。
+    // 旧行为下这种降级是**静默**的（生产上曾因此少走三个月的零线程路径），
+    // 这里把它变成可观测的。仅当确实是 Group 且非 reactor 能力时触发。
+    if !wire_codec && !splice && !offloaded {
+        if let outbound::Outbound::Group(g) = dialer {
+            warn_group_not_reactor_once(g.name.as_str());
+        }
+    }
     let upstream_fd = socket.as_ref().map(|s| s.as_raw_fd());
     if splice {
         RELAY_STATS.splice_total.fetch_add(1, Ordering::Relaxed);
