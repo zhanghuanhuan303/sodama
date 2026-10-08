@@ -1,0 +1,476 @@
+# 第二阶段 · 开发记录（devlog）
+
+> **第一阶段**（K0–K3 内核攻坚 / P14–P36 生态接入 / M1–M4 性能专项 / 内存与资源边界终测）
+> 的成果综述见 [`sodama-atlas.html`](./sodama-atlas.html)。
+> 本文件是**第二阶段**（生产实战轮）的逐条记录。
+>
+> 记录约定：**问题 → 侦查证据 → 结论 → 动作 → 验收**。每条在解决之后追加，
+> 不改写历史；未解决的条目保留并标注状态。
+
+- 记录起点：2026-10-08
+- 生产环境：OpenWrt Kwrt x86_64（2 核 / 4 GB），`root@192.0.2.10`
+- 基线代码：`main@d99a349`（Atlas v1.0 对应版本）
+
+## 目录
+
+| # | 日期 | 问题 | 状态 |
+|---|---|---|---|
+| 1 | 2026-10-08 | 面板"更新规则集"失败 | ✅ 已定位（非引擎故障）+ 发现 1 个隐患 |
+| 2 | 2026-10-08 | Reactor 未接管生产会话（组拨号绕过） | ✅ 已**确证**（debug 行数 0），待决策修法 |
+| 3 | 2026-10-08 | 引擎内存随运行时长上升（40 MB → 75 MB） | 🕐 观察中（已排除泄漏，追踪器在跑） |
+| 4 | 2026-10-08 | 日志体系：无时间戳 / 无轮转 / 在 tmpfs | 🟡 归档+轮转已部署；时间戳需引擎改动 |
+| 5 | 2026-10-08 | 订阅源重复（`subA` 与 `3` 同一 URL） | ✅ 已删除（成员 226 → 163） |
+| 6 | 2026-10-09 | 节点入口 IP 漂移 + 拨号失败率 40% | ✅ 根因已定位（**探测线程卡死**）并已修复 + 加看门狗 |
+| 7 | 2026-10-09 | 处置轮：清理遗留物 / 日志归档 / 探测复活 | ✅ 已执行（§7） |
+| 8 | 2026-10-09 | 修复轮：四项引擎侧修复 + 部署 | ✅ 已交付并实测（§8） |
+
+---
+
+## 1 · 面板"更新规则集"失败（2026-10-08）
+
+### 侦查
+
+| 证据 | 值 |
+|---|---|
+| `status.reload` | `ok: true`、`error: null`、`slot 1` |
+| 引擎日志 | `rules reloaded: 20 match_sets -> slot 0 (was 1)` —— 重载成功 |
+| `rule_sets[user_proxy]` | `entries: 0`，`suffix/full/keyword/regex = 0/0/0/0` |
+| `rule_sets[user_direct]` | `entries: 0` |
+| `/etc/sodama/rules/user_proxy.txt` | 534 字节，**16 行全部是注释**（`grep -vc "^#"` = 0） |
+| `/etc/sodama/rules/user_direct.txt` | 332 字节，同样只有注释 |
+| `config.dae` 的 `rule_set` 段 | 只有两个本地文件；远程 URL 是**注释掉的示例** |
+| 引擎每次 reload 的告警 | `geoexp: domain(ruleset:user_proxy) 为空（规则不匹配任何域；列表文件只有注释？）` |
+| 同批日志 | `订阅 subA 拉取失败: Resource temporarily unavailable (os error 11)` |
+
+### 结论
+
+**不是引擎的"更新规则集"坏了**，是三重叠加：
+
+1. **没有可更新的对象** —— `rule_set` 段里没有任何启用的远程 URL；
+2. **本地名单是空模板** —— 两个 `.txt` 全是注释示例，有效条目 0 条
+   （面板上"规则集"页显示 0 条是**如实反映**，不是失败）；
+3. **同批的订阅拉取抖动** —— 日志里真正报错的是 `订阅 subA 拉取失败`。
+
+面板对 `reload_ok=false` 的文案是「**热重载未确认**」，而本次 `reload.ok=true`，
+所以用户看到的"失败"更可能来自 ③ 的订阅报错或 ② 的空名单观感。
+
+### 附带发现（**隐患，需要修**）
+
+远程规则集的失败语义（`sodama/loader/src/ruleset.rs:165`）：
+
+```
+刷新失败回退旧缓存（日志警示）；无缓存可用则【硬失败】
+→ Err("规则集 {tag}: 拉取失败且无可用缓存: {e}（源: {src}）")
+```
+
+而面板落盘路径 `apply_config_text`（`panel/backend/src/main.rs:1651`）是
+**先写盘、再等 reload 回执，失败不回滚**。
+
+⟹ **一次「首次拉取就失败的远程规则集」会把坏条目永久留在 `config.dae` 里，
+导致之后每一次 reload 都失败**。当前生产配置里没有坏条目，说明已被移除。
+
+### 动作（待做）
+
+- [ ] 面板侧：`reload_ok=false` 时提示"配置已写入但未生效"，并给出**一键回滚**（写回上一版文本）
+- [ ] 引擎侧：把「远程规则集首拉失败」与「配置语法错」区分开——建议降级为**软失败**
+      （该规则集标记为空 + 告警，其余照常 reload），或至少在 status 里把这条规则集标红
+- [ ] 文档：把"首次使用远程规则集必须先在路由器上验证 URL 可达"写进 `docs/deploy.md`
+
+---
+
+## 2 · Reactor 未接管生产会话（组拨号绕过）
+
+### 侦查
+
+**代码路径**（`sodama/loader/src/`）：
+
+```
+outbound.rs:990  Outbound::codec_reactor_capable()
+                   match 只列 Trojan / Vless / Vmess / Shadowsocks / Ssr / AnyTls
+                   → Group 落 `_ => false`
+main.rs:2892     let wire_codec = !splice && !offloaded && dialer.codec_reactor_capable();
+main.rs:2901     let reactor_codec = !splice && !offloaded && wire_codec && reactor::codec_available();
+main.rs:2984     if reactor_codec { reactor::submit_codec(...) }
+```
+
+生产 dialer 是 `group:proxy` ⟹ `wire_codec = false` ⟹ `reactor_codec = false`
+⟹ 连接**退回传统双泵线程路径**（`main.rs:2993+`）。
+
+**现场定量取证**（`/root/reactor-probe.sh`，16 轮 × 10 s，生产实例）：
+
+```
+样本 16 点，conns_active 范围 5..8
+拟合：线程 = 15.9 + 2.39 × 活跃连接
+```
+
+- 截距 **15.9** ≈ Reactor 池的 16 个 worker —— **池子建起来了，但没接到活**；
+- 斜率 **2.39** ≈ 每条代理连接 2 个 OS 线程（双泵路径，1 MiB 栈 + 64 KiB 缓冲）。
+
+**旁证**：`splice_total = 0`、`pipe_created = 0`、`pipe_reused = 0`（全时段）。
+
+**对照**：实验室内 M4 是用**单 outbound** 验证的（`vless-tls` 2000 长连接 = 27 线程 / 61 MB），
+所以"Reactor 可用"与"Reactor 在生产被使用"是两件事。
+
+### 结论
+
+`Outbound::Group` 是唯一未声明 reactor 能力的常用出站类型，而它恰好是
+**生产配置里覆盖率 100% 的那一种**。影响随并发线性放大：
+2 核软路由上并发到 100 条代理连接时，就是 200 个线程 / 200 MiB 栈。
+
+### 动作（待决策）
+
+> 按用户指示：本项**不改引擎**，先在路由器上用测试脚本量化。
+> 脚本已就位：`/root/reactor-probe.sh`（只读，不重启不改配置）。
+
+可选收敛方向（供决策，未实施）：
+
+1. **组内选定成员后交回 reactor**：`GroupRuntime::dial_tcp` 返回后，由 relay 侧
+   用**实际选中成员**的 `codec_reactor_capable()` 重新判定（语义最准，改动在 relay 主路径）；
+2. **保守放行**：`Group` 若其全部成员都是 reactor-capable 则返回 true（改动最小，
+   但组内混协议时会误判）；
+3. **维持现状**：先补齐可观测（`reactor_codec_sessions` 计数器），再决定。
+
+---
+
+## 3 · 引擎内存随运行时长上升（观察中）
+
+### 侦查
+
+| 时点 | RSS | RssAnon | 线程 | 备注 |
+|---|---|---|---|---|
+| reload 后（用户观察） | ~40 MB | — | — | 生产配置启动水位 |
+| 22:38（up 17.3 h） | 68.8 MB | 62.7 MB | 53 | |
+| 23:38（up 18.3 h） | 75.4 MB | 69.2 MB | 52 | 1 小时 +6.6 MB |
+| 23:47（up 18.4 h） | **69.7 MB** | 63.5 MB | 30 | **回落 5.8 MB** —— 非单调 |
+| 23:49（up 18.4 h） | 71.2 MB | 64.9 MB | 32 | |
+
+> **首个反证**：RSS 在 23:38→23:47 之间**回落了 5.8 MB**，且线程数同步从 52 降到 30。
+> 单调泄漏不会出现回落 ⟹ 强烈支持「**分配器高水位 + 随负载涨落**」而非真泄漏。
+> （同时段 `map_conn_state` 562 → 62、`redirect_track` 1030 → 54，是连接收敛后的正常回落。）
+
+**"启动 40 MB"是合理的**：生产配置比实验室重得多 —— 208–226 个节点、
+4 个订阅源、`geosite:cn` 5718 + `geoip:cn` 14719 + `category-ads-all` 879 条规则、
+DNS 位图与域名统计。实验室空闲基线 11–12 MB 是"50 节点单订阅"口径，两者不可直接比。
+
+**已排除的泄漏候选**：
+
+| 候选 | 实测 | 结论 |
+|---|---|---|
+| `domain_stats` | 30 条 | 有界 ✅ |
+| DNS 缓存 | `cache_entries: 137` | 有界 ✅ |
+| `published_ips` | 81409 | 是**累计计数器**（`fetch_add`），非集合 ✅ |
+| `pname.map_entries` | 62 | 有界 ✅ |
+| `redirect_track` / `conn_state` | 1030 / 562（事故时曾满 65536） | janitor 在清 ✅ |
+
+**主要嫌疑：分配器高水位 + 高频大块分配**
+
+1. **musl 下 `malloc_trim` 是空实现**（本项目已记录的经验）——空闲页**不会**还给内核；
+   RSS 只会爬到历史峰值水位，然后停在那里；
+2. **每 2 秒一次的大块分配**：面板 `REFRESH_MS = 2000`（`panel/frontend/src/lib.rs:26`）
+   → 引擎每次 `status_json()` **全量构建**一棵 `serde_json::Value`
+   （生产约 81 KB，含 208+ 节点数组）→ 一天 4.3 万次申请/释放；
+3. **连接 churn**：累计 11 862 条连接，每条 2 个 64 KiB 泵缓冲 + 2 个 1 MiB 栈。
+
+### 结论（待验证）
+
+倾向判定为**分配器高水位 / 碎片**（可停在高位不再增长），而**非单调泄漏**。
+判据：**空闲期（无流量、无人看面板）观察 RSS 是否平台化**。
+
+### 动作
+
+- [x] 部署只读追踪器 `/root/sodama-mem-track.sh`（每分钟采样 →
+      `/root/sodama-mem-track.tsv`：RSS / RssAnon / 线程 / FD / conns / dial_errors /
+      bytes / DNS / 两个 eBPF map 水位）
+- [ ] 观察 24–48 h，把 RSS 与 `conns_total`、`dns_queries` 做相关性；
+      **若空闲段平台化 → 高水位结论成立；若空闲段仍上升 → 真泄漏，转专项**
+- [ ] 若确认是高水位：评估在**返回前调用 `malloc_trim` 的替身**
+      （musl 下无效 → 考虑 arena 复用/对象池，或把 status JSON 改为**复用缓冲**增量序列化）
+
+---
+
+## 4 · 日志体系（待处理）
+
+| 问题 | 现状 | 影响 |
+|---|---|---|
+| **在 tmpfs 上** | `/var` 是 `/tmp` 的符号链接（`/var -> tmp`），日志实体是 `/tmp/log/sodama.log` | **重启即丢**，17 h 的日志无法追溯 |
+| **无轮转** | 单文件 12.5 MB / 150 062 行，无任何 logrotate 配置 | overlay 只剩 386 MB |
+| **无时间戳** | 行格式 `[sodama] ...` | 事后取证只能靠行号推断 |
+| 面板无独立日志 | stdout → procd → logd 环形缓冲（`logread`） | 已被冲刷，查不到面板侧错误 |
+
+### 动作（待做）
+
+- [ ] 引擎：日志行加 ISO8601 时间戳前缀
+- [ ] 部署：`/etc/logrotate.d/sodama` 或按大小自截断（保留副本到 `/overlay`）
+- [ ] 部署：cron 定期把 `/tmp/log/sodama.log` 归档到 `/overlay`（持久分区）
+
+---
+
+## 5 · 订阅源重复（待处理）
+
+`/api/v1/sources` 实测：
+
+```
+order 0  subA  https://sub1.example.com/sub?token=REDACTED   63 节点  ← 活动
+order 1  2     https://sub2.example.com/sub?token=REDACTED       50 节点
+order 2  1     https://sub3.example.com/sub?token=REDACTED      29 节点
+order 3  3     https://sub1.example.com/sub?token=REDACTED   63 节点  ← 与 subA 完全相同
+```
+
+`subA` 与 `3` 是**同一个 URL 配了两遍**，226 个成员里有 63 个是重复的，
+白付一份健康探测与槽位。**动作**：删掉 `3`。
+
+---
+
+## 6 · 节点入口 IP 漂移 → 拨号失败率 40%（待决策）
+
+### 侦查
+
+| 证据 | 值 |
+|---|---|
+| 最近 4000 行日志 | `RELAY established` **778** vs `失败（group` **519** → 失败率 **40%** |
+| 失败原因 | **100% 是 `connect timeout`**（`tail -4000 \| grep 失败 \| sed 's/: .*//'` 全部同一类） |
+| `metrics` | `dial_errors` 334（22:38）→ **853**（23:38），1 小时 +519 |
+| `group.failovers` | 533（22:38）→ **1571**（23:38） |
+| `group` 成员数 | 149 → 205 → **208 → 226**（订阅持续刷新，名单不稳定） |
+| 节点地址 | subA 的 `香港01` 从 `203.0.113.252:28537` 变为 `203.0.113.243:28537`（**端口不变，IP 变**） |
+| 订阅原文 | 节点 server 是**域名** `node-a.example.com:28537`（base64 解码后可见），SNI `sni.example.com` |
+| 路由器侧解析 | `node-a.example.com` → `203.0.113.119` / `203.0.113.48`（**与引擎显示的 IP 不同**） |
+| 健康探测结果 | **208/208 个成员 `last_ms`、`ema_ms` 全为 `null`** —— 自上次订阅刷新后**没有一次探测成功** |
+| 节点存活 | 166 alive / 42 dead |
+
+### 结论（机理）
+
+三条链路叠加，互相放大：
+
+1. **入口域名的 A 记录在漂移**（18.139.x → 15.168.x → 13.208/13.229），
+   机场在轮换入口；
+2. **引擎的粘滞 IP 会把解析结果钉住**（日志：`sticky: node-a.example.com:28537 → 203.0.113.252:28537（粘滞 IP 已固定）`）
+   —— 钉住的入口一旦失效，该节点持续 `connect timeout`，直到「3 次失败作废」或 reload 重置；
+3. **健康探测 100% 失败 ⟹ `ema_ms` 全空 ⟹ `MinMovingAvg` 无值可排**
+   —— 组选不出"最健康"的成员，退化为按索引顺序取，**继续命中坏入口**，形成自锁。
+
+> 注：探测失败究竟是"节点真不可达"还是"探测路径本身的问题"，尚未分离。
+> 探测目标是 `cp.cloudflare.com:80`（`GET /generate_204`），需要经节点连通。
+
+### 动作（待决策）
+
+- [ ] **先分离**：抓一次探测的完整过程（`SODAMA_REACTOR_DEBUG` 不覆盖这里，
+      需要临时开更细的日志或手工用同一路径复现一次拨号）
+- [ ] 节点看护策略（用户此前已提出该问题）：
+      ① 粘滞 IP 加"失败即失效"的更快判据（当前 3 次）
+      ② 探测失败与节点不可达分开记账（区分"经节点连不通"与"目标本身不通"）
+      ③ 组内至少保留一个"最后可用"成员，避免全组漂到坏入口
+- [ ] 订阅刷新时对**入口 IP 变更**给出显式日志（现在只有 sticky 固定日志）
+
+---
+
+## 7 · 处置轮（2026-10-09 00:00–00:25）
+
+> 按「全部做一下」一次性执行 A/B/C/D。全程两次引擎重启（各 ~10 s），
+> 改动前均已备份到 `/root/backup-<stamp>/`；配置改后经 `sodama validate` 自检通过。
+
+### 7.1 C · 遗留物清理
+
+| 项 | 处置 |
+|---|---|
+| `/var/sodama`（7.7 MB 误拷二进制） | 已删 |
+| `/tmp/{sodama-new,sodama-udpfix,sodama-ebpf}`（16 MB 旧构建） | 已删 |
+| `/tmp/*.dae`（测试配置 ×5）、`panel.conf.new`、`reload-timing.sh`、`*.log` ×4 | 已删 |
+| `/tmp/sodama-diag{,.tar.gz}`（旧诊断包） | 已删 |
+| 遗留进程 `tail -f /var/log/sodama.log`（PID 3420）+ `trace.sh` | 已 kill |
+
+**效果**：`/tmp` 占用 **61.3 MB → 29.6 MB**（tmpfs 直接吃内存，等于回收 ≈32 MB RAM）；overlay 回收 7.7 MB。
+
+### 7.2 根因 · 健康探测线程卡死（**本次最重要的发现**）
+
+| 证据 | 值 |
+|---|---|
+| `probes_ok` / `probes_fail`（引擎 status，权威） | **双双冻结** 在 21549 / 5123，连续 3 次采样（跨 2 分钟）不动 |
+| `probe_interval_secs` / `probe_active` | 30s / true（自述在跑，实际不动） |
+| 有 `last_ms` 的节点数 | **0 / 226** |
+| 线程现场 | TID 32585：`syscall=45`（recvfrom）、`wchan=wait_woken` —— **阻塞在无超时的 socket 读** |
+
+**机理**：`group.rs:710` 的探测批用 `std::thread::scope` + `s.spawn(move || probe(j))`，
+而 `thread::scope` **会等待批内全部线程结束**。只要有一个探测线程卡死，
+整轮永不返回 → 健康循环彻底停摆。卡死点在 `probe()` 的末尾读取：
+
+```rust
+let _ = sock.set_read_timeout(Some(Duration::from_secs(3)));  // ← 返回值被丢弃
+...
+let read_ok = matches!(d.from_remote.read(&mut buf), Ok(n) if n > 0);
+```
+
+`set_read_timeout` 的失败被 `let _ =` 吞掉；一旦其未生效（或协议层内部的读路径不受该超时约束），
+这个 `read` 就永久阻塞。
+
+**因果链**：探测停摆 → `ema_ms` 全空 → `MinMovingAvg` 无值可排 → 组退化为按索引取成员
+→ 命中失效入口 → **拨号失败率 40%**（成功 778 / 失败 519，全是 `connect timeout`）。
+
+**双重旁证**：① 入口 IP 实际可达（`curl` 得 `Empty reply from server` = TCP 握手成功）；
+② `dial_errors` 在 853 后**停涨**——说明那一波是瞬时的，而探测停摆是**持续**的。
+
+**运行时兜底已部署**：`/root/sodama-watchdog.sh`（每 5 min 检查，`probes_ok` 冻结 ≥1800 s
+则自动 `restart`）。窗口取 1800 s 为了避开空闲退避时的 600 s 探测间隔。
+
+> **待做的引擎侧修法**（本阶段不改代码）：
+> ① `probe()` 改为**总有硬超时**（`set_read_timeout` 失败不再静默）；
+> ② 批处理不用 `thread::scope`（改为独立线程 + 全局 deadline），单个探测卡死不应拖垮整轮；
+> ③ 状态面加 `probes_last_ok_secs_ago`，让“探测停了”能被直接观测。
+
+### 7.3 A · Reactor 确实被绕过（确证）
+
+方法：临时向 `/etc/init.d/sodama` 注入 `export SODAMA_REACTOR_DEBUG=1` → 重启 →
+跑 90 s 真实流量 → 数日志里的 `reactor-dbg: codec 投递`。
+
+| 观察项 | 结果 |
+|---|---|
+| 启动自述 | `M4 reactor 已启动（2 workers，epoll/splice+codec，每连接 0 线程）` |
+| **`reactor-dbg` 行数** | **0** |
+| 对照（斜率法，重启前） | `线程 = 15.9 + 2.39 × 活跃连接` |
+
+⟹ **Reactor 建起来了、自述已启用，但在生产（组拨号）下一条会话也没收到**。
+调试变量已从 init 脚本移除并再次重启复原（残留检查：0 行）。
+
+### 7.4 B · 节点看护（已恢复）
+
+重启后：
+
+| 指标 | 重启前 | 重启后 |
+|---|---|---|
+| `probes_ok` 增速 | **0 / 2 min**（冻结） | **+181 / 45 s** |
+| `probes_fail` | 5123（冻结） | 40（本世代） |
+| 有延迟数据的节点 | **0 / 226** | 282 |
+| 成员存活 | 163 / 226 | **163 / 163** |
+
+### 7.5 D · 去重复订阅源（已完成）
+
+删除与 `subA` 同 URL 的 `3` 号源，热重载后：
+
+```
+订阅 subA: 拉取成功，66 个节点（来源顺序 #1）
+订阅 2:   拉取成功，50 个节点（来源顺序 #2）
+订阅 1:   拉取成功，50 个节点（来源顺序 #3）
+订阅热更新：组 proxy 163 成员（继承 163 健康）
+config-watch: 自动 reload 完成（ok=true match_sets=20 error=null）
+```
+
+成员 **226 → 163**（去掉 63 个重复），健康探测负担同步下降 ≈ 28%。
+
+### 7.6 C · 日志归档与轮转（已部署）
+
+| 项 | 处置 |
+|---|---|
+| 持久化归档 | `/root/sodama-log-archive.sh`：日志 > 8 MiB 时 `cp` 到 `/root/logs/sodama-<ts>.log`（保留最近 12 份） |
+| 安全截断 | 已核实引擎日志 fd 带 **O_APPEND**（flags `0x88401`）⟹ 截断安全，写入会从新 EOF 继续 |
+| 定时 | crontab：`*/30` 归档、`*/5` 看门狗 |
+| ⚠️ 未解 | **日志行仍无时间戳** —— 需引擎侧改动（`crate::log` 加 ISO8601 前缀），本阶段未动代码 |
+
+### 7.7 内存基线（重启后实测）
+
+| 指标 | 重启后 90 s | 重启前（up 18 h） |
+|---|---|---|
+| RSS | **39.0 MB** | 75.4 MB |
+| 线程 | **21** | 52 |
+
+⟹ 印证了用户观察的「重启后 40 多 MB」：**这是生产配置（163–226 节点 / 4 订阅 /
+geosite 5.7k + geoip 14.7k）的自然启动水位**，不是异常。
+18 h 后涨到 75 MB 的那部分，倾向为分配器高水位（见 §3），追踪器继续采样。
+
+### 7.8 本轮后的待办
+
+- [x] 引擎：探测硬超时 + 批处理不卡死（§7.2） → **见 §8**
+- [x] 引擎：远程规则集首拉失败改软失败 + 面板自动回滚（§1） → **见 §8**
+- [x] 引擎：`Group` 接入 reactor + `reactor_codec_sessions` 计数器（§2 / §7.3） → **见 §8**
+- [x] 引擎：日志行加时间戳（§7.6） → **见 §8**
+- [ ] 观察 24–48 h：内存曲线（平台化 vs 持续上升）+ 看门狗日志
+- [ ] 面板：`reload_ok=false` 的文案与回滚入口 → **已随 §8.2 自动回滚一并处理**
+
+---
+
+## 8 · 修复轮（2026-10-09 00:25–01:00）
+
+> 四项引擎侧修复 + 部署 + 单测。改动共 9 个文件 / +404 行。
+> 单测：**271 passed / 0 failed**（含新增 3 条）；OpenWrt x86_64 构建 → 部署实测。
+
+### 8.1 ① 探测不再卡死（`group.rs`）
+
+| 修法 | 说明 |
+|---|---|
+| **硬超时必判** | `probe()` 不再 `let _ = set_read_timeout(..)`；设置失败即判本次探测失败并返回错误，**绝不进入无超时的读** |
+| **补写超时** | 同时 `set_write_timeout(3s)` |
+| **批处理不再卡** | 探测批由 `std::thread::scope`（等全部子线程）改为 **独立 spawn + 带超时收集**（`PROBE_BATCH_DEADLINE = 30s`）；超时未回的线程被放弃，主循环必定继续 |
+| **可观测** | 新增 `probes_stragglers` 计数器 + 超时日志一行 |
+| 顺带 | 探测线程栈 512 KiB（原默认 8 MiB），`thread::Builder::name("probe")` 便于 /proc 辨认 |
+
+### 8.2 ② 远程规则集不再自锁（`ruleset.rs` + 面板）
+
+- **引擎**：新增 `RuleSet::error`；`load_one` 拆为 `load_one_inner` + **软失败包装** ——
+  任一规则集失败只把自己置空并记录原因，**不阻塞其它集合与整体 reload**；状态面 `rule_sets[].error` 上报。
+- **面板**：`apply_config_text` 加 **失败自动回滚** —— 写盘前保留上一版；
+  若 `reload_ok == Some(false)` 则自动回写上一版并再等一次回执，回报里明说“已自动回滚”。
+- **面板**：配置页规则集行新增“加载失败”提示（经 `DomainFileView.error` 透出）。
+
+### 8.3 ③ 组拨号不再绕过 Reactor（`outbound.rs` + `group.rs`）
+
+```rust
+Self::Group(g) => g.codec_reactor_capable_all(),   // 逐成员实算，保守放行
+```
+
+语义：组内**全部**成员都是 reactor-capable（vless/anytls/vmess/trojan/ss非shadowtls/ssr）才放行；
+混入 tuic/hy2/juicity/naive/QUIC 任一个则整组退回双泵线程路径 —— 慢但正确。
+新增 `reactor_codec_sessions` 计数器（metrics: `sodama_relay_reactor_codec_sessions`）作为永久可观测。
+
+### 8.4 ④ 日志时间戳（`main.rs`）
+
+日志行变为 `[sodama] 2026-10-09 00:45:10 <msg>`。
+
+时区三级兜底（首次部署踩到“差 8 小时”）：
+
+1. `TZ` 已设 → `localtime_r`（两端 libc 都尊重完整 TZ 库）；
+2. 否则读 `/etc/TZ` 的简单形式（OpenWrt 为 `CST-8`）→ 自实现 `parse_posix_tz` + `epoch_to_civil`；
+3. 都不可用 → `localtime_r` 兜底（glibc 会读 `/etc/localtime`）。
+
+新增单测：`posix_tz_simple_forms`（含 `CST-8` / `UTC0` / `EST5` / `<+08>-8` / 带 DST 规则的形式 / 非法输入）、
+`epoch_to_civil_matches_known_instants`（含闰日与负 epoch）。
+
+### 8.5 部署后实测（前后对照）
+
+| 指标 | 修复前 | 修复后 |
+|---|---|---|
+| 斜率拟合（Δ线程/Δ连接） | **+2.39** | **−0.11**（≈ 0） |
+| `reactor_codec_sessions` | 计数器不存在；`reactor-dbg` 行数 **0** | **12 / 12 连接**（100% 走 Reactor） |
+| 线程构成中的 `relay` | **36** | **0** |
+| 总线程（同量级负载） | 52 | **30**（15 sodama + 14 probe + 1 gc） |
+| `probes_stragglers` | 计数器不存在 | **1**（新机制真的抓到一次卡死探测，且未拖垮整轮） |
+| 日志行 | `[sodama] msg`（无时间） | `[sodama] 2026-10-09 00:45:10 msg` |
+| `codec_reactor_capable` | 字段不存在 | `true` |
+| 单测 | 268 | **271** |
+
+> 线程数在负载下仍有 17–40 的波动，来自探测批（并发 24）+ 短命线程，
+> **不再与并发连接数线性相关** —— 这正是 Reactor 接管的定义。
+
+### 8.6 本轮的边界与遗留
+
+- **未验证**：探测硬超时的“写超时”分支未在真实卡死场景复现（`probes_stragglers=1` 是
+  自然发生的一次）；下一轮若再出现 stragglers，应到 `/proc/<pid>/task/*/syscall` 采一次现场。
+- **未做**：`reactor_codec` 对 **Vision/WS 组合** 的长期稳定性验证（实验室逐字节过，生产未持续观察）。
+- **未做**：规则集软失败只在代码层验证，**未在生产造一次“首拉失败”**（怕干扰网络）。
+- 72 h soak 仍未做，`bounded-memory` 表述仍不启用。
+
+---
+
+## 附 A · 路由器侧工具清单（**不入库**，仅存在于软路由）
+
+| 路径 | 用途 | 部署时间 |
+|---|---|---|
+| `/root/reactor-probe.sh` | Reactor 接管情况取证（斜率法；只读） | 2026-10-08 |
+| `/root/sodama-mem-track.sh` | 内存追迹器（每分钟采样 → `/root/sodama-mem-track.tsv`） | 2026-10-08 |
+| `/root/sodama-log-archive.sh` | 日志归档 + 安全截断（cron `*/30`） | 2026-10-09 |
+| `/root/sodama-watchdog.sh` | 探测停摆看门狗（cron `*/5`，冻结 ≥1800s 则重启） | 2026-10-09 |
+| `/root/backup-<stamp>/` | 配置与 init 脚本改动前的备份 | 2026-10-09 |
+| `/root/logs/` | 归档日志与 `watchdog.log`（持久分区） | 2026-10-09 |
+| `docs/notes/deploy-engine.sh`（开发机侧） | 引擎二进制部署：备份→停服→就位→起服→就绪等待→自检 | 2026-10-09 |
+
+> 按约定：这些脚本**不提交到项目**，只在软路由上运行；仓库内 `docs/notes/`
+> 留有一份副本用于记录（该目录已在 `.git/info/exclude` 中，不会入库）。
+> 对照：**实验室**脚本（`sodama/lab/**`）才是入库的可复现工件。
