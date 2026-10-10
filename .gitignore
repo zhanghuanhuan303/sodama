@@ -36,3 +36,7 @@ nohup.out
 
 # OpenWrt 预编译产物（由 lab/build-openwrt.sh 生成，随 SDK 使用，不入库）
 /sodama/install/openwrt/prebuilt/
+
+# 生产健康曲线数据（由 lab/prod/health-track.sh 拉取，不入库）
+sodama-health.tsv
+docs/notes/health-curve.svg
