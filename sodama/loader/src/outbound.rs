@@ -165,7 +165,46 @@ pub fn marked_tcp_connect(addr: SocketAddr, timeout: Duration) -> io::Result<Tcp
     // ping-pong p50=43ms；开 NODELAY 后回到微秒级）。
     let stream = TcpStream::from(fd);
     let _ = stream.set_nodelay(true);
+    // ⚠ 握手期硬超时（2026-10-09 生产事故）：connect 的 timeout 只盖到
+    // `poll(POLLOUT)` 为止；连接建立后 socket 是**阻塞且无读写超时**的，
+    // 协议握手（VLESS 应答头 / anytls settings / TLS 记录）一旦碰上
+    // “能建连但不回包”的节点就会在 recvfrom 里**永久阻塞**。
+    // 这里先把 RCVTIMEO/SNDTIMEO 设成同一个 timeout，由 `Outbound::dial_tcp`
+    // 在握手完成后清除（见那里的注释），不污染后续长空闲转发。
+    set_sock_timeouts(stream.as_raw_fd(), Some(timeout))?;
     Ok(stream)
+}
+
+/// 设置/清除 socket 的 `SO_RCVTIMEO` + `SO_SNDTIMEO`。
+/// `None` = 清除（timeval 全 0 意为“永不超时”）。
+/// SO_*TIMEO 是 socket 级选项，对该 socket 的所有 `dup` 副本生效，
+/// 因此在一个 fd 上设/清即可惠及 `from_remote`/`to_remote`/`socket`。
+pub(crate) fn set_sock_timeouts(fd: std::os::fd::RawFd, t: Option<Duration>) -> io::Result<()> {
+    let tv = match t {
+        Some(d) => libc::timeval {
+            tv_sec: d.as_secs() as libc::time_t,
+            tv_usec: d.subsec_micros() as libc::suseconds_t,
+        },
+        None => libc::timeval {
+            tv_sec: 0,
+            tv_usec: 0,
+        },
+    };
+    for opt in [libc::SO_RCVTIMEO, libc::SO_SNDTIMEO] {
+        let rc = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                opt,
+                &tv as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::timeval>() as libc::socklen_t,
+            )
+        };
+        if rc != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
 }
 
 /// 带 SO_MARK 的 UDP socket（未绑定；用于 DNS 上游与 UDP NAT/relay 出口）。
@@ -1115,6 +1154,15 @@ impl Outbound {
         let r = self.dial_tcp_inner(target, timeout);
         if let Some(server) = self.server_addr() {
             crate::sticky::note_dial(server, r.is_ok());
+        }
+        // 握手已结束：清掉 `marked_tcp_connect` 为握手设的读写超时。
+        // 不留下是为了避免污染后续转发：泵路径会长时间空闲，残留的
+        // RCVTIMEO 会把“安静但正常的连接”误判为超时。
+        // （reactor 路径自己会把它置为非阻塞，非阻塞下 SO_RCVTIMEO 本就被忽略。）
+        if let Ok(d) = &r {
+            if let Some(s) = d.socket.as_ref() {
+                let _ = set_sock_timeouts(s.as_raw_fd(), None);
+            }
         }
         r
     }
@@ -2621,6 +2669,75 @@ fn parse_trojan(rest: &str) -> Result<Outbound, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 读回 socket 的 `SO_RCVTIMEO`（微秒；0 = 未设）。
+    fn rcvtimeo_us(fd: std::os::fd::RawFd) -> i64 {
+        let mut tv = libc::timeval {
+            tv_sec: 0,
+            tv_usec: 0,
+        };
+        let mut len = std::mem::size_of::<libc::timeval>() as libc::socklen_t;
+        let rc = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_RCVTIMEO,
+                &mut tv as *mut _ as *mut libc::c_void,
+                &mut len,
+            )
+        };
+        assert_eq!(rc, 0, "getsockopt(SO_RCVTIMEO) 应成功");
+        tv.tv_sec as i64 * 1_000_000 + tv.tv_usec as i64
+    }
+
+    /// 近似比较：内核会把 `SO_*TIMEO` 向上取整到时钟粒度（实测 1_500_000 µs
+    /// 读回 1_500_333 µs），因此不能用严格相等。
+    fn assert_timeo_us(got: i64, want: i64, what: &str) {
+        let d = (got - want).abs();
+        assert!(
+            d <= 100_000,
+            "{what}: 期望约 {want} µs，实际 {got} µs（差 {d} µs）"
+        );
+    }
+
+    /// 回归（2026-10-09 生产事故）：`marked_tcp_connect` 过去只盖了 connect 的
+    /// poll 超时，返回的 socket 是**阻塞无读写超时**的 —— 碰上"能建连但不回包"的
+    /// 节点，协议握手会在 recvfrom 里永久阻塞（实测 553 个 probe 线程卡死、
+    /// VmSize 432 MB / RSS 105 MB）。
+    ///
+    /// 本用例先验 helper 的设/清语义（不需特权），再在 root 下顺带验一次
+    /// `marked_tcp_connect` 真的会设上（设 SO_MARK 需要 CAP_NET_ADMIN）。
+    #[test]
+    fn handshake_timeout_set_then_cleared() {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        let s = std::net::TcpStream::connect(addr).unwrap();
+        let fd = s.as_raw_fd();
+        assert_eq!(rcvtimeo_us(fd), 0, "新 socket 默认无读超时");
+        set_sock_timeouts(fd, Some(Duration::from_secs(2))).unwrap();
+        assert_timeo_us(rcvtimeo_us(fd), 2_000_000, "设置后应可读回");
+        set_sock_timeouts(fd, None).unwrap();
+        assert_eq!(rcvtimeo_us(fd), 0, "清除后应回到 0");
+        // dup 共享同一 socket 选项：在一个 fd 上设即对所有副本生效
+        let dup = s.try_clone().unwrap();
+        set_sock_timeouts(dup.as_raw_fd(), Some(Duration::from_millis(1500))).unwrap();
+        assert_timeo_us(rcvtimeo_us(fd), 1_500_000, "dup 共享同一 socket 选项");
+
+        // root 下才能设 SO_MARK；顺带验握手期超时确实被设上
+        if unsafe { libc::geteuid() } == 0 {
+            let l2 = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let a2 = l2.local_addr().unwrap();
+            let m = marked_tcp_connect(a2, Duration::from_secs(2)).unwrap();
+            assert_timeo_us(
+                rcvtimeo_us(m.as_raw_fd()),
+                2_000_000,
+                "握手期必须已设 RCVTIMEO（否则握手读会永久阻塞）",
+            );
+            set_sock_timeouts(m.as_raw_fd(), None).unwrap();
+            assert_eq!(rcvtimeo_us(m.as_raw_fd()), 0, "dial_tcp 收尾应清除");
+        }
+    }
+
     use std::io::{Read, Write};
     use std::net::ToSocketAddrs;
 

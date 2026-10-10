@@ -199,6 +199,23 @@ pub struct GroupStats {
 const PROBE_BATCH_DEADLINE: Duration = Duration::from_secs(30);
 /// 探测线程栈：探测只做小分配，无需默认 8 MiB（大批量时省内存）。
 const PROBE_STACK: usize = 512 * 1024;
+/// **在跑的探测线程上限**（安全网）。
+///
+/// 背景（2026-10-09 生产事故，第二阶段 §9）：探测改为「独立 spawn + 超时收集」后，
+/// 被放弃的线程若因握手读无超时而**永不退出**，就会永久累积——20 小时攒到 553 个
+/// probe 线程 / VmSize 432 MB / RSS 105 MB。
+/// 这里用「存活计数 + 上限」把最坏情况封死：一旦撞顶就跳过本轮并告警，
+/// 线程数不再无界增长（真正的根因已在 `outbound.rs` 的握手硬超时里修掉）。
+static PROBE_LIVE: AtomicU64 = AtomicU64::new(0);
+const PROBE_MAX_LIVE: u64 = 96;
+
+/// 探测线程存活计数守卫（无论正常结束还是被放弃，只要线程真的退出就会 −1）。
+struct ProbeLiveGuard;
+impl Drop for ProbeLiveGuard {
+    fn drop(&mut self) {
+        PROBE_LIVE.fetch_sub(1, Ordering::Relaxed);
+    }
+}
 
 /// 状态面用的节点快照（含可公开协议事实，供控制面板列展示）。
 #[derive(Clone)]
@@ -743,20 +760,32 @@ impl GroupRuntime {
                 // 改为独立 spawn + 带超时的收集：超时未回的线程被放弃（其迟到结果
                 // 仍经 `record_probe` 记入，不丢），主循环必定继续。
                 while i < n {
+                    // 安全网：在跑的探测线程撞顶说明大量探测卡死未退，本轮跳过。
+                    let live = PROBE_LIVE.load(Ordering::Relaxed);
+                    if live >= PROBE_MAX_LIVE {
+                        crate::log(&format!(
+                            "健康探测: 存活探测线程 {live} 已达上限 {PROBE_MAX_LIVE}（大量探测未退出），\
+                             本轮跳过；若持续出现请上报（根因见标记为 dial 的握手超时）"
+                        ));
+                        break;
+                    }
                     let end = (i + 24).min(n);
                     let (tx, rx) = std::sync::mpsc::channel::<()>();
                     for j in i..end {
                         let g = g.clone();
                         let tx = tx.clone();
+                        PROBE_LIVE.fetch_add(1, Ordering::Relaxed);
                         let b = std::thread::Builder::new()
                             .name("probe".into())
                             .stack_size(PROBE_STACK);
                         if b.spawn(move || {
+                            let _guard = ProbeLiveGuard;
                             let _ = g.probe(j);
                             let _ = tx.send(());
                         })
                         .is_err()
                         {
+                            PROBE_LIVE.fetch_sub(1, Ordering::Relaxed);
                             crate::log("健康探测: 线程创建失败，跳过该成员本轮");
                         }
                     }
@@ -782,6 +811,13 @@ impl GroupRuntime {
                         }
                     }
                     i = end;
+                    // 撞顶就中断本轮剩余批次（不再继续攒线程）
+                    if PROBE_LIVE.load(Ordering::Relaxed) >= PROBE_MAX_LIVE {
+                        crate::log(&format!(
+                            "健康探测: 本轮提前结束（存活探测线程达上限 {PROBE_MAX_LIVE}）"
+                        ));
+                        break;
+                    }
                 }
                 // P34：探测一轮后刷新活动订阅层（切换在探测周期内记日志，空闲期也可见）
                 {
