@@ -12,6 +12,7 @@
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpStream, UdpSocket};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -172,6 +173,8 @@ pub fn marked_tcp_connect(addr: SocketAddr, timeout: Duration) -> io::Result<Tcp
     // 这里先把 RCVTIMEO/SNDTIMEO 设成同一个 timeout，由 `Outbound::dial_tcp`
     // 在握手完成后清除（见那里的注释），不污染后续长空闲转发。
     set_sock_timeouts(stream.as_raw_fd(), Some(timeout))?;
+    // 墙钟上限：握手无论怎么重试，到点都会被 shutdown 打断
+    arm_dial_watchdog(stream.as_raw_fd(), timeout);
     Ok(stream)
 }
 
@@ -179,6 +182,70 @@ pub fn marked_tcp_connect(addr: SocketAddr, timeout: Duration) -> io::Result<Tcp
 /// `None` = 清除（timeval 全 0 意为“永不超时”）。
 /// SO_*TIMEO 是 socket 级选项，对该 socket 的所有 `dup` 副本生效，
 /// 因此在一个 fd 上设/清即可惠及 `from_remote`/`to_remote`/`socket`。
+// ---- 拨号墙钟看门狗 ----------------------------------------------------------
+//
+// 起因（2026-10-10 生产事故）：`marked_tcp_connect` 的 `timeout` 只覆盖
+// `poll(POLLOUT)`；建连后 socket 是阻塞且无读写超时的，协议握手碰上
+// “端口开、能建连、但不回包”的节点就在 recvfrom 里永久阻塞（实测 553 个
+// probe 线程卡死 / VmSize 432 MB）。
+// 加上 `SO_RCVTIMEO` 后阻塞被降级为「超时返回」，但握手路径仍可能在超时后
+// 继续重试 —— 总时长依旧无上界。这里再加一层**墙钟上限**：到点直接
+// `shutdown(2)` 该 socket，让任何阻塞中的读立刻返回，从而结束整个拨号。
+//
+// 用线程局部保存「本次拨号在看护的标志」：拨号在同一线程内完成；组拨号会
+// 嵌套调用成员拨号，内层 armed→disarm 后外层拿到空值，互不干扰。
+
+thread_local! {
+    static CUR_DIAL_WATCH: std::cell::RefCell<Option<Arc<AtomicBool>>> =
+        std::cell::RefCell::new(None);
+}
+
+/// 给 `fd` 起墙钟看门狗；返回取消标志（由 `disarm_dial_watchdog` 置位）。
+fn arm_dial_watchdog(fd: RawFd, deadline: Duration) -> Option<Arc<AtomicBool>> {
+    if deadline.is_zero() {
+        return None;
+    }
+    // 取一份 dup 给看门狗，保证 shutdown 时 fd 仍有效
+    let owned = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) }
+        .try_clone_to_owned()
+        .ok()?;
+    let cancel = Arc::new(AtomicBool::new(false));
+    let c = cancel.clone();
+    std::thread::Builder::new()
+        .name("dial-wd".into())
+        .stack_size(64 * 1024)
+        .spawn(move || {
+            // 分片睡眠：正常拨号完成时立即退出，不空等整个 deadline
+            let step = Duration::from_millis(20);
+            let mut waited = Duration::ZERO;
+            while waited < deadline {
+                if c.load(AtomicOrdering::Relaxed) {
+                    return;
+                }
+                let s = step.min(deadline - waited);
+                std::thread::sleep(s);
+                waited += s;
+            }
+            if c.load(AtomicOrdering::Relaxed) {
+                return;
+            }
+            // 到点仍未结束：掐断连接，让阻塞中的读写立即返回
+            let _ = unsafe { libc::shutdown(owned.as_raw_fd(), libc::SHUT_RDWR) };
+        })
+        .ok()?;
+    CUR_DIAL_WATCH.with(|w| *w.borrow_mut() = Some(cancel.clone()));
+    Some(cancel)
+}
+
+/// 拨号结束（无论成败）：取消本线程的看门狗。
+fn disarm_dial_watchdog() {
+    CUR_DIAL_WATCH.with(|w| {
+        if let Some(c) = w.borrow_mut().take() {
+            c.store(true, AtomicOrdering::Relaxed);
+        }
+    });
+}
+
 pub(crate) fn set_sock_timeouts(fd: std::os::fd::RawFd, t: Option<Duration>) -> io::Result<()> {
     let tv = match t {
         Some(d) => libc::timeval {
@@ -1152,6 +1219,8 @@ impl Outbound {
 
     pub fn dial_tcp(&self, target: &Target, timeout: Duration) -> io::Result<DialedStream> {
         let r = self.dial_tcp_inner(target, timeout);
+        // 拨号已结束：先解除墙钟看门狗（成败都要）
+        disarm_dial_watchdog();
         if let Some(server) = self.server_addr() {
             crate::sticky::note_dial(server, r.is_ok());
         }
@@ -2669,6 +2738,43 @@ fn parse_trojan(rest: &str) -> Result<Outbound, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 墙钟看门狗：到点应 `shutdown` socket，让阻塞中的读立即返回。
+    /// 这是「握手可能超时后继续重试」的最终兜底（见 arm_dial_watchdog 注释）。
+    #[test]
+    fn dial_watchdog_shuts_down_after_deadline() {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        let s = std::net::TcpStream::connect(addr).unwrap();
+        let rd = s.try_clone().unwrap();
+        arm_dial_watchdog(s.as_raw_fd(), Duration::from_millis(200)).unwrap();
+        let t0 = std::time::Instant::now();
+        let mut b = [0u8; 8];
+        let r = (&rd).read(&mut b); // 阻塞读：等看门狗掐断
+        let dt = t0.elapsed();
+        assert!(
+            matches!(r, Ok(0) | Err(_)),
+            "看门狗应让读返回 0/错误，实际 {r:?}"
+        );
+        assert!(dt < Duration::from_secs(2), "应在 deadline 附近返回，实际 {dt:?}");
+        disarm_dial_watchdog();
+    }
+
+    /// 正常拨号路径：取消后 socket **不得**被掐断（否则会误杀成功连接）。
+    #[test]
+    fn dial_watchdog_cancel_keeps_socket_alive() {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        let s = std::net::TcpStream::connect(addr).unwrap();
+        let (mut peer, _) = l.accept().unwrap();
+        arm_dial_watchdog(s.as_raw_fd(), Duration::from_millis(250)).unwrap();
+        disarm_dial_watchdog(); // 模拟 dial_tcp 收尾
+        std::thread::sleep(Duration::from_millis(500)); // 超过 deadline
+        peer.write_all(b"hi").unwrap();
+        let mut b = [0u8; 2];
+        (&s).read_exact(&mut b).unwrap();
+        assert_eq!(&b, b"hi", "取消后连接应仍然可用");
+    }
 
     /// 读回 socket 的 `SO_RCVTIMEO`（微秒；0 = 未设）。
     fn rcvtimeo_us(fd: std::os::fd::RawFd) -> i64 {
