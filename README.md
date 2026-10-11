@@ -166,6 +166,9 @@ sudo lab/lab.sh down
 - [`docs/phase2-devlog.md`](./docs/phase2-devlog.md) — **第二阶段 · 生产实战轮**开发记录：
   软路由生产环境自 2026-10-08 起的四轮侦查/修复（探测卡死与线程泄漏、粘滞 IP 重解析、热重载解耦、
   按源保留、订阅正文完整性）+ 72h 生产测试记分板与遗留监控台账。
+- [`docs/security-proposal.md`](./docs/security-proposal.md) — **安全工程提案（待采纳）**：
+  攻击面取证（9 类输入 × 解析器 × 现有防线）、nightly + bpf-linker 供应链缺口，
+  S0–S5 排期（fuzz ≥8 目标、QEMU 特权加载 CI、工具链钉死与 cargo-deny、panic 面与默认暴露面收紧）。
 - [`docs/adr/`](./docs/adr/) — 63 条已采纳 ADR（ADR-0001..0063）：每个决策的背景、选项、理由、后果、
   **实测验证方式**与修订条件。重要节点：0002（eBPF 程序语言：先 C 后迁）、
   0023/0024/0025（数据面 Rust 全量迁移 → C 对象退场）、0029（真网关模式）、
