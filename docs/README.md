@@ -21,6 +21,7 @@ docs/
 ├── openwrt.md                    # OpenWrt 支持（musl 构建/内核 fragment/ipk/procd/QEMU 冒烟）
 ├── reviews/                      # 第三方评审存档（原文）+ 工程方采纳提案（I1–I5）
 ├── optimization-roadmap.md       # 优化方向（数据驱动，O1–O10 优先级与验收）
+├── dae-optimization-research.md  # ★ 面向 dae 的优化与创新研究：已做/能做清单、三条迁移路线、负面结论（dev 分支）
 ├── adr/                          # 已采纳决策记录（ADR-0001..0063）
 ├── modules/                      # 模块级规格（tuic-v5-client-spec.md / hysteria2-client-spec.md，由源码研究产出）
 └── migration/                    # (待建) 迁移日志与对拍报告
