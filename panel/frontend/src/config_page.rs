@@ -8,6 +8,7 @@ use shared::{
     DomainFileView, DomainsView, InspectView, ParamKind, ParamsView, SaveResult, SourcesView,
 };
 
+use crate::runtime::fmt_ago;
 use crate::{fmt_bytes, get_json, post_json};
 
 /// 前端侧 URL 脱敏（只回避 token 值，用于批量预览列表）。
@@ -463,17 +464,47 @@ pub fn ConfigPage(token: RwSignal<Option<String>>) -> impl IntoView {
                                 let t2 = tag.clone();
                                 let t3 = tag.clone();
                                 let active = s.active;
+                                // P0（2026-10-11）：展示引擎最近一次拉取状态（含磁盘缓存回退/失败原因）。
+                                let pull_txt = match s.pull_ok {
+                                    Some(true) => {
+                                        let via = match s.pull_source.as_str() {
+                                            "disk" => "（磁盘缓存回退）",
+                                            "memory" => "（内存缓存）",
+                                            "cooldown" => "（限流冷却）",
+                                            _ => "",
+                                        };
+                                        format!(
+                                            "✓ {} 节点{} · {}拉取",
+                                            s.pull_nodes,
+                                            via,
+                                            fmt_ago(s.pull_ago_secs),
+                                        )
+                                    }
+                                    Some(false) => format!(
+                                        "✗ 拉取失败：{}",
+                                        s.pull_error.clone().unwrap_or_else(|| "未知".into())
+                                    ),
+                                    None => "尚无拉取记录".to_string(),
+                                };
+                                let pull_style = if s.pull_ok == Some(false) {
+                                    "font-size:0.78em;color:var(--warn)"
+                                } else {
+                                    "font-size:0.78em"
+                                };
                                 view! {
                                     <tr class="row">
                                         <td class="mono num dim">{s.order.to_string()}</td>
                                         <td class="mono">{tag.clone()}</td>
                                         <td class="mono dim url-cell">{s.url.clone()}</td>
                                         <td class="mono num">{format!("{} / {}", s.alive, s.nodes)}</td>
-                                        <td>{if active {
-                                            view! { <span class="tag-on">"当前"</span> }.into_any()
-                                        } else {
-                                            view! { <span class="dim">"—"</span> }.into_any()
-                                        }}</td>
+                                        <td>
+                                            {if active {
+                                                view! { <span class="tag-on">"当前"</span> }.into_any()
+                                            } else {
+                                                view! { <span class="dim">"—"</span> }.into_any()
+                                            }}
+                                            <div class="dim mono" style=pull_style>{pull_txt}</div>
+                                        </td>
                                         <td class="act-cell">
                                             <button class="btn btn-mini" disabled=move || busy.get()
                                                 on:click=move |_| run_action("/api/v1/config/subs/move",

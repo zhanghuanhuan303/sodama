@@ -386,7 +386,7 @@ pub fn AiTrafficCard(status: RwSignal<Option<StatusView>>) -> impl IntoView {
 }
 
 /// 距今秒数 → 人类可读。
-fn fmt_ago(secs: u64) -> String {
+pub(crate) fn fmt_ago(secs: u64) -> String {
     match secs {
         0..=2 => "刚刚".to_string(),
         s if s < 60 => format!("{s}s 前"),

@@ -28,6 +28,8 @@ pub struct StatusView {
     pub group: GroupView,
     pub nodes: Vec<NodeView>,
     pub rule_sets: Vec<RuleSetView>,
+    /// P0（2026-10-11）：订阅源状态（tag/最近拉取/结果/节点数；不含 URL/token）。
+    pub subscriptions: Vec<SubSourceView>,
     pub maps: MapsView,
     pub pname: PnameView,
     pub config_watch: WatchView,
@@ -95,6 +97,24 @@ pub struct RelayView {
     pub splice_fallbacks: u64,
     pub offload_enabled: bool,
     pub offloaded_total: u64,
+}
+
+/// P0（2026-10-11）：单个订阅源最近一次拉取状态（引擎 `status.subscriptions[]`）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SubSourceView {
+    pub tag: String,
+    pub rank: u64,
+    /// 拉取时刻（Unix 秒）
+    pub at_sec: u64,
+    /// 本次是否可用（含磁盘缓存回退）
+    pub ok: bool,
+    /// 失败原因 / 回退说明（成功时为 None 或上一次错误）
+    pub error: Option<String>,
+    /// 可用节点数
+    pub nodes: u64,
+    /// net / disk / memory / cooldown
+    pub source: String,
 }
 
 /// P-AI：单个域名的连接/流量统计（引擎 `status.domain_stats[]`）。
@@ -416,6 +436,15 @@ pub struct SourceInfo {
     pub nodes: u64,
     pub alive: u64,
     pub active: bool,
+    /// P0（2026-10-11）：引擎最近一次拉取状态（None = 尚无记录）。
+    pub pull_ok: Option<bool>,
+    pub pull_error: Option<String>,
+    /// 距上次拉取的秒数（无记录 = 0）
+    pub pull_ago_secs: u64,
+    /// 可用节点数（拉取结果）
+    pub pull_nodes: u64,
+    /// net / disk / memory / cooldown（空 = 无记录）
+    pub pull_source: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

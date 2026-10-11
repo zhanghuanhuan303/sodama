@@ -24,7 +24,8 @@ mod configapi;
 use shared::{
     ConfigView, DnsView, DomainStatView, FileContent, FileInfo, GroupView, LoginReq, LoginResp,
     MapsView, NodeDetail, NodePoint, NodeView, PnameView, RelayView, ReloadView, RuleSetView,
-    Sample, SaveResult, SeriesView, SniffView, SourceInfo, SourcesView, StatusView, WatchView,
+    Sample, SaveResult, SeriesView, SniffView, SourceInfo, SourcesView, StatusView,
+    SubSourceView, WatchView,
 };
 
 // ---------------------------------------------------------------- 配置
@@ -460,6 +461,22 @@ fn to_view(root: &Value, engine: &Engine) -> StatusView {
         .as_array()
         .map(|a| a.iter().map(str_of).collect())
         .unwrap_or_default();
+    let subscriptions = root["subscriptions"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .map(|s| SubSourceView {
+                    tag: str_of(&s["tag"]),
+                    rank: u64_of(&s["rank"]),
+                    at_sec: u64_of(&s["at_sec"]),
+                    ok: bool_of(&s["ok"]),
+                    error: s["error"].as_str().map(str::to_string),
+                    nodes: u64_of(&s["nodes"]),
+                    source: str_of(&s["source"]),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     let sections = root["config"]["sections"]
         .as_array()
         .map(|a| a.iter().map(str_of).collect())
@@ -565,6 +582,7 @@ fn to_view(root: &Value, engine: &Engine) -> StatusView {
         },
         nodes,
         rule_sets,
+        subscriptions,
         maps: MapsView {
             conn_state: u64_of(&root["maps"]["conn_state"]),
             domain_routing: u64_of(&root["maps"]["domain_routing"]),
@@ -1499,15 +1517,20 @@ async fn api_sources(State(ctx): State<Ctx>, headers: HeaderMap, uri: Uri) -> Re
         Some(v) => Some(v),
         None => fetch_view(&ctx, &engine).await.ok(),
     };
-    let (active_tag, nodes) = match &view {
-        Some(v) => (v.group.active_tag.clone(), v.nodes.clone()),
-        None => (String::new(), Vec::new()),
+    let (active_tag, nodes, subs_status) = match &view {
+        Some(v) => (
+            v.group.active_tag.clone(),
+            v.nodes.clone(),
+            v.subscriptions.clone(),
+        ),
+        None => (String::new(), Vec::new(), Vec::new()),
     };
     let sources = entries
         .iter()
         .enumerate()
         .map(|(i, (tag, url))| {
             let ns: Vec<&NodeView> = nodes.iter().filter(|n| &n.tag == tag).collect();
+            let st = subs_status.iter().find(|s| &s.tag == tag);
             SourceInfo {
                 tag: tag.clone(),
                 url: redact(url),
@@ -1515,6 +1538,11 @@ async fn api_sources(State(ctx): State<Ctx>, headers: HeaderMap, uri: Uri) -> Re
                 nodes: ns.len() as u64,
                 alive: ns.iter().filter(|n| n.alive).count() as u64,
                 active: *tag == active_tag,
+                pull_ok: st.map(|s| s.ok),
+                pull_error: st.and_then(|s| s.error.clone()),
+                pull_ago_secs: st.map(|s| now_secs().saturating_sub(s.at_sec)).unwrap_or(0),
+                pull_nodes: st.map(|s| s.nodes).unwrap_or(0),
+                pull_source: st.map(|s| s.source.clone()).unwrap_or_default(),
             }
         })
         .collect();
@@ -1561,10 +1589,15 @@ async fn api_source_promote(
     if let Err(e) = write_preserving(&path, &new_text) {
         return err_json(StatusCode::BAD_GATEWAY, e);
     }
-    let reload_ok = wait_reload(&ctx, &engine, prev_at, 15).await;
+    let reload_ok = wait_reload(&ctx, &engine, prev_at, 30).await;
+    let message = if reload_ok.is_none() {
+        format!("已把订阅源 {} 设为第一顺位（引擎回执超时，请稍后刷新确认）", req.tag)
+    } else {
+        format!("已把订阅源 {} 设为第一顺位", req.tag)
+    };
     Json(SaveResult {
         ok: true,
-        message: format!("已把订阅源 {} 设为第一顺位", req.tag),
+        message,
         reload_ok,
     })
     .into_response()
@@ -1677,12 +1710,12 @@ pub(crate) async fn apply_config_text(
     if let Err(e) = write_preserving(&engine.engine_config, text) {
         return err_json(StatusCode::BAD_GATEWAY, e);
     }
-    let reload_ok = wait_reload(ctx, engine, prev_at, 20).await;
+    let reload_ok = wait_reload(ctx, engine, prev_at, 60).await;
     if reload_ok == Some(false) {
         if let Some(prev) = prev_text {
             let at_before_rollback = current_reload_at(ctx, engine).await;
             if write_preserving(&engine.engine_config, &prev).is_ok() {
-                let rolled = wait_reload(ctx, engine, at_before_rollback, 20).await;
+                let rolled = wait_reload(ctx, engine, at_before_rollback, 60).await;
                 return Json(SaveResult {
                     ok: false,
                     message: format!(
@@ -1705,9 +1738,14 @@ pub(crate) async fn apply_config_text(
         })
         .into_response();
     }
+    let message = if reload_ok.is_none() {
+        format!("{ok_msg} —— 引擎回执超时（可能仍在处理，请稍后刷新状态确认）")
+    } else {
+        ok_msg
+    };
     Json(SaveResult {
         ok: true,
-        message: ok_msg,
+        message,
         reload_ok,
     })
     .into_response()
@@ -1739,10 +1777,15 @@ async fn api_file_save(
     if let Err(e) = write_preserving(&path, &req.text) {
         return err_json(StatusCode::BAD_GATEWAY, e);
     }
-    let reload_ok = wait_reload(&ctx, &engine, prev_at, 15).await;
+    let reload_ok = wait_reload(&ctx, &engine, prev_at, 30).await;
+    let message = if reload_ok.is_none() {
+        format!("已保存 {}（引擎热重载；回执超时，请稍后刷新确认）", req.name)
+    } else {
+        format!("已保存 {}（引擎热重载）", req.name)
+    };
     Json(SaveResult {
         ok: true,
-        message: format!("已保存 {}（引擎热重载）", req.name),
+        message,
         reload_ok,
     })
     .into_response()
@@ -1807,13 +1850,20 @@ async fn api_reload(State(ctx): State<Ctx>, headers: HeaderMap, uri: Uri) -> Res
         Ok(v) => v,
         Err(e) => return err_json(StatusCode::BAD_GATEWAY, e),
     };
-    let reload_ok = wait_reload(&ctx, &engine, prev_at, 20).await;
+    let reload_ok = wait_reload(&ctx, &engine, prev_at, 60).await;
     let ok = reload_ok.unwrap_or(code == 0);
+    let mut stderr = err;
+    if reload_ok.is_none() {
+        if !stderr.is_empty() {
+            stderr.push('\n');
+        }
+        stderr.push_str("（引擎回执超时；重载可能仍在进行，请稍后刷新状态确认）");
+    }
     Json(shared::ActionResult {
         ok,
         code,
         stdout: out,
-        stderr: err,
+        stderr,
     })
     .into_response()
 }

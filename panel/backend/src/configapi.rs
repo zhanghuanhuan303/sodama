@@ -745,7 +745,7 @@ async fn api_group_policy(
             }
             (
                 format!("fixed('{node}')"),
-                format!("已锁定节点 {node}（死亡自动兑底）"),
+                format!("已锁定节点 {node}（死亡自动兜底）"),
             )
         }
         other => return err_json(StatusCode::BAD_REQUEST, format!("未知策略 {other}")),
