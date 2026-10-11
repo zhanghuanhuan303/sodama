@@ -22,8 +22,12 @@ byte-exact parity tests against dae's Go rule compiler and a netns test lab.*
 - **控制台（Web）**：Rust 后端（axum）+ Rust→WASM 前端（Leptos）的**单文件 musl 二进制**，
   跑在软路由上（~3 MB RSS）：总览（运行时/曲线/节点表）+ 配置页（订阅/规则集/分流条目在线改，
   validate 护栏 + 热重载回执），**引擎零改动**（见 [`panel/`](./panel/README.md)）。
+- **生产实战（第二阶段，2026-10-08 起）**：真网关模式在 OpenWrt 软路由（x86_64 / 2 核 / 4 GB）上线，
+  接管全屋流量、接入真实订阅（REALITY / anytls / vless 混合）；四轮侦查/修复全部落地——健康探测线程
+  卡死与泄漏、粘滞 IP「永不重解析」、热重载超时误报、订阅截断静默通过（见
+  [`docs/phase2-devlog.md`](./docs/phase2-devlog.md)）；**72h 生产测试进行中**。
 
-最新一轮完整回归（唯一 Rust 数据面，2026-10-06）：
+实验室全量回归（唯一 Rust 数据面，2026-10-06，第二阶段起点基线）：
 
 | 项 | 结果 |
 |---|---|
@@ -49,6 +53,23 @@ byte-exact parity tests against dae's Go rule compiler and a netns test lab.*
 > **五万并发压测**见 [`docs/benchmark-report.html`](docs/benchmark-report.html)（自包含可离线打开；
 > perf-report / memory-report v1·v2 已并入，保留为存档）。复现：`sudo lab/perf/run.sh all` · `lab/perf/mem-system.sh`。
 
+## 第二阶段 · 生产实战（2026-10-08 起）
+
+真网关模式部署在 OpenWrt 软路由上接管全屋流量，转入「问题 → 侦查 → 结论 → 动作 → 验收」的
+生产实战轮（逐条证据见 [`docs/phase2-devlog.md`](./docs/phase2-devlog.md)）：
+
+| 轮次 | 根因（暴露面） | 修复 | 生产验收 |
+|---|---|---|---|
+| §7–§8 探测卡死 | `thread::scope` 等齐探测批 + 无超时读 → 探测冻结，拨号失败率 40%；组拨号绕过 Reactor；远程规则集自锁；日志无时间戳 | 探测硬超时 + 带超时收集；组拨号回归 Reactor；规则集软失败 + 面板回滚；日志时间戳 | Reactor 接管 12/12（100%）；`relay` 线程 36→0；线程斜率 +2.39→−0.11 |
+| §9 线程泄漏（§8 回归） | 握手读无超时 + 探测线程无上限 → 553 个 `recvfrom` 阻塞线程 | `SO_RCVTIMEO` 设/清 + 探测上限 96 + **拨号墙钟看门狗**（到点 `shutdown`） | `stragglers` 归零（25 h 0/1486）；`dial_errors` 0；探测看门狗从未触发 |
+| §10–§11 看护/热重载 | 粘滞 IP「只作废不重解析」（subA 63→6 存活）；reload 同步拉订阅（19–34 s 超时误报）；失败源被全量替换清空；截断正文静默通过 | `sticky::resolve_for_dial`；reload 与拉取解耦；按源保留成员；Content-Length 精确校验；磁盘缓存 + 周期刷新 + 自愈重试 | 面板回执 19–34 s → 0.74 s；组 100 成员（继承健康）；截断实战捕获 ×2 并自愈；重启不丢源 |
+
+**修复后稳态**（25 h 曲线，1486 采样）：RSS 平台 **50–53 MB**（重启瞬时 39.4 MB）；线程 16–66；
+`stragglers` **0/1486**；探测看门狗从未触发；三次热重载前后内存无跳变。
+
+**72h 生产测试进行中**（2026-10-11 启动）：判据为相对 1 h 基线漂移 ≤5% 且失败零增长；
+在完成前不启用「bounded-memory」表述（运行协议与记分板见 devlog §12）。
+
 ## 仓库结构
 
 ```
@@ -63,6 +84,7 @@ docs/                        决策、架构与报告
 ├── project-summary.html         工程总结报告
 ├── perf-report.md               四方性能对拍（已并入 benchmark-report；存档）
 ├── parity-status.md             对标进度：dae（Go）↔ sodama（全 Rust）分域覆盖度
+├── phase2-devlog.md             第二阶段（生产实战轮）开发记录（侦查/修复/验收 + 72h 测试记分板）
 └── notes/                       本地工程笔记（**不入库**：含真实订阅/节点信息，见 .git/info/exclude）
 
 sodama/                    引擎（构建、实验、测试都在这里）
@@ -76,7 +98,8 @@ sodama/                    引擎（构建、实验、测试都在这里）
 │   ├── parity.sh + parity/   与 dae Go 编译器的规则编译对拍（逐字节）
 │   ├── proto-check/           真实 Go 客户端 / Go 参考服务端跨实现联调
 │   ├── real-node-e2e.sh       真实 vless-ws 订阅节点端到端验收（env 注入节点）
-│   └── matrix.sh              内核矩阵（宿主 / QEMU 第二内核）
+│   ├── matrix.sh              内核矩阵（宿主 / QEMU 第二内核）
+│   └── prod/                  生产健康曲线：health-track.sh + health-plot.py（判据线内建）
 ├── README.md                  实验手册：构建、拓扑、会话、实测输出
 └── NOTES.md                   数据面/协议栈的源码级笔记（带行号与坑清单）
 
@@ -140,6 +163,9 @@ sudo lab/lab.sh down
 - [`docs/architecture-decision.html`](./docs/architecture-decision.html) — 主决策档案：
   上游 dae 的模块/规模分析、Rust 重写的收益与风险、部署形态（Rust worker + eBPF 分流）、
   决策点 D1–D8 与迁移路线（K0–K3、P3–P18）。
+- [`docs/phase2-devlog.md`](./docs/phase2-devlog.md) — **第二阶段 · 生产实战轮**开发记录：
+  软路由生产环境自 2026-10-08 起的四轮侦查/修复（探测卡死与线程泄漏、粘滞 IP 重解析、热重载解耦、
+  按源保留、订阅正文完整性）+ 72h 生产测试记分板与遗留监控台账。
 - [`docs/adr/`](./docs/adr/) — 63 条已采纳 ADR（ADR-0001..0063）：每个决策的背景、选项、理由、后果、
   **实测验证方式**与修订条件。重要节点：0002（eBPF 程序语言：先 C 后迁）、
   0023/0024/0025（数据面 Rust 全量迁移 → C 对象退场）、0029（真网关模式）、
