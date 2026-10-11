@@ -186,7 +186,7 @@ ol.endnotes li{margin-bottom:.5rem}
 <div class="classbar">
   <span class="cls">密级 · 最高</span>
   <span>SODAMA ATLAS · 内部研究档案 · 未经许可不得外传</span>
-  <span class="push">v1.0 · 2026-10-08 · main@d99a349</span>
+  <span class="push">v1.1 · 2026-10-11 · main@1e1906d</span>
 </div>
 
 <div class="page">
@@ -198,11 +198,11 @@ ol.endnotes li{margin-bottom:.5rem}
   <p class="sub">全 Rust 代理数据面 · 开发研究图集</p>
   <dl class="meta">
     <div><dt>对象</dt><dd>sodama —— Go 版 dae 代理内核的全 Rust 重写</dd></div>
-    <div><dt>范围</dt><dd>核心技术验证 · 架构对照 · 性能与资源边界 · 工程方法论 · 踩坑档案 · 余项地图</dd></div>
-    <div><dt>周期</dt><dd>2026-10-03 — 2026-10-08（含软路由生产环境实战）</dd></div>
+    <div><dt>范围</dt><dd>核心技术验证 · 架构对照 · 性能与资源边界 · 工程方法论 · 踩坑档案 · 第二阶段生产实战 · 余项地图</dd></div>
+    <div><dt>周期</dt><dd>2026-10-03 — 2026-10-11（软路由生产实战 + 第二阶段加固）</dd></div>
     <div><dt>基准机</dt><dd>Arch / Linux 6.18.54-lts / i9-9900KF 8C16T / 31 GB；生产机：OpenWrt Kwrt x86_64 2 核</dd></div>
     <div><dt>对照</dt><dd>dae v2.1.1（上游 Go）· sing-box 1.14.2 · v2ray 5.52.0 · mihomo 1.19.32</dd></div>
-    <div><dt>归档</dt><dd>ADR ×63 · 单测 264 · HTML 报告与数据源见 §8 索引</dd></div>
+    <div><dt>归档</dt><dd>ADR ×63 · 单测 274+ · HTML 报告与数据源见 §9 索引</dd></div>
   </dl>
 </header>
 
@@ -216,7 +216,7 @@ ol.endnotes li{margin-bottom:.5rem}
   <div><b>28</b><span>恒定线程数（1k→50k 并发不变）</span></div>
   <div><b>16.9 Gbps</b><span>VLESS + splice 零拷贝吞吐</span></div>
   <div><b>≈52 KB</b><span>每连接内核侧内存（扣除对照）</span></div>
-  <div><b>264</b><span>单元测试通过</span></div>
+  <div><b>274+</b><span>单元测试通过（10-06 基线 268）</span></div>
   <div><b>63</b><span>架构决策记录 ADR</span></div>
 </div>
 
@@ -233,6 +233,8 @@ ol.endnotes li{margin-bottom:.5rem}
 <div class="callout">
   <p><strong>一句话结论。</strong>sodama 以个位数到两位数 MB 的<em class="term">用户态</em>内存与恒定线程数承载高并发连接；真实上限由<strong>内核内存</strong>与<strong>加密协议 CPU</strong>决定，而不是线程或用户态分配器。<span class="sn">这是全篇最重要的口径纪律：<b>用户态优势 ≠ 系统优势</b>。20 000 连接时 sodama 的用户态仅占系统总增量的约 2.5%，其余在内核对象（socket、inode、pipe、dentry）。只报 RSS 是<strong>不完整</strong>的。</span></p>
 </div>
+
+<p>以上为第一阶段收口口径。<strong>v1.1 新增 <a href="#s8">§8 · 第二阶段 · 生产实战轮</a></strong>——真实软路由上的四轮侦查/修复、修复后 25 h 稳态与进行中的 72h 生产测试；原始证据见 <code>docs/phase2-devlog.md</code>。</p>
 </section>
 
 <nav class="toc">
@@ -255,7 +257,8 @@ ol.endnotes li{margin-bottom:.5rem}
     <li><a href="#s5">工程实践与方法论</a></li>
     <li><a href="#s6">踩坑档案 · 十二则现场笔记</a></li>
     <li><a href="#s7">余项地图 · A–I 类待办与永久边界</a></li>
-    <li><a href="#s8">复现与索引 · 命令、ADR、数据源</a></li>
+    <li><a href="#s8">第二阶段 · 生产实战轮（2026-10-08 起）</a></li>
+    <li><a href="#s9">复现与索引 · 命令、ADR、数据源</a></li>
   </ol>
 </nav>
 
@@ -786,7 +789,7 @@ ol.endnotes li{margin-bottom:.5rem}
   <text x="540" y="166" text-anchor="middle" font-size="10.5" fill="#6f6a5c">0</text>
   <text x="773.3" y="166" text-anchor="middle" font-size="10.5" fill="#6f6a5c">＋5% 判据</text>
 </svg>
-<figcaption><b>图 10 · 60 分钟长稳（233 个采样点）：全部漂移落在 ±5% 判据带内 → PASS。</b>负载为常驻 200 条长连接 + 每 5 s 一波微量 churn + 每 60 s 一次 8 MB×2 流全双工校验；RTT 中位 34–93 µs、p99 229–904 µs、零失败。<b>但 60 分钟不等于 72 小时</b>——在完成 72 h 之前，本项目不使用「bounded-memory」的绝对表述。</figcaption>
+<figcaption><b>图 10 · 60 分钟长稳（233 个采样点）：全部漂移落在 ±5% 判据带内 → PASS。</b>负载为常驻 200 条长连接 + 每 5 s 一波微量 churn + 每 60 s 一次 8 MB×2 流全双工校验；RTT 中位 34–93 µs、p99 229–904 µs、零失败。<b>但 60 分钟不等于 72 小时</b>——在完成 72 h 之前，本项目不使用「bounded-memory」的绝对表述（<b>72h 生产测试已于 2026-10-11 启动</b>，见 §8.3）。</figcaption>
 </figure>
 </section>
 
@@ -794,7 +797,7 @@ ol.endnotes li{margin-bottom:.5rem}
 <h2><span class="num">§5</span>工程实践与方法论</h2>
 
 <h3>5.1 · 三级验收：单测 / lab 专项 / 跨实现逐字节</h3>
-<p>单元测试（264 项）只证明函数级行为。真正的信心来自第二级与第三级：<strong>lab 专项</strong>在 netns 里跑真实拓扑（双拓扑 × 九用例、嗅探 punt 三路径、UDP v6、DoH-h2、ECS 回填与刷新、Vision XTLS 状态机……）；<strong>跨实现逐字节</strong>则把产物与另一个独立实现对齐——规则编译输出与 Go 版对拍 5/5，Vision 帧层与 Xray 夹具四模式逐字节，TLS 记录层与 Go/quic-go 参考服务端互操作，shadow-tls v1/v2/v3 与 sing-shadowtls 三版交叉。<span class="sn">为什么「跨实现」比「自测」重要：自测只能证明<b>自洽</b>，跨实现才能证明<b>正确</b>。一个编码器只要编码与解码互为逆运算，就能通过所有自测，同时和世界上其他所有实现都不兼容。</span></p>
+<p>单元测试（10-06 基线 268 项、修复批次后 274+）只证明函数级行为。真正的信心来自第二级与第三级：<strong>lab 专项</strong>在 netns 里跑真实拓扑（双拓扑 × 九用例、嗅探 punt 三路径、UDP v6、DoH-h2、ECS 回填与刷新、Vision XTLS 状态机……）；<strong>跨实现逐字节</strong>则把产物与另一个独立实现对齐——规则编译输出与 Go 版对拍 5/5，Vision 帧层与 Xray 夹具四模式逐字节，TLS 记录层与 Go/quic-go 参考服务端互操作，shadow-tls v1/v2/v3 与 sing-shadowtls 三版交叉。<span class="sn">为什么「跨实现」比「自测」重要：自测只能证明<b>自洽</b>，跨实现才能证明<b>正确</b>。一个编码器只要编码与解码互为逆运算，就能通过所有自测，同时和世界上其他所有实现都不兼容。</span></p>
 
 <h3>5.2 · 夹具工程学</h3>
 <p>三次踩坑把夹具从「辅助工具」提升为「需要被验证的被测对象」：</p>
@@ -923,7 +926,7 @@ ol.endnotes li{margin-bottom:.5rem}
     <tr><td class="c">F</td><td>嗅探 / IPv6</td><td>QUIC 观测 → UDP 域名拨号 · ICMPv6 error 转发 · IPv6 分片重组</td><td class="c">低</td></tr>
     <tr><td class="c">G</td><td>性能与质量</td><td>kTLS 异机重测 · fuzz 目标（.dae 解析 / DNS 报文 / CH 解析）· 特权内核加载类 CI · 夜间长稳 · <code>lab.sh verify</code> 探针陈旧修复</td><td class="c">中</td></tr>
     <tr><td class="c">H</td><td>文档</td><td>顶层 README 状态区重写 · 用户手册（配置参考 + Go→Rust 迁移指南）· 基准报告固化</td><td class="c">中</td></tr>
-    <tr><td class="c">I</td><td>资源 / 系统内存专项</td><td>I1 四层模型 ✅ · I2 FD 治理 ✅ · I3 转发原语 ✅ · I4 长稳曲线（60 min ✅ / 72 h 待机时）· I5 报告口径 ✅</td><td class="c">已闭环</td></tr>
+    <tr><td class="c">I</td><td>资源 / 系统内存专项</td><td>I1 四层模型 ✅ · I2 FD 治理 ✅ · I3 转发原语 ✅ · I4 长稳曲线（60 min ✅；72 h 生产测试进行中 → §8.3）· I5 报告口径 ✅</td><td class="c">已闭环</td></tr>
   </tbody>
 </table>
 
@@ -935,9 +938,37 @@ ol.endnotes li{margin-bottom:.5rem}
 </section>
 
 <section id="s8">
-<h2><span class="num">§8</span>复现与索引 · 命令、ADR、数据源</h2>
+<h2><span class="num">§8</span>第二阶段 · 生产实战轮（2026-10-08 起）</h2>
 
-<h3>8.1 · 复现命令</h3>
+<p>第一阶段的数字全部来自受控环境。2026-10-08，sodama 第一次以<strong>真网关模式</strong>部署到那台 2 核软路由上，接管全屋流量并接入真实订阅（百级节点成员，REALITY / anytls / vless 混合）。从这一天起，测试不再是「跑一遍用例」，而是连续多日的 7×24 运行——用户可感知的故障直接进入「问题 → 侦查 → 结论 → 动作 → 验收」的循环。<sup class="fnref"><a href="#fn10">10</a></sup><span class="sn">本节是压缩后的结论层；原始证据层（日志摘录、时间线、前后对照、逐项回填）在 <code>docs/phase2-devlog.md</code>。两份文档的纪律相同：不改写历史，未解决项保留并标注状态。</span></p>
+
+<p>四轮侦查下来，一条规律被验证了四遍：<strong>生产暴露的缺陷全部位于子系统之间的接缝</strong>——探测循环与拨号语义的接缝、组能力判断与 Reactor 的接缝、热重载与订阅拉取的接缝、节点域名与入口轮换的接缝。实验室用例逐条对得上功能，但对不上这些接缝。</p>
+
+<h3>8.1 · 四轮侦查与修复（§7–§11，全部已验收）</h3>
+
+<table class="tight">
+  <caption>表 8 · 第二阶段缺陷清单：根因 → 修复 → 生产验收（完整证据见 devlog 对应章节）</caption>
+  <thead><tr><th>轮次</th><th>根因（暴露现象）</th><th>修复</th><th>生产验收</th></tr></thead>
+  <tbody>
+    <tr><td>§7–§8<br>探测卡死</td><td>健康探测批用 <code>thread::scope</code> 等齐全部子线程，一个卡在无超时 <code>recvfrom</code> 的线程冻结整轮（<code>probes_*</code> 双双冻结、0/226 节点有延迟数据）→ 组退化为按索引取成员 → 拨号失败率 40%。另有：组拨号绕过 Reactor、远程规则集首拉失败自锁、日志无时间戳</td><td>探测硬超时必判 + 批处理改「独立 spawn + 带超时收集」+ <code>probes_stragglers</code> 计数；组内成员全部 reactor-capable 才放行；规则集软失败 + 面板自动回滚；日志 ISO8601 时间戳</td><td>Reactor 接管 12/12；<code>relay</code> 线程 36 → 0；线程斜率（Δ线程 / Δ连接）+2.39 → −0.11；部署即恢复节点看护</td></tr>
+    <tr><td>§9<br>线程泄漏<br>（§8 回归）</td><td>被放弃的探测线程不退出 + 协议握手读没有任何超时（<code>marked_tcp_connect</code> 清掉非阻塞后未设 <code>SO_RCVTIMEO</code>）→ 553 个 probe 线程阻塞在 <code>recvfrom</code>，VmRSS 104.7 MB / VmSize 432 MB</td><td>建连即设 <code>SO_RCVTIMEO / SO_SNDTIMEO</code>、握手完成即清；<code>PROBE_MAX_LIVE=96</code> 上限封顶；<strong>拨号墙钟看门狗</strong>：deadline 到点 <code>shutdown(fd)</code> 硬截断</td><td>线程从「累积到 553」变为 18–43 波动；<code>stragglers</code> 归零（看门狗后 7 连采 0 → 25 h 0/1486）；<code>dial_errors</code> 0；看门狗线程按设计短命（正常 20 ms 内退出）</td></tr>
+    <tr><td>§10<br>粘滞 IP</td><td>粘滞 IP「只作废不重解析」：节点域名仅在解析期钉一次，失败后没有运行时路径再解析（与上游 <code>StickyIpDialer</code> 语义不符）——机场轮换入口后 63 个节点死剩 6</td><td><code>sticky::resolve_for_dial</code>：拨号时缓存命中零开销，失效 / TTL 过期即重解析；按域名计失败；仅实际换 IP 时打日志</td><td>单测 ×4（保持 / 失效重解析 / TTL / IP 直通）；组 100 成员（继承健康）；subA 端点内容变更（外部因素）由用户侧换订阅处置</td></tr>
+    <tr><td>§11<br>热重载</td><td>热重载同步拉取全部订阅（19–34 s）→ 面板 15/20 s 回执窗口超时误报；拉取失败的源被全量替换清空（113 → 22 成员）；读循环把 EOF 与读超时都当正文正常结束（截断静默通过）</td><td>reload 与拉取解耦（后台 <code>sub-refresh</code>）；按源保留成员；Content-Length 精确校验 + 读超时 ≠ EOF；订阅磁盘缓存；周期刷新 6 h±10% + 429 冷却 + 失败自愈退避；宽容读取仅作最后手段（告警）</td><td>面板回执 0.74 s（旧 19–34 s）；截断实战捕获 ×2 并自愈；重启不丢源；<code>/api/v1/sources</code> 展示每源拉取状态</td></tr>
+  </tbody>
+</table>
+
+<h3>8.2 · 修复后的生产稳态（25 h 曲线，1486 采样）</h3>
+<p>修复批次部署后连续观测 25 小时（10-10 14:15 → 10-11 15:11）：RSS 稳定在 <strong>50–53 MB 平台</strong>（小时均值 48.3 → 52.8 → 51.1，非单调上升；小时峰值 58.9 为一次 ws 帧截断风暴的瞬时值——客户端中止与网络劣化叠加，观察项）；VmSize ≈93 MB 平稳；线程 16–66；fd 常态 ≈160（风暴瞬时峰 504）；<strong>stragglers 0/1486</strong>；探测看门狗从未触发；三次热重载前后内存无跳变。<span class="sn">§11.7 修复批次重启后，RSS 瞬时值 39.4 MB / VmSize 80.9 MB / 20 线程——这是三个订阅源、百级节点成员的生产配置的自然启动水位。</span></p>
+
+<h3>8.3 · 72h 生产测试（进行中）</h3>
+<p>2026-10-11，<strong>72 小时生产测试</strong>在软路由上启动：这是 I4 长稳判据的生产侧执行（实验室侧 <code>soak-curve.sh</code> 与 <code>SOAK_SECS=259200</code> 保持独立口径）。判据：相对 1 h 基线，RSS / FD 漂移 ≤5%、失败指标零增长；叠加生产侧检查项——<code>stragglers</code> 恒 0、看门狗不触发、<code>dial_errors</code> 不增长。采样走 <code>sodama/lab/prod/health-track.sh</code>（拉取 60 s 粒度 TSV）+ <code>health-plot.py</code>（判据线内建的自包含 SVG）。<span class="sn">运行协议：测试期间不重启引擎、不触发会归零计数器的写操作；看门狗一旦动作（重启引擎）即测试作废、重新起算。24 / 48 / 72 h 三个检查点的记分板在 <code>docs/phase2-devlog.md</code> §12 按检查点回填。</span></p>
+<p>在 72 小时检查点通过之前，本项目继续<strong>不启用</strong>「bounded-memory」的绝对表述——§5.3 第 6 条（时长要诚实）从一句纪律变成了一个正在跑的工程任务。</p>
+</section>
+
+<section id="s9">
+<h2><span class="num">§9</span>复现与索引 · 命令、ADR、数据源</h2>
+
+<h3>9.1 · 复现命令</h3>
 <pre><code># 构建（loader + eBPF 对象；eBPF 需固定 nightly + bpf-linker）
 cargo build --release
 lab/build-ebpf-rs.sh
@@ -959,7 +990,7 @@ sudo lab/perf/soak-curve.sh run 3600
 # OpenWrt 交叉构建（musl 静态）
 lab/build-openwrt.sh --arch x86_64</code></pre>
 
-<h3>8.2 · ADR 索引（63 篇）</h3>
+<h3>9.2 · ADR 索引（63 篇）</h3>
 <p>ADR 记录「<em>为什么这么做</em>」，<code>parity-status.md</code> 记录「<em>做到了哪里</em>」；两处不一致时以 ADR + NOTES 实测为准。</p>
 
 <table class="tight">
@@ -977,13 +1008,14 @@ lab/build-openwrt.sh --arch x86_64</code></pre>
   </tbody>
 </table>
 
-<h3>8.3 · 数据源索引</h3>
+<h3>9.3 · 数据源索引</h3>
 <table class="tight">
   <caption>表 7 · 本图集引用的工件</caption>
   <thead><tr><th>工件</th><th>内容</th></tr></thead>
   <tbody>
     <tr><td><code>docs/parity-status.md</code> v2.14</td><td>15 域对标 + 三个口径 + 优势项 + Top 缺口</td></tr>
     <tr><td><code>docs/benchmark-report.html</code> v3.0</td><td>合并版《性能与资源边界报告》：吞吐/内存四层/FD/五万并发/长稳</td></tr>
+    <tr><td><code>docs/phase2-devlog.md</code> §1–§12</td><td>第二阶段 · 生产实战轮：四轮侦查/修复/验收 + 72h 生产测试记分板 + 附 A/B 台账</td></tr>
     <tr><td><code>docs/reviews/2026-10-05-i1-system-memory-data.md</code></td><td>系统内存四层模型原始数据与口径</td></tr>
     <tr><td><code>docs/reviews/2026-10-05-memory-final-review-a.md</code> / <code>-b.md</code></td><td>第三方评审原文（含 pipe 容量推算质疑）</td></tr>
     <tr><td><code>docs/reviews/2026-10-05-i3-forwarding-primitives.md</code></td><td>splice / copy pump / io_uring 三档选型</td></tr>
@@ -992,6 +1024,7 @@ lab/build-openwrt.sh --arch x86_64</code></pre>
     <tr><td><code>docs/openwrt.md</code> · <code>docs/deploy.md</code></td><td>内核 fragment/CAP 要求/逐项排障 · systemd 与安装</td></tr>
     <tr><td><code>docs/notes/</code></td><td>生产事故复盘 · 部署笔记 · 软路由实录（部分含敏感信息，不入库）</td></tr>
     <tr><td><code>sodama/lab/perf/</code></td><td>run.sh · scaling.sh · mem.sh · mem-system.sh · soak-curve.sh · udp.sh · real.sh</td></tr>
+    <tr><td><code>sodama/lab/prod/</code></td><td>生产健康曲线：health-track.sh（pull/plot/status）· health-plot.py（TSV → 自包含 SVG）</td></tr>
   </tbody>
 </table>
 </section>
@@ -1008,11 +1041,13 @@ lab/build-openwrt.sh --arch x86_64</code></pre>
   <li id="fn7"><code>docs/adr/ADR-0058-m4-reactor.md</code>——epoll worker 池、stage 1/2 划分、io_uring A/B 结论与关闭开关。</li>
   <li id="fn8"><code>docs/adr/ADR-0025-remove-c-datapath.md</code>——C 数据面退役；配合 ADR-0023/0024 的两阶段迁移。</li>
   <li id="fn9"><code>docs/adr/ADR-0062-p35-inotify-fast-reload-config-source-of-truth.md</code>——配置文件作为唯一事实来源与 inotify 毫秒级热驱动；配合 ADR-0061/0063。</li>
+  <li id="fn10"><code>docs/phase2-devlog.md</code>（§1–§12，2026-10-08 起）——第二阶段 · 生产实战轮：四轮侦查/修复/验收的完整证据、72h 生产测试记分板与附 A/B 台账。</li>
 </ol>
 </section>
 
 <div class="colophon">
-  <p><strong>SODAMA ATLAS</strong> · 全 Rust 代理数据面开发研究图集 · v1.0 · 2026-10-08 · 对应代码 <code>main@d99a349</code>。</p>
+  <p><strong>SODAMA ATLAS</strong> · 全 Rust 代理数据面开发研究图集 · v1.1 · 2026-10-11 · 对应代码 <code>main@1e1906d</code>（第二阶段修复批次 §11.7 后）。</p>
+  <p>v1.1 增量：<a href="#s8">§8 · 第二阶段 · 生产实战轮</a>——四轮生产侦查/修复的收口结论、修复后 25 h 稳态与进行中的 72h 生产测试；原始证据见 <code>docs/phase2-devlog.md</code>。</p>
   <p>本图集为单文件 HTML，样式与图表全部内联（SVG），无外部依赖。排版遵循 Tufte 式书卷原则：正文窄栏、边注旁置、数据优先、表格无竖线、图表与正文同宽、克制用色。</p>
   <p>所有数字均为本机或真实环境实测，未做外推；所有「未做」项均显式登记。口径与边界见 §5.3。项目以 AGPL-3.0 授权（许可证头一致性审计待办，见 §7 A8）。</p>
 </div>
@@ -1023,7 +1058,7 @@ lab/build-openwrt.sh --arch x86_64</code></pre>
 <div class="classbar bottom">
   <span class="cls">密级 · 最高</span>
   <span>SODAMA ATLAS · 内部研究档案 · 未经许可不得外传</span>
-  <span class="push">v1.0 · 2026-10-08</span>
+  <span class="push">v1.1 · 2026-10-11</span>
 </div>
 
 </body>
