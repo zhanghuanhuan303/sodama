@@ -167,7 +167,7 @@ impl Health {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Member {
     pub name: String,
     pub tag: String,
@@ -443,6 +443,17 @@ impl GroupRuntime {
             Err(p) => *p.into_inner() = new_inner,
         }
         (n, inherited)
+    }
+
+    /// P0（2026-10-11）：按 tag 克隆组内成员（订阅热更新的「按源保留」用：
+    /// 拉取失败的来源沿用旧成员，成功的来源整体替换）。
+    pub fn clone_members_by_tag(&self, tags: &[String]) -> Vec<Member> {
+        self.inner()
+            .members
+            .iter()
+            .filter(|m| tags.iter().any(|t| t == &m.tag))
+            .cloned()
+            .collect()
     }
 
     fn health_lock(inner: &GroupInner) -> std::sync::MutexGuard<'_, Vec<Health>> {

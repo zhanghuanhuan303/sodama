@@ -65,6 +65,10 @@ fn sockaddr_in_of(addr: SocketAddr) -> Option<libc::sockaddr_in> {
 /// 带 SO_MARK 的 TCP 连接（非阻塞 connect + poll 超时）。
 /// 数据面（sodama_wan_egress/sodama_lan_ingress）见 mark 直接放行，避免代理出口自环。
 pub fn marked_tcp_connect(addr: SocketAddr, timeout: Duration) -> io::Result<TcpStream> {
+    // P0（2026-10-11）：域名节点每次拨号过粘滞缓存——作废/TTL 到期即重新解析
+    // （旧实现只在解析期固定一次，机场轮换入口后节点永远钉在旧 IP 上）。
+    // 非域名源（不在 origin 表）与仍有效的钉选原地址直通，零网络开销。
+    let addr = crate::sticky::resolve_for_dial(addr);
     let (family, storage, sa_len) = match addr {
         SocketAddr::V4(_) => {
             let sin = sockaddr_in_of(addr).unwrap();

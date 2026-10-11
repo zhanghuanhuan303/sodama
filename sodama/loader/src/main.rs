@@ -1130,6 +1130,7 @@ struct SodaRedirectEntry {
 }
 unsafe impl aya::Pod for SodaRedirectEntry {}
 
+#[derive(Clone)]
 struct Args {
     ebpf: String,
     /// LAN 侧接口（ingress 分流）；`--lan none` = 不挂 LAN 钩子（纯本机网关）
@@ -3727,7 +3728,10 @@ fn do_reload(args: &Args, ebpf: &mut Ebpf, startup: bool, fast: bool) -> ReloadO
             // 监听线程尚未启动，重拉时解析节点域名会被自己的数据面拦截并自我阻塞
             // （getaddrinfo 超时卡死启动，钩子空挂 → 断网；重启后 DNS 缓存为空必现）。
             if !startup {
-                reload_group_members(args, fast);
+                // P0（2026-10-11）：本地部分（policy/组结构）随 reload 立即生效；
+                // 订阅拉取与成员替换转入后台——reload 回执不再等待网络（旧实现可达 34s）。
+                apply_group_policy_local(args);
+                request_sub_refresh(args, fast);
             }
             log(&format!("热重载完成（{n} 条 match_set）"));
             // P33：运行时参数热更新（CLI > config > 现值；仅变更时记日志）。
@@ -4142,92 +4146,368 @@ fn cache_put_sub(url: &str, nodes: &[subscribe::ParsedNode]) {
     );
 }
 
+/// P0（2026-10-11）：内存缓存里上次成功拉取的节点数（节点数骤降告警用）。
+fn cache_peek_count(url: &str) -> Option<usize> {
+    let cache = SUB_NODE_CACHE.get()?;
+    let m = match cache.lock() {
+        Ok(m) => m,
+        Err(p) => p.into_inner(),
+    };
+    m.get(url).map(|(_, nodes)| nodes.len())
+}
+
+/// 人类可读的时长（"42s"/"3min"/"2h"）。
+fn fmt_age_secs(s: u64) -> String {
+    if s < 90 {
+        format!("{s}s")
+    } else if s < 5400 {
+        format!("{}min", s / 60)
+    } else {
+        format!("{}h", s / 3600)
+    }
+}
+
 /// P34：拉取单个订阅并解析（失败记日志返回空；rank = 来源顺序）。
-/// P35：`fast`（watch 触发的自动 reload）命中缓存时不重走网络——改订阅顺序/开关源秒级生效；
+/// P35：`fast`（watch 触发的自动 reload）命中内存缓存时不重走网络；
 /// 手动 reload/SIGHUP 传 `fast=false` 强制重拉（P18e 语义）。
+/// P0（2026-10-11）：失败时回退磁盘缓存（最近一次成功正文）、登记来源状态；
+/// 429（限流）触发冷却——冷却期内不再打网络，直接用缓存。
 fn fetch_one_sub(
     tag: &str,
     url: &str,
     rank: u32,
     timeout: Duration,
     fast: bool,
+    cfg_dir: Option<&Path>,
 ) -> Vec<subscribe::ParsedNode> {
+    let mk_status = |ok: bool, error: Option<String>, nodes: usize, source: &'static str| {
+        subscribe::record_source_status(subscribe::SourceStatus {
+            tag: tag.to_string(),
+            rank,
+            at_sec: unix_now_sec(),
+            ok,
+            error,
+            nodes,
+            fails: 0, // record_source_status 会按前一条状态累计
+            source,
+        });
+    };
     if fast {
         if let Some(ns) = cache_get_sub(url, tag, rank) {
+            mk_status(true, None, ns.len(), "memory");
             return ns;
         }
     }
-    match subscribe::fetch(url, timeout).and_then(|b| subscribe::decode_body(&b)) {
-        Ok(text) => {
-            let (mut ns, errs) = subscribe::parse_subscription(&text, tag);
-            for e in errs.iter().take(3) {
-                log(&format!("订阅 {tag}: {e}"));
+    let mut last_err: Option<String> =
+        subscribe::cooldown_remaining(url).map(|remain| format!("限流冷却中（剩 {remain}s）"));
+    if last_err.is_none() {
+        // P0（2026-10-11）：链路截断是概率性的（生产实测：同一源分钟级内时好时坏），
+        // 单次失败不放弃——最多重试 3 次（间隔 0.6s / 1.2s）。
+        for attempt in 1..=3u32 {
+            match subscribe::fetch(url, timeout)
+                .and_then(|b| subscribe::decode_body(&b).map(|t| (b, t)))
+            {
+                Ok((body, text)) => {
+                let (mut ns, errs) = subscribe::parse_subscription(&text, tag);
+                for e in errs.iter().take(3) {
+                    log(&format!("订阅 {tag}: {e}"));
+                }
+                if errs.len() > 3 {
+                    log(&format!("订阅 {tag}: 另有 {} 行不支持", errs.len() - 3));
+                }
+                if ns.is_empty() {
+                    last_err = Some("解析结果为空".into());
+                } else {
+                    // 节点数骤降告警（截断被 CL 校验兜住后的第二道可见性；仅告警不拒绝）。
+                    if let Some(prev) = cache_peek_count(url) {
+                        if prev >= 8 && ns.len() * 2 < prev {
+                            log(&format!(
+                                "订阅 {tag}: 警告：节点数骤降 {prev} -> {}（疑似截断/套餐变更，请留意）",
+                                ns.len()
+                            ));
+                        }
+                    }
+                    for n in &mut ns {
+                        n.rank = rank;
+                    }
+                    log(&format!(
+                        "订阅 {tag}: 拉取成功，{} 个节点（来源顺序 #{rank}）",
+                        ns.len()
+                    ));
+                    cache_put_sub(url, &ns);
+                    if let Some(dir) = cfg_dir {
+                        if let Err(e) = subscribe::disk_store(dir, tag, &body) {
+                            log(&format!("订阅 {tag}: 磁盘缓存写入失败: {e}"));
+                        }
+                    }
+                    mk_status(true, None, ns.len(), "net");
+                    return ns;
+                }
             }
-            if errs.len() > 3 {
-                log(&format!("订阅 {tag}: 另有 {} 行不支持", errs.len() - 3));
+                Err(e) => {
+                    let es = e.to_string();
+                    subscribe::note_fetch_error(url, &es);
+                    if attempt < 3 {
+                        log(&format!("订阅 {tag}: 第 {attempt} 次拉取失败（{es}），重试…"));
+                        std::thread::sleep(Duration::from_millis(600 * attempt as u64));
+                    }
+                    last_err = Some(es);
+                }
             }
-            for n in &mut ns {
-                n.rank = rank;
-            }
-            log(&format!(
-                "订阅 {tag}: 拉取成功，{} 个节点（来源顺序 #{rank}）",
-                ns.len()
-            ));
-            cache_put_sub(url, &ns);
-            ns
-        }
-        Err(e) => {
-            log(&format!("订阅 {tag} 拉取失败: {e}"));
-            Vec::new()
         }
     }
+    // 失败回退：磁盘缓存（最近一次成功正文，含凭据，权限 0600）。
+    if let Some(dir) = cfg_dir {
+        if let Some((body, age)) = subscribe::disk_load(dir, tag) {
+            if let Ok(text) = subscribe::decode_body(&body) {
+                let (mut ns, _errs) = subscribe::parse_subscription(&text, tag);
+                if !ns.is_empty() {
+                    for n in &mut ns {
+                        n.rank = rank;
+                    }
+                    log(&format!(
+                        "订阅 {tag}: 拉取失败（{}），回退磁盘缓存（{}前抓取，{} 个节点）",
+                        last_err.clone().unwrap_or_default(),
+                        fmt_age_secs(age),
+                        ns.len()
+                    ));
+                    mk_status(true, last_err, ns.len(), "disk");
+                    return ns;
+                }
+            }
+        }
+    }
+    // 最后手段：截断宽容重取一次（仅当上面全部失败——首跑无缓存 + 链路持续截断时
+    // 的可用性兜底；解出的部分节点仍会经健康探测自我验证，不写磁盘缓存以免污染
+    // “上次完整副本”）。
+    if last_err.is_some() {
+        if let Ok(body) = subscribe::fetch_lenient(url, timeout) {
+            if let Ok(text) = subscribe::decode_body(&body) {
+                let (mut ns, _errs) = subscribe::parse_subscription(&text, tag);
+                if !ns.is_empty() {
+                    for n in &mut ns {
+                        n.rank = rank;
+                    }
+                    log(&format!(
+                        "订阅 {tag}: 警告：仅取得不完整正文（{} 字节，{} 个节点）——为可用性放行（截断容错）",
+                        body.len(),
+                        ns.len()
+                    ));
+                    cache_put_sub(url, &ns);
+                    mk_status(true, Some("截断容错：正文不完整".into()), ns.len(), "net");
+                    return ns;
+                }
+            }
+        }
+    }
+    let e = last_err.unwrap_or_else(|| "未知错误".into());
+    log(&format!("订阅 {tag} 拉取失败: {e}"));
+    mk_status(false, Some(e), 0, "net");
+    Vec::new()
 }
 
-/// 拉取内联节点 + 全部订阅（config subscription 与 CLI `--subscribe`）——
-/// 组构建与 SIGHUP 订阅热更新共用。
+/// P0（2026-10-11）：按来源返回的拉取结果（「按源保留」语义需要区分来源成败）。
+struct SourceFetch {
+    tag: String,
+    rank: u32,
+    ok: bool,
+    nodes: Vec<subscribe::ParsedNode>,
+}
+
+/// 拉取内联节点 + 全部订阅，**按来源**返回（组构建 / 订阅热更新共用）。
 /// P34：来源顺序 = 内联 node(0) → CLI --subscribe(1..) → config subscription(声明顺序)；
 /// 顺序回退（pacman 风格，`subscription_failover` 默认开）：前面来源有活节点就用它。
 /// P35：`fast` 见 `fetch_one_sub`（watch 自动 reload 走缓存）。
-fn fetch_nodes(
-    cfg: Option<&config::Config>,
-    args: &Args,
-    fast: bool,
-) -> Vec<subscribe::ParsedNode> {
+fn fetch_sources(cfg: Option<&config::Config>, args: &Args, fast: bool) -> Vec<SourceFetch> {
     let node_specs = cfg.map(config::inline_nodes).unwrap_or_default();
     let sub_specs = cfg.map(config::subscriptions).unwrap_or_default();
-    let mut nodes: Vec<subscribe::ParsedNode> = Vec::new();
-    for n in &node_specs {
-        match outbound::parse(&n.link) {
-            Ok(o) => nodes.push(subscribe::ParsedNode {
-                name: n.name.clone(),
-                tag: "node".into(),
-                rank: 0,
-                outbound: o,
-            }),
-            Err(e) => log(&format!("节点 {} 不支持: {e}", n.name)),
-        }
-    }
     let timeout = Duration::from_secs(15);
     let cfg_dir = args
         .config
         .as_deref()
         .map(Path::new)
         .and_then(|p| p.parent());
+    // 清理已不在配置里的来源状态（删源后不留幽灵条目）。
+    let mut live: Vec<String> = Vec::new();
+    if !node_specs.is_empty() {
+        live.push("node".into());
+    }
+    live.extend((1..=args.subscribe.len()).map(|i| format!("cli{i}")));
+    live.extend(sub_specs.iter().map(|s| s.tag.clone()));
+    subscribe::prune_source_status(&live);
+    let mut out: Vec<SourceFetch> = Vec::new();
+    if !node_specs.is_empty() {
+        let mut nodes = Vec::new();
+        for n in &node_specs {
+            match outbound::parse(&n.link) {
+                Ok(o) => nodes.push(subscribe::ParsedNode {
+                    name: n.name.clone(),
+                    tag: "node".into(),
+                    rank: 0,
+                    outbound: o,
+                }),
+                Err(e) => log(&format!("节点 {} 不支持: {e}", n.name)),
+            }
+        }
+        let ok = !nodes.is_empty();
+        out.push(SourceFetch {
+            tag: "node".into(),
+            rank: 0,
+            ok,
+            nodes,
+        });
+    }
     let mut rank = 1u32;
     for (i, raw) in args.subscribe.iter().enumerate() {
         let tag = format!("cli{}", i + 1);
         let url = resolve_sub_url(None, raw);
-        let mut ns = fetch_one_sub(&tag, &url, rank, timeout, fast);
-        nodes.append(&mut ns);
+        let nodes = fetch_one_sub(&tag, &url, rank, timeout, fast, cfg_dir);
+        out.push(SourceFetch {
+            tag,
+            rank,
+            ok: !nodes.is_empty(),
+            nodes,
+        });
         rank += 1;
     }
     for s in &sub_specs {
         let url = resolve_sub_url(cfg_dir, &s.url);
-        let mut ns = fetch_one_sub(&s.tag, &url, rank, timeout, fast);
-        nodes.append(&mut ns);
+        let nodes = fetch_one_sub(&s.tag, &url, rank, timeout, fast, cfg_dir);
+        out.push(SourceFetch {
+            tag: s.tag.clone(),
+            rank,
+            ok: !nodes.is_empty(),
+            nodes,
+        });
         rank += 1;
     }
-    nodes
+    out
+}
+
+/// 兼容旧调用方：扁平化全部来源的节点（启动期组构建）。
+fn fetch_nodes(cfg: Option<&config::Config>, args: &Args, fast: bool) -> Vec<subscribe::ParsedNode> {
+    fetch_sources(cfg, args, fast)
+        .into_iter()
+        .flat_map(|s| s.nodes)
+        .collect()
+}
+
+/// P0（2026-10-11）：组 policy 本地热应用（不依赖任何订阅网络拉取）。
+/// 背景：旧实现把 policy 应用塞在订阅热更新里，且「全源拉取失败」时早退——
+/// 控制面板「手动切节点/恢复自动」会静默不生效（生产实测，见 §11）。
+fn apply_group_policy_local(args: &Args) {
+    let Some(lock) = GROUP_SET.get() else {
+        return;
+    };
+    let Some(cfg) = args
+        .config
+        .as_ref()
+        .and_then(|p| config::load(std::path::Path::new(p)).ok())
+    else {
+        return;
+    };
+    let group_specs = config::groups(&cfg);
+    if group_specs.is_empty() {
+        return;
+    }
+    let g = match lock.write() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    for spec in &group_specs {
+        let want = group::parse_policy(spec.policy.as_deref());
+        if let Some(rt) = g.groups.iter().find(|rt| rt.name == spec.name) {
+            if *rt.policy() != want {
+                log(&format!(
+                    "热重载：组 {} policy -> {}",
+                    spec.name,
+                    group::policy_name(&want)
+                ));
+                rt.set_policy(want);
+            }
+        }
+    }
+}
+
+/// P0（2026-10-11）：订阅热更新从 reload 关键路径解耦。
+/// reload 立即返回回执；本函数把「拉取订阅 + 替换成员」投递到常驻后台线程，
+/// 同一时刻最多一轮拉取；排队中的请求自动合并（fast 语义：任一强制重拉即强制）。
+static SUB_REFRESH_TX: std::sync::OnceLock<std::sync::mpsc::Sender<bool>> =
+    std::sync::OnceLock::new();
+
+fn request_sub_refresh(args: &Args, fast: bool) {
+    let tx = SUB_REFRESH_TX.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<bool>();
+        let args = args.clone();
+        let _ = std::thread::Builder::new()
+            .name("sub-refresh".into())
+            .stack_size(512 * 1024)
+            .spawn(move || {
+                while let Ok(mut fast) = rx.recv() {
+                    while let Ok(f2) = rx.try_recv() {
+                        fast = fast && f2;
+                    }
+                    log(&format!("订阅热更新：后台开始拉取（fast={fast}）"));
+                    reload_group_members(&args, fast);
+                    log("订阅热更新：本轮后台拉取结束");
+                }
+            });
+        tx
+    });
+    if tx.send(fast).is_err() {
+        log("订阅热更新：后台线程已退出（发送失败）");
+    }
+}
+
+/// P1（2026-10-11）：订阅读周期刷新（对照 Clash 的 interval；dae 无此物）。
+/// `global.subscription_update_interval`（秒；默认 21600 = 6h；0 = 关闭），±10% 抖动。
+fn spawn_subscription_scheduler(args: &Args) {
+    let cfg = args
+        .config
+        .as_ref()
+        .and_then(|p| config::load(std::path::Path::new(p)).ok());
+    let has_cfg_subs = cfg
+        .as_ref()
+        .map(|c| !config::subscriptions(c).is_empty())
+        .unwrap_or(false);
+    if args.subscribe.is_empty() && !has_cfg_subs {
+        return;
+    }
+    let interval = cfg
+        .as_ref()
+        .and_then(|c| config::global_value(c, "subscription_update_interval"))
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(21600);
+    if interval == 0 {
+        log("订阅周期刷新: 已关闭（subscription_update_interval = 0）");
+        return;
+    }
+    let args = args.clone();
+    let _ = std::thread::Builder::new()
+        .name("sub-timer".into())
+        .spawn(move || {
+            let jitter = (interval / 10).max(1);
+            let mut next_periodic =
+                unix_now_sec() + interval - jitter / 2 + rand::random::<u64>() % jitter;
+            loop {
+                std::thread::sleep(Duration::from_secs(60));
+                let now = unix_now_sec();
+                // P1（2026-10-11）：失败源自愈重试（退避 5min→1h；429 冷却仍然生效）。
+                if subscribe::sources_need_retry(now) {
+                    log("订阅自动重试：失败源已到退避窗口，重新拉取");
+                    request_sub_refresh(&args, false);
+                }
+                if now >= next_periodic {
+                    log(&format!("订阅周期刷新: 触发（间隔 {interval}s）"));
+                    request_sub_refresh(&args, false);
+                    let jitter = (interval / 10).max(1);
+                    next_periodic = now + interval - jitter / 2 + rand::random::<u64>() % jitter;
+                }
+            }
+        });
+    log(&format!(
+        "订阅周期刷新: 已启用（每 {interval}s ±10%，失败源 5min→1h 退避自愈）"
+    ));
 }
 
 /// P18e/P19：SIGHUP 订阅热更新——重拉订阅，按组 filter 替换成员（同名继承健康）。
@@ -4243,11 +4523,31 @@ fn reload_group_members(args: &Args, fast: bool) {
             })
             .ok()
     });
-    let nodes = fetch_nodes(cfg.as_ref(), args, fast);
-    if nodes.is_empty() {
-        log("订阅热更新：未获得任何节点，保留旧成员");
+    let sources = fetch_sources(cfg.as_ref(), args, fast);
+    let ok_count = sources.iter().filter(|s| s.ok).count();
+    log(&format!(
+        "订阅热更新：拉取完成（{ok_count}/{} 源成功）",
+        sources.len()
+    ));
+    if ok_count == 0 {
+        log("订阅热更新：全部来源拉取失败，保留旧成员");
         return;
     }
+    // P0（2026-10-11）：按源保留——只有「拉取失败」的来源沿用旧成员（转换为
+    // ParsedNode 后与成功来源一起过组过滤器）；成功来源整体替换；从配置删除的
+    // 来源不在 sources 里，自然丢弃（旧实现：任何源失败即全量替换 → 该源被清空）。
+    let rank_of: std::collections::HashMap<String, u32> =
+        sources.iter().map(|s| (s.tag.clone(), s.rank)).collect();
+    let failed: Vec<String> = sources
+        .iter()
+        .filter(|s| !s.ok)
+        .map(|s| s.tag.clone())
+        .collect();
+    let nodes: Vec<subscribe::ParsedNode> = sources
+        .iter()
+        .filter(|s| s.ok)
+        .flat_map(|s| s.nodes.iter().cloned())
+        .collect();
     let group_specs = cfg.as_ref().map(config::groups).unwrap_or_default();
     let specs: Vec<(String, Option<config::GroupSpec>)> = if group_specs.is_empty() {
         vec![("proxy".to_string(), None)]
@@ -4266,7 +4566,21 @@ fn reload_group_members(args: &Args, fast: bool) {
     if old_names == new_names {
         for (i, (name, spec)) in specs.iter().enumerate() {
             let filters = spec.as_ref().map(|s| s.filters.clone()).unwrap_or_default();
-            let members = group::build_members(&nodes, &filters);
+            // P0：失败来源的旧成员转回 ParsedNode，与成功来源一起过滤/排序。
+            let mut all_nodes = nodes.clone();
+            if !failed.is_empty() {
+                for m in g.groups[i].clone_members_by_tag(&failed) {
+                    let rank = rank_of.get(&m.tag).copied().unwrap_or(m.rank);
+                    all_nodes.push(subscribe::ParsedNode {
+                        name: m.name,
+                        tag: m.tag,
+                        rank,
+                        outbound: m.outbound,
+                    });
+                }
+            }
+            let carried = all_nodes.len() - nodes.len();
+            let members = group::build_members(&all_nodes, &filters);
             if members.is_empty() {
                 log(&format!(
                     "订阅热更新：组 {name} filter 后无成员，保留旧成员"
@@ -4284,7 +4598,12 @@ fn reload_group_members(args: &Args, fast: bool) {
                 g.groups[i].set_policy(want);
             }
             log(&format!(
-                "订阅热更新：组 {name} {n} 成员（继承 {inherited} 健康）"
+                "订阅热更新：组 {name} {n} 成员（继承 {inherited} 健康{carried_note}）",
+                carried_note = if carried > 0 {
+                    format!("；沿用失败源 {carried} 成员")
+                } else {
+                    String::new()
+                }
             ));
         }
     } else {
@@ -5071,6 +5390,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             secs
         ));
     }
+    // P1（2026-10-11）：订阅读周期刷新（后台；默认 6h，见 global.subscription_update_interval）。
+    spawn_subscription_scheduler(&args);
     let _keep_tx = status_tx;
 
     // P3a：DNS 线程在 host ns（回包直接从宿主接口发向客户端；监听 fd 来自 daens）。
@@ -7326,6 +7647,7 @@ fn status_json(ebpf: &mut Ebpf) -> serde_json::Value {
         },
         "domain_stats": snapshot_domain_stats(),
         "rule_sets": rule_sets_json(),
+        "subscriptions": subscribe::source_status_json(),
         "dialer": match OUTBOUND.get() {
             Some(o) => o.name(),
             None => "none".to_string(),

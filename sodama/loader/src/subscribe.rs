@@ -46,7 +46,7 @@ fn url_file_target(body: &[u8]) -> Option<&str> {
 pub fn fetch(url: &str, timeout: Duration) -> io::Result<Vec<u8>> {
     let mut cur = url.to_string();
     for _ in 0..=MAX_REDIRECTS {
-        match fetch_once(&cur, timeout)? {
+        match fetch_once(&cur, timeout, false)? {
             Fetch::Body(b) => return Ok(b),
             Fetch::Redirect(loc) => cur = resolve_location(&cur, &loc)?,
         }
@@ -54,12 +54,30 @@ pub fn fetch(url: &str, timeout: Duration) -> io::Result<Vec<u8>> {
     Err(io::Error::other(format!("订阅重定向过多: {url}")))
 }
 
+/// P0（2026-10-11）：**截断宽容模式**（最后手段）。
+///
+/// 严格模式（`fetch`）对正文完整性把关（CL/超时/换行），但首次部署且无磁盘缓存时，
+/// 持续截断的链路会让引擎“零节点启动”（生产实测：15:35 双源截断 → dialer=none）。
+/// 本函数仅在上游全部失败且无缓存可用时作为最后手段，接受不完整正文——
+/// 解出的部分节点仍会经健康探测自我验证。调用方必须记警告日志。
+pub fn fetch_lenient(url: &str, timeout: Duration) -> io::Result<Vec<u8>> {
+    let mut cur = url.to_string();
+    for _ in 0..=MAX_REDIRECTS {
+        match fetch_once(&cur, timeout, true)? {
+            Fetch::Body(b) => return Ok(b),
+            Fetch::Redirect(loc) => cur = resolve_location(&cur, &loc)?,
+        }
+    }
+    Err(io::Error::other(format!("订阅重定向过多: {url}")))
+}
+
+#[derive(Debug)]
 enum Fetch {
     Body(Vec<u8>),
     Redirect(String),
 }
 
-fn fetch_once(url: &str, timeout: Duration) -> io::Result<Fetch> {
+fn fetch_once(url: &str, timeout: Duration, lenient: bool) -> io::Result<Fetch> {
     if let Some(path) = url.strip_prefix("file://") {
         let body = std::fs::read(path)?;
         if let Some(target) = url_file_target(&body) {
@@ -121,6 +139,7 @@ fn fetch_once(url: &str, timeout: Duration) -> io::Result<Fetch> {
     writer.flush()?;
     let mut raw = Vec::new();
     let mut buf = [0u8; 16384];
+    let mut timed_out = false;
     loop {
         match buf_reader.read(&mut buf) {
             Ok(0) => break,
@@ -133,12 +152,15 @@ fn fetch_once(url: &str, timeout: Duration) -> io::Result<Fetch> {
             Err(e)
                 if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut =>
             {
-                break
+                // 读超时不再当作「正文正常结束」——交给 parse_http_response 结合
+                // Content-Length/换行收尾判定是否截断（P0，2026-10-11：截断曾静默通过）。
+                timed_out = true;
+                break;
             }
             Err(e) => return Err(e),
         }
     }
-    parse_http_response(&raw)
+    parse_http_response(&raw, timed_out, lenient)
 }
 
 fn parse_http_url(url: &str) -> io::Result<(bool, String, u16, String)> {
@@ -200,7 +222,7 @@ fn resolve_location(base: &str, loc: &str) -> io::Result<String> {
     ))
 }
 
-fn parse_http_response(raw: &[u8]) -> io::Result<Fetch> {
+fn parse_http_response(raw: &[u8], timed_out: bool, lenient: bool) -> io::Result<Fetch> {
     let pos = raw
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
@@ -218,6 +240,8 @@ fn parse_http_response(raw: &[u8]) -> io::Result<Fetch> {
     let mut location = None;
     let mut chunked = false;
     let mut gzip = false;
+    let mut content_length: Option<usize> = None;
+    let mut retry_after: Option<String> = None;
     for l in lines {
         let Some((k, v)) = l.split_once(':') else {
             continue;
@@ -228,6 +252,8 @@ fn parse_http_response(raw: &[u8]) -> io::Result<Fetch> {
             "location" => location = Some(v.to_string()),
             "transfer-encoding" if v.to_ascii_lowercase().contains("chunked") => chunked = true,
             "content-encoding" if v.to_ascii_lowercase().contains("gzip") => gzip = true,
+            "content-length" => content_length = v.parse().ok(),
+            "retry-after" => retry_after = Some(v.to_string()),
             _ => {}
         }
     }
@@ -241,7 +267,11 @@ fn parse_http_response(raw: &[u8]) -> io::Result<Fetch> {
         return Ok(Fetch::Redirect(loc));
     }
     if !(200..300).contains(&code) {
-        return Err(io::Error::other(format!("订阅 HTTP 状态 {code}")));
+        // 429（限流）带 Retry-After 原样透传，供上层做冷却与诊断（P1，2026-10-11）。
+        let extra = retry_after
+            .map(|r| format!("；Retry-After: {r}"))
+            .unwrap_or_default();
+        return Err(io::Error::other(format!("订阅 HTTP 状态 {code}{extra}")));
     }
     if gzip {
         return Err(io::Error::new(
@@ -253,6 +283,29 @@ fn parse_http_response(raw: &[u8]) -> io::Result<Fetch> {
     let body = if chunked {
         decode_chunked(body)?
     } else {
+        // P0（2026-10-11）：截断完整性——旧实现把 EOF/读超时都当正文正常结束，
+        // 半截订阅会被静默当成功（生产实测 50 节点被截成 22）。
+        // ① 有 Content-Length：必须精确匹配；
+        // ② 无 CL 且因读超时结束、且正文无换行收尾 —— 高度可疑的截断。
+        // `lenient`（最后手段）时不做①②，正文原样返回（调用方记警告）。
+        if !lenient {
+            if let Some(cl) = content_length {
+                if body.len() != cl {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("HTTP 正文不完整（{}/{} 字节，疑似截断）", body.len(), cl),
+                    ));
+                }
+            } else if timed_out && !body.is_empty() && !body.ends_with(b"\n") {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "HTTP 正文读取超时且无换行收尾（{} 字节，疑似截断）",
+                        body.len()
+                    ),
+                ));
+            }
+        }
         body.to_vec()
     };
     Ok(Fetch::Body(body))
@@ -334,6 +387,185 @@ pub fn decode_body(body: &[u8]) -> io::Result<String> {
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("订阅正文非 UTF-8: {e}")))
 }
 
+// ---------------------------------------------------------------- P0（2026-10-11）
+// 订阅源状态 / 磁盘缓存 / 限流冷却——均**不含 URL/token**，供状态面与面板展示。
+
+/// 单个订阅源最近一次拉取的状态。
+#[derive(Clone)]
+pub struct SourceStatus {
+    pub tag: String,
+    pub rank: u32,
+    pub at_sec: u64,
+    pub ok: bool,
+    pub error: Option<String>,
+    pub nodes: usize,
+    /// 连续失败次数（成功清零；自愈重试的退避依据）。
+    pub fails: u32,
+    /// net（网络）/ disk（磁盘缓存回退）/ memory（内存缓存）/ cooldown（限流冷却）
+    pub source: &'static str,
+}
+
+fn source_status_map() -> &'static std::sync::Mutex<Vec<SourceStatus>> {
+    static S: std::sync::OnceLock<std::sync::Mutex<Vec<SourceStatus>>> = std::sync::OnceLock::new();
+    S.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+pub fn record_source_status(mut st: SourceStatus) {
+    let mut m = match source_status_map().lock() {
+        Ok(m) => m,
+        Err(p) => p.into_inner(),
+    };
+    if let Some(prev) = m.iter().find(|x| x.tag == st.tag).cloned() {
+        // 连续失败计数：失败叠加（success/disk 回退均视为“拿到数据”，归零）。
+        st.fails = if st.ok { 0 } else { prev.fails.saturating_add(1) };
+        if let Some(slot) = m.iter_mut().find(|x| x.tag == st.tag) {
+            *slot = st;
+        }
+    } else {
+        st.fails = if st.ok { 0 } else { 1 };
+        m.push(st);
+    }
+}
+
+/// P1（2026-10-11）：自愈重试判据——是否有失败源按退避到期（需重新拉取）。
+/// 退避：300s · 2^(fails-1)，封顶 3600s（首次失败 5 分钟后重试）。
+pub fn sources_need_retry(now_sec: u64) -> bool {
+    let m = match source_status_map().lock() {
+        Ok(m) => m,
+        Err(p) => p.into_inner(),
+    };
+    m.iter().any(|s| {
+        if s.ok {
+            return false;
+        }
+        let shift = s.fails.saturating_sub(1).min(4);
+        let backoff = (300u64 << shift).min(3600);
+        now_sec >= s.at_sec.saturating_add(backoff)
+    })
+}
+
+/// 配置里已不存在的来源从状态表移除（删源后不留幽灵条目）。
+pub fn prune_source_status(keep: &[String]) {
+    let mut m = match source_status_map().lock() {
+        Ok(m) => m,
+        Err(p) => p.into_inner(),
+    };
+    m.retain(|s| keep.iter().any(|k| k == &s.tag));
+}
+
+pub fn source_status_json() -> serde_json::Value {
+    let m = match source_status_map().lock() {
+        Ok(m) => m,
+        Err(p) => p.into_inner(),
+    };
+    serde_json::Value::Array(
+        m.iter()
+            .map(|s| {
+                serde_json::json!({
+                    "tag": s.tag,
+                    "rank": s.rank,
+                    "at_sec": s.at_sec,
+                    "ok": s.ok,
+                    "error": s.error,
+                    "nodes": s.nodes,
+                    "fails": s.fails,
+                    "source": s.source,
+                })
+            })
+            .collect(),
+    )
+}
+
+/// 限流冷却：收到 429 后短期不再打网络（回退内存/磁盘缓存），避免火上浇油。
+const COOLDOWN_429_SECS: u64 = 15 * 60;
+
+fn cooldown_map() -> &'static std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>> {
+    static C: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>> =
+        std::sync::OnceLock::new();
+    C.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// 记录一次拉取错误；429（含 Retry-After 文本）触发本 URL 的冷却。
+pub fn note_fetch_error(url: &str, err: &str) {
+    if err.contains("429") {
+        let mut m = match cooldown_map().lock() {
+            Ok(m) => m,
+            Err(p) => p.into_inner(),
+        };
+        m.insert(url.to_string(), std::time::Instant::now());
+    }
+}
+
+/// 冷却剩余秒数（None = 未冷却）。
+pub fn cooldown_remaining(url: &str) -> Option<u64> {
+    let m = match cooldown_map().lock() {
+        Ok(m) => m,
+        Err(p) => p.into_inner(),
+    };
+    let at = m.get(url)?;
+    let elapsed = at.elapsed().as_secs();
+    if elapsed >= COOLDOWN_429_SECS {
+        return None;
+    }
+    Some(COOLDOWN_429_SECS - elapsed)
+}
+
+/// 磁盘缓存路径：`<配置目录>/sub-cache/<tag>.bin`。
+pub fn disk_cache_path(cfg_dir: &std::path::Path, tag: &str) -> std::path::PathBuf {
+    let safe: String = tag
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    cfg_dir.join("sub-cache").join(format!("{safe}.bin"))
+}
+
+/// 落盘最近一次成功拉取的**原始正文**（含 base64；目录 0700、文件 0600——含凭据）。
+pub fn disk_store(cfg_dir: &std::path::Path, tag: &str, body: &[u8]) -> io::Result<()> {
+    let path = disk_cache_path(cfg_dir, tag);
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+        }
+    }
+    use std::io::Write as _;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts.open(&path)?;
+    f.write_all(body)?;
+    f.sync_all().ok();
+    Ok(())
+}
+
+/// 读磁盘缓存；返回（原始正文, 距写入秒数）。
+pub fn disk_load(cfg_dir: &std::path::Path, tag: &str) -> Option<(Vec<u8>, u64)> {
+    let path = disk_cache_path(cfg_dir, tag);
+    let body = std::fs::read(&path).ok()?;
+    if body.is_empty() {
+        return None;
+    }
+    let age = std::fs::metadata(&path)
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| std::time::SystemTime::now().duration_since(t).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    Some((body, age))
+}
+
 /// 解析订阅正文为节点列表（`(nodes, errors)`；错误逐行报告，不中断）。
 pub fn parse_subscription(text: &str, tag: &str) -> (Vec<ParsedNode>, Vec<String>) {
     let mut nodes = Vec::new();
@@ -407,12 +639,12 @@ mod tests {
     #[test]
     fn http_response_plain_and_chunked() {
         let resp = b"HTTP/1.0 200 OK\r\nContent-Length: 3\r\n\r\nabc";
-        match parse_http_response(resp).unwrap() {
+        match parse_http_response(resp, false, false).unwrap() {
             Fetch::Body(b) => assert_eq!(b, b"abc"),
             _ => panic!("expect body"),
         }
         let resp = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\n";
-        match parse_http_response(resp).unwrap() {
+        match parse_http_response(resp, false, false).unwrap() {
             Fetch::Body(b) => assert_eq!(b, b"abc"),
             _ => panic!("expect body"),
         }
@@ -421,12 +653,40 @@ mod tests {
     #[test]
     fn http_response_redirect_and_gzip() {
         let resp = b"HTTP/1.1 302 Found\r\nLocation: https://x.example/sub\r\n\r\n";
-        match parse_http_response(resp).unwrap() {
+        match parse_http_response(resp, false, false).unwrap() {
             Fetch::Redirect(l) => assert_eq!(l, "https://x.example/sub"),
             _ => panic!("expect redirect"),
         }
         let resp = b"HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\n\r\n\x1f\x8b";
-        assert!(parse_http_response(resp).is_err());
+        assert!(parse_http_response(resp, false, false).is_err());
+    }
+
+    #[test]
+    fn http_response_truncation_rejected() {
+        // P0（2026-10-11）：截断完整性——声明 10 字节只到 3，必须报错（
+        // 旧实现会静默当 3 字节正文——生产实测 50 节点被截成 22）。
+        let resp = b"HTTP/1.0 200 OK\r\nContent-Length: 10\r\n\r\nabc";
+        assert!(parse_http_response(resp, false, false).is_err());
+        // 无 CL + 读超时结束 + 无换行收尾 —— 疑似截断，报错。
+        let resp = b"HTTP/1.0 200 OK\r\n\r\nss://YWVzLTEyOA==";
+        assert!(parse_http_response(resp, true, false).is_err());
+        // 无 CL + EOF 结束 —— 无法判定，放行（上层有节点数骤降告警适配）。
+        let resp = b"HTTP/1.0 200 OK\r\n\r\nss://YWVzLTEyOA==";
+        assert!(parse_http_response(resp, false, false).is_ok());
+        // lenient（最后手段）：同样输入放行，正文原样返回。
+        let resp = b"HTTP/1.0 200 OK\r\nContent-Length: 10\r\n\r\nabc";
+        match parse_http_response(resp, false, true).unwrap() {
+            Fetch::Body(b) => assert_eq!(b, b"abc"),
+            _ => panic!("expect lenient body"),
+        }
+    }
+
+    #[test]
+    fn http_response_429_retry_after_passthrough() {
+        // P1：429 限流带 Retry-After——错误信息透传，供冷却逻辑识别。
+        let resp = b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 120\r\n\r\n";
+        let e = parse_http_response(resp, false, false).unwrap_err().to_string();
+        assert!(e.contains("429") && e.contains("120"), "{e}");
     }
 
     #[test]
