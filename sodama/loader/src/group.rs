@@ -248,6 +248,21 @@ pub fn probe_interval_for(
     }
 }
 
+/// P37b（2026-10-13，CF 额度事故）：分片睡眠的「叫醒」判定（纯函数，便于测试）。
+/// 只有**退避中**（`was_idle`）且未睡满时才允许提前唤醒（恢复活跃节奏）；
+/// 正常节奏（未退避）必须睡满 `interval`——旧实现无条件叫醒，而 busy 是常真信号
+/// （挂机长连接/微流量），把探测循环打成了“探完一轮喘 1 秒再来”，
+/// 实测 ~3.1 次/秒（设计值 0.53 次/秒的 6 倍），6 小时打掉 CF Worker 日额度 6.8 万。
+pub fn probe_sleep_should_wake(
+    was_idle: bool,
+    slept: u64,
+    interval: u64,
+    watched: bool,
+    busy: bool,
+) -> bool {
+    was_idle && slept < interval && (watched || busy)
+}
+
 pub struct GroupRuntime {
     pub name: String,
     /// policy 热可替换（控制面板“手动切节点”/config 编辑都靠 reload 即时生效；
@@ -840,15 +855,21 @@ impl GroupRuntime {
                     let hs = Self::health_lock(&inner);
                     g.note_active_layer(&inner, &hs);
                 }
-                // 分片睡眠：退避期间被「叫醒」时不等待剩余时间
-                // （P37/A1：watched 恒 false——保留占位；叫醒条件实际由流量信号承担）。
+                // 分片睡眠：**仅退避期间**允许被「叫醒」提前进入下一轮（P37b，CF 额度事故修复）。
+                // 正常节奏（interval == base）必须睡满；退避态（interval > base）才有
+                // “有新流量立刻恢复活跃”的语义——判定逻辑见 `probe_sleep_should_wake`。
+                let was_idle = interval > base;
                 let mut slept = 0u64;
                 while slept < interval {
                     std::thread::sleep(Duration::from_secs(1));
                     slept += 1;
-                    if slept < interval
-                        && (crate::watched_recently(20) || crate::traffic_active(active_window))
-                    {
+                    if probe_sleep_should_wake(
+                        was_idle,
+                        slept,
+                        interval,
+                        crate::watched_recently(20),
+                        crate::traffic_active(active_window),
+                    ) {
                         break;
                     }
                 }
@@ -1201,6 +1222,19 @@ mod tests {
         assert_eq!(probe_interval_for(30, 0, false, false, &mut z), 30);
         assert_eq!(probe_interval_for(30, 0, false, false, &mut z), 30);
         assert_eq!(z, 0);
+    }
+
+    #[test]
+    fn probe_sleep_wake_only_while_idle() {
+        // 正常节奏（未退避）：任何信号都不叫醒——必须睡满 interval（P37b 事故回归）
+        assert!(!probe_sleep_should_wake(false, 1, 30, false, true));
+        assert!(!probe_sleep_should_wake(false, 29, 30, true, true));
+        // 退避态：有信号提前唤醒（恢复活跃节奏）
+        assert!(probe_sleep_should_wake(true, 1, 600, false, true));
+        assert!(probe_sleep_should_wake(true, 30, 600, true, false));
+        // 退避态但无信号 / 已睡满：不叫醒
+        assert!(!probe_sleep_should_wake(true, 600, 600, true, true));
+        assert!(!probe_sleep_should_wake(true, 1, 600, false, false));
     }
 
     #[test]

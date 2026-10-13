@@ -3818,11 +3818,11 @@ pub fn watched_recently(within: u64) -> bool {
     t > 0 && unix_now_sec().saturating_sub(t) < within
 }
 
-/// 最近 `within` 秒内有真实转发（或有活跃连接）。
+/// 最近 `within` 秒内**建立过新连接**（relay 建连打点）。
+/// P37b（2026-10-13，CF 额度事故）：不再把「有活跃连接」算作活跃——挂机长连接
+/// （推送保活/下载/SSH）不代表有人在用，旧语义让 busy 恒真（与 dae/sing-box 的
+/// 「活跃 = 新连接/Touch」对齐：长连接本身不续期）。影响面只有健康探测节奏。
 pub fn traffic_active(within: u64) -> bool {
-    if RELAY_STATS.conns_active.load(Ordering::Relaxed) > 0 {
-        return true;
-    }
     let t = LAST_TRAFFIC.load(Ordering::Relaxed);
     t > 0 && unix_now_sec().saturating_sub(t) < within
 }
