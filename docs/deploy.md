@@ -234,9 +234,10 @@ sodama validate <config.dae>            # 无需 root / socket
 
 配置热驱动（P35）：inotify 事件驱动为默认（毫秒级 + 100ms 去抖；事件名过滤 + 快照复核），
 `global { watch_config: 10 }` 或 `--watch-config 10` 启用（值 = 无 inotify 时的兜底扫描秒数）；
-自动 reload 走订阅节点缓存（`sub_cache_ttl`，默认 60s；手动 `reload`/`systemctl reload` 仍强制重拉）。
+自动 reload 走订阅节点缓存（`sub_cache_ttl`，默认 1800s；失败源负缓存 `sub_fail_ttl` 默认
+600s——未变源不打订阅服务器；手动 `reload`/`systemctl reload` 仍强制重拉）。
 行为参数可全部写进 `global`（`dial_mode/dial_timeout/sniffing_timeout/watch_config/sub_cache_ttl/
-geodata_dir/log_file/status_socket` 等）——**配置文件即唯一事实来源**，CLI 仅作调试覆盖。
+sub_fail_ttl/geodata_dir/log_file/status_socket` 等）——**配置文件即唯一事实来源**，CLI 仅作调试覆盖。
 
 多订阅与默认配置目录（P34/P35）：config `subscription` 段按**声明顺序回退**（pacman 镜像风格）——
 首个有 alive 节点的源生效，全部标死才切下一源；`global { subscription_failover: false }`

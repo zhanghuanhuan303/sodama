@@ -871,6 +871,125 @@ worker 停摆现象加诊断日志后未再复现；全链路日志（“后台�
 
 ---
 
+## 13 · 探测/订阅频率研究：dae 与同类内核策略对照 + 修复提案（2026-10-13）
+
+> 背景：生产观察「订阅服务器一直被请求 + 节点延迟一直被测」（面板首页探测计数快速上涨、订阅端点 429），疑耗订阅额度与节点握手预算。本节为**纯代码研究**（无实测——路由器 SSH 当刻不可达，见 13.6）。
+>
+> 方法：sodama 源头审计（本仓库）+ dae 上游 clone（较新线）；同类内核**离线精读源码**：mihomo v1.19.32、sing-box v1.14.2、Xray v1.260327.0、v2ray v5.54.2（经 goproxy.cn 拉出 module zip 存 `/tmp/refproj`，未入库）。
+
+### 13.1 sodama 现状（审计结论，全部有行号）
+
+**订阅拉取触发点**（`loader/src/main.rs`）：
+
+| 触发 | 位置 | fast | 每源请求量 | 频率 |
+|---|---|---|---|---|
+| 进程启动 | `build_groups`→`fetch_nodes` | false | ≤×3（重试） | 每次启动 |
+| 配置/规则文件变更（inotify+10s 兜底） | `do_reload`→`request_sub_refresh`（L4438） | true | 60s 缓存命中=0；否则 ×3 | 每次保存后（距上次 >60s） |
+| 手动 reload / 面板热重载 | `sodama reload` | false | 强制 ×3 | 手动 |
+| 周期刷新 | `sub-timer` | false | ×3 | `subscription_update_interval`=21600s（6h±10%） |
+| 失败源自愈 | `subscribe.rs:432 sources_need_retry`（5m→1h 退避） | false | 全部源 ×3（**缺陷**：不只失败源） | 退避节律 |
+
+磁盘缓存 `sub-cache/*.bin` 写入**不**触发重载（`watch.rs` 逐文件名过滤，只关心 config/include/rule_set）；内存缓存 TTL `SUB_CACHE_TTL_SECS`（L197，默认 60s）；**失败源无负缓存**（缓存只在成功时写 `cache_put_sub`，L4099 `cache_get_sub`）→ 持续失败的源被每次配置保存 ×3 重打。
+
+**延迟探测节奏**（`group.rs:720 spawn_health_loop`）：
+
+- 每轮：`watched = watched_recently(20)` / `busy = traffic_active(base.max(30))`；
+- `probe_interval_for(base=check_interval(默认 30s), cap=probe_idle_cap(默认 600s), watched, busy, idle_rounds)`（L234）：`watched||busy`→全速 base 并清零退避，否则 ×2 指数退避到 cap；
+- **退避几乎永不生效**：`note_watch()`（L3787）被 `status_json()`（L7564，函数首行）打点——面板秒级轮询 + `health-track`（每分钟）+ watchdog（每 5min）+ 任何 CLI 查询；`note_traffic()`（L3791）每次 relay 建连打点，且 `conns_active>0` 直接算 busy（家庭网微流量常驻）。
+- ⇒ **7×24 以 30s 全速探测全部（含死）节点**；100 成员 ≈ 28.8 万次/天经节点握手。
+- 探测并发 24（L764 注记）；`check_interval`/`probe_idle_cap` 均可配置，路由器配置未显式写。
+
+### 13.2 dae 原版怎么做（上游 clone，较新线）
+
+1. **默认 `check_interval: 30s` + `check_tolerance: 50ms`**（`config/config.go:30-31`；tolerance 是**选路迟滞**非失败计数；全局与组级可 override）。
+2. **「无消费不探测」**（`submitCheckTasks`：`if !d.hasAliveDialerSets(...)` 跳过——没有任何策略引用该 latent 就不探）；只对 routing 引用的 outbound 激活探测（`control_plane_dialtarget.go:24 ActivateCheck: referencedOutbounds` 检查）。
+3. **每节点独立 timer + 冷启动随机相位**（`connectivity_check.go:829-929`：cold-start 后 `nextDelay = fastrand.Int63n(cycle)` 打散，之后按 interval）。
+4. 全局探测 worker 池（ants，`calcPoolSize = clamp(40+ceil(sqrt(n)*10),40,256)`，非阻塞）。
+5. **定向唤醒**：`NotifyCheck*`（checkCh/checkDnsUdpCh/checkTcpCh），带 **2s 冷却**。
+6. 恢复机制（`recovery_state.go`）：`backoffLevel`+`StableSuccessCount`；`HandleNoAliveDialer`（仅错误路径）→`Resuscitate`（按 MinCheckInterval 限流）→定向唤醒；「stability-based wash white」——某协议族**有失败且无成功**才重置其评分。
+7. **订阅只在启动 + SIGHUP 拉取**（`cmd/run_controlplane.go:250-330`），**无周期刷新**；`http-file` scheme 拉取成功才落盘到 `persist.d/<tag>.sub`，失败回退读缓存；失败语义 `resolvingfailed`，若「全失败且 0 节点」则**不整体替换**（保留旧状态）。
+
+### 13.3 同类内核对照表（代码出处已核）
+
+| 维度 | sodama 现状 | dae | mihomo 1.19.32 | sing-box 1.14.2 | Xray 26.x | v2ray 5.54 |
+|---|---|---|---|---|---|---|
+| 探测默认间隔 | 30s（退避 cap 600s） | 30s | **300s**（组 `groupOption.Interval=300`，`outboundgroup/parser.go:171`；provider health-check 亦默认 300，`provider/parser.go:67`） | **3min**（`constant/timeout.go:14 DefaultURLTestInterval`） | **10s**（`observer.go:74` `sleepTime := 10s`） | 1min×10 采样=10min/轮（`burst/healthping.go:57,64`） |
+| 空闲是否探测 | **是（退避被污染失效）** | 否（无引用不探） | lazy 默认 **true**：轮次内无 touch 则跳过（`healthcheck.go:52`；`groupOption{Lazy:true}` `outboundgroup/parser.go:52`） | **无 Touch 不建 ticker**；idle_timeout 30min 后停探（`urltest.go Touch/loopCheck`；`DefaultURLTestIdleTimeout=30min`）；启动先探一轮 | 否（一直探） | 随 balancer 启动 scheduler（消费才探） |
+| 「活跃/touch」来源 | status 查询（面板/CLI/watchdog/health-track **任何**查询）+relay 建连+conns_active>0 | 每节点 timer；定向唤醒 | 拨号路径 `Unwrap(metadata,touch=true)`/`GetProxies(true)`；**状态 API `tunnel.Proxies()` 不 touch**（`tunnel/tunnel.go:215`） | 新连接 `DialContext/ListenPacket` 首行 `Touch()`；**status 不算** | — | — |
+| 死节点处理 | 无区别 | 无降频（recovery 只走错误路径） | 无区别 | 非 force 时跳过 `now-last_test < interval` 的节点（`urlTestBatch.test` history 时间戳） | 无区别 | 无区别 |
+| 探测并发 | 24 | ants 40–256 | errgroup limit 10 | batch 并发 10 | 串行（EnableConcurrency 默认 false；每节点间隔 sleep） | doCheck 采样 |
+| 订阅刷新 | 启动+变更+6h+自愈 | 无周期（启动+SIGHUP） | `interval` 未显式配=0=**不自动刷新**（`fetcher.go:239` `else if f.interval > 0`）；官方示例 3600；启动时缓存过旧 force 拉一次；失败 backoff（`NewFetcher`：Min=min(10s,interval)、Max=interval、×2）→**失败快重试**；hash 不变→跳过 | 无订阅 | 无订阅 | 无订阅 |
+| 失败语义 | 磁盘缓存兜底；自愈重拉**全部**源 | 全失败且 0 节点不替换 | 失败保留旧内容+backoff | — | — | — |
+| 手动触发 | `sodama reload` 全量 | NotifyCheck* 定向 | `/proxies/:name/delay` 单点 | urltest API(force) | observatory API | Check(tags) |
+| 默认测试 URL | （路由器 config 定） | — | `https://www.gstatic.com/generate_204`（`constant/adapters.go:65`） | 用户配 | `https://www.google.com/generate_204`（`observer.go:162`） | `https://connectivitycheck.gstatic.com/generate_204` |
+
+### 13.4 结论
+
+1. **确认两个真缺陷（sodama 独有）**：①「看着/流量」信号被 status 查询击穿（对照：mihomo 状态 API 不 touch、sing-box Touch 只在新连接）→ 退避机制形同虚设；②订阅失败源无负缓存 + 自愈重拉全部源。
+2. **「空闲即不探/少探」是主流**（mihomo lazy 默认 true、sing-box idle 停 ticker、dae 无引用不探、v2ray 随 balancer 消费）——我们的「指数退避」方向一致，但信号源不对。**「状态查询 ≠ 活跃」是最该抄的一条**。
+3. 主流**都不做「死节点慢车道」**（dae 的 recovery 也只在错误路径限流）——原 A1「死节点降频」降级为可选，先修信号源。
+4. 订阅 6h 周期相比 dae（无周期）偏激进但可接受；真正要修的是变更触发与失败路径（0 请求提升空间最大）。
+5. sing-box 的「history 时间戳跳过」可顺手借鉴：同节点被多组共享时避免一轮内重复探测（评估项 D1）。
+6. 各家测试 URL 均为 generate_204 类——无需变更。
+
+### 13.5 修订提案（等拍板）
+
+**P-A 探测节奏**
+
+- **A1（核心，最小改动）**：把 `note_watch()` 从 `status_json()`（`main.rs:7564`）移除——状态查询不再视为「有人看」。`watched` 信号保留给未来的显式面板心跳；当前效果 = 探测活跃度只由 `note_traffic` + `conns_active` 驱动，安静家庭网夜间退避到 600s。
+- A2（配套）：`busy` 口径评估——维持 `conns_active>0` 算忙（折衷，防误杀挂机长连用户），先不动。
+- A3：路由器 config 显式写 `check_interval`、`probe_idle_cap`，配置即文档。
+- **验收**：空闲夜 8h 内日志出现「空闲退避」且稳定于 cap；`probes_total` 增速昼/夜比 ≥3×；面板打开/关闭不改变探测节奏。
+
+**P-B 订阅拉取**
+
+- **B1**：变更触发（fast=true）只对「URL 新增/变更」的源打网；未变的源延长内存缓存 TTL 至 30min（或直接读磁盘缓存）。
+- **B2**：失败源负缓存：记录 `failed_at`，`sub_fail_ttl`（默认 600s）内不重试。
+- **B3**：自愈重试只拉失败源（`sources_need_retry` 传集合过滤）。
+- **验收**：连续编辑 config 10 次 → 订阅端点请求数 ≤（增量源数×3）；失败源在 TTL 内 0 请求。
+
+**P-C 观测**
+
+- C1：`status.subscriptions[]` 增 `fetches_total`/`fetch_fail_total`/`last_fetch_at`；探测侧沿用 `probes_*`。面板可展示「今日订阅请求数」供额度自证。
+
+**P-D 评估项（先不做）**
+
+- D1 跨组共享成员的单轮去重（sing-box history 思路）；D2 每节点相位抖动（dae 思路）——两者都要先有 A1 落地后的真实基线再评估。
+
+### 13.6 阻碍与待办
+
+- 路由器 SSH 当刻不可达（`connect refused` 于 22，ping 通）——**实测验证与部署待路由器恢复**；本节的「现状」均为代码结论，无生产实测佐证。
+- 拍板后实施顺序：A1 →（面板如需配合）→ B1–B3 → C1；`cargo test` + 构建部署（`lab/build-openwrt.sh` + `docs/notes/deploy-engine.sh`）。
+
+### 13.7 实施与验证（用户拍板 a1+b+c，2026-10-13）
+
+**落地内容**（ADR-0064）：
+
+| 项 | 改动 | 文件 |
+|---|---|---|
+| A1 | `status_json()` 删 `note_watch()`；活跃度只由流量驱动；`note_watch` 降为显式心跳预留（`#[allow(dead_code)]`）；日志措辞更新 | `main.rs`（~L7683）/ `group.rs` 注释 |
+| B1 | `SubFetchMode::{Full,Fast,Heal}`；`SUB_CACHE_TTL_SECS` 默认 60→**1800**；seen 集合（`mark_sub_seen`/`sub_seen`）+ Fast 走内存→磁盘、0 请求 | `main.rs` + `subscribe.rs` |
+| B2 | `SUB_FAIL_TTL_SECS` 默认 **600**（global `sub_fail_ttl`）；`note_fetch_error` 记失败时刻；Fast 负缓存内不打网 | `subscribe.rs` + `config.rs` |
+| B3 | `sources_need_retry()->bool` → `sources_due_for_retry()->Vec<String>`；sub-timer 发 `Heal(set)` 定向重拉 | `subscribe.rs` + `main.rs` |
+| 队列 | `SubFetchMode::merge`（Full 优先；Heal 并集；Fast 最窄） | `main.rs` |
+| C1 | `subscriptions[]` 增 `fetches_total`/`fetch_fail_total`/`last_fetch_at`（只由 net 推进）；status `config_watch` 增 `sub_fail_ttl_secs` | `subscribe.rs` + `main.rs` |
+
+**验证**：
+
+- `cargo test` **285/285**（新增：B1 seen 往返、B2 负缓存窗口、B3 定向列表、C1 计数只由 net 推进、`merge` 语义；
+  注：`sticky::tests::dial_time_reresolves_after_invalidation` 存在既有并行 flaky——与其它测试共用全局 DNS mock，
+  单独/串行均通过，与本轮改动无关）；
+- OpenWrt 构建：`lab/build-openwrt.sh --arch x86_64` → `sodama 7.6M · sodama-ebpf 494K`；
+- **部署前基线**（旧引擎，20.6h 世代）：`probes_ok=89886 / probes_fail=220057`（71% 打向死节点）、
+  `probe_active=true`、`probe_interval_secs=30` 恒定；`sub_cache_ttl_secs=60`；
+- **部署后**：6s 就绪，50 节点正常；`subscriptions[]` C1 字段可见（`fetches_total=1`=启动拉取）；
+- **B1 实测**：`touch /etc/sodama/config.dae` → `reload-fast` → 日志 `订阅 2: 命中缓存（44.7s 前抓取，50 个节点）`，
+  `fetches_total` 保持 **1**（0 网络请求）✓
+- **待观察判据**：夜间无流量窗口出现「空闲退避」且 `probe_interval_secs` 稳定于 cap；
+  失败源出现时日志「订阅自动重试：N 个失败源到退避窗口（…），定向重拉」且 `fetches_total` 只对失败源 +1。
+
+---
+
 ## 附 A · 路由器侧工具清单（**不入库**，仅存在于软路由）
 
 | 路径 | 用途 | 部署时间 |
@@ -900,3 +1019,4 @@ worker 停摆现象加诊断日志后未再复现；全链路日志（“后台�
 | B5 | 计数重置瑕疵 | `probes_ok/fail/stragglers` 随订阅热更新归零 | 已知；跨世代看进程级指标 |
 | B6 | 72h 生产测试 | **已启动**（2026-10-11，§12）；判据/脚本就绪 | 按 §12 记分板回填 24/48/72 h；bounded-memory 表述待通过后启用 |
 | B7 | Vision/WS 长跑 | `reactor_codec_sessions` 100%；泵失败均为客户端 RST | 继续观察 |
+| B8 | P37 待验收（dev 分支已提交） | ADR-0064（A1/B1/B2/B3/C1）已部署生产；B1 实测 0 请求✓；待观察：夜间「空闲退避」日志、失败源 `Heal` 定向重拉 | **稳定观察 ≥1 晚后提醒用户合并 dev → main** |

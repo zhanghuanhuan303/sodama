@@ -403,6 +403,13 @@ pub struct SourceStatus {
     pub fails: u32,
     /// net（网络）/ disk（磁盘缓存回退）/ memory（内存缓存）/ cooldown（限流冷却）
     pub source: &'static str,
+    // ---- P37（2026-10-13）C1：订阅请求计数（额度自证）----
+    /// 累计实际打网次数（含成功与失败；memory/disk 命中不计）。
+    pub fetches_total: u64,
+    /// 累计打网失败次数。
+    pub fetch_fail_total: u64,
+    /// 最近一次打网时刻（unix 秒；0 = 从未打网）。
+    pub last_fetch_at: u64,
 }
 
 fn source_status_map() -> &'static std::sync::Mutex<Vec<SourceStatus>> {
@@ -415,33 +422,52 @@ pub fn record_source_status(mut st: SourceStatus) {
         Ok(m) => m,
         Err(p) => p.into_inner(),
     };
+    // C1：打网计数只由 net 来源推进；memory/disk 命中沿用前值（保留“服务器真被请求几次”语义）。
+    let is_net = st.source == "net";
     if let Some(prev) = m.iter().find(|x| x.tag == st.tag).cloned() {
         // 连续失败计数：失败叠加（success/disk 回退均视为“拿到数据”，归零）。
         st.fails = if st.ok { 0 } else { prev.fails.saturating_add(1) };
+        if is_net {
+            st.fetches_total = prev.fetches_total.saturating_add(1);
+            st.fetch_fail_total = prev.fetch_fail_total + u64::from(!st.ok);
+            st.last_fetch_at = st.at_sec;
+        } else {
+            st.fetches_total = prev.fetches_total;
+            st.fetch_fail_total = prev.fetch_fail_total;
+            st.last_fetch_at = prev.last_fetch_at;
+        }
         if let Some(slot) = m.iter_mut().find(|x| x.tag == st.tag) {
             *slot = st;
         }
     } else {
         st.fails = if st.ok { 0 } else { 1 };
+        st.fetches_total = u64::from(is_net);
+        st.fetch_fail_total = u64::from(is_net && !st.ok);
+        st.last_fetch_at = if is_net { st.at_sec } else { 0 };
         m.push(st);
     }
 }
 
-/// P1（2026-10-11）：自愈重试判据——是否有失败源按退避到期（需重新拉取）。
+/// P1（2026-10-11）：自愈重试判据——返回**按退避到期**的失败源 tag 列表。
 /// 退避：300s · 2^(fails-1)，封顶 3600s（首次失败 5 分钟后重试）。
-pub fn sources_need_retry(now_sec: u64) -> bool {
+/// P37（2026-10-13 / B3）：从 bool 改为列表——调用方只对这些源定向重拉，
+/// 不再连带健康源（旧行为：任一失败源到期 → 全部源重打）。
+pub fn sources_due_for_retry(now_sec: u64) -> Vec<String> {
     let m = match source_status_map().lock() {
         Ok(m) => m,
         Err(p) => p.into_inner(),
     };
-    m.iter().any(|s| {
-        if s.ok {
-            return false;
-        }
-        let shift = s.fails.saturating_sub(1).min(4);
-        let backoff = (300u64 << shift).min(3600);
-        now_sec >= s.at_sec.saturating_add(backoff)
-    })
+    m.iter()
+        .filter(|s| {
+            if s.ok {
+                return false;
+            }
+            let shift = s.fails.saturating_sub(1).min(4);
+            let backoff = (300u64 << shift).min(3600);
+            now_sec >= s.at_sec.saturating_add(backoff)
+        })
+        .map(|s| s.tag.clone())
+        .collect()
 }
 
 /// 配置里已不存在的来源从状态表移除（删源后不留幽灵条目）。
@@ -470,6 +496,10 @@ pub fn source_status_json() -> serde_json::Value {
                     "nodes": s.nodes,
                     "fails": s.fails,
                     "source": s.source,
+                    // C1：订阅服务器请求计数（额度自证）
+                    "fetches_total": s.fetches_total,
+                    "fetch_fail_total": s.fetch_fail_total,
+                    "last_fetch_at": s.last_fetch_at,
                 })
             })
             .collect(),
@@ -486,7 +516,15 @@ fn cooldown_map() -> &'static std::sync::Mutex<std::collections::HashMap<String,
 }
 
 /// 记录一次拉取错误；429（含 Retry-After 文本）触发本 URL 的冷却。
+/// P37（B2）：同时登记「最近失败时刻」——配置热重载（Fast）对负缓存窗口内的源不打网。
 pub fn note_fetch_error(url: &str, err: &str) {
+    {
+        let mut m = match fetch_fail_map().lock() {
+            Ok(m) => m,
+            Err(p) => p.into_inner(),
+        };
+        m.insert(url.to_string(), std::time::Instant::now());
+    }
     if err.contains("429") {
         let mut m = match cooldown_map().lock() {
             Ok(m) => m,
@@ -508,6 +546,73 @@ pub fn cooldown_remaining(url: &str) -> Option<u64> {
         return None;
     }
     Some(COOLDOWN_429_SECS - elapsed)
+}
+
+// ---------------------------------------------------------------- P37（2026-10-13）
+// 对照研究（devlog §13）：dae 的订阅只在启动/SIGHUP 拉取；mihomo 的 fetcher 以 hash 不变
+// 跳过、失败走 backoff。同类均不会因「配置热重载」反复打订阅服务器——本区块补上两条记忆：
+//   * `sub_seen`：曾成功拉取过该 URL → 配置热重载（Fast）不再打网（磁盘缓存兜底）；
+//   * `fetch_fail`：最近一轮打网失败 → 负缓存窗口内不再打网（自愈/手动/周期仍然放行）。
+
+/// 曾成功拉取过的 URL 集合（B1）——「URL 未变」的判定依据。
+fn sub_seen_set() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
+    static S: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    S.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
+pub fn mark_sub_seen(url: &str) {
+    let mut m = match sub_seen_set().lock() {
+        Ok(m) => m,
+        Err(p) => p.into_inner(),
+    };
+    // 上限保护（URL 集合规模 = 源数量级，32 足矣；超出淘汰最旧不可得，直接限容）。
+    if m.len() >= 64 && !m.contains(url) {
+        m.clear();
+    }
+    m.insert(url.to_string());
+}
+
+pub fn sub_seen(url: &str) -> bool {
+    let m = match sub_seen_set().lock() {
+        Ok(m) => m,
+        Err(p) => p.into_inner(),
+    };
+    m.contains(url)
+}
+
+/// 最近一次打网失败时刻（B2 负缓存）。
+fn fetch_fail_map() -> &'static std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>> {
+    static F: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
+    > = std::sync::OnceLock::new();
+    F.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// 负缓存剩余秒数（None = 不在负缓存窗口内或 ttl=0 关闭）。
+pub fn fetch_fail_remaining(url: &str, ttl_secs: u64) -> Option<u64> {
+    if ttl_secs == 0 {
+        return None;
+    }
+    let m = match fetch_fail_map().lock() {
+        Ok(m) => m,
+        Err(p) => p.into_inner(),
+    };
+    let at = m.get(url)?;
+    let elapsed = at.elapsed().as_secs();
+    if elapsed >= ttl_secs {
+        return None;
+    }
+    Some(ttl_secs - elapsed)
+}
+
+/// 打网成功后清除负缓存（下次失败重新计时）。
+pub fn clear_fetch_fail(url: &str) {
+    let mut m = match fetch_fail_map().lock() {
+        Ok(m) => m,
+        Err(p) => p.into_inner(),
+    };
+    m.remove(url);
 }
 
 /// 磁盘缓存路径：`<配置目录>/sub-cache/<tag>.bin`。
@@ -598,6 +703,72 @@ pub fn parse_subscription(text: &str, tag: &str) -> (Vec<ParsedNode>, Vec<String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- P37（2026-10-13 / B1・B2・B3・C1）----
+
+    fn mk_status(tag: &str, ok: bool, source: &'static str, at: u64) -> SourceStatus {
+        SourceStatus {
+            tag: tag.into(),
+            rank: 1,
+            at_sec: at,
+            ok,
+            error: if ok { None } else { Some("x".into()) },
+            nodes: 0,
+            fails: 0,
+            source,
+            fetches_total: 0,
+            fetch_fail_total: 0,
+            last_fetch_at: 0,
+        }
+    }
+
+    #[test]
+    fn b2_fail_negative_cache_window() {
+        let url = "https://t.example/b2-unique";
+        assert!(fetch_fail_remaining(url, 600).is_none());
+        note_fetch_error(url, "连接超时");
+        let remain = fetch_fail_remaining(url, 600).expect("负缓存应命中");
+        assert!(remain > 0 && remain <= 600);
+        // ttl=0 = 关闭负缓存
+        assert!(fetch_fail_remaining(url, 0).is_none());
+        clear_fetch_fail(url);
+        assert!(fetch_fail_remaining(url, 600).is_none());
+    }
+
+    #[test]
+    fn b1_seen_set_roundtrip() {
+        let url = "https://t.example/b1-unique";
+        assert!(!sub_seen(url));
+        mark_sub_seen(url);
+        assert!(sub_seen(url));
+    }
+
+    #[test]
+    fn b3_due_for_retry_only_failed_sources() {
+        // 独特 tag，避免与并行测试的全局状态表互扰；只做包含断言。
+        record_source_status(mk_status("t_b3_ok", true, "net", 100));
+        record_source_status(mk_status("t_b3_fail", false, "net", 100));
+        // 首次失败退避 300s：now=200 未到期，now=400 到期。
+        let due_now = sources_due_for_retry(200);
+        assert!(!due_now.iter().any(|t| t == "t_b3_fail"));
+        let due_later = sources_due_for_retry(400);
+        assert!(due_later.iter().any(|t| t == "t_b3_fail"));
+        assert!(!due_later.iter().any(|t| t == "t_b3_ok"));
+    }
+
+    #[test]
+    fn c1_fetch_counters_only_advance_on_net() {
+        let tag = "t_c1_net";
+        record_source_status(mk_status(tag, false, "net", 10)); // 打网失败 #1
+        record_source_status(mk_status(tag, true, "disk", 11)); // 磁盘兜底：不计打网
+        record_source_status(mk_status(tag, true, "net", 12)); // 打网成功 #2
+        record_source_status(mk_status(tag, true, "memory", 13)); // 内存命中：不计
+        let m = source_status_map().lock().unwrap_or_else(|p| p.into_inner());
+        let s = m.iter().find(|s| s.tag == tag).expect("状态应存在");
+        assert_eq!(s.fetches_total, 2);
+        assert_eq!(s.fetch_fail_total, 1);
+        assert_eq!(s.last_fetch_at, 12);
+    }
 
     #[test]
     fn decode_plain_and_base64() {

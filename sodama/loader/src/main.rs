@@ -196,7 +196,12 @@ static CONFIG_WATCH_INTERVAL: AtomicU64 = AtomicU64::new(0);
 /// P35：热驱动传输方式（true=inotify 已启用，false=纯兜底轮询）。
 static CONFIG_WATCH_INOTIFY: AtomicBool = AtomicBool::new(false);
 /// P35：订阅节点缓存 TTL（秒；watch 触发的 fast reload 复用，0=关）。
-static SUB_CACHE_TTL_SECS: AtomicU64 = AtomicU64::new(60);
+/// P37（B1）：默认 60 → 1800——未变源在配置热重载时 0 请求（对齐 dae 语义：
+/// 订阅拉取不随配置热重载发生；内容更新交给周期刷新/手动 reload）。
+static SUB_CACHE_TTL_SECS: AtomicU64 = AtomicU64::new(1800);
+/// P37（B2）：失败源负缓存窗口（秒；fast 重载对窗口内失败源不打网，0=关）。
+/// 与自愈退避（300s·2^n）/429 冷却（15min）互补：这里管「配置热重载别去敲失败源」。
+static SUB_FAIL_TTL_SECS: AtomicU64 = AtomicU64::new(600);
 /// P35：订阅节点缓存（url → (抓取时刻, 节点)）——「改订阅顺序」这类 reload 不再重走网络。
 static SUB_NODE_CACHE: OnceLock<
     Mutex<std::collections::HashMap<String, (Instant, std::sync::Arc<Vec<subscribe::ParsedNode>>)>>,
@@ -1406,7 +1411,8 @@ fn usage() -> ! {
            --dns-upstream <url>  P3a：DNS 上游（host:port 或 udp://host:port）\n\
            --watch-config <秒>    P33/P35：配置热驱动（0=关）。inotify 目录事件驱动为主（毫秒级 +
                                  100ms 去抖），<秒> 为无 inotify 时的兜底扫描间隔；变更自动 reload，
-                                 且订阅节点走缓存（sub_cache_ttl，默认 60s）秒级生效
+                                 且订阅节点走缓存（sub_cache_ttl，默认 1800s；失败源负缓存
+                                 sub_fail_ttl 默认 600s）秒级生效——未变源不打订阅服务器
            --log-file <path>     P6/P35：日志写文件（默认 stdout；SIGHUP 时 reopen，轮转友好；
                                  可用 config global.log_file 代替）
            --dump                打印编译出的 match_set / LPM 内容\n\
@@ -3731,7 +3737,12 @@ fn do_reload(args: &Args, ebpf: &mut Ebpf, startup: bool, fast: bool) -> ReloadO
                 // P0（2026-10-11）：本地部分（policy/组结构）随 reload 立即生效；
                 // 订阅拉取与成员替换转入后台——reload 回执不再等待网络（旧实现可达 34s）。
                 apply_group_policy_local(args);
-                request_sub_refresh(args, fast);
+                // P37（B1-B3）：watch 触发的 fast reload 对未变源 0 请求；
+                // 手动 reload / SIGHUP 仍为 Full（强制拉取）。
+                request_sub_refresh(
+                    args,
+                    if fast { SubFetchMode::Fast } else { SubFetchMode::Full },
+                );
             }
             log(&format!("热重载完成（{n} 条 match_set）"));
             // P33：运行时参数热更新（CLI > config > 现值；仅变更时记日志）。
@@ -3774,16 +3785,25 @@ fn unix_now_sec() -> u64 {
 
 // ---------------------------------------------------------------- 活跃度信号（优雅空闲）
 //
-// 组健康探测的节奏由「有人在看吗」+「有流量吗」决定：
-//   * `note_watch()`：每次状态面查询（面板/CLI）打点——面板开着就等于“有人看”；
+// P37（2026-10-13 / A1）修订：健康探测节奏**只由「有流量吗」决定**——
 //   * `note_traffic()`：每次 relay 建连打点（加上 conns_active 计数）——有真实转发。
-// 两者皆无时健康探测指数退避，避免空闲时每 30s 拨全部节点（省 CPU/内存/流量）。
+// 无人用（无新连接、无活跃连接）时健康探测指数退避到 `probe_idle_cap`，
+// 避免空闲时每 30s 拨全部节点（省 CPU/内存/节点握手）。
+//
+// 背景（devlog §13 对照研究）：旧实现把「状态面查询」也算作“有人在看”，
+// 而面板秒级轮询 / health-track / watchdog / 任何 CLI 查询都会走 `status_json()`
+// → 探针退避被永久钉在全速档（7×24 探测全部含死节点）。对照同类：
+// mihomo 的状态 API（`tunnel.Proxies()`）不 touch、sing-box 仅在新连接 Touch——
+// 「状态查询 ≠ 活跃」才是惯例。`note_watch()` 机制保留（供未来面板显式心跳），
+// 但不再在任何自动路径上打点。
 
 /// 最近一次状态面查询（unix 秒；0 = 从未）。
+/// P37（A1）：已无自动打点来源——预留给未来的**显式**面板心跳（当前无调用点）。
 static LAST_WATCH: AtomicU64 = AtomicU64::new(0);
 /// 最近一次真实转发活动（unix 秒；0 = 从未）。
 static LAST_TRAFFIC: AtomicU64 = AtomicU64::new(0);
 
+#[allow(dead_code)] // P37（A1）：预留——仅允许“显式心跳”场景调用，状态查询不得再自动打点
 pub fn note_watch() {
     LAST_WATCH.store(unix_now_sec(), Ordering::Relaxed);
 }
@@ -3920,7 +3940,7 @@ fn build_groups(args: &Args) -> Option<outbound::Outbound> {
         return None;
     }
 
-    let nodes = fetch_nodes(cfg.as_ref(), args, false);
+    let nodes = fetch_nodes(cfg.as_ref(), args, &SubFetchMode::Full);
     if nodes.is_empty() {
         log("未获得任何可用节点，组不启用");
         return None;
@@ -4167,17 +4187,53 @@ fn fmt_age_secs(s: u64) -> String {
     }
 }
 
+/// P37（2026-10-13 / B1/B3）：订阅拉取模式。
+/// - `Full`：强制拉取（启动 / 手动 reload / SIGHUP / 周期刷新）——所有源打网；
+/// - `Fast`：配置热重载触发——未变源走缓存（内存→磁盘）不打网；失败源在负缓存窗口内不打网；
+/// - `Heal(set)`：自愈重试——仅 `set` 里的失败源打网，其余源走缓存（不再连带健康源）。
+#[derive(Clone, Debug, PartialEq)]
+enum SubFetchMode {
+    Full,
+    Fast,
+    Heal(std::collections::HashSet<String>),
+}
+
+impl SubFetchMode {
+    /// 队列合并（sub-refresh 后台线程）：取「更宽」的那个——
+    /// 任一 Full → Full；Heal 之间取并集；Fast 与 Heal 混合 → Heal（打网集合更大）。
+    fn merge(self, other: SubFetchMode) -> SubFetchMode {
+        use SubFetchMode::*;
+        match (self, other) {
+            (Full, _) | (_, Full) => Full,
+            (Heal(mut a), Heal(b)) => {
+                a.extend(b);
+                Heal(a)
+            }
+            (Heal(a), Fast) | (Fast, Heal(a)) => Heal(a),
+            (Fast, Fast) => Fast,
+        }
+    }
+
+    fn label(&self) -> String {
+        match self {
+            SubFetchMode::Full => "full".into(),
+            SubFetchMode::Fast => "fast".into(),
+            SubFetchMode::Heal(s) => format!("heal({} 源)", s.len()),
+        }
+    }
+}
+
 /// P34：拉取单个订阅并解析（失败记日志返回空；rank = 来源顺序）。
-/// P35：`fast`（watch 触发的自动 reload）命中内存缓存时不重走网络；
-/// 手动 reload/SIGHUP 传 `fast=false` 强制重拉（P18e 语义）。
+/// P35：订阅节点内存缓存（§B1 延长至 30min）——配置热重载命中时不重走网络。
 /// P0（2026-10-11）：失败时回退磁盘缓存（最近一次成功正文）、登记来源状态；
 /// 429（限流）触发冷却——冷却期内不再打网络，直接用缓存。
+/// P37（2026-10-13 / B1/B2）：`mode` 决定非强制拉取的缓存优先策略与失败负缓存。
 fn fetch_one_sub(
     tag: &str,
     url: &str,
     rank: u32,
     timeout: Duration,
-    fast: bool,
+    mode: &SubFetchMode,
     cfg_dir: Option<&Path>,
 ) -> Vec<subscribe::ParsedNode> {
     let mk_status = |ok: bool, error: Option<String>, nodes: usize, source: &'static str| {
@@ -4190,12 +4246,68 @@ fn fetch_one_sub(
             nodes,
             fails: 0, // record_source_status 会按前一条状态累计
             source,
+            // C1：打网计数由 record_source_status 按 source=="net" 累计/沿用。
+            fetches_total: 0,
+            fetch_fail_total: 0,
+            last_fetch_at: 0,
         });
     };
-    if fast {
+    // P0/P37：磁盘缓存读取（快路径与失败回退共用——最近一次成功正文，含凭据，权限 0600）。
+    let disk_fallback = |why: &str| -> Option<Vec<subscribe::ParsedNode>> {
+        let dir = cfg_dir?;
+        let (body, age) = subscribe::disk_load(dir, tag)?;
+        let text = subscribe::decode_body(&body).ok()?;
+        let (mut ns, _errs) = subscribe::parse_subscription(&text, tag);
+        if ns.is_empty() {
+            return None;
+        }
+        for n in &mut ns {
+            n.rank = rank;
+        }
+        log(&format!(
+            "订阅 {tag}: {why}，回退磁盘缓存（{}前抓取，{} 个节点）",
+            fmt_age_secs(age),
+            ns.len()
+        ));
+        Some(ns)
+    };
+    // P37（B1/B3）：非强制模式——未变的源优先缓存、不打网。
+    let cache_first = match mode {
+        SubFetchMode::Full => false,
+        SubFetchMode::Fast => true,
+        // Heal(set)：只有集合内的失败源打网，其余走缓存。
+        SubFetchMode::Heal(set) => !set.contains(tag),
+    };
+    if cache_first {
         if let Some(ns) = cache_get_sub(url, tag, rank) {
             mk_status(true, None, ns.len(), "memory");
             return ns;
+        }
+        // B2：失败源负缓存——窗口内不打网（磁盘兜底；没有则空手回去，组按「按源保留」沿用旧成员）。
+        let fail_ttl = SUB_FAIL_TTL_SECS.load(Ordering::Relaxed);
+        if let Some(remain) = subscribe::fetch_fail_remaining(url, fail_ttl) {
+            if let Some(ns) = disk_fallback(&format!("失败负缓存中（剩 {remain}s）")) {
+                mk_status(
+                    true,
+                    Some(format!("失败负缓存（剩 {remain}s）")),
+                    ns.len(),
+                    "disk",
+                );
+                return ns;
+            }
+            log(&format!(
+                "订阅 {tag}: 失败负缓存中（剩 {remain}s），本轮跳过网络"
+            ));
+            return Vec::new();
+        }
+        // B1：URL 未变（曾成功拉取过）→ 磁盘缓存，不打网。
+        // 对齐 dae：订阅拉取不随配置热重载发生；内容更新交给周期刷新/手动 reload。
+        if subscribe::sub_seen(url) {
+            if let Some(ns) = disk_fallback("URL 未变更（配置热重载不打网）") {
+                mk_status(true, None, ns.len(), "disk");
+                return ns;
+            }
+            // 磁盘缓存缺失（被清理/首跑未落盘）→ 兜底打网。
         }
     }
     let mut last_err: Option<String> =
@@ -4235,6 +4347,9 @@ fn fetch_one_sub(
                         ns.len()
                     ));
                     cache_put_sub(url, &ns);
+                    // P37（B1）：登记「曾成功拉取」——下次配置热重载（Fast）走磁盘缓存不打网。
+                    subscribe::mark_sub_seen(url);
+                    subscribe::clear_fetch_fail(url);
                     if let Some(dir) = cfg_dir {
                         if let Err(e) = subscribe::disk_store(dir, tag, &body) {
                             log(&format!("订阅 {tag}: 磁盘缓存写入失败: {e}"));
@@ -4257,25 +4372,12 @@ fn fetch_one_sub(
         }
     }
     // 失败回退：磁盘缓存（最近一次成功正文，含凭据，权限 0600）。
-    if let Some(dir) = cfg_dir {
-        if let Some((body, age)) = subscribe::disk_load(dir, tag) {
-            if let Ok(text) = subscribe::decode_body(&body) {
-                let (mut ns, _errs) = subscribe::parse_subscription(&text, tag);
-                if !ns.is_empty() {
-                    for n in &mut ns {
-                        n.rank = rank;
-                    }
-                    log(&format!(
-                        "订阅 {tag}: 拉取失败（{}），回退磁盘缓存（{}前抓取，{} 个节点）",
-                        last_err.clone().unwrap_or_default(),
-                        fmt_age_secs(age),
-                        ns.len()
-                    ));
-                    mk_status(true, last_err, ns.len(), "disk");
-                    return ns;
-                }
-            }
-        }
+    if let Some(ns) = disk_fallback(&format!(
+        "拉取失败（{}）",
+        last_err.clone().unwrap_or_default()
+    )) {
+        mk_status(true, last_err, ns.len(), "disk");
+        return ns;
     }
     // 最后手段：截断宽容重取一次（仅当上面全部失败——首跑无缓存 + 链路持续截断时
     // 的可用性兜底；解出的部分节点仍会经健康探测自我验证，不写磁盘缓存以免污染
@@ -4294,6 +4396,8 @@ fn fetch_one_sub(
                         ns.len()
                     ));
                     cache_put_sub(url, &ns);
+                    subscribe::mark_sub_seen(url);
+                    subscribe::clear_fetch_fail(url);
                     mk_status(true, Some("截断容错：正文不完整".into()), ns.len(), "net");
                     return ns;
                 }
@@ -4317,8 +4421,8 @@ struct SourceFetch {
 /// 拉取内联节点 + 全部订阅，**按来源**返回（组构建 / 订阅热更新共用）。
 /// P34：来源顺序 = 内联 node(0) → CLI --subscribe(1..) → config subscription(声明顺序)；
 /// 顺序回退（pacman 风格，`subscription_failover` 默认开）：前面来源有活节点就用它。
-/// P35：`fast` 见 `fetch_one_sub`（watch 自动 reload 走缓存）。
-fn fetch_sources(cfg: Option<&config::Config>, args: &Args, fast: bool) -> Vec<SourceFetch> {
+/// P37（B1/B2/B3）：`mode` 决定缓存优先/负缓存/定向重拉（见 `SubFetchMode`）。
+fn fetch_sources(cfg: Option<&config::Config>, args: &Args, mode: &SubFetchMode) -> Vec<SourceFetch> {
     let node_specs = cfg.map(config::inline_nodes).unwrap_or_default();
     let sub_specs = cfg.map(config::subscriptions).unwrap_or_default();
     let timeout = Duration::from_secs(15);
@@ -4361,7 +4465,7 @@ fn fetch_sources(cfg: Option<&config::Config>, args: &Args, fast: bool) -> Vec<S
     for (i, raw) in args.subscribe.iter().enumerate() {
         let tag = format!("cli{}", i + 1);
         let url = resolve_sub_url(None, raw);
-        let nodes = fetch_one_sub(&tag, &url, rank, timeout, fast, cfg_dir);
+        let nodes = fetch_one_sub(&tag, &url, rank, timeout, mode, cfg_dir);
         out.push(SourceFetch {
             tag,
             rank,
@@ -4372,7 +4476,7 @@ fn fetch_sources(cfg: Option<&config::Config>, args: &Args, fast: bool) -> Vec<S
     }
     for s in &sub_specs {
         let url = resolve_sub_url(cfg_dir, &s.url);
-        let nodes = fetch_one_sub(&s.tag, &url, rank, timeout, fast, cfg_dir);
+        let nodes = fetch_one_sub(&s.tag, &url, rank, timeout, mode, cfg_dir);
         out.push(SourceFetch {
             tag: s.tag.clone(),
             rank,
@@ -4385,8 +4489,8 @@ fn fetch_sources(cfg: Option<&config::Config>, args: &Args, fast: bool) -> Vec<S
 }
 
 /// 兼容旧调用方：扁平化全部来源的节点（启动期组构建）。
-fn fetch_nodes(cfg: Option<&config::Config>, args: &Args, fast: bool) -> Vec<subscribe::ParsedNode> {
-    fetch_sources(cfg, args, fast)
+fn fetch_nodes(cfg: Option<&config::Config>, args: &Args, mode: &SubFetchMode) -> Vec<subscribe::ParsedNode> {
+    fetch_sources(cfg, args, mode)
         .into_iter()
         .flat_map(|s| s.nodes)
         .collect()
@@ -4431,30 +4535,30 @@ fn apply_group_policy_local(args: &Args) {
 
 /// P0（2026-10-11）：订阅热更新从 reload 关键路径解耦。
 /// reload 立即返回回执；本函数把「拉取订阅 + 替换成员」投递到常驻后台线程，
-/// 同一时刻最多一轮拉取；排队中的请求自动合并（fast 语义：任一强制重拉即强制）。
-static SUB_REFRESH_TX: std::sync::OnceLock<std::sync::mpsc::Sender<bool>> =
+/// 同一时刻最多一轮拉取；排队中的请求自动合并（P37/B1-B3：按 `SubFetchMode` 取更宽语义）。
+static SUB_REFRESH_TX: std::sync::OnceLock<std::sync::mpsc::Sender<SubFetchMode>> =
     std::sync::OnceLock::new();
 
-fn request_sub_refresh(args: &Args, fast: bool) {
+fn request_sub_refresh(args: &Args, mode: SubFetchMode) {
     let tx = SUB_REFRESH_TX.get_or_init(|| {
-        let (tx, rx) = std::sync::mpsc::channel::<bool>();
+        let (tx, rx) = std::sync::mpsc::channel::<SubFetchMode>();
         let args = args.clone();
         let _ = std::thread::Builder::new()
             .name("sub-refresh".into())
             .stack_size(512 * 1024)
             .spawn(move || {
-                while let Ok(mut fast) = rx.recv() {
-                    while let Ok(f2) = rx.try_recv() {
-                        fast = fast && f2;
+                while let Ok(mut mode) = rx.recv() {
+                    while let Ok(m2) = rx.try_recv() {
+                        mode = mode.merge(m2);
                     }
-                    log(&format!("订阅热更新：后台开始拉取（fast={fast}）"));
-                    reload_group_members(&args, fast);
+                    log(&format!("订阅热更新：后台开始拉取（{}）", mode.label()));
+                    reload_group_members(&args, &mode);
                     log("订阅热更新：本轮后台拉取结束");
                 }
             });
         tx
     });
-    if tx.send(fast).is_err() {
+    if tx.send(mode).is_err() {
         log("订阅热更新：后台线程已退出（发送失败）");
     }
 }
@@ -4493,13 +4597,19 @@ fn spawn_subscription_scheduler(args: &Args) {
                 std::thread::sleep(Duration::from_secs(60));
                 let now = unix_now_sec();
                 // P1（2026-10-11）：失败源自愈重试（退避 5min→1h；429 冷却仍然生效）。
-                if subscribe::sources_need_retry(now) {
-                    log("订阅自动重试：失败源已到退避窗口，重新拉取");
-                    request_sub_refresh(&args, false);
+                // P37（B3）：只对到期的失败源定向重拉（旧行为：连带健康源一起重打）。
+                let due = subscribe::sources_due_for_retry(now);
+                if !due.is_empty() {
+                    log(&format!(
+                        "订阅自动重试：{} 个失败源到退避窗口（{}），定向重拉",
+                        due.len(),
+                        due.join("/")
+                    ));
+                    request_sub_refresh(&args, SubFetchMode::Heal(due.into_iter().collect()));
                 }
                 if now >= next_periodic {
                     log(&format!("订阅周期刷新: 触发（间隔 {interval}s）"));
-                    request_sub_refresh(&args, false);
+                    request_sub_refresh(&args, SubFetchMode::Full);
                     let jitter = (interval / 10).max(1);
                     next_periodic = now + interval - jitter / 2 + rand::random::<u64>() % jitter;
                 }
@@ -4512,7 +4622,8 @@ fn spawn_subscription_scheduler(args: &Args) {
 
 /// P18e/P19：SIGHUP 订阅热更新——重拉订阅，按组 filter 替换成员（同名继承健康）。
 /// 组名集合变化（config 编辑）时整体重建（不做健康继承，日志明示）。
-fn reload_group_members(args: &Args, fast: bool) {
+/// P37：`mode` 决定本轮哪些源打网（Full/Fast/Heal，见 `SubFetchMode`）。
+fn reload_group_members(args: &Args, mode: &SubFetchMode) {
     let Some(lock) = GROUP_SET.get() else {
         return;
     };
@@ -4523,7 +4634,7 @@ fn reload_group_members(args: &Args, fast: bool) {
             })
             .ok()
     });
-    let sources = fetch_sources(cfg.as_ref(), args, fast);
+    let sources = fetch_sources(cfg.as_ref(), args, mode);
     let ok_count = sources.iter().filter(|s| s.ok).count();
     log(&format!(
         "订阅热更新：拉取完成（{ok_count}/{} 源成功）",
@@ -4747,6 +4858,13 @@ fn apply_runtime_params(args: &Args, cfg: Option<&config::Config>) {
         let old = SUB_CACHE_TTL_SECS.swap(s, Ordering::SeqCst);
         if old != s {
             log(&format!("热更新: sub_cache_ttl {old}s -> {s}s"));
+        }
+    }
+    // P37（B2）：失败源负缓存窗口（fast 重载对窗口内失败源不打网）。
+    if let Some(s) = g("sub_fail_ttl").and_then(|v| parse_duration_secs(&v)) {
+        let old = SUB_FAIL_TTL_SECS.swap(s, Ordering::SeqCst);
+        if old != s {
+            log(&format!("热更新: sub_fail_ttl {old}s -> {s}s"));
         }
     }
 }
@@ -7562,8 +7680,9 @@ fn rule_sets_json() -> serde_json::Value {
 
 /// P6：状态面主查询体（status / metrics 共用数据源）。
 fn status_json(ebpf: &mut Ebpf) -> serde_json::Value {
-    // 有人查状态 = “有人在看”→ 健康探测保持活跃节奏（优雅空闲的信号源之一）。
-    note_watch();
+    // P37（2026-10-13 / A1）：状态查询**不再**回写「有人在看」信号。
+    // 旧行为让面板轮询 / health-track / watchdog / CLI 把探测退避永久重置为全速档，
+    // 与同类惯例相反（mihomo 状态 API 不 touch、sing-box 只在新连接 Touch；见 devlog §13）。
     let rules_state = LAST_RULES.lock().ok().and_then(|g| g.clone());
     let cfg_state = CONFIG_STATE.lock().ok().and_then(|g| g.clone());
     let conn_state = count_map::<SodaTuple, SodaConnState>(ebpf, "conn_state_map");
@@ -7644,6 +7763,7 @@ fn status_json(ebpf: &mut Ebpf) -> serde_json::Value {
             "transport": if CONFIG_WATCH_INOTIFY.load(Ordering::Relaxed) { "inotify" } else { "poll" },
             "debounce_ms": crate::watch::DEBOUNCE.as_millis() as u64,
             "sub_cache_ttl_secs": SUB_CACHE_TTL_SECS.load(Ordering::Relaxed),
+            "sub_fail_ttl_secs": SUB_FAIL_TTL_SECS.load(Ordering::Relaxed),
         },
         "domain_stats": snapshot_domain_stats(),
         "rule_sets": rule_sets_json(),
@@ -8165,6 +8285,29 @@ fn handle_status_query(cmd: &str, ebpf: &mut Ebpf, args: &Args) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- P37（2026-10-13）SubFetchMode 合并语义 ----
+
+    #[test]
+    fn subfetch_mode_merge_prefers_wider() {
+        use SubFetchMode::*;
+        let heal = |tags: &[&str]| Heal(tags.iter().map(|s| s.to_string()).collect());
+        // 任一 Full → Full（超集）
+        assert_eq!(Fast.merge(Full), Full);
+        assert_eq!(heal(&["a"]).merge(Full), Full);
+        // Heal 之间取并集
+        let m = heal(&["a"]).merge(heal(&["b", "c"]));
+        match m {
+            Heal(s) => {
+                assert!(s.contains("a") && s.contains("b") && s.contains("c"));
+            }
+            other => panic!("期待 Heal，得到 {other:?}"),
+        }
+        // Fast 与 Heal 混合 → Heal（打网集合更大）
+        assert_eq!(Fast.merge(heal(&["a"])), heal(&["a"]));
+        // Fast 之间仍为 Fast
+        assert_eq!(Fast.merge(Fast), Fast);
+    }
 
     #[test]
     fn posix_tz_simple_forms() {

@@ -251,7 +251,8 @@ P6（suspend/reload/metrics/sysdump/日志轮转/整配置热重载）已完成*
   优先级 CLI 显式值 > config global > 现值）；**配置热驱动（P33/P35）**：`--watch-config <秒>`
   或 config `global { watch_config: 10 }`——inotify 目录事件驱动（毫秒级 + 100ms 去抖，事件名
   过滤 + 快照复核；<秒> = 无 inotify 时的兜底扫描），变更自动 `reload-fast`（订阅节点走
-  `sub_cache_ttl` 缓存，默认 60s；手动 reload/SIGHUP 仍强制重拉）；坏配置保留旧槽/旧参数；
+  `sub_cache_ttl` 缓存，默认 1800s；失败源负缓存 `sub_fail_ttl` 默认 600s——未变源不打
+  订阅服务器；手动 reload/SIGHUP 仍强制重拉）；坏配置保留旧槽/旧参数；
   状态面 `config_watch {transport, debounce_ms, ...}`；`metrics` 输出 Prometheus 文本（daed GraphQL 不做，
   见 ADR-0021）
 - **P7 收敛**：C 基准端点（`lab/bench_io.c` + `lab/bench.sh`）六路径剖面（口径如实：perf 不可用，
@@ -573,7 +574,8 @@ target/release/sodama sysdump [--socket <path>] [--out <file>]
 target/release/sodama trace [--seconds N]
 # P33/P35：配置热驱动（inotify 事件驱动，毫秒级 + 100ms 去抖；<秒> = 兜底扫描；见 ADR-0060/0062）
 #   config `global { watch_config: 10 }`（或 --watch-config 10）；变更自动 fast reload
-#   （订阅节点缓存 sub_cache_ttl，默认 60s）——改配置保存即生效
+#   （订阅节点缓存 sub_cache_ttl，默认 1800s；失败源负缓存 sub_fail_ttl 默认 600s）——改配置保存即生效，
+#   未变源 0 请求（P37；手动 reload/SIGHUP 仍强制重拉）
 target/release/sodama reload --socket /tmp/sodama-status.sock   # 手动线：等价 SIGHUP（同步等结果，强制重拉订阅）
 sudo env USE_CONFIG=/tmp/sodama-watch.dae USE_WATCH_CONFIG=2 USE_DIALER=direct lab/lab.sh up  # lab 自动线
 # P34/P35：多订阅顺序回退（pacman 风格）与默认配置发现（ADR-0061）
@@ -582,7 +584,7 @@ sudo env USE_CONFIG=/tmp/sodama-watch.dae USE_WATCH_CONFIG=2 USE_DIALER=direct l
 #   默认配置候选：$XDG_CONFIG_HOME/sodama/config.dae → ~/.config/sodama/config.dae
 #   → /etc/sodama/config.dae（无 home 的软路由/OpenWrt 可用系统目录）
 # P35：行为参数全部写进 config（唯一事实来源）：dial_mode/dial_timeout/sniffing_timeout/
-#   watch_config/sub_cache_ttl/geodata_dir/log_file/status_socket/…；命令行仅进程级参数与调试覆盖
+#   watch_config/sub_cache_ttl/sub_fail_ttl/geodata_dir/log_file/status_socket/…；命令行仅进程级参数与调试覆盖
 sudo lab/lab.sh sub-order-up && sudo lab/lab.sh test-sub-order   # 顺序回退 + 重排 2s 内生效（inotify+缓存）端到端
 # P36：用户分流名单 + 标准格式规则集（独立文件/URL 自动更新，ADR-0063）
 #   config `rule_set { tag: 'url|路径' }` → routing `domain(ruleset: tag) -> proxy|direct`

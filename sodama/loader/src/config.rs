@@ -1151,6 +1151,8 @@ const GLOBAL_KEYS: &[&str] = &[
     // P35：配置即唯一事实来源——行为参数可直接写在 global（CLI 显式值仅作调试覆盖）
     "watch_config",
     "sub_cache_ttl",
+    // P37（B2）：失败源负缓存窗口（秒；配置热重载对窗口内失败源不打网；默认 600；0=关）
+    "sub_fail_ttl",
     "log_file",
     "status_socket",
     "geodata_dir",

@@ -190,7 +190,7 @@ pub struct GroupStats {
     pub active_rank: AtomicU64,
     /// 当前健康探测节奏（秒；空闲退避时变大）——状态面展示用。
     pub probe_interval: AtomicU64,
-    /// 本轮是否处于「活跃探测」（有人看状态或有流量）。
+    /// 本轮是否处于「活跃探测」（P37/A1 后由流量信号决定；显式心跳为预留位）。
     pub probe_active: AtomicU64,
 }
 
@@ -229,7 +229,8 @@ pub struct NodeSnap {
 }
 
 /// 探测节奏决策（纯函数，便于测试）：
-/// 有人看/有流量 → 基准间隔并清零退避；两者皆无 → 指数退避（×2 到 `cap`）。
+/// 有流量（或显式心跳，预留位 `watched`）→ 基准间隔并清零退避；否则指数退避（×2 到 `cap`）。
+/// P37（A1）：`watched` 当前恒为 false（状态查询不再打点，见 main.rs 活跃度信号块）。
 /// `cap = 0` = 不退避（保持旧行为）。
 pub fn probe_interval_for(
     base: u64,
@@ -723,9 +724,12 @@ impl GroupRuntime {
         }
         let g = self.clone();
         std::thread::spawn(move || {
-            // 优雅空闲：探测频率跟随「有没有人用」——有人看状态（面板/CLI）或有流量时按
-            // `check_interval`；两者都无则指数退避到 `probe_idle_cap`（默认 600s）。
-            // 退避期间分片睡眠（每秒醒一次），一旦有人看/有流量立刻恢复活跃探测。
+            // 优雅空闲：探测频率跟随「有流量吗」——有真实转发时按 `check_interval`；
+            // 无流量则指数退避到 `probe_idle_cap`（默认 600s）。
+            // P37（A1，devlog §13）：状态面查询**不再**算作“有人在看”（旧实现被面板轮询/
+            // health-track/watchdog 永久钉在全速档）；`watched_recently` 机制保留供未来
+            // 显式面板心跳使用（当前无打点来源）。
+            // 退避期间分片睡眠（每秒醒一次），一旦有流量立刻恢复活跃探测。
             let base = g.check_interval_secs.max(1);
             let active_window = base.max(30);
             let mut idle_rounds: u32 = 0;
@@ -745,11 +749,11 @@ impl GroupRuntime {
                             "空闲退避"
                         },
                         if watched {
-                            "有人在看状态"
+                            "显式心跳"
                         } else if busy {
                             "最近有流量"
                         } else {
-                            "无人看且无流量"
+                            "无流量（状态查询不计）"
                         }
                     ));
                     last_logged = interval;
@@ -837,6 +841,7 @@ impl GroupRuntime {
                     g.note_active_layer(&inner, &hs);
                 }
                 // 分片睡眠：退避期间被「叫醒」时不等待剩余时间
+                // （P37/A1：watched 恒 false——保留占位；叫醒条件实际由流量信号承担）。
                 let mut slept = 0u64;
                 while slept < interval {
                     std::thread::sleep(Duration::from_secs(1));
@@ -1179,7 +1184,7 @@ mod tests {
     #[test]
     fn probe_interval_backs_off_when_idle() {
         let mut n = 0u32;
-        // 有人看 / 有流量：保持基准节奏
+        // 显式心跳（watched，预留）/ 有流量：保持基准节奏
         assert_eq!(probe_interval_for(30, 600, true, false, &mut n), 30);
         assert_eq!(n, 0, "活跃时清零退避");
         assert_eq!(probe_interval_for(30, 600, false, true, &mut n), 30);
