@@ -186,7 +186,7 @@ ol.endnotes li{margin-bottom:.5rem}
 <div class="classbar">
   <span class="cls">密级 · 最高</span>
   <span>SODAMA ATLAS · 内部研究档案 · 未经许可不得外传</span>
-  <span class="push">v1.1 · 2026-10-11 · main@1e1906d</span>
+  <span class="push">v1.2 · 2026-10-16 · main@97ebe9f</span>
 </div>
 
 <div class="page">
@@ -198,11 +198,11 @@ ol.endnotes li{margin-bottom:.5rem}
   <p class="sub">全 Rust 代理数据面 · 开发研究图集</p>
   <dl class="meta">
     <div><dt>对象</dt><dd>sodama —— Go 版 dae 代理内核的全 Rust 重写</dd></div>
-    <div><dt>范围</dt><dd>核心技术验证 · 架构对照 · 性能与资源边界 · 工程方法论 · 踩坑档案 · 第二阶段生产实战 · 余项地图</dd></div>
-    <div><dt>周期</dt><dd>2026-10-03 — 2026-10-11（软路由生产实战 + 第二阶段加固）</dd></div>
+    <div><dt>范围</dt><dd>核心技术验证 · 架构对照 · 性能与资源边界 · 工程方法论 · 踩坑档案 · 第二阶段生产实战 · 内存安全审计 · 余项地图</dd></div>
+    <div><dt>周期</dt><dd>2026-10-03 — 2026-10-16（软路由生产实战 + 第二阶段加固 + 审计修复批上线）</dd></div>
     <div><dt>基准机</dt><dd>Arch / Linux 6.18.54-lts / i9-9900KF 8C16T / 31 GB；生产机：OpenWrt Kwrt x86_64 2 核</dd></div>
     <div><dt>对照</dt><dd>dae v2.1.1（上游 Go）· sing-box 1.14.2 · v2ray 5.52.0 · mihomo 1.19.32</dd></div>
-    <div><dt>归档</dt><dd>ADR ×63 · 单测 274+ · HTML 报告与数据源见 §9 索引</dd></div>
+    <div><dt>归档</dt><dd>ADR ×64 · 单测 287 · HTML 报告与数据源见 §9 索引</dd></div>
   </dl>
 </header>
 
@@ -216,8 +216,8 @@ ol.endnotes li{margin-bottom:.5rem}
   <div><b>28</b><span>恒定线程数（1k→50k 并发不变）</span></div>
   <div><b>16.9 Gbps</b><span>VLESS + splice 零拷贝吞吐</span></div>
   <div><b>≈52 KB</b><span>每连接内核侧内存（扣除对照）</span></div>
-  <div><b>274+</b><span>单元测试通过（10-06 基线 268）</span></div>
-  <div><b>63</b><span>架构决策记录 ADR</span></div>
+  <div><b>287</b><span>单元测试通过（审计修复批后）</span></div>
+  <div><b>64</b><span>架构决策记录 ADR</span></div>
 </div>
 
 <table>
@@ -234,7 +234,7 @@ ol.endnotes li{margin-bottom:.5rem}
   <p><strong>一句话结论。</strong>sodama 以个位数到两位数 MB 的<em class="term">用户态</em>内存与恒定线程数承载高并发连接；真实上限由<strong>内核内存</strong>与<strong>加密协议 CPU</strong>决定，而不是线程或用户态分配器。<span class="sn">这是全篇最重要的口径纪律：<b>用户态优势 ≠ 系统优势</b>。20 000 连接时 sodama 的用户态仅占系统总增量的约 2.5%，其余在内核对象（socket、inode、pipe、dentry）。只报 RSS 是<strong>不完整</strong>的。</span></p>
 </div>
 
-<p>以上为第一阶段收口口径。<strong>v1.1 新增 <a href="#s8">§8 · 第二阶段 · 生产实战轮</a></strong>——真实软路由上的四轮侦查/修复、修复后 25 h 稳态与进行中的 72h 生产测试；原始证据见 <code>docs/phase2-devlog.md</code>。</p>
+<p>以上为第一阶段收口口径。<strong>v1.1 新增 <a href="#s8">§8 · 第二阶段 · 生产实战轮</a></strong>——真实软路由上的四轮侦查/修复与稳态观测。<strong>v1.2 增量</strong>：探测/订阅治理（CF 额度事故 → 6× 超速归零，ADR-0064）、AF-XDP 预研的条件性否决、<strong>内存安全审计（unsafe 专项）</strong>及其修复批上线——2d5h39m 生产数据比对把「拨号看门狗未解除」实锤为 DoH 连接 3 s 生命周期并已修复、把「退出残留」预测证伪降级；新一轮 72h 生产测试进行中（§8.4–§8.6 与 <code>docs/memory-safety-audit.html</code>）。</p>
 </section>
 
 <nav class="toc">
@@ -257,7 +257,7 @@ ol.endnotes li{margin-bottom:.5rem}
     <li><a href="#s5">工程实践与方法论</a></li>
     <li><a href="#s6">踩坑档案 · 十二则现场笔记</a></li>
     <li><a href="#s7">余项地图 · A–I 类待办与永久边界</a></li>
-    <li><a href="#s8">第二阶段 · 生产实战轮（2026-10-08 起）</a></li>
+    <li><a href="#s8">第二阶段 · 生产实战轮 · 审计修复批收口（2026-10-08 起）</a></li>
     <li><a href="#s9">复现与索引 · 命令、ADR、数据源</a></li>
   </ol>
 </nav>
@@ -962,7 +962,18 @@ ol.endnotes li{margin-bottom:.5rem}
 
 <h3>8.3 · 72h 生产测试（进行中）</h3>
 <p>2026-10-11，<strong>72 小时生产测试</strong>在软路由上启动：这是 I4 长稳判据的生产侧执行（实验室侧 <code>soak-curve.sh</code> 与 <code>SOAK_SECS=259200</code> 保持独立口径）。判据：相对 1 h 基线，RSS / FD 漂移 ≤5%、失败指标零增长；叠加生产侧检查项——<code>stragglers</code> 恒 0、看门狗不触发、<code>dial_errors</code> 不增长。采样走 <code>sodama/lab/prod/health-track.sh</code>（拉取 60 s 粒度 TSV）+ <code>health-plot.py</code>（判据线内建的自包含 SVG）。<span class="sn">运行协议：测试期间不重启引擎、不触发会归零计数器的写操作；看门狗一旦动作（重启引擎）即测试作废、重新起算。24 / 48 / 72 h 三个检查点的记分板在 <code>docs/phase2-devlog.md</code> §12 按检查点回填。</span></p>
-<p>在 72 小时检查点通过之前，本项目继续<strong>不启用</strong>「bounded-memory」的绝对表述——§5.3 第 6 条（时长要诚实）从一句纪律变成了一个正在跑的工程任务。</p>
+<p>在 72 小时检查点通过之前，本项目继续<strong>不启用</strong>「bounded-memory」的绝对表述——§5.3 第 6 条（时长要诚实）从一句纪律变成了一个正在跑的工程任务。<span class="sn">v1.2 注：该轮于 10-13 23:41 以 P37b 版重新起算（第一轮被 §14 事故后的修复接管），至 10-16 05:44 审计修复批部署收口，共 2d5h39m；判据回填与新一轮见 §8.6 与 <code>docs/phase2-devlog.md</code> §16–§18。</span></p>
+
+<h3>8.4 · 探测节奏与订阅治理（§13–§14，ADR-0064）</h3>
+<p>72h 测试期间的 CF Worker 额度事故（自建线当日 68k/100k 请求）牽出两个叠加缺陷：<code>traffic_active</code> 把「有长连接」恒判为忙，且探测循环的分片睡眠在正常节奏下也被流量「叫醒」——16 成员实测 3.2 探测/秒，是设计值（0.53/s）的 <strong>6 倍</strong>。修复（P37/P37b）：状态查询不再算「有人在看」、仅退避态允许提前唤醒、失败源负缓存与定向自愈、订阅拉取前置缓存判定。<span class="sn">v1.2 生产回验（2d5h39m）：16 节点 32 次/分、36 节点 68 次/分，恰为设计值（修复前 6× 超速）；订阅 2.2 天 10 次拉取 0 失败。「夜间退避 600s」在恒忙家庭网不适用——判据修正为「无流量窗口退避」。</span></p>
+
+<h3>8.5 · AF-XDP 预研（§15，条件性否决）</h3>
+<p>对「内核旁路」的一次定向预研结论为条件性否决：软路由 4× Intel I211（igb）未接入 xsk 收包路径（只能走 XDP_SKB 慢路径）、既有实测瓶颈在加密与拷贝（<code>rep_movs 46.8%</code>）而非收包、代理架构需配套用户态 TCP 栈才能兑现收益。重评估判据（10G+ 且驱动支持 ZC 等三条以上）固化于 <code>docs/af-xdp-research.md</code>。</p>
+
+<h3>8.6 · 内存安全审计与修复批（§16–§18）</h3>
+<p>v1.2 的收口工作是一次<strong>unsafe 专项审计</strong>：loader + ebpf-rs 全部 167 个 <code>unsafe {}</code> / 19 个 <code>unsafe fn</code> / 10 个 <code>unsafe impl</code> 逐处人工审读 + 定向模式扫描 + clippy，产出 3 高 / 4 中 / 13 低与完整「已核销清单」（<code>docs/memory-safety-audit.html</code> v1.1）。<span class="sn">审读纪律与第一阶段相同：每条发现给出行号级证据与复核指引；「查过没问题」的位置同样入册，使覆盖范围可证。</span></p>
+<p>审计结论随后用生产引擎 <strong>2d5h39m</strong>（10-13 23:41 → 10-16 05:44）真实数据逐项比对：<strong>H2（拨号看门狗未解除）被实锤</strong>——逐秒扫描显示 DoH 持久连接恰好 3 s 生命周期（≈1.4 万次重连/天，重试逻辑静默掩盖）；<strong>M4（退出残留）被证伪降级</strong>——aya ≥5.7 走 <code>bpf_link_create</code>，进程退出自动解绑，三个世代 6/6 挂载零失败；H1/H3（splice 管道 / 线程泵）与 M1（组世代线程）、M2/M3（UDP NAT 表）生产零暴露。</p>
+<p>修复批（H1/H2/H3 + M1/M2/M3 + L1/L2/L5 加固）于 2026-10-16 05:44 上线（<code>main@97ebe9f</code>，287/287 测试、OpenWrt 构建通过）：部署回验——DoH 连接 40 s 逐秒扫描端口全程不变（对照修复前「恰好 3 s 一换」）、空闲 <code>dial-wd</code> 线程 0、新观测计数（<code>pipe_discarded</code> / <code>reply_sockets_evicted</code>）在位。<strong>新一轮 72h 生产测试</strong>已在同一批次上启动（devlog §18）。</p>
 </section>
 
 <section id="s9">
@@ -1015,7 +1026,11 @@ lab/build-openwrt.sh --arch x86_64</code></pre>
   <tbody>
     <tr><td><code>docs/parity-status.md</code> v2.14</td><td>15 域对标 + 三个口径 + 优势项 + Top 缺口</td></tr>
     <tr><td><code>docs/benchmark-report.html</code> v3.0</td><td>合并版《性能与资源边界报告》：吞吐/内存四层/FD/五万并发/长稳</td></tr>
-    <tr><td><code>docs/phase2-devlog.md</code> §1–§12</td><td>第二阶段 · 生产实战轮：四轮侦查/修复/验收 + 72h 生产测试记分板 + 附 A/B 台账</td></tr>
+    <tr><td><code>docs/phase2-devlog.md</code> §1–§18</td><td>第二阶段 · 生产实战轮：四轮侦查/修复/验收 + P37/P37b 治理 + 审计修复批上线回验与两轮 72h 记分板 + 附 A/B 台账</td></tr>
+    <tr><td><code>docs/memory-safety-audit.html</code> v1.1</td><td>内存安全审计（unsafe 专项）：167/19/10 审读 + 2d5h39m 生产比对（H2 实锤 / M4 证伪）+ 修复批与部署回验</td></tr>
+    <tr><td><code>docs/af-xdp-research.md</code></td><td>AF-XDP 可行性预研：硬件/瓶颈/架构三层否决 + 重评估判据</td></tr>
+    <tr><td><code>docs/dae-optimization-research.md</code></td><td>面向 dae 的优化与创新研究：已做/能做清单、迁移路线、负面结论</td></tr>
+    <tr><td><code>docs/adr/ADR-0064-p37-probe-idle-signal-and-sub-fetch-modes.md</code></td><td>P37：探测活跃信号与订阅拉取模式（A1/B1–B3/C1）</td></tr>
     <tr><td><code>docs/reviews/2026-10-05-i1-system-memory-data.md</code></td><td>系统内存四层模型原始数据与口径</td></tr>
     <tr><td><code>docs/reviews/2026-10-05-memory-final-review-a.md</code> / <code>-b.md</code></td><td>第三方评审原文（含 pipe 容量推算质疑）</td></tr>
     <tr><td><code>docs/reviews/2026-10-05-i3-forwarding-primitives.md</code></td><td>splice / copy pump / io_uring 三档选型</td></tr>
@@ -1041,13 +1056,13 @@ lab/build-openwrt.sh --arch x86_64</code></pre>
   <li id="fn7"><code>docs/adr/ADR-0058-m4-reactor.md</code>——epoll worker 池、stage 1/2 划分、io_uring A/B 结论与关闭开关。</li>
   <li id="fn8"><code>docs/adr/ADR-0025-remove-c-datapath.md</code>——C 数据面退役；配合 ADR-0023/0024 的两阶段迁移。</li>
   <li id="fn9"><code>docs/adr/ADR-0062-p35-inotify-fast-reload-config-source-of-truth.md</code>——配置文件作为唯一事实来源与 inotify 毫秒级热驱动；配合 ADR-0061/0063。</li>
-  <li id="fn10"><code>docs/phase2-devlog.md</code>（§1–§12，2026-10-08 起）——第二阶段 · 生产实战轮：四轮侦查/修复/验收的完整证据、72h 生产测试记分板与附 A/B 台账。</li>
+  <li id="fn10"><code>docs/phase2-devlog.md</code>（§1–§18，2026-10-08 起）——第二阶段 · 生产实战轮：四轮侦查/修复/验收的完整证据、P37/P37b 治理、审计修复批上线回验与两轮 72h 生产测试记分板、附 A/B 台账。</li>
 </ol>
 </section>
 
 <div class="colophon">
-  <p><strong>SODAMA ATLAS</strong> · 全 Rust 代理数据面开发研究图集 · v1.1 · 2026-10-11 · 对应代码 <code>main@1e1906d</code>（第二阶段修复批次 §11.7 后）。</p>
-  <p>v1.1 增量：<a href="#s8">§8 · 第二阶段 · 生产实战轮</a>——四轮生产侦查/修复的收口结论、修复后 25 h 稳态与进行中的 72h 生产测试；原始证据见 <code>docs/phase2-devlog.md</code>。</p>
+  <p><strong>SODAMA ATLAS</strong> · 全 Rust 代理数据面开发研究图集 · v1.2 · 2026-10-16 · 对应代码 <code>main@97ebe9f</code>（内存安全审计修复批上线后）。</p>
+  <p>v1.1 增量：<a href="#s8">§8 · 第二阶段 · 生产实战轮</a>——四轮生产侦查/修复的收口结论与修复后稳态；原始证据见 <code>docs/phase2-devlog.md</code>。<br>v1.2 增量：§8.4–§8.6——P37/P37b 探测与订阅治理（ADR-0064）、AF-XDP 预研否决、内存安全审计（unsafe 专项）与修复批上线回验、新一轮 72h 生产测试进行中。</p>
   <p>本图集为单文件 HTML，样式与图表全部内联（SVG），无外部依赖。排版遵循 Tufte 式书卷原则：正文窄栏、边注旁置、数据优先、表格无竖线、图表与正文同宽、克制用色。</p>
   <p>所有数字均为本机或真实环境实测，未做外推；所有「未做」项均显式登记。口径与边界见 §5.3。项目以 AGPL-3.0 授权（许可证头一致性审计待办，见 §7 A8）。</p>
 </div>
@@ -1058,7 +1073,7 @@ lab/build-openwrt.sh --arch x86_64</code></pre>
 <div class="classbar bottom">
   <span class="cls">密级 · 最高</span>
   <span>SODAMA ATLAS · 内部研究档案 · 未经许可不得外传</span>
-  <span class="push">v1.1 · 2026-10-11</span>
+  <span class="push">v1.2 · 2026-10-16</span>
 </div>
 
 </body>
