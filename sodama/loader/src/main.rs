@@ -279,6 +279,8 @@ struct RelayStats {
     pipe_created: AtomicU64,
     pipe_reused: AtomicU64,
     pipe_released: AtomicU64,
+    /// H1：带残留字节而被丢弃（不入缓存）的 pipe 数——应为个位数（RST/异常收尾时）。
+    pipe_discarded: AtomicU64,
     /// P18e：并发上限拒绝数（--max-conns）。
     limit_rejected: AtomicU64,
     /// M4：交给 Reactor 的 codec 会话数（每连接 0 线程）。
@@ -300,6 +302,7 @@ static RELAY_STATS: RelayStats = RelayStats {
     pipe_created: AtomicU64::new(0),
     pipe_reused: AtomicU64::new(0),
     pipe_released: AtomicU64::new(0),
+    pipe_discarded: AtomicU64::new(0),
     limit_rejected: AtomicU64::new(0),
     reactor_codec_sessions: AtomicU64::new(0),
 };
@@ -539,6 +542,8 @@ struct UdpNatStats {
     bytes_down: AtomicU64,
     evicted: AtomicU64,
     errors: AtomicU64,
+    /// M3 修复：回包 socket 表超限逐出的条目数。
+    reply_sockets_evicted: AtomicU64,
 }
 static UDP_NAT_STATS: UdpNatStats = UdpNatStats {
     sessions_total: AtomicU64::new(0),
@@ -548,6 +553,7 @@ static UDP_NAT_STATS: UdpNatStats = UdpNatStats {
     bytes_down: AtomicU64::new(0),
     evicted: AtomicU64::new(0),
     errors: AtomicU64::new(0),
+    reply_sockets_evicted: AtomicU64::new(0),
 };
 
 /// 一条 UDP NAT 会话：每个 (client, orig_dst) 一个出口（direct 或 ss），
@@ -3170,7 +3176,12 @@ fn handle_relay_conn(mut client: TcpStream) {
     };
     if let Some(c_read) = sibling_read {
         let h2 = handle.clone();
-        let up_dst = upstream_fd;
+        // H3 修复：上方向线程只持 fd **号码**，而 handler 栈上的 `socket`（kill dup）
+        // 会在函数返回时析构（双泵收尾不覆盖它）——旧代码用它的号码，半关闭
+        // 序（上方向仍在跑、handler 已返回）下会写入已关闭/被复用的 fd。
+        // 改用 handle 内保活的 upstream dup：RELAY_CONNS 持有 handle 直至两个方向
+        // 都 pump_done，号码寿命覆盖本线程的全部 splice 使用。
+        let up_dst = handle.upstream.as_ref().map(|u| u.as_raw_fd());
         let done = pump_done.clone();
         std::thread::spawn(move || {
             let mut spliced = false;
@@ -4721,6 +4732,15 @@ fn reload_group_members(args: &Args, mode: &SubFetchMode) {
         log(&format!(
             "订阅热更新：组集合变更 {old_names:?} -> {new_names:?}，重建全部组（不继承健康）"
         ));
+        // M1 修复：旧世代显式停探测线程（否则线程 + 成员集随配置编辑史无界累积，
+        // 且旧世代会继续对废弃节点打探测——与 P37 额度治理冲突）。
+        let stopped = g.groups.iter().filter(|old| !old.stopped()).count();
+        for old in g.groups.iter() {
+            old.stop();
+        }
+        if stopped > 0 {
+            log(&format!("组集合变更：已停止 {stopped} 个旧世代健康探测线程"));
+        }
         let mut groups = Vec::with_capacity(specs.len());
         let mut by_name = std::collections::HashMap::new();
         for (i, (name, spec)) in specs.iter().enumerate() {
@@ -5903,6 +5923,12 @@ fn send_batch_to_udp(fd: RawFd, to: SocketAddr, datas: &[&[u8]]) -> std::io::Res
     Ok(())
 }
 
+/// L1 加固：cmsg 解析缓冲显式 8 字节对齐（`CMSG_DATA` 会强转 `sockaddr_in/in6` 并解引用；
+/// 与 ktls 路径的 `Ctl` 同范式，避免 `[u8; N]` 仅 align-1 的形式 UB）。
+#[repr(align(8))]
+#[derive(Clone, Copy)]
+struct CtlBuf([u8; 128]);
+
 /// 收一个 UDP 报文，返回 (长度, 客户端地址, 原始目的地址)。
 #[allow(dead_code)] // A/B 与降级路径保留
 fn recv_with_orig_dst(
@@ -5914,15 +5940,15 @@ fn recv_with_orig_dst(
         iov_base: buf.as_mut_ptr() as *mut libc::c_void,
         iov_len: buf.len(),
     };
-    let mut control = [0u8; 128];
+    let mut control = CtlBuf([0u8; 128]);
     let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
     msg.msg_name = &mut name as *mut _ as *mut libc::c_void;
     msg.msg_namelen = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
     msg.msg_iov = &mut iov;
     msg.msg_iovlen = 1;
-    msg.msg_control = control.as_mut_ptr() as *mut libc::c_void;
+    msg.msg_control = control.0.as_mut_ptr() as *mut libc::c_void;
     // P7：msg_controllen 在 glibc 是 usize、musl 是 u32（socklen_t），用 as _ 适配。
-    msg.msg_controllen = control.len() as _;
+    msg.msg_controllen = control.0.len() as _;
     let n = unsafe { libc::recvmsg(fd, &mut msg, 0) };
     if n < 0 {
         return Err(std::io::Error::last_os_error());
@@ -5968,7 +5994,7 @@ fn orig_dst_from_cmsgs(msg: &libc::msghdr) -> std::io::Result<SocketAddr> {
 struct UdpRecvBatch {
     slots: Vec<Vec<u8>>,
     names: Vec<libc::sockaddr_storage>,
-    ctrls: Vec<[u8; 128]>,
+    ctrls: Vec<CtlBuf>,
     iovecs: Vec<libc::iovec>,
     msgs: Vec<libc::mmsghdr>,
     max: usize,
@@ -5979,7 +6005,7 @@ impl UdpRecvBatch {
         let max = max.max(1);
         let mut slots: Vec<Vec<u8>> = (0..max).map(|_| vec![0u8; 65536]).collect();
         let mut names: Vec<libc::sockaddr_storage> = vec![unsafe { std::mem::zeroed() }; max];
-        let mut ctrls: Vec<[u8; 128]> = vec![[0u8; 128]; max];
+        let mut ctrls: Vec<CtlBuf> = vec![CtlBuf([0u8; 128]); max];
         // 预先取堆指针（Vec 移动不改变堆地址），后续不再 realloc。
         let names_ptr = names.as_mut_ptr();
         let ctrls_ptr = ctrls.as_mut_ptr();
@@ -6001,7 +6027,7 @@ impl UdpRecvBatch {
             m.msg_hdr.msg_iov = unsafe { iovecs_ptr.add(i) };
             m.msg_hdr.msg_iovlen = 1;
             m.msg_hdr.msg_control = unsafe { ctrls_ptr.add(i) as *mut libc::c_void };
-            m.msg_hdr.msg_controllen = ctrls[i].len() as _;
+            m.msg_hdr.msg_controllen = ctrls[i].0.len() as _;
             msgs.push(m);
         }
         UdpRecvBatch {
@@ -6029,7 +6055,7 @@ impl UdpRecvBatch {
             for i in 0..n {
                 self.msgs[i].msg_hdr.msg_namelen =
                     std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
-                self.msgs[i].msg_hdr.msg_controllen = self.ctrls[i].len() as _;
+                self.msgs[i].msg_hdr.msg_controllen = self.ctrls[i].0.len() as _;
                 self.msgs[i].msg_len = 0;
             }
             let rc = unsafe {
@@ -6693,6 +6719,19 @@ fn clear_domain_slot(ebpf: &mut Ebpf, slot: u32) -> Result<(), Box<dyn std::erro
 // ---------------------------------------------------------------- P4b：UDP NAT
 
 /// 上游回包 → 客户端（每会话一个 reader 线程；O7：recvmmsg 批量收 + sendmmsg 批量回）。
+/// M2 修复：会话退役（reader 致命退出 / janitor 空闲回收共用）——置 `alive=false`
+/// 并从分片表摘除。旧行为仅 janitor 摘表：reader 死后退场时表项残留，而客户端上行
+/// 会持续刷新 `last_ns`，使空闲回收永不触发（死会话 + 后端 fd 常驻）。
+fn udp_nat_retire(sess: &UdpSession) {
+    sess.alive.store(false, Ordering::Relaxed);
+    let key = (sess.client, sess.relay.target());
+    if let Ok(mut t) = udp_nat_shard(&key).lock() {
+        if t.remove(&key).is_some() {
+            UDP_NAT_STATS.evicted.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
 fn udp_session_reader(sess: Arc<UdpSession>) {
     // O8：槽走缓冲池且按需增长（空闲会话 ≈1×64KB）。
     let mut slots: Vec<bufpool::PoolBuf> = Vec::new();
@@ -6715,6 +6754,8 @@ fn udp_session_reader(sess: Arc<UdpSession>) {
             }
             Err(e) => {
                 log(&format!("udp nat: 会话读结束（{e}）"));
+                // M2 修复：致命退出同步摘表（否则客户端持续上行会永久保活死会话）。
+                udp_nat_retire(&sess);
                 break;
             }
         };
@@ -6731,6 +6772,10 @@ fn udp_session_reader(sess: Arc<UdpSession>) {
     }
 }
 
+/// M3 修复：回包 socket 表上限。超出后逐出任意一条——`Arc` 语义保证在用会话不受影响
+/// （会话持有自己的 Arc，fd 在最后一个引用释放时才关闭；被逐目的地址下次按需重建）。
+const REPLY_SOCKET_CAP: usize = 128;
+
 /// 取（或创建）绑定 addr 的透明回包 socket，与 DNS 回包共用同一缓存。
 fn reply_socket_for(
     map: &mut std::collections::HashMap<SocketAddr, Arc<OwnedFd>>,
@@ -6738,6 +6783,15 @@ fn reply_socket_for(
 ) -> Option<Arc<OwnedFd>> {
     if let Some(s) = map.get(&addr) {
         return Some(s.clone());
+    }
+    // M3 修复：旧实现只插不删（键=历史用过的全部目的地址），长跑大 pps 下 fd/RSS 缓慢抬升。
+    if map.len() >= REPLY_SOCKET_CAP {
+        if let Some(k) = map.keys().next().copied() {
+            map.remove(&k);
+            UDP_NAT_STATS
+                .reply_sockets_evicted
+                .fetch_add(1, Ordering::Relaxed);
+        }
     }
     match make_transparent_udp_bound(addr) {
         Ok(fd) => {
@@ -6929,7 +6983,7 @@ fn udp_nat_janitor_loop() {
             .load(Ordering::Relaxed)
             .saturating_mul(1_000_000_000);
         let now = monotonic_now_ns();
-        let mut dead: Vec<((SocketAddr, SocketAddr), Arc<UdpSession>)> = Vec::new();
+        let mut dead: Vec<Arc<UdpSession>> = Vec::new();
         for shard in UDP_NAT.iter() {
             if let Ok(t) = shard.lock() {
                 dead.extend(
@@ -6937,16 +6991,12 @@ fn udp_nat_janitor_loop() {
                         .filter(|(_, s)| {
                             now.saturating_sub(s.last_ns.load(Ordering::Relaxed)) > idle_ns
                         })
-                        .map(|(k, s)| (*k, s.clone())),
+                        .map(|(_, s)| s.clone()),
                 );
             }
         }
-        for (k, s) in dead {
-            s.alive.store(false, Ordering::Relaxed);
-            UDP_NAT_STATS.evicted.fetch_add(1, Ordering::Relaxed);
-            if let Ok(mut t) = udp_nat_shard(&k).lock() {
-                t.remove(&k);
-            }
+        for s in dead {
+            udp_nat_retire(&s);
         }
     }
 }
@@ -7791,6 +7841,7 @@ fn status_json(ebpf: &mut Ebpf) -> serde_json::Value {
             "pipe_created": RELAY_STATS.pipe_created.load(Ordering::Relaxed),
             "pipe_reused": RELAY_STATS.pipe_reused.load(Ordering::Relaxed),
             "pipe_released": RELAY_STATS.pipe_released.load(Ordering::Relaxed),
+            "pipe_discarded": RELAY_STATS.pipe_discarded.load(Ordering::Relaxed),
             "fds_used": fd_used(),
             "fds_soft_limit": NOFILE_SOFT.load(Ordering::Relaxed),
             "max_conns": RELAY_MAX_CONNS.load(Ordering::Relaxed),
@@ -7833,6 +7884,7 @@ fn status_json(ebpf: &mut Ebpf) -> serde_json::Value {
             "bytes_down": UDP_NAT_STATS.bytes_down.load(Ordering::Relaxed),
             "evicted": UDP_NAT_STATS.evicted.load(Ordering::Relaxed),
             "errors": UDP_NAT_STATS.errors.load(Ordering::Relaxed),
+            "reply_sockets_evicted": UDP_NAT_STATS.reply_sockets_evicted.load(Ordering::Relaxed),
             "idle_timeout_secs": UDP_IDLE_SECS.load(Ordering::Relaxed),
         },
         "hooks": HOOKS.lock().map(|h| h.clone()).unwrap_or_default(),

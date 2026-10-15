@@ -108,18 +108,28 @@ impl DirWatcher {
     /// 排空事件队列并判断是否有「关心的」事件。
     fn drain(&mut self) -> bool {
         let mut hot = false;
-        let mut buf = [0u8; 8192];
+        // L1 加固：事件缓冲显式 4 字节对齐（`inotify_event` 含 u32 字段；从 [u8; N]
+        // 基址强转指针再解引在规范层面要求对齐）。
+        #[repr(align(4))]
+        struct EvBuf([u8; 8192]);
+        let mut buf = EvBuf([0u8; 8192]);
         loop {
-            let n = unsafe { libc::read(self.fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
+            let n = unsafe {
+                libc::read(
+                    self.fd.as_raw_fd(),
+                    buf.0.as_mut_ptr().cast(),
+                    buf.0.len(),
+                )
+            };
             if n <= 0 {
                 break; // EAGAIN 或错误
             }
             let hdr = std::mem::size_of::<libc::inotify_event>();
             let mut off = 0usize;
             while off + hdr <= n as usize {
-                let ev = unsafe { &*(buf.as_ptr().add(off).cast::<libc::inotify_event>()) };
+                let ev = unsafe { &*(buf.0.as_ptr().add(off).cast::<libc::inotify_event>()) };
                 let len = ev.len as usize;
-                let name = &buf[off + hdr..(off + hdr + len).min(n as usize)];
+                let name = &buf.0[off + hdr..(off + hdr + len).min(n as usize)];
                 off += hdr + len;
                 if ev.mask & libc::IN_Q_OVERFLOW != 0 {
                     hot = true; // 队列溢出：丢失了事件，交给快照复核

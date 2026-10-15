@@ -242,12 +242,31 @@ fn arm_dial_watchdog(fd: RawFd, deadline: Duration) -> Option<Arc<AtomicBool>> {
 }
 
 /// 拨号结束（无论成败）：取消本线程的看门狗。
-fn disarm_dial_watchdog() {
+/// H2 修复起对外可见（`pub(crate)`）：不经 `dial_tcp` 的拨号路径靠 `DialWatchdogGuard` 兜底。
+pub(crate) fn disarm_dial_watchdog() {
     CUR_DIAL_WATCH.with(|w| {
         if let Some(c) = w.borrow_mut().take() {
             c.store(true, AtomicOrdering::Relaxed);
         }
     });
+}
+
+/// H2 修复：拨号看门狗作用域守卫——在 `marked_tcp_connect` 成功后创建，作用域结束
+/// 自动解除本线程看门狗。修复「只在 `dial_tcp` 解除、其它路径武装后无人解除 → 到点
+/// `shutdown(2)` 活跃 socket（DoH 持久连接实测 3 s 生命周期、UDP-over-stream 到点被断）」
+/// 的 arm/disarm 不对称。
+pub(crate) struct DialWatchdogGuard;
+
+impl DialWatchdogGuard {
+    pub(crate) fn new() -> Self {
+        Self
+    }
+}
+
+impl Drop for DialWatchdogGuard {
+    fn drop(&mut self) {
+        disarm_dial_watchdog();
+    }
 }
 
 pub(crate) fn set_sock_timeouts(fd: std::os::fd::RawFd, t: Option<Duration>) -> io::Result<()> {
@@ -648,12 +667,16 @@ fn recvmmsg_udp(
     let mut msgs: [libc::mmsghdr; UDP_BATCH_MAX] = unsafe { std::mem::zeroed() };
     for i in 0..n {
         let slot = &mut out[i];
-        let cap = slot.capacity();
-        if cap < UDP_SLOT {
-            slot.reserve(UDP_SLOT - cap);
+        if slot.capacity() < UDP_SLOT {
+            // 罕见路径（当前调用图不可达）：一次性补齐容量并零初始化。
+            // L2 修复：旧守卫 `reserve(UDP_SLOT - cap)` 语义错误（reserve 保证的是
+            // capacity ≥ len+additional），在 len<cap 时会越过容量。
+            slot.as_mut_vec().resize(UDP_SLOT, 0);
+        } else {
+            // SAFETY：容量 ≥ UDP_SLOT；`PoolBuf` 缓冲自 zeroed() 起全字节已初始化
+            // （之后仅 truncate 缩短 len），set_len 暴露的区间均已初始化。
+            unsafe { slot.as_mut_vec().set_len(UDP_SLOT) };
         }
-        // SAFETY：容量已确保；len 仅用于 recv 写入，随后按 msg_len truncate。
-        unsafe { slot.as_mut_vec().set_len(UDP_SLOT) };
         iovecs[i] = libc::iovec {
             iov_base: slot.as_mut_ptr() as *mut libc::c_void,
             iov_len: UDP_SLOT,
@@ -1639,6 +1662,10 @@ impl Outbound {
     /// UDP 出口；Ok(None) = 该协议不支持 UDP 代理（调用方决定直连回退）。
     pub fn dial_udp(&self, target: SocketAddr, timeout: Duration) -> io::Result<Option<UdpRelay>> {
         let r = self.dial_udp_inner(target, timeout);
+        // H2 修复：与 dial_tcp 对称解除墙钟看门狗。旧实现遗漏此处：VLESS/VMess 的
+        // UDP-over-stream 长连接会在 `timeout` 到点时被看门狗 shutdown（生产实测该
+        // 机制导致 DoH 持久连接 3 s 生命周期；UDP-over-stream 同理）。
+        disarm_dial_watchdog();
         if let Some(server) = self.server_addr() {
             crate::sticky::note_dial(server, r.is_ok());
         }

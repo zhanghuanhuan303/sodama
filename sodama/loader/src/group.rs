@@ -280,6 +280,10 @@ pub struct GroupRuntime {
     sub_failover: AtomicBool,
     /// 空闲探测退避上限（秒；0 = 不退避，保持旧行为）；config global `probe_idle_cap`。
     idle_cap_secs: AtomicU64,
+    /// 世代停止标志（M1 修复）：组集合变更重建时旧 `GroupRuntime` 会被容器替换，
+    /// 但探测线程以 `self.clone()` 强持有自身——不加停止位则旧世代线程/成员集
+    /// 永不释放，且持续对废弃节点打探测（与 P37 额度治理冲突）。
+    stop: AtomicBool,
 }
 
 /// 成员 + 健康（整体替换以实现“生成代”隔离）。
@@ -325,6 +329,7 @@ impl GroupRuntime {
             stats: GroupStats::default(),
             sub_failover: AtomicBool::new(true),
             idle_cap_secs: AtomicU64::new(600),
+            stop: AtomicBool::new(false),
         })
     }
 
@@ -362,6 +367,15 @@ impl GroupRuntime {
     /// 空闲探测退避上限（秒；0 = 不退避）。
     pub fn set_idle_cap(&self, secs: u64) {
         self.idle_cap_secs.store(secs, Ordering::Relaxed);
+    }
+
+    /// M1 修复：请求本世代探测线程退场（幂等；由组集合重建方调用）。
+    pub fn stop(&self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+
+    pub fn stopped(&self) -> bool {
+        self.stop.load(Ordering::Relaxed)
     }
 
     /// 当前策略（Arc 快照；热路径用，不拷贝名字）。
@@ -750,6 +764,11 @@ impl GroupRuntime {
             let mut idle_rounds: u32 = 0;
             let mut last_logged: u64 = 0;
             loop {
+                // M1 修复：世代停止（组集合重建丢弃旧组）时退场，释放线程与成员集。
+                if g.stopped() {
+                    crate::log(&format!("健康探测线程退出（组 {} 世代停止）", g.name));
+                    break;
+                }
                 let watched = crate::watched_recently(20);
                 let busy = crate::traffic_active(active_window);
                 let cap = g.idle_cap_secs.load(Ordering::Relaxed);
@@ -790,6 +809,9 @@ impl GroupRuntime {
                 // 改为独立 spawn + 带超时的收集：超时未回的线程被放弃（其迟到结果
                 // 仍经 `record_probe` 记入，不丢），主循环必定继续。
                 while i < n {
+                    if g.stopped() {
+                        break; // M1：世代已停，不再新开探测批次
+                    }
                     // 安全网：在跑的探测线程撞顶说明大量探测卡死未退，本轮跳过。
                     let live = PROBE_LIVE.load(Ordering::Relaxed);
                     if live >= PROBE_MAX_LIVE {
@@ -863,6 +885,9 @@ impl GroupRuntime {
                 while slept < interval {
                     std::thread::sleep(Duration::from_secs(1));
                     slept += 1;
+                    if g.stopped() {
+                        break; // M1：停止位在分片睡眠中被置位时立即回顶退出
+                    }
                     if probe_sleep_should_wake(
                         was_idle,
                         slept,

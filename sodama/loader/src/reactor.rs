@@ -154,6 +154,23 @@ fn put_pipe(cache: &mut Vec<[RawFd; 2]>, p: [RawFd; 2]) {
     }
 }
 
+/// H1 修复：管道回收决策——`pending > 0`（仍有未送达字节）**不复用**，直接关闭丢弃。
+/// 旧实现把带残留字节的管道直接入缓存：下一个取到它的会话会把这些字节当成自己的
+/// 数据发给对端（跨会话串流），且 pending 记账与管道实存失配。
+fn recycle_pipe(cache: &mut Vec<[RawFd; 2]>, p: [RawFd; 2], pending: usize) {
+    if pending > 0 {
+        if p[0] >= 0 {
+            unsafe {
+                libc::close(p[0]);
+                libc::close(p[1]);
+            }
+        }
+        RELAY_STATS.pipe_discarded.fetch_add(1, Ordering::Relaxed);
+    } else {
+        put_pipe(cache, p);
+    }
+}
+
 fn arm_pipe(dir: &mut Dir, cache: &mut Vec<[RawFd; 2]>) -> io::Result<()> {
     if dir.pipe[1] >= 0 {
         return Ok(());
@@ -1073,11 +1090,15 @@ impl Worker {
             m.remove(&sid);
         }
         RELAY_STATS.conns_active.fetch_sub(1, Ordering::Relaxed);
-        // I2：pipe 回收到 worker 本地 cache（懒建/复用的回收半边）
+        // I2：pipe 回收到 worker 本地 cache（懒建/复用的回收半边）。
+        // H1 修复：带残留字节（pending>0）的管道不入缓存，直接丢弃（recycle_pipe）。
+        // 可达性：dead（RST/错误）与 stop/rearm 失败路径均不要求 pending==0，
+        // 旧实现会在这些路径上把残留字节留给下一个会话（且 sweep 的空闲释放
+        // 反倒检查了 pending——不变量已在唯一入口固化）。
         if let Mode::Splice { c2u, u2c } = &mut sess.mode {
             for d in [&mut *c2u, &mut *u2c] {
                 let p = std::mem::replace(&mut d.pipe, [-1, -1]);
-                put_pipe(&mut self.pipe_cache, p);
+                recycle_pipe(&mut self.pipe_cache, p, d.pending);
             }
         }
     }
@@ -1519,6 +1540,35 @@ fn worker_loop(worker: Arc<Mutex<Worker>>, rx: Arc<Mutex<Receiver<Session>>>, _i
             match w.pending.pop() {
                 Some(sid) => w.pump_session(sid),
                 None => break,
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// H1 回归：带残留字节（pending>0）的管道不得进入缓存；干净的管道正常入缓存。
+    /// 注：此处不断言「fd 已关闭」（并行测试可能立即复占同一 fd 号，fcntl 探测有竞态）。
+    #[test]
+    fn pending_pipe_is_discarded_not_recycled() {
+        let mut cache: Vec<[RawFd; 2]> = Vec::new();
+
+        let p = new_pipe().unwrap();
+        let one = [b'x'];
+        let w = unsafe { libc::write(p[1], one.as_ptr() as *const libc::c_void, 1) };
+        assert_eq!(w, 1, "管道写入 1 字节用于模拟残留");
+        recycle_pipe(&mut cache, p, 1);
+        assert!(cache.is_empty(), "带残留字节的管道不得入缓存（跨会话串流风险）");
+
+        let q = new_pipe().unwrap();
+        recycle_pipe(&mut cache, q, 0);
+        assert_eq!(cache.len(), 1, "干净的管道应正常入缓存复用");
+        for f in cache.drain(..) {
+            unsafe {
+                libc::close(f[0]);
+                libc::close(f[1]);
             }
         }
     }

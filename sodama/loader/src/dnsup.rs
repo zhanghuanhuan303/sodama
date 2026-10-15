@@ -341,6 +341,9 @@ impl Upstream {
     fn exchange_tcp(&self, query: &[u8]) -> Result<Vec<u8>, String> {
         let mut s = outbound::marked_tcp_connect(self.addr, CONNECT_TIMEOUT)
             .map_err(|e| format!("TCP 连接上游失败: {e}"))?;
+        // H2 修复：作用域结束自动解除拨号看门狗（旧实现武装后无人解除，
+        // 到点会把仍在用的 socket shutdown）。
+        let _wg = outbound::DialWatchdogGuard::new();
         s.set_read_timeout(Some(EXCHANGE_TIMEOUT)).ok();
         s.set_write_timeout(Some(EXCHANGE_TIMEOUT)).ok();
         write_tcp_dns(&mut s, query)?;
@@ -358,6 +361,9 @@ impl Upstream {
         }
         let tcp = outbound::marked_tcp_connect(self.addr, CONNECT_TIMEOUT)
             .map_err(|e| format!("连接上游失败: {e}"))?;
+        // H2 修复：看门狗覆盖本次 TLS 握手，persist_conn 返回（连接入库）即解除——
+        // 持久连接不再在 `CONNECT_TIMEOUT` 到点时被掐断（生产实测 3 s 生命周期）。
+        let _wg = outbound::DialWatchdogGuard::new();
         let ((r, w), negotiated) = tls::connect_alpn(
             tcp,
             &self.tls_sni(),

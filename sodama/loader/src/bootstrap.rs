@@ -135,6 +135,8 @@ fn query_server(server: SocketAddr, qname: &str) -> Result<Vec<IpAddr>, String> 
             // TC=1：走 TCP 重查
             let tcp = crate::outbound::marked_tcp_connect(server, QUERY_TIMEOUT)
                 .map_err(|e| format!("bootstrap TCP 连接失败: {e}"))?;
+            // H2 修复：本次查询结束（作用域退出）即解除拨号看门狗。
+            let _wg = crate::outbound::DialWatchdogGuard::new();
             tcp.set_read_timeout(Some(QUERY_TIMEOUT)).ok();
             let mut t = tcp;
             use std::io::{Read, Write};

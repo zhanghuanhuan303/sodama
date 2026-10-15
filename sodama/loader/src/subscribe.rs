@@ -114,6 +114,8 @@ fn fetch_once(url: &str, timeout: Duration, lenient: bool) -> io::Result<Fetch> 
         .copied()
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("解析 {host} 失败")))?;
     let sock = crate::outbound::marked_tcp_connect(addr, timeout)?;
+    // H2 修复：拉取结束时解除拨号看门狗（避免拉取完成后到点误 shutdown）。
+    let _wg = crate::outbound::DialWatchdogGuard::new();
     sock.set_read_timeout(Some(timeout))?;
     sock.set_write_timeout(Some(timeout))?;
     let host_header = if port == 80 || port == 443 {

@@ -862,12 +862,17 @@ fn connect_impl(
                 // 驱动失败（超时/异常记录等）——已读字节都在 rustls 缓冲里，可继续
                 // 完整握手；但可能已消费 post-handshake 记录，RX 不可安装，只试 TX。
                 let mut sock = &tcp;
-                conn.complete_io(&mut sock).map_err(|e2| {
-                    io::Error::new(
+                if let Err(e2) = conn.complete_io(&mut sock) {
+                    // L5 加固：失败早退路径同样清掉线程本地密钥暂存
+                    // （正常路径在下方 `take()`；旧实现此路径遗留 ≤64B/线程）。
+                    KTLS_SINK.with(|s| {
+                        *s.borrow_mut() = None;
+                    });
+                    return Err(io::Error::new(
                         e.kind(),
                         format!("tls 握手失败（逐记录: {e}；complete_io: {e2}）"),
-                    )
-                })?;
+                    ));
+                }
             }
         }
     } else {
