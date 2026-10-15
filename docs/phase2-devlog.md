@@ -1068,6 +1068,53 @@ worker 停摆现象加诊断日志后未再复现；全链路日志（“后台�
   4. **内存/线程 bounded**（口径同 §12 记分板）。
 - 数据回填：按 §12 协议；本轮结末时出验收记录。
 
+## 17 · 审计修复批次 + 2d5h39m 生产数据比对（2026-10-16）
+
+> 触发：`docs/memory-safety-audit.html` v1.0（unsafe 专项审计）产出后，用户要求「把 2d5h37m 真实运行数据调下来比对得出结论」，并拍板「直接修复」。
+
+### 17.1 取证（引擎世代 2026-10-13 23:41:53 起，2d5h39m）
+
+- 样本：`health.tsv` 3210 行 + `mem-track.tsv` 3215 行（1 分钟粒度）、status/metrics 快照、日志全史、socket/fd/线程现场解剖、`/proc/<pid>/net/tcp` 逐秒扫描；原始数据在开发机 `docs/notes/prod-audit-2026-10-16/`（不入库）。
+- 基线：RSS 47.2 均值 / 53.5 峰 MB；线程常态 17–19；fd 随活跃连接（≈2/条 + ≈100 基座）；stragglers 全程 0；probes 110,240 / fail 140；订阅 2.2 天 10 次拉取、0 失败；UDP NAT 全零；conns 36,019 = reactor codec 36,019、splice 0。
+
+### 17.2 审计发现 × 实况结论
+
+| 发现 | 判定 | 关键证据 |
+|---|---|---|
+| H2 拨号看门狗未解除 | **实锤** | DoH 连接恰好 3s 生命周期（逐秒扫描 5/5 条）+ 端口每次更换；≈1.4 万次重连/天；`exchange_https` 重试静默吞掉失败（日志无痕）|
+| M4 退出残留 | **证伪降级** | aya ≥5.7 走 `bpf_link_create`（进程退出自动解绑）；3 世代 6/6 挂载、零 EEXIST；<5.7 fallback 才成立 |
+| H1/H3 | 零暴露 | splice_total=0、pipe 计数全 0（ws 负载 100% codec）|
+| M1 组世代线程 | 未触发 | 日志全史无「组集合变更」；16→36 成员走 replace_members（不新建线程）|
+| M2/M3 UDP 表 | 零暴露 | udp_nat 全零（无 UDP 代理会话）|
+
+- 事件窗：00:56–01:10 上游网络事件（dial_errors 全部 1072 集中于此；线程峰 154、fd 峰 455；~15min 自愈）——顺带复核 §9（探测线程硬超时）修复持续成立、无卡死线程累积。
+- P37b 达标：16 节点 32 次/分 / 36 节点 68 次/分 = 设计值；「空闲退避」仅 3 次 60s（家庭网 busy 近乎恒真，「夜间退避 600s」验收判据本环境不适用）。
+- 新观察：ws 帧截断（CF 线抖动，~30 条/200 行）；DoH「400」风暴与网络事件同窗（成因未定）。
+
+### 17.3 修复批次（已实施未部署；报告 §9 有逐文件清单）
+
+| 条目 | 修法 |
+|---|---|
+| H1 | reactor `destroy` 回收改 `recycle_pipe`（pending>0 直接关闭不入缓存）+ `pipe_discarded` 计数 + 回归测试 |
+| H2 | `DialWatchdogGuard`（作用域自动解除）+ `dial_udp` 对称解除 + dnsup/subscribe/bootstrap 接入 |
+| H3 | 上方向线程改持 `handle.upstream` 的 fd（RELAY_CONNS 保活至双泵结束）|
+| M1 | `GroupRuntime.stop` 世代停止位 + 重建前停旧世代（日志「已停止 N 个旧世代健康探测线程」）|
+| M2 | `udp_nat_retire` 共用退役（reader 致命退出即摘表）|
+| M3 | 回包 socket 表上限 128 + 逐出计数 |
+| L1/L2/L5 | 对齐缓冲（CtlBuf/EvBuf）；recvmmsg 容量守卫；kTLS 密钥早退清理 |
+
+### 17.4 验证
+
+- `cargo test` **287/287**（286 基线 + 新增 1）；`cargo clippy` 无新增（余 3 条 correctness 为既有）；
+- OpenWrt x86_64 交叉构建通过：`sodama 7.6M · sodama-ebpf 496K`（即部署产物）；
+- 部署后判据（报告 §9）：DoH 连接生命周期 >3s、空闲 `dial-wd` 归零、`pipe_discarded≈0`、组删除后线程回落、UDP NAT 计数联动。
+
+### 17.5 待办
+
+- [ ] 部署本批次（`docs/notes/deploy-engine.sh`）并回填上述判据；部署会结束当前 72h 测试窗口，先记录收口数据；
+- [ ] H1/H3 虽生产零暴露，随批上线（一旦启用可 splice 链路/UDP NAT 即进入暴露面）；
+- [ ] 新观察两项（ws 帧截断、DoH 400 风暴）另立观察项。
+
 ---
 
 ## 附 A · 路由器侧工具清单（**不入库**，仅存在于软路由）

@@ -1,0 +1,450 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>sodama · 内存安全与资源生命周期审计报告（unsafe 专项）v1.1</title>
+<style>
+  :root{
+    --ink:#1a1d21; --muted:#5a6570; --rule:#d9dee4; --rule-soft:#e8ecf0;
+    --navy:#1f4e79; --navy-soft:#eef3f8; --warm:#a0522d; --warm-soft:#f8f1ec;
+    --bg:#ffffff; --code:#f4f6f8;
+  }
+  *{box-sizing:border-box}
+  html{-webkit-text-size-adjust:100%}
+  body{
+    margin:0; background:var(--bg); color:var(--ink);
+    font:15px/1.75 "Segoe UI",system-ui,-apple-system,"Noto Sans SC","PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;
+    font-variant-numeric:tabular-nums;
+  }
+  .wrap{max-width:980px;margin:0 auto;padding:48px 40px 96px}
+  header.doc{border-bottom:2px solid var(--ink);padding-bottom:22px;margin-bottom:34px}
+  .kicker{font-size:12px;letter-spacing:.18em;text-transform:uppercase;color:var(--muted);margin-bottom:10px}
+  h1{font-size:27px;line-height:1.35;margin:0 0 10px;font-weight:700;letter-spacing:.01em}
+  .subtitle{color:var(--muted);font-size:14.5px;margin:0 0 16px}
+  .meta{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:6px 28px;font-size:13px;color:var(--muted)}
+  .meta b{color:var(--ink);font-weight:600}
+  .badge{display:inline-block;border:1px solid var(--ink);border-radius:3px;padding:1px 8px;font-size:11.5px;letter-spacing:.08em;margin-left:8px;vertical-align:2px}
+  h2{font-size:19px;margin:44px 0 14px;padding-bottom:6px;border-bottom:1px solid var(--rule);font-weight:700}
+  h3{font-size:15.5px;margin:28px 0 10px;font-weight:700}
+  h4{font-size:14px;margin:20px 0 8px;font-weight:700}
+  p{margin:10px 0}
+  ul,ol{margin:10px 0 10px 4px;padding-left:22px}
+  li{margin:4px 0}
+  small,.small{font-size:12.5px;color:var(--muted)}
+  code,kbd{background:var(--code);border:1px solid var(--rule-soft);border-radius:3px;padding:1px 5px;font:12.5px/1.5 ui-monospace,SFMono-Regular,Consolas,monospace}
+  pre{background:var(--code);border:1px solid var(--rule-soft);border-radius:4px;padding:12px 14px;overflow:auto;font:12.5px/1.65 ui-monospace,SFMono-Regular,Consolas,monospace}
+  table{width:100%;border-collapse:collapse;margin:14px 0;font-size:13.5px}
+  th,td{border-bottom:1px solid var(--rule-soft);padding:7px 10px;text-align:left;vertical-align:top}
+  thead th{border-bottom:1.5px solid var(--ink);font-weight:600;font-size:12.5px;letter-spacing:.02em}
+  td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
+  tbody tr:hover{background:#fafbfc}
+  .callout{border-left:3px solid var(--navy);background:var(--navy-soft);padding:12px 16px;margin:16px 0;border-radius:0 4px 4px 0}
+  .callout.warn{border-color:var(--warm);background:var(--warm-soft)}
+  .callout p:first-child{margin-top:0}.callout p:last-child{margin-bottom:0}
+  figure{margin:22px 0;border:1px solid var(--rule-soft);border-radius:4px;padding:14px 14px 8px}
+  figcaption{font-size:12.5px;color:var(--muted);margin-top:8px;line-height:1.6}
+  .toc{columns:2;column-gap:40px;font-size:13.5px;margin:14px 0}
+  .toc a{color:var(--ink);text-decoration:none;border-bottom:1px dotted var(--rule)}
+  .toc a:hover{color:var(--navy)}
+  .kv{display:grid;grid-template-columns:190px 1fr;gap:4px 18px;font-size:13.5px;margin:12px 0}
+  .kv dt{color:var(--muted)}
+  .kv dd{margin:0}
+  .tag{display:inline-block;font-size:11.5px;border-radius:3px;padding:1px 7px;letter-spacing:.03em}
+  .tag.ok{background:#e9f3ec;color:#1d5c34;border:1px solid #c4ddcd}
+  .tag.part{background:#fdf3e4;color:#7a5217;border:1px solid #ecd6ad}
+  .tag.no{background:#f6ecec;color:#7d2f2f;border:1px solid #e4c4c4}
+  .num{white-space:nowrap}
+  .rule{margin:34px 0;border:0;border-top:1px solid var(--rule-soft)}
+  footer.doc{margin-top:56px;padding-top:18px;border-top:1px solid var(--rule);font-size:12.5px;color:var(--muted)}
+  @media print{
+    .wrap{max-width:none;padding:0 6mm}
+    h2{break-after:avoid} figure,table{break-inside:avoid}
+    a{color:inherit;text-decoration:none}
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header class="doc">
+  <div class="kicker">SODAMA · 技术报告 · 代码审计</div>
+  <h1>内存安全与资源生命周期审计报告<span class="badge">unsafe 专项 · v1.1</span></h1>
+  <p class="subtitle">loader + ebpf-rs 全量 <code>unsafe</code> 人工审读 · 泄漏/UB/资源保留三类风险 · 发现清单与已核销清单 · 修复优先级 · <b>2d5h39m 生产实况比对</b> · 修复批次已落地（未部署，§9）</p>
+  <div class="meta">
+    <div><b>日期</b>：2026-10-16</div>
+    <div><b>对象</b>：sodama（Rust 重写 dae；eBPF 数据面 + 用户态 loader）</div>
+    <div><b>审计基线</b>：<code>dev@d1bdb46</code>（工作树无未提交改动）</div>
+    <div><b>范围</b>：<code>sodama/loader</code> + <code>sodama/ebpf-rs</code> 共 54 个源文件；<code>dae/</code>、<code>panel/</code> 无 unsafe</div>
+    <div><b>方法</b>：全量人工审读（<code>unsafe {}</code> 167 处 / <code>unsafe fn</code> 19 处 / <code>unsafe impl</code> 10 处）+ 定向模式扫描 + <code>cargo clippy</code></div>
+    <div><b>状态</b>：<b>只读审计——未修改任何代码</b>；全部发现为静态结论（clippy 为实跑）</div>
+  </div>
+</header>
+
+<h2 id="abstract">摘要</h2>
+<p>本报告回应「审计 unsafe 代码的内存泄漏风险」的专项要求：对 loader 与数据面（eBPF）中全部不安全语法点做逐处审读，按 <b>UB 风险 / 内存泄漏 / fd·资源泄漏 / 有界保留</b> 四类给出判定，并把「查过且没有问题」的核销清单完整列出（§5），使结论可复核、范围可证。</p>
+<p>总体判断：</p>
+<ul>
+  <li><b>未发现无条件成立的用户态堆内存泄漏</b>。unsafe 部分以 syscall 包装（socket/ioctl/epoll/pipe/splice/mmsg）为主，fd 所有权整体规范（前置 <code>raw &lt; 0</code> 检查、<code>OwnedFd</code> 收尾、成对删插），7 个 <code>unsafe impl aya::Pod</code> 与内核侧结构逐字段同位。</li>
+  <li><b>发现 3 项高优先、4 项中优先、13 项低优先/加固、2 项附带</b>（非内存类）。三项高优先分别为：reactor 管道回收不排空导致的<b>跨会话数据串流</b>（H1）；拨号墙钟看门狗 arm/disarm 不对称导致<b>活跃 socket 被定时掐断</b>（H2）；legacy splice 路径捕获 fd <b>号码</b>而非句柄导致的 fd use-after-close（H3）。</li>
+  <li><b>「持有期无界」而非分配器泄漏</b>是本次的主要泄漏形态：组世代线程（M1）、UDP NAT 会话表（M2）、透明回包 socket 表（M3）、退出残留的内核钩子（M4）。与第一阶段结论（分配器高水位、非泄漏，见 devlog §3）一致。</li>
+  <li>H2 与 M1 都与既有记录直接呼应：H2 是 §9「探测线程泄漏」修复（墙钟看门狗）引入的副作用；M1 与 P37「探测/额度治理」动机冲突（旧世代线程仍在探测）。</li>
+</ul>
+
+<div class="callout warn">
+  <p><b>结论纪律</b>：本报告以<b>静态审计</b>为主——除 <code>cargo clippy</code> 为实跑外，v1.0 条目均基于逐行代码审读与依赖源码（aya 0.14.0）对照；<b>v1.1 增补 §8 生产实况比对（2d5h39m 真实运行数据）</b>，其中 H2 被实锤、M4 被证伪降级，其余发现生产零暴露。每条发现标注置信度与复核指引；修复建议的实施状态见 §9。</p>
+</div>
+
+<h3>发现总表</h3>
+<table>
+  <thead><tr><th>ID</th><th>严重度</th><th>类别</th><th>一句话</th><th>位置</th><th>置信度</th></tr></thead>
+  <tbody>
+    <tr><td>H1</td><td><span class="tag no">高</span></td><td>跨会话数据串流</td><td>reactor 回收 pipe 不排空，残留字节发给下一个复用该管道的会话</td><td><code>reactor.rs:1049-1083</code></td><td>高</td></tr>
+    <tr><td>H2</td><td><span class="tag no">高</span></td><td>fd/行为缺陷</td><td>拨号看门狗只在 <code>dial_tcp</code> 解除；<code>dial_udp</code> 等路径到点 shutdown 活跃 socket。<b>生产实锤（§8）：DoH 持久连接恰好 3s 生命周期≈ 1.4 万次重连/天</b></td><td><code>outbound.rs:181/1227/1640</code></td><td>高</td></tr>
+    <tr><td>H3</td><td><span class="tag no">高</span></td><td>fd use-after-close</td><td>上方向泵线程持 raw fd 号码，handler 先返回时 fd 号被关闭/可复用</td><td><code>main.rs:3052/3173/3246</code></td><td>高</td></tr>
+    <tr><td>M1</td><td><span class="tag part">中</span></td><td>线程+内存泄漏</td><td>组集合变更重建时旧组健康探测线程无退出路径，每代泄漏线程与成员集</td><td><code>group.rs:736-877</code>、<code>main.rs:4720-4739</code></td><td>高</td></tr>
+    <tr><td>M2</td><td><span class="tag part">中</span></td><td>fd/内存保留（条件）</td><td>UDP NAT reader 致命退出不摘表；客户端上行持续刷新 last_ns 使空闲回收永不触发</td><td><code>main.rs:6716-6719/6880/6924-6952</code></td><td>高</td></tr>
+    <tr><td>M3</td><td><span class="tag part">中</span></td><td>fd/内存保留</td><td>透明回包 socket 表只增不删（每目的地址 1 socket + 8MB 收发缓冲设定）</td><td><code>main.rs:6734-6753/5771-5772</code></td><td>高</td></tr>
+    <tr><td>M4</td><td><span class="tag ok">低</span></td><td>内核对象残留（条件性）</td><td>v1.1 证伪降级：aya ≥5.7 走 <code>bpf_link_create</code>、进程退出自动解绑；仅 &lt;5.7 内核 fallback 路径成立。生产 3 世代 6/6 挂载、零 EEXIST（§8）</td><td><code>main.rs:1877/1900/5657/5675</code></td><td>高</td></tr>
+    <tr><td>L1</td><td><span class="tag ok">低</span></td><td>UB 风险（形式）</td><td>cmsg / inotify 事件缓冲无对齐声明（同文件已有正确范式）</td><td><code>main.rs:5917/5982</code>、<code>watch.rs:111</code></td><td>中</td></tr>
+    <tr><td>L2</td><td><span class="tag ok">低</span></td><td>UB 风险（潜势）</td><td><code>set_len(UDP_SLOT)</code> 的 <code>reserve</code> 守卫语义写错（当前不可达）</td><td><code>outbound.rs:651-656</code></td><td>中</td></tr>
+    <tr><td>L3</td><td><span class="tag ok">低</span></td><td>状态残留</td><td>DNS 后台刷新单飞表在 panic 路径不会清理（key 永久卡死）</td><td><code>dns.rs:681-688</code>、<code>main.rs:6449-6488</code></td><td>中</td></tr>
+    <tr><td>L4</td><td><span class="tag ok">低</span></td><td>并发尖峰（有界）</td><td>DNS stale 刷新线程无全局并发闸（上界≈缓存键集合）</td><td><code>main.rs:6449</code></td><td>中</td></tr>
+    <tr><td>L5</td><td><span class="tag ok">低</span></td><td>状态残留</td><td>kTLS 密钥暂存线程本地在握手失败早退路径未清（量级 ≤64B/线程，有界）</td><td><code>tls.rs:858/865-870/884</code></td><td>高</td></tr>
+    <tr><td>L6</td><td><span class="tag ok">低</span></td><td>有界保留</td><td>TLS <code>ClientConfig</code> 按 ALPN 组合缓存只增不删（键=配置出现过的 ALPN 集合）</td><td><code>tls.rs:308-331</code></td><td>高</td></tr>
+    <tr><td>L7</td><td><span class="tag ok">低</span></td><td>有界保留</td><td>sticky <code>origin</code> 表只增不删（reload <code>reset()</code> 兜底；≈百 B/条/次重解析）</td><td><code>sticky.rs:85-86/186/203</code></td><td>高</td></tr>
+    <tr><td>L8</td><td><span class="tag ok">低</span></td><td>有界保留</td><td>订阅「429 冷却表」与「负缓存表」过期只判不删，删源后条目常驻</td><td><code>subscribe.rs:512-616</code></td><td>高</td></tr>
+    <tr><td>L9</td><td><span class="tag ok">低</span></td><td>有界保留</td><td>geodata 四个缓存无上限无淘汰（键=配置出现过的 code/文件；进程期常驻）</td><td><code>geodata.rs:317-323</code></td><td>高</td></tr>
+    <tr><td>L10</td><td><span class="tag ok">低</span></td><td>有界保留（容量）</td><td><code>UDP_SLOT=65600</code> 恰好越过大档分界 65536，槽按 128KB 档保留（最高 ~2× 放大）</td><td><code>outbound.rs:541</code>、<code>bufpool.rs:11-12</code></td><td>高</td></tr>
+    <tr><td>L11</td><td><span class="tag ok">低</span></td><td>脆弱不变量</td><td>raw <code>BPF_MAP_LOOKUP_ELEM</code> 不传用户缓冲长度（当前尺寸对齐成立）</td><td><code>main.rs:963-1015</code></td><td>高</td></tr>
+    <tr><td>L12</td><td><span class="tag ok">低</span></td><td>有界保留（并发）</td><td>探测线程上限为「批次前检查」，单批最坏超顶 ≈24</td><td><code>group.rs:794-821</code></td><td>高</td></tr>
+    <tr><td>L13</td><td><span class="tag ok">低</span></td><td>有界保留（峰值）</td><td>ruleset 重载瞬时新旧两份共存（峰值 2×，随后旧份释放）</td><td><code>ruleset.rs:86-100</code>、<code>main.rs:3566-3595</code></td><td>高</td></tr>
+    <tr><td>A1</td><td><span class="tag">附带</span></td><td>启动健壮性（非内存）</td><td>同一 TC 程序多接口 attach 第二次 <code>load()</code> 返回 AlreadyLoaded 而失败</td><td><code>main.rs:1791-1803/5320-5350</code></td><td>高</td></tr>
+    <tr><td>A2</td><td><span class="tag">附带</span></td><td>静态工具（非内存）</td><td>clippy correctness 3 处 error（未纳入本次深挖）</td><td><code>hysteria2.rs:375</code>、<code>tls13.rs:723/808</code></td><td>高</td></tr>
+  </tbody>
+</table>
+<p class="small">严重度口径：<b>高</b>=确认的正确性/数据安全缺陷或可触发的资源误用；<b>中</b>=条件触发的泄漏/保留，或与额度/稳定性目标冲突；<b>低</b>=形式 UB、脆弱不变量、微量有界保留与加固项。<b>「置信度」指机制判定把握</b>，不代表已运行时复现。</p>
+<div class="callout">
+  <p><b>v1.1 修订摘要</b>：本报告 v1.0 发布后完成两项后续工作——① 以生产引擎 <b>2d5h39m</b> 真实数据逐项比对（§8）：<b>H2 生产确认（实锤）</b>、<b>M4 证伪降级</b>（上表与 §3 已同步修订）、H1/H3/M1/M2/M3 本负载零暴露；② 修复批次落地（§9）：H1/H2/H3/M1/M2/M3 + L1/L2/L5 加固，<code>cargo test 287/287</code>、OpenWrt x86_64 构建通过，<b>尚未部署</b>。</p>
+</div>
+
+<h3>目录</h3>
+<nav class="toc">
+  <a href="#scope">1 · 范围与方法</a><br>
+  <a href="#high">2 · 高优先发现（H1–H3）</a><br>
+  <a href="#mid">3 · 中优先发现（M1–M4）</a><br>
+  <a href="#low">4 · 低优先与加固（L1–L13、附带 A1/A2）</a><br>
+  <a href="#cleared">5 · 已核销清单</a><br>
+  <a href="#fix">6 · 修复建议与优先级</a><br>
+  <a href="#relation">7 · 与既有记录的关系 · 局限</a><br>
+  <a href="#prod">8 · 生产实况比对（2d5h39m）</a><br>
+  <a href="#fixbatch">9 · 修复批次与验证</a>
+</nav>
+
+<h2 id="scope">1 · 范围与方法</h2>
+
+<table>
+  <thead><tr><th>项</th><th>值</th></tr></thead>
+  <tbody>
+    <tr><td>不安全语法点统计（loader + ebpf-rs，含测试）</td><td><code>unsafe {}</code> 块 <b>167</b> · <code>unsafe fn</code> <b>19</b> · <code>unsafe impl</code> <b>10</b></td></tr>
+    <tr><td>集中文件（<code>unsafe</code> 出现次数）</td><td><code>loader/main.rs</code>(75) · <code>loader/outbound.rs</code>(31) · <code>loader/reactor.rs</code>(25) · <code>ebpf-rs/progs.rs</code>(20) · <code>ebpf-rs/flow.rs</code>(11) · <code>tls.rs</code>(8) · <code>watch.rs</code>(7) · <code>cgroup.rs</code>(7) · <code>route.rs</code>(6) · 其余≤3</td></tr>
+    <tr><td>dae / panel</td><td>0 处 unsafe（不列入范围）</td></tr>
+    <tr><td>方法 A：全量人工审读</td><td>逐处阅读全部 unsafe 语法点及其调用方/被调用方；fd 所有权沿调用链核对；裸指针/切片生命周期核对</td></tr>
+    <tr><td>方法 B：定向模式扫描</td><td><code>from_raw_fd</code>/<code>into_raw</code>/<code>mem::forget</code>/<code>ManuallyDrop</code>/<code>set_len</code>/<code>from_raw_parts</code>/<code>transmute</code>；静态注册表（<code>OnceLock&lt;Mutex&lt;HashMap…&gt;&gt;</code>）抽查增删配对；<code>thread::spawn</code> 退出条件</td></tr>
+    <tr><td>方法 C：对照物</td><td>eBPF 两侧结构体逐字段对照（<code>loader</code> ↔ <code>ebpf-rs/common.rs</code>）；aya 0.14.0 源码（attach/link 语义，<code>~/.cargo/registry/.../aya-0.14.0</code>）；内核 map-in-map / cgroup attach 语义</td></tr>
+    <tr><td>方法 D：静态工具（实跑）</td><td><code>cargo clippy -p sodama</code>：81 warnings + <b>3 个 correctness error</b>（后者见 A2）；<code>mem::forget</code> 那条 warning（<code>main.rs:1805</code>）证实其遗忘对象无 Drop——真实 link 由 <code>Ebpf</code> 持有（见 M4 分析）</td></tr>
+    <tr><td>组织方式</td><td>三路分工初审（main.rs / 反应堆与 IO / 缓存与保留内存）+ 主审逐条复核（所有行号回读原文，关键结论对照 aya 源码与内核语义后才入册）</td></tr>
+  </tbody>
+</table>
+
+<p><b>证据分级</b>（沿用 <code>docs/README.md</code> 约定）：本报告条目均为 <b>源码实测</b>（静态阅读/统计可得）；涉及「实际触发概率、水位增长速率」的表述为<b>推断</b>并已显式标注；无「已实测」级结论（未做运行时复现）。</p>
+<p><b>局限</b>：(a) 未运行 Miri/ASan/valgrind（syscall 密集路径不适用 Miri；未搭建 sanitizer 构建）；(b) 未审计第三方 crate 内部 unsafe（aya/rustls/quinn/ring 等）；(c) 未做 eBPF verifier 语义与运行期 map 水位的实测；(d) eBPF 侧地图容量上限内的「键空间残留」属设计取舍，仅在波及用户态时列出。</p>
+
+<h2 id="high">2 · 高优先发现</h2>
+
+<h3>H1 · reactor 回收 pipe 不排空 → 跨会话数据串流 <span class="tag no">高</span></h3>
+<dl class="kv">
+  <dt>位置</dt><dd><code>reactor.rs:1049-1083</code>（destroy 回收）、<code>reactor.rs:142-155</code>（put_pipe）、<code>reactor.rs:383-433</code>（drain）、对照 <code>reactor.rs:1170-1176</code>（sweep 的空闲释放有 <code>pending==0</code> 检查）</dd>
+  <dt>类别</dt><dd>跨会话数据串流（资源生命周期缺陷；非内存泄漏、非 UB）</dd>
+  <dt>置信度</dt><dd>机制=高；「缓存复用后先行写出」的时序命中=中（未运行时复现）</dd>
+</dl>
+<pre>// reactor.rs:1076-1082  destroy()：无条件把两条 pipe 放回 worker 本地缓存
+if let Mode::Splice { c2u, u2c } = &amp;mut sess.mode {
+    for d in [&amp;mut *c2u, &amp;mut *u2c] {
+        let p = std::mem::replace(&amp;mut d.pipe, [-1, -1]);
+        put_pipe(&amp;mut self.pipe_cache, p);      // ← 不排空、不问 pending
+    }
+}
+// 对照 drain() 的注释（reactor.rs:385）："不变量：释放仅在 pending==0 时发生"
+// 对照 sweep()（reactor.rs:1172）：if d.pending == 0 &amp;&amp; d.pipe[0] >= 0 { ... }</pre>
+<p><b>机理</b>：<code>put_pipe</code> 把管道（容量 <code>PIPE_SZ=1 MiB</code>，<code>reactor.rs:34</code>）直接放入 worker 本地缓存（上限 8 对），<b>管道内可能是刚从 socket splice 进来的、尚未 drain 给对端的字节</b>。而 destroy 的进入条件并不蕴含 pending==0：</p>
+<ul>
+  <li><code>finished()</code>（<code>reactor.rs:577-585</code>）在 <code>dead</code> 时为真；<code>dead</code> 由 EPOLLERR 或任一方向 fill/drain 报错置位（<code>reactor.rs:529-534</code>）——典型如客户端 RST 时 u2c 方向仍可能有~1 MiB 未送达响应；</li>
+  <li><code>sweep()</code> 的 stop 分支（janitor 强制回收，<code>reactor.rs:1199-1207</code>）与 <code>rearm</code> 失败分支（<code>reactor.rs:1128-1131</code>）同样不检查 pending。</li>
+</ul>
+<p><b>后果</b>：后续会话从缓存取到该管道后（<code>arm_pipe</code>，<code>reactor.rs:157-168</code>），<code>fill</code> 把<b>新数据追加在残留字节之后</b>，<code>drain</code> 按 <code>pending.min(CHUNK)</code> 从管道读端取——FIFO 先取出的是<b>上一会话的残留字节</b>并发送给新会话的对端（跨连接数据污染/隐私暴露）；同时 pending 记账与管道实存失配，半关闭时点（<code>maybe_half_close</code>，<code>reactor.rs:451</code>）可能提前触发导致丢数。生产默认开启 reactor（<code>reactor::enabled()</code> 仅在 <code>SODAMA_NO_REACTOR</code> 设置时关闭），RST 属日常事件，<b>命中概率应按「worker 缓存复用 × 非对称收尾」评估为现实存在</b>（推断）。</p>
+<p><b>建议修法（未实施）</b>：destroy 中若任一方向 <code>pending &gt; 0</code> 或 eof 不一致，则先非阻塞排空至 EAGAIN（丢弃）再入缓存，或直接 close 该管道不入缓存；亦可给 <code>put_pipe</code> 加「入缓存前断言两方向 pending==0，否则 close」的硬约束，把不变量固化到唯一入口。</p>
+<p><b>复核指引</b>：读 <code>reactor.rs:136-168 / 383-433 / 1049-1083 / 1128-1131 / 1160-1180 / 1425-1440</code>；运行时验证：加「destroy 时 pending&gt;0 计数」临时探针，在压测中制造客户端 RST 观察计数与串流日志。</p>
+
+<h3>H2 · 拨号墙钟看门狗 arm/disarm 不对称 → 活跃 socket 被定时掐断 <span class="tag no">高</span></h3>
+<dl class="kv">
+  <dt>位置</dt><dd>武装 <code>outbound.rs:181</code>（<code>marked_tcp_connect</code> 内）· 解除 <code>outbound.rs:1227</code>（仅 <code>dial_tcp</code>）· 缺失点 <code>outbound.rs:1640-1646</code>（<code>dial_udp</code>）</dd>
+  <dt>类别</dt><dd>行为缺陷（活跃连接被 shutdown）+ fd/线程有界保留（≤deadline）</dd>
+  <dt>置信度</dt><dd>代码事实=高；运行时后果=中高（若被同线程后续 disarm 意外掩盖则减轻，见下）</dd>
+</dl>
+<pre>// outbound.rs:179-181  marked_tcp_connect：每次 TCP 拨号都武装墙钟看门狗
+set_sock_timeouts(stream.as_raw_fd(), Some(timeout))?;
+arm_dial_watchdog(stream.as_raw_fd(), timeout);   // 到点对 dup 执行 shutdown(SHUT_RDWR)
+
+// outbound.rs:1224-1227  dial_tcp：拨号结束即解除（成败都解除）
+let r = self.dial_tcp_inner(target, timeout);
+disarm_dial_watchdog();
+
+// outbound.rs:1640-1646  dial_udp：**没有** disarm_dial_watchdog()
+let r = self.dial_udp_inner(target, timeout);
+if let Some(server) = self.server_addr() { crate::sticky::note_dial(server, r.is_ok()); }
+r</pre>
+<p><b>机理与波及面</b>：看门狗线程分片睡眠（20ms 粒度）至 <code>timeout</code> 后，对该 socket 的独立 dup 执行 <code>shutdown(2)</code>（<code>outbound.rs:207-241</code>）。<code>disarm_dial_watchdog</code> 全仓库仅 <code>dial_tcp</code> 与测试调用（已核实）。因此以下路径在拨号成功后的 <code>timeout</code>（拨号层默认 <code>RELAY_DIAL_TIMEOUT_MS=5000</code>）到点会被**主动掐断**：</p>
+<ul>
+  <li><b>VLESS / VMess 的 UDP-over-stream</b>（<code>outbound.rs:1698/1729</code> 经 <code>marked_tcp_connect</code> 建立长连接，承载 UDP NAT 转发与 UDP 健康探测）——5s 后连接被切断；</li>
+  <li><b>DNS 上游持久连接（DoT/DoH）</b>（<code>dnsup.rs:342/359</code> 直用 <code>marked_tcp_connect</code>）——<code>CONNECT_TIMEOUT</code> 到点被切断，之后复用「看似存活」的持久连接会失败；</li>
+  <li>订阅拉取（<code>subscribe.rs:116</code>）与 bootstrap DNS（<code>bootstrap.rs:136</code>）——一次性连接被提前/滞后关闭，主要影响是看门狗线程 + dup fd 存活至 deadline（有界）。</li>
+</ul>
+<p>另注意：<code>CUR_DIAL_WATCH</code> 为线程本地且新武装会覆盖旧值——旧看门狗的 cancel 标志不再可达，<b>即使同一线程稍后发生一次 <code>dial_tcp</code>，也只解除最新一次武装</b>（<code>outbound.rs:240/245-251</code>）。除非同线程恰好覆盖，否则上述拨号必被掐断；生产上 UDP NAT 主要走 ss/hy2/tuic（不触发此路径）时症状会被掩盖（推断）。</p>
+<p><b>建议修法（未实施）</b>：把 disarm 改为 RAII guard（作用域结束自动解除，覆盖所有拨号入口）；或在 <code>dial_udp</code>/dnsup/subscribe/bootstrap 各拨号出口补 <code>disarm_dial_watchdog()</code>；同时为嵌套拨号把「单个槽位」升级为栈/代际标记，使 disarm 只作用于本次武装。</p>
+<p><b>复核指引</b>：读 <code>outbound.rs:207-251 / 1224-1241 / 1640-1646 / 1690-1745</code>、<code>dnsup.rs:342-380</code>；运行时验证：以 VLESS 节点起 UDP NAT 会话，抓 <code>ss -tnp</code> 观察 5s 周期性 RST，或临时把看门狗日志开关打开。</p>
+<p><b>v1.1 生产实锤（§8）</b>：30s 逐秒扫描显示每条约 223.5.5.5:443 的连接<b>恰好存活 3 秒</b>（= <code>CONNECT_TIMEOUT</code>）后消失、端口每次更换（≈ 1.4 万次重连/天）；<code>exchange_https</code> 的「丢弃连接重试」把首试失败静默吞掉，故日志无痕、错误计数不涨。已修复（§9）。</p>
+
+<h3>H3 · legacy splice 上方向线程持 raw fd 号码 → fd use-after-close <span class="tag no">高</span></h3>
+<dl class="kv">
+  <dt>位置</dt><dd>捕获 <code>main.rs:3052</code> · 线程使用 <code>main.rs:3171-3181</code> · 原始 <code>socket</code> 析构点 <code>main.rs:3246</code>（函数返回）；对照 <code>outbound.rs:1243-1257</code>（<code>DialedStream.socket</code> 为 <code>kill</code> dup）</dd>
+  <dt>类别</dt><dd>fd 生命周期误用（use-after-close：写错对象或静默截断；非 Rust UB）</dd>
+  <dt>置信度</dt><dd>机制=高；触发前提=非默认开关（<code>SODAMA_NO_REACTOR=1</code>，实验室 A/B 路径）+ 方向不对称收尾</dd>
+</dl>
+<pre>// main.rs:3052  只捕获 fd "号码"（i32），不是句柄
+let upstream_fd = socket.as_ref().map(|s| s.as_raw_fd());
+// main.rs:3173-3181  上方向（client→上游）独立线程
+let up_dst = upstream_fd;                       // i32 拷贝进 move 闭包
+... splice_pump(c_read.as_raw_fd(), dst /* up_dst */, ...)
+// main.rs:3245-3246  下方向泵在本线程结束后：pump_done(); } ← socket（kill dup）在此析构，
+//                    fd 号被关闭；而线程保活的是 handle.upstream（另一个 dup，保 description 不保号码）</pre>
+<p><b>机理</b>：两泵设计（<code>main.rs:3156-3162</code>，为修复历史「泵线程泄漏」而引入）保证连接收尾在<b>两个方向都结束</b>后才 <code>relay_finish</code>；<code>handle</code> 内的 <code>upstream</code> dup 在此期间使 file description 保活。但上方向线程使用的 <code>up_dst</code> 是 <code>DialedStream.socket</code>（<code>kill</code> dup）的<b>号码</b>，该对象由 handler 函数栈持有，函数返回即关闭该号码。触发序：下方向先结束（上游半关闭/先出错）而客户端仍在上传 → handler 返回、号码关闭 → 上方向线程随后 <code>splice</code> 到该号码：未被复用则 <code>EBADF</code>（上传静默截断、且 <code>Fatal</code> 分支置 <code>spliced=true</code> 不落回退泵）；被并发 <code>accept/dial/pipe2</code> 复用则把客户端数据**写进无关对象**（跨连接数据污染）。</p>
+<p><b>建议修法（未实施）</b>：上方向线程改用 <code>handle.upstream</code>（RELAY_CONNS 内 dup，保活至双泵结束）的 <code>as_raw_fd()</code>；或将 <code>socket</code>（<code>Option&lt;TcpStream&gt;</code>）直接 move 进闭包、在闭包内取号；并顺带为「关闭前断言无在用 raw fd」建立约定。</p>
+<p><b>复核指引</b>：读 <code>main.rs:3035-3061 / 3155-3246</code>、<code>outbound.rs:1243-1257</code>；运行时验证：<code>SODAMA_NO_REACTOR=1</code> 下构造「上游先 FIN、客户端继续发送」的半关闭用例，观察上传截断/交叉写。</p>
+
+<h2 id="mid">3 · 中优先发现</h2>
+
+<h3>M1 · 组集合变更重建 → 旧世代健康探测线程永不退出（线程+成员集泄漏） <span class="tag part">中</span></h3>
+<dl class="kv">
+  <dt>位置</dt><dd><code>group.rs:736-877</code>（<code>spawn_health_loop</code>，<code>loop</code> 无退出条件，无 stop 字段/无 <code>impl Drop</code>）· 重建点 <code>main.rs:4720-4739</code>（组集合变更分支 <code>*g = GroupSet{…}</code>）· 调用 <code>main.rs:4004-4092</code>（<code>make_group_runtime</code> → <code>spawn_health_loop</code>）</dd>
+  <dt>类别</dt><dd>线程泄漏 + 内存保留（每代 = 1 线程 + 全部成员/健康表；且旧世代继续探测）</dd>
+  <dt>置信度</dt><dd>高（结构缺退出路径=代码事实）</dd>
+</dl>
+<p><b>机理</b>：探测线程以 <code>let g = self.clone()</code> 捕获组实例后进入 <code>loop</code>（按 <code>check_interval</code> 至退避 cap 的节奏持续运行，<code>group.rs:752-876</code>）。组集合变更（组名增删）时 <code>main.rs:4720-4739</code> 重建全部组并整体替换 <code>GroupSet</code>——旧组从容器移除，但被<b>自己的探测线程</b>强持有，永不析构：线程数、成员集、健康历史随配置编辑史单调累积无上限；旧世代还继续对已废弃节点打探测（与 P37/§14 的 CF 额度治理目标直接冲突）。正常路径（组名不变 → <code>replace_members</code> 继承健康、不新建线程）不受影响。</p>
+<p><b>建议修法（未实施）</b>：<code>GroupRuntime</code> 增加 <code>stop: AtomicBool</code>，主循环与分片睡眠检查退出；重建前对旧 <code>GroupSet</code> 逐组置 stop（或引入代际号，旧代自动退场）；并加「健康线程数 == 组数」的断言式状态字段。</p>
+<p><b>复核指引</b>：<code>group.rs:736-877</code>（确认无 break/无 Drop）、<code>main.rs:4700-4740</code>；运行时验证：反复增删一个订阅组名若干次，观察 <code>/proc/&lt;pid&gt;/task</code> 中探测线程数只增不减。</p>
+
+<h3>M2 · UDP NAT：reader 致命退出不摘表；上行持续刷新 last_ns 使回收永不触发 <span class="tag part">中</span></h3>
+<dl class="kv">
+  <dt>位置</dt><dd><code>main.rs:6716-6719</code>（错误分支只 <code>break</code>）· 表格移除仅 <code>main.rs:6944-6950</code>（janitor，按 <code>last_ns</code>）· 上行刷新 <code>main.rs:6880/6900</code></dd>
+  <dt>类别</dt><dd>fd/内存保留（条件性、可无时间上限）</dd>
+  <dt>置信度</dt><dd>高（代码路径确定）</dd>
+</dl>
+<p><b>机理</b>：<code>udp_session_reader</code> 在 recv 致命错误时仅退出线程、<b>不</b>从 <code>UDP_NAT</code> 摘除会话；而客户端每次上行都会刷新 <code>last_ns</code>（<code>6880/6900</code>），janitor 的回收判据只看 <code>last_ns</code>（<code>6937-6939</code>）。于是「reader 已死 + 客户端仍持续发包」的会话及其后端 relay fd、回包 socket 引用将<b>无限期驻留</b>（直到客户端静默 60s 且 janitor 到点）。与 H2 组合（VLESS/Vmess UDP 被 5s 掐断后客户端继续用）会放大为常驻死会话。</p>
+<p><b>建议修法（未实施）</b>：reader 的绝路分支在退出前执行摘表（复用 janitor 的移除函数：置 <code>alive=false</code> + <code>remove</code>）；janitor 增加「<code>alive==false</code> 立即回收」分支。</p>
+<p><b>复核指引</b>：<code>main.rs:6696-6732 / 6870-6921 / 6924-6952</code>；运行时验证：对某 UDP 目的持续发包并在上游注入错误，对比 <code>status</code> 中 UDP 会话数与 <code>/proc/&lt;pid&gt;/fd</code>。</p>
+
+<h3>M3 · 透明回包 socket 表只增不删 <span class="tag part">中</span></h3>
+<dl class="kv">
+  <dt>位置</dt><dd><code>main.rs:6735-6753</code>（取/建，唯一持有者 <code>main.rs:6497</code>）· 每 socket 缓冲设定 <code>main.rs:5771-5772</code>（<code>SO_RCVBUF/SNDBUF = 8&lt;&lt;20</code>，实际受 <code>rmem_max</code> 约束）</dd>
+  <dt>类别</dt><dd>fd/内存保留（键=去重后的目的地址集合，无淘汰）</dd>
+  <dt>置信度</dt><dd>高（全文件无 remove；已 grep 全部使用点）</dd>
+</dl>
+<p><b>机理</b>：<code>reply_sockets: HashMap&lt;SocketAddr, Arc&lt;OwnedFd&gt;&gt;</code> 服务于 UDP NAT 回包（透明源地址）。条目=每目的地址一个透明 UDP socket，<b>无 TTL/LRU/清空</b>，随进程存活；目的地址越杂（QUIC/P2P/游戏/DNS 变体端口）表越大。单条目价值：netns 内一个 socket + <code>8MB</code> 收发缓冲<b>设定</b>（内核按 <code>rmem_max</code> 截断，典型落到数百 KB）。属「与历史目的地址数成正比」的有界但无淘汰保留；长跑大 pps 家庭网关上是渐进型 fd/RSS 抬升来源。</p>
+<p><b>建议修法（未实施）</b>：给表加引用计数或 TTL 淘汰（与 UDP_NAT 会话空闲联动：某 <code>orig_dst</code> 无会话超过 N 分钟即 close 并从表摘除）；或复用单一 socket + <code>sendmsg</code> 带 <code>IP_PKTINFO</code> 指定源地址（需评估透明场景可行性）。</p>
+<p><b>复核指引</b>：<code>main.rs:6495-6500 / 6734-6753 / 5760-5775</code>；运行时验证：<code>ss -unlp</code> 计数随访问过的 UDP 目的地址数增长。</p>
+
+<h3>M4 · 退出残留：cgroup 钩子（所有内核）与 &lt;6.6 的 tc 过滤器；重启 EEXIST 静默降级 <span class="tag ok">低（v1.1 修正）</span></h3>
+<p><b>v1.1 生产比对修正（降级）</b>：aya 0.14 的 cgroup attach 在内核 ≥5.7 走 <code>bpf_link_create</code>（<code>aya-0.14.0/src/programs/cgroup_sock.rs:77-95</code>），link 随进程退出自动解绑；生产（6.12.92）三个世代连续「6/6 挂载成功、零 EEXIST/失败日志」，直接证伪了「重启静默降级」的预测。本节结论仅在 <b>&lt;5.7 内核</b>（aya fallback 到 <code>bpf_prog_attach</code>）或 <b>&lt;6.6 + 非正常退出</b>（tc netlink 过滤器）时成立。详见 §8。</p>
+<dl class="kv">
+  <dt>位置</dt><dd>挂载 <code>main.rs:1871-1911</code>（6 个 cgroup 钩子，<code>CgroupAttachMode::Single</code>，失败仅 log）· 退出 <code>main.rs:5656-5676</code>（注释断言 + <code>process::exit(0)</code>）· TCX/网表分支 aya <code>tc.rs:240</code></dd>
+  <dt>类别</dt><dd>内核对象残留 + 功能静默降级（非用户态泄漏）</dd>
+  <dt>置信度</dt><dd>高（残留与 EEXIST 为内核/aya 语义；「重启后具体表现」建议实测一次）</dd>
+</dl>
+<p><b>机理</b>：（a）<code>bpf_prog_attach</code> 到 cgroup 的引用由 cgroup 持有，<b>进程退出不会自动摘除</b>（与内核版本无关）；<code>graceful_shutdown</code> 直接 <code>exit(0)</code>，<code>Ebpf</code> 永不 Drop。（b）TC 过滤器：aya 仅在内核 ≥6.6 走 TCX（fd 关闭即原子摘除）；&lt;5.17–6.5 走 netlink，摘除需要 <code>NlLink::detach</code>（RTM_DELTFILTER），而该路径在本进程永不触达（<code>mem::forget(link)</code> + <code>exit</code>；注：clippy 已证实 forget 的对象无 Drop，真正 link 由 <code>Ebpf</code> 持有，故「forget 造成每轮泄漏」不成立，问题在 <b>退出路径从不 detach</b>）。</p>
+<p><b>后果</b>：SIGTERM 重启/崩溃（procd respawn）后，旧一代 program/map 继续注册在 cgroup 上（保留旧 maps → 内核内存驻留一代）；新进程 <code>Single</code> attach 第二个（同名类型不同 program）时返回 <code>EEXIST</code>，当前代码只记日志继续 → <b>pname 路由静默失效</b>（<code>sodama0peer</code> 侧 l4 分流不受影响，但进程名匹配规则全部失灵）。</p>
+<p><b>建议修法（未实施）</b>：启动时对目标 cgroup 先执行一次「清空该类钩子」（<code>bpf_prog_detach2</code>/查询后 detach）再 attach；或在 <code>graceful_shutdown</code> 中显式 detach 全部 HOOKS/tc 链接（保留 <code>exit</code> 仅作兜底）；并把 EEXIST 从「仅告警」升级为「先 detach 再重试」。</p>
+<p><b>复核指引</b>：<code>main.rs:1860-1915 / 1791-1812 / 5656-5676</code>，aya <code>tc.rs:236-246/486-501</code>、<code>links.rs:400-420</code>；运行时验证：重启 daemon 后 <code>bpftool cgroup tree</code> 观察旧程序是否仍在。</p>
+
+<h2 id="low">4 · 低优先与加固项</h2>
+
+<h3>L1 · cmsg / inotify 事件缓冲无对齐声明（形式 UB） <span class="tag ok">低</span></h3>
+<p><b>位置</b>：<code>main.rs:5917</code>（<code>let mut control = [0u8; 128];</code>）、<code>main.rs:5982</code>（<code>Vec&lt;[u8; 128]&gt;</code> 的 <code>UdpRecvBatch.ctrls</code>，生产 DNS 路径在用）、<code>watch.rs:111</code>（<code>let mut buf = [0u8; 8192];</code> 后 <code>watch.rs:120</code> <code>cast::&lt;inotify_event&gt;()</code>）。<b>机理</b>：从 align-1 缓冲派生的指针解引用为对齐 4 的结构体（<code>sockaddr_in/in6</code>、<code>inotify_event</code>）在规范层面是 UB；实践上因栈/堆分配对齐富余而未触发。同文件已有正确范式：<code>main.rs:2119</code> <code>#[repr(align(8))] struct Ctl([u8; 64])</code>、<code>tls.rs:499</code> 同款。<b>建议</b>：统一抽一个 <code>#[repr(align(8))] struct AlignedBuf&lt;const N: usize&gt;([u8; N])</code> 复用到三处；或对事件字段改用 <code>read_unaligned</code>。<b>复核</b>：上述四处对照行号。</p>
+
+<h3>L2 · <code>set_len(UDP_SLOT)</code> 的容量守卫写法错误（当前不可达） <span class="tag ok">低</span></h3>
+<p><b>位置</b>：<code>outbound.rs:649-656</code>。<code>if cap &lt; UDP_SLOT { slot.reserve(UDP_SLOT - cap); }</code>——<code>reserve(additional)</code> 保证 <code>capacity ≥ len + additional</code>，当 <code>len &lt; cap</code> 时不足以保证容量 ≥ <code>UDP_SLOT</code>，随后 <code>set_len</code> 可能越过 capacity（破坏 Vec 不变量）。当前所有槽均来自 <code>PoolBuf::zeroed(UDP_SLOT=65600)</code>（走大档、cap≥128KB，且 resize 已零初始化），该分支不可达、无实际 UB；但守卫语义应写为 <code>reserve(UDP_SLOT - len)</code> 或直接 <code>resize(UDP_SLOT, 0)</code>。一旦未来有调用方传入 65536-cap 的槽（<code>main.rs:2053</code> 已有此规格缓冲）即成为真 UB。<b>复核</b>：<code>outbound.rs:636-695</code>、<code>bufpool.rs:41-71/87-107</code>。</p>
+
+<h3>L3 · DNS 后台刷新单飞表在 panic 路径不清（key 永久卡死） <span class="tag ok">低</span></h3>
+<p><b>位置</b>：<code>dns.rs:681-688</code>（<code>begin_refresh/end_refresh</code>，注释写明「无论成败，必须调用」）、<code>main.rs:6449-6488</code>（<code>end_refresh</code> 在线程体末尾，无 <code>catch_unwind</code>/RAII）。<b>机理</b>：刷新线程体内任何 panic 将跳过 <code>end_refresh</code> → 该 key 永久留在 <code>refreshing</code>（String 量级）且该 (scope,qname,qtype,up) 之后<b>永不再后台刷新</b>（功能静默退化）。触发需 panic（上游交换均有超时，概率低）。<b>建议</b>：以 RAII guard 承接 <code>end_refresh</code>。<b>复核</b>：<code>dns.rs:675-693</code>、<code>main.rs:6430-6490</code>。</p>
+
+<h3>L4 · DNS stale 刷新线程无全局并发闸（有界尖峰） <span class="tag ok">低</span></h3>
+<p><b>位置</b>：<code>main.rs:6449</code>。同 key 单飞，但不同 key 并发 spawn（默认 8MB 栈/线程，VmSize 尖峰；RSS 视实际栈用量）。上界≈缓存去重键数（<code>DNS_CACHE_MAX_ENTRIES=1024</code>）——属有界尖峰。大量热门域名同时过期时（推断）会出现一次性线程尖峰。<b>建议</b>：加全局并发计数（同 <code>PROBE_LIVE</code> 风格）或改线程池。<b>复核</b>：<code>main.rs:6430-6489</code>、<code>dns.rs:520-528</code>。</p>
+
+<h3>L5 · kTLS 密钥暂存线程本地早退未清（有界，≤64B/线程） <span class="tag ok">低</span></h3>
+<p><b>位置</b>：<code>tls.rs:858</code>（置 <code>Some(default)</code>）→ <code>tls.rs:865-870</code>（逐记录握手失败 + <code>complete_io</code> 也失败时 <code>?</code> 早退，不清）→ <code>tls.rs:884-886</code>（正常路径才 <code>take</code>）。下次 kTLS 握手会覆盖，线程退出即释放，无跨连接串用。<b>建议</b>：早退路径补 <code>take()</code>（防御性）。<b>复核</b>：<code>tls.rs:845-896</code>。</p>
+
+<h3>L6 · TLS ClientConfig 按 ALPN 缓存只增不删 <span class="tag ok">低</span></h3>
+<p><b>位置</b>：<code>tls.rs:308-331</code>。无 ALPN 的两种常用组合为静态 <code>OnceLock</code>（有界）；带 ALPN 的组合按 (insecure 已并入键) 缓存，每项含 <code>RootCertStore</code>（几十~几百 KB）。键=配置历史上出现过的 ALPN 集合 → 有界于配置编辑史。<b>建议</b>：加「与当前配置引用集合对齐」的清理或改用固定 key（协议集合有限）。<b>复核</b>：<code>tls.rs:306-335</code>。</p>
+
+<h3>L7 · sticky origin 表只增（reload 兜底） <span class="tag ok">低</span></h3>
+<p><b>位置</b>：<code>sticky.rs:85-86</code>（每次成功解析插入 <code>origin</code>）、<code>sticky.rs:180-191</code>（失败作废只删 <code>by_key</code>）、<code>sticky.rs:203-204</code>（<code>reset()</code> 两表全清，由 <code>main.rs:3665-3667</code> 每次 reload 调用）。保留是<b>设计使然</b>（注释说明作废后仍需知道重解析谁）；量级 ≈100-150B/条 × 域名-IP 变更次数，reload 兜底。仅「长期不 reload 的挂机进程 + 频繁换 IP 的机场域名」会缓慢累积。<b>建议</b>：作废时若该域名已有新 origin 映射可删旧地址条目。<b>复核</b>：<code>sticky.rs:34-95/160-205</code>。</p>
+
+<h3>L8 · 订阅两张只增小表（429 冷却 / 失败负缓存） <span class="tag ok">低</span></h3>
+<p><b>位置</b>：<code>subscribe.rs:512-549</code>（<code>cooldown_map</code>）、<code>subscribe.rs:585-616</code>（<code>fetch_fail_map</code>）。两者在读取时按经过时间判定是否「过期」，但<b>过期不移除</b>；唯一删除路径分别是「成功清除负缓存」<code>clear_fetch_fail</code>（<code>main.rs:4352/4400</code>）与无（冷却表）。被删除的源/轮换 token 的旧 URL 条目常驻。量级 ≈150B/条，增长=历史出现过的失败 URL 数。<b>建议</b>：读取命中过期时顺手 remove，或加条数上限。<b>复核</b>：<code>subscribe.rs:505-616</code>。</p>
+
+<h3>L9 · geodata 四个缓存无上限、无淘汰、无清空 <span class="tag ok">低</span></h3>
+<p><b>位置</b>：<code>geodata.rs:317-323</code>（文件/解析缓存，<code>Rc</code> 共享）；宿主 <code>main.rs:3441-3454</code>（<code>static GEO: OnceLock&lt;Mutex&lt;Geodata&gt;&gt;</code>，reload 不复用也不重建）。键=(dat 路径, code[@attr]/ext 文件)；条目可观（如 <code>geoip:us</code> ≈293k 前缀 ≈ 十几 MB，注释见 <code>rules.rs:42-43</code>），且 dat 原文整份驻留。正常运行（配置固定）为有界保留；长期编辑配置/切换 <code>ext:</code> 文件则单调增长。副产物：文件缓存以路径为键且永不失效——**就地更新 <code>geoip.dat</code> 后不重启不生效**（非泄漏，运维须知）。<b>建议</b>：加条数/字节上限或 reload 时按当前引用集合修剪。<b>复核</b>：<code>geodata.rs:310-450</code>（grep 无 <code>remove/clear</code>）。</p>
+
+<h3>L10 · UDP_SLOT 与缓冲池档位错配（≈2× 放大） <span class="tag ok">低</span></h3>
+<p><b>位置</b>：<code>outbound.rs:541</code> <code>UDP_SLOT=65_600</code> 恰好大于 <code>bufpool.rs:11</code> <code>CLASS_SMALL=65_536</code>，逐槽走 <code>CLASS_LARGE=128 KiB</code> 档；每会话 ≤32 槽（<code>outbound.rs:689-692</code>），空闲会话 ≥1 槽（64→128KB 档）。回收链完整（会话回收→池按 8MB 字节封顶，超出直接释放），<b>不是泄漏</b>，仅容量评估需按 128KB/槽；且槽 Drop 时因 <code>cap≥128KB</code> 入 large 档，复用面略窄。<b>建议</b>：<code>UDP_SLOT</code> 取 65536（正好小档）或明确注释该取舍。<b>复核</b>：<code>outbound.rs:541/636-695</code>、<code>bufpool.rs:11-14/41-61/87-107</code>。</p>
+
+<h3>L11 · raw BPF map lookup 不传用户缓冲长度（当前尺寸对齐，属脆弱不变量） <span class="tag ok">低</span></h3>
+<p><b>位置</b>：<code>main.rs:963-1015</code>（<code>bpf_map_op_raw</code>）、使用点 <code>1062-1075/1105-1114/2520-2536</code>。内核按 map 的 value_size 向用户指针写入，用户侧不传长度；当前 <code>SodaTuple/SodaConnState=40/24</code>、DNS key/value<code>=20/32</code> 两侧（<code>ebpf-rs/maps.rs:30/52-57</code> ↔ <code>main.rs:874-957</code>）逐一核对一致 → <b>无实际越界</b>。但两侧结构为手工镜像，未来单侧加字段即变栈越界写。<b>建议</b>：运行时以 <code>map.info().value_size()</code> 校验并断言。<b>复核</b>：上述行号 + <code>ebpf-rs/common.rs:157-231</code>。</p>
+
+<h3>L12 · 探测线程上限为「批次前检查」（单批最坏超顶 ≈24） <span class="tag ok">低</span></h3>
+<p><b>位置</b>：<code>group.rs:794-821</code>。<code>PROBE_MAX_LIVE=96</code> 检查在整批 24 个 spawn <b>之前</b>，批内不再检查 → 最坏并发 ≈119；线程栈显式 512KB，被放弃线程在握手/读硬超时后必退（<code>group.rs:934-952</code> 注明超时设置失败即判失败）。属有界保留（非泄漏）；对 2 核路由器的瞬时 VmSize 影响 ≈60MB 量级。<b>建议</b>：把检查粒度降到每 spawn 或把批大小收进剩余额度。<b>复核</b>：<code>group.rs:209-218/792-851/934-952</code>。</p>
+
+<h3>L13 · ruleset 重载瞬时双份（有界峰值） <span class="tag ok">低</span></h3>
+<p><b>位置</b>：<code>ruleset.rs:86-100</code>（每次 <code>load</code> 新建 store）、替换点 <code>main.rs:3566-3595</code>（<code>*g = store</code>）。加载期新旧两份共存（峰值 2×），随后旧份释放；单表单受文本规模驱动（远程正文有 8MB 上限，本地文件无上限）。<b>建议</b>：维持现状，按 <code>total()</code> 计数加阈值告警即可。<b>复核</b>：<code>ruleset.rs:25-33/86-100/131-250</code>。</p>
+
+<h3>A1 · 附带（非内存）：同程序多接口 attach 第二次失败 <span class="tag">附带</span></h3>
+<p><b>位置</b>：<code>main.rs:1791-1803</code>（每次 <code>attach()</code> 都 <code>program.load()?</code>）、调用循环 <code>main.rs:5320-5350</code>（<code>for iface in &amp;args.lan / wan / dual</code>，<code>Args.lan: Vec&lt;String&gt;</code>）；aya 语义 <code>aya-0.14.0/src/programs/mod.rs:727</code>（已加载程序再次 <code>load()</code> → <code>ProgramError::AlreadyLoaded</code>）。<code>--lan a --lan b</code> 等<b>多接口配置会在第二个接口启动失败</b>（单接口不受影响）；OpenWrt init 的 <code>--lan $lan</code> 未加引号，空格分隔的多接口值会触发。<b>建议</b>：attach 前判断已加载则跳过 load（或对 <code>AlreadyLoaded</code> 容忍后直接 attach）。<b>复核</b>：上述行号 + <code>install/openwrt/files/sodama.init:56</code>。</p>
+
+<h3>A2 · 附带（非内存）：clippy correctness 3 处 error（实跑） <span class="tag">附带</span></h3>
+<p><b>位置/输出</b>（<code>cargo clippy -p sodama</code>，另 81 warnings）：</p>
+<pre>loader/src/hysteria2.rs:375:13: error: an async construct yields a type which is itself awaitable: awaitable value not awaited
+loader/src/tls13.rs:723:9: error: this loop never actually loops
+loader/src/tls13.rs:808:17: error: this loop never actually loops
+error: could not compile `sodama` (bin "sodama") due to 3 previous errors</pre>
+<p>三处均为 clippy `correctness` 组（默认 deny），是「可疑逻辑」而非内存问题；<b>未纳入本次深挖</b>（属功能正确性范畴），建议单独复查。另注：<code>main.rs:1805</code> 的 <code>mem::forget</code> 被 clippy 提示「值无 Drop」——与 M4 分析一致（forget 本身无副作用，真正 link 由 <code>Ebpf</code> 持有）。</p>
+
+<h2 id="cleared">5 · 已核销清单（查过，判定无问题）</h2>
+<p class="small">下列位置在审计中逐处读过并给出结论；列出以证明覆盖范围。<b>核销 ≠ 永不需复查</b>——结构镜像类（Pod/裸 map 访问）在两侧任一侧变更后需重新核对。</p>
+<table>
+  <thead><tr><th>域</th><th>核销内容与理由</th></tr></thead>
+  <tbody>
+    <tr><td>Pod 布局（10 个 <code>unsafe impl</code>）</td><td><code>main.rs:864-957/1125-1136</code>（Config/Tuple/ConnState/EpochIp/DomainRouting/PidPname/DnsSenderKey/DnsSenderPname/RedirectEntry）、<code>rules.rs:76-89</code>（MatchSet）：全部 <code>#[repr(C)]</code> 且与 <code>ebpf-rs/common.rs</code> 逐字段同位（SodaConnState 有 4B 隐式尾填充，但仅被读取、从未由用户态 insert，无未初始化写；RedirectEntry 显式 pad 补洞）。</td></tr>
+    <tr><td>socket + from_raw_fd（全部 6 处）</td><td><code>main.rs:1636/1671/1734/5765</code>、<code>outbound.rs:124/297</code>：均先判 <code>raw &lt; 0</code> 再接管 <code>OwnedFd</code>；失败路径由 OwnedFd drop 关 fd。</td></tr>
+    <tr><td>epoll / eventfd（reactor）</td><td><code>reactor.rs:951-1012</code>：epfd/wake 每个失败分支先 close 后 wrap；<code>fd_index/LOCATIONS/RELAY_CONNS</code> 在 destroy 成对摘除；无 Session↔reactor 循环 Arc（Session→Arc&lt;RelayHandle&gt;，handle 不持 socket）。</td></tr>
+    <tr><td>pipe 生命周期（除 H1）</td><td><code>reactor.rs:124-155</code>：缓存上限 8、满则 close；destroy 先 <code>replace([-1,-1])</code>，<code>Session::drop</code> 只关 ≥0，无双重 close；splice 错误分类（EAGAIN/EINTR/EINVAL-kTLS）完整。</td></tr>
+    <tr><td>看门狗 dup</td><td><code>outbound.rs:213-215</code>：<code>try_clone_to_owned</code>（CLOEXEC），线程退出随 drop 关闭；disarm 缺失另见 H2。</td></tr>
+    <tr><td>mmsg 数组族</td><td><code>main.rs:5866-6043</code>、<code>outbound.rs:646-694</code>：iovec/name/control 生命周期覆盖 syscall；构造后不再 realloc（堆址稳定）；每轮重置 <code>namelen/controllen/msg_len</code>，返回后 <code>min(msg_len, slot.len())</code> 收敛，不读 set_len 全区间。</td></tr>
+    <tr><td>splice/poll/shutdown/dup/ioctl</td><td><code>main.rs:2128-2260/2393/5261-5310/5693-5754/5780-5848</code>：指针/长度/错误分支逐处核对；sockaddr 转换先零化后按 family 分派。</td></tr>
+    <tr><td>bufpool</td><td><code>bufpool.rs</code> 全文：两档各持至多 N 个 + <code>POOL_MAX_BYTES=8MB</code> 字节封顶，超限直接释放；Drop 归还按容量分档正确。</td></tr>
+    <tr><td>DNS 缓存</td><td><code>dns.rs:884-950</code>：1024 上限 + 命中过期删除 + 批量清扫 + 满时逐出，三删除路径齐备；key 含 scope/do_bit 不因 ECS 维度失控。</td></tr>
+    <tr><td>dnsroute</td><td><code>dnsroute.rs</code>：容器编译期一次构建、运行时只读；reload 为整 Arc 替换（无插入点 → 无增长）。</td></tr>
+    <tr><td>sniffer</td><td><code>sniffer.rs:435-481</code>：<code>recv(MSG_PEEK)</code> 缓冲=常量、切片 <code>[..n]</code> 永不越界；poll 超时计算 <code>min(i32::MAX)</code> 截断；无任何静态缓存。</td></tr>
+    <tr><td>watch.rs（除对齐）</td><td><code>watch.rs:40-147</code>：inotify fd 前置检查；wd 表在 <code>IN_IGNORED</code>/stale 时摘除；事件遍历 <code>off+hdr≤n</code> 与 <code>name.min(n)</code> 双保险。</td></tr>
+    <tr><td>tls.rs kTLS</td><td><code>tls.rs:411-554</code>：install 三种 cipher 全字段初始化（无尾部 padding）、长度 <code>size_of_val</code>；<code>ktls_read</code> 控制缓冲显式 8 对齐、cmsg 遍历在 <code>msg_controllen</code> 内。</td></tr>
+    <tr><td>reactor 会话退出路径</td><td>EOF（双侧 done）/错误 RST（dead）/注册失败/worker 关停均可达 <code>destroy</code> 且摘注册表；唯一例外为 H1 的回收不排空。</td></tr>
+    <tr><td>eBPF 内核侧</td><td><code>flow.rs:30-45</code> conn_state 查找带 TTL 淘汰；<code>progs.rs:115-133</code> <code>map_lookup_raw</code>+<code>bpf_sk_assign</code> 后 <code>bpf_sk_release</code> 成对（含错误路径）；<code>cgroup.rs</code> sock_release 摘 cookie 表；<code>route.rs</code> 有界循环 + scratch 复用（<code>write_bytes</code> 清零）。map 均为容量封顶（65536/131072/2048k 等），键空间残留有界。</td></tr>
+    <tr><td>静态注册表增删配对</td><td><code>RELAY_CONNS</code>（insert 3097 / delete 3250、3302）、<code>UDP_NAT</code>（insert 6857 / janitor 6944）、<code>OFFLOAD_WATCH</code>（push 2363 / swap_remove 2455、3234-3243）：正常路径成对（其边缘情况分别见 M2/M3）。</td></tr>
+    <tr><td>订阅退避</td><td><code>subscribe.rs:451-471</code>：背退为纯函数计算（无 timer/任务堆积），成功清零。</td></tr>
+    <tr><td>group 探测硬超时链</td><td><code>group.rs:934-952</code>：读/写超时设置失败即判失败（§8/§9 修复成果在本审计中确认仍成立）。</td></tr>
+  </tbody>
+</table>
+
+<h2 id="fix">6 · 修复建议与优先级（均未实施）</h2>
+<table>
+  <thead><tr><th>优先级</th><th>条目</th><th>建议动作</th></tr></thead>
+  <tbody>
+    <tr><td><span class="tag no">P0</span></td><td>H1 / H2 / H3</td><td>H1：destroy 前排空或改 close（把「pending==0 才入缓存」固化为 put_pipe 唯一入口断言）；H2：disarm 改 RAII guard（或逐拨号入口补齐）；H3：上方向线程使用 <code>handle.upstream</code> 的 fd 或将 socket 句柄 move 进闭包。</td></tr>
+    <tr><td><span class="tag part">P1</span></td><td>M1 / M2 / M3 / M4</td><td>M1：<code>GroupRuntime.stop</code> + 重建前逐组停线程（含「健康线程数==组数」状态位）；M2：reader 绝路分支摘表 + janitor 认 <code>alive=false</code>；M3：回包 socket 表加 TTL/引用计数淘汰；M4：启动/退出双向显式 detach + EEXIST 重试。</td></tr>
+    <tr><td><span class="tag ok">P2</span></td><td>L1–L13</td><td>L1：对齐缓冲统一封装（3 处）；L2：reserve 语义修正；L3：refreshing RAII；L4：刷新线程并发闸；L5/L7/L8/L9：小表清理与缓存淘汰；L6：ALPN 缓存与配置对齐；L10：UDP_SLOT 取 65536；L11：map 尺寸运行时断言；L12：探测上限检查粒度；L13：状态面加阈值告警。</td></tr>
+    <tr><td><span class="tag">附带</span></td><td>A1 / A2</td><td>A1：多接口 attach 前跳过已加载/容忍 AlreadyLoaded；A2：三处 clippy correctness 单独复查。</td></tr>
+  </tbody>
+</table>
+<p class="small">修复后建议的回归手段：<b>H1</b>=「destroy 时 pending&gt;0」计数器 + RST 压测；<b>H2</b>=VLESS-UDP 长会话存活时长；<b>H3</b>=<code>SODAMA_NO_REACTOR=1</code> 半关闭用例；<b>M1</b>=组名增删循环下的线程计数；<b>M2</b>=UDP 会话注入错误后的表计数；<b>M4</b>=重启后 <code>bpftool cgroup tree</code> 与 pname 规则命中。</p>
+<p class="small"><b>实施状态（v1.1）</b>：P0 三项（H1/H2/H3）与 P1 的 M1/M2/M3、以及加固项 L1/L2/L5 已实施并通过测试/构建（清单与验证见 §9）；M4 因生产证伪降级为条件性、暂不改动；L3/L4/L6–L13 维持记录在案。</p>
+
+<h2 id="relation">7 · 与既有记录的关系 · 局限</h2>
+<ul>
+  <li><b>devlog §3（内存随运行时长上升）</b>：当时判定为「分配器高水位、非泄漏」。本次未推翻该结论——新发现中没有任何一条会表现为「无流量时 RSS 单调上升」；M1/M2/M3 是<b>事件驱动</b>的持有期问题，复盘时建议按「操作史 / 目的地址多样性 / 错误史」三个维度看曲线。</li>
+  <li><b>devlog §9（探测线程泄漏）</b>：其修复（握手硬超时 + 墙钟看门狗）引入了 H2（disarm 不对称）；同次修复的「放弃线程」设计本次复核仍成立。建议把「看门狗/后台线程的生命周期对称性」列入修复回归清单。</li>
+  <li><b>devlog §7.7（重启残留）</b>：当时是 /tmp 用户态残留；M4 是同类精神的内核侧残留（cgroup 钩子跨重启存活），且会引发 pname 路由静默失效——与 §13「状态查询可观测性」的治理思路一脉相承：<b>让静默降级变成可观测</b>。</li>
+  <li><b>P37/§14（CF 额度）</b>：M1 的旧世代探测线程与额度治理目标直接冲突；修复优先级建议不低于 P1。</li>
+  <li><b>局限</b>：全部条目为静态结论（未运行时复现）；未审计第三方依赖内部 unsafe；未做 sanitizer/Miri（syscall 密集不适用）；eBPF 侧未做运行期 map 水位实测。审计基线 <code>dev@d1bdb46</code>，后续提交落入修复方案后本报告结论需按版本复核。</li>
+</ul>
+
+<h2 id="prod">8 · 生产实况比对（2d5h39m · 2026-10-16）</h2>
+<p><b>取数口径</b>：生产软路由（OpenWrt x86_64 · 内核 6.12.92）引擎 PID 30427，世代 <code>2026-10-13 23:41:53 → 2026-10-16 05:21</code>（<b>2d 5h 39m</b>）。样本：<code>health.tsv</code> 3210 行 + <code>mem-track.tsv</code> 3215 行（1 分钟粒度）、<code>status</code>/<code>metrics</code> 快照、日志全史（10-09 起 7 份归档 + 当前）、socket/fd/线程现场解剖、<code>/proc/&lt;pid&gt;/net/tcp</code> 逐秒扫描。原始数据留存 <code>docs/notes/prod-audit-2026-10-16/</code>（不入库）。</p>
+
+<h3>8.1 运行基线与世代统计</h3>
+<table>
+  <thead><tr><th>指标</th><th>值</th><th>备注</th></tr></thead>
+  <tbody>
+    <tr><td>RSS</td><td>47.2 MB 均值 / 53.5 MB 峰（稳态 46–53）</td><td>无单调漂移；峰在拨号风暴窗口</td></tr>
+    <tr><td>RssAnon / VmSize</td><td>40.9 MB 均值 / VmSize 峰 215 MB</td><td>瞬态 VmSize 由 relay 会话线程（1MiB 栈 ×~90）主导</td></tr>
+    <tr><td>线程数</td><td>常态 17–19 · 峰 154（00:56–01:10）</td><td>风暴后完全回落；无阶梯增长</td></tr>
+    <tr><td>fd</td><td>随活跃连接 ≈2/条 + 固定基座（bpf 41 + 监听/UDP 等 ≈60）；峰 455（瞬态）</td><td>无泄漏级漂移证据</td></tr>
+    <tr><td>stragglers / probes_ok / fail</td><td>0 / 110,240 / 140</td><td>§9 修复（握手硬超时）持续成立</td></tr>
+    <tr><td>dial_errors</td><td>0 → 1072（<b>全部集中于 00:56–01:10</b>），其后 3.5h 零增长</td><td>单一上游网络事件、自愈</td></tr>
+    <tr><td>订阅</td><td>fetches_total 10（tag3=9 / tag1=1）、fetch_fail 0</td><td>B1/B2/C1 达标</td></tr>
+    <tr><td>会话路径</td><td>conns_total 36,019 = reactor_codec 36,019；splice_total 0；pipe_* 全 0</td><td>ws+TLS 不可 splice → 100% codec（H1/H3 零暴露根源）</td></tr>
+    <tr><td>UDP NAT</td><td>sessions/errors/evicted 全 0（UDP 全直连）</td><td>M2/M3 零暴露</td></tr>
+    <tr><td>pname / eBPF maps</td><td>hooks 6/6 · map_entries 61 · hits 0；conn_state 315 / redirect_track 329 / domain_routing 12,924</td><td>janitor 清理日志常态可见</td></tr>
+    <tr><td>探测节奏</td><td>16 节点 32 次/分、36 节点 68 次/分（= 设计值）；「空闲退避」仅 3 次 60s</td><td>P37b 达标；家庭网 traffic_active 近乎恒真，「夜间退避 600s」验收判据此环境不适用</td></tr>
+  </tbody>
+</table>
+
+<h3>8.2 发现 × 实况对照</h3>
+<table>
+  <thead><tr><th>发现</th><th>生产判定</th><th>关键证据</th></tr></thead>
+  <tbody>
+    <tr><td>H2</td><td><span class="tag no">确认（实锤）</span></td><td>DoH 连接恰好 3s 生命周期（逐秒扫描 5/5 条）+ 端口更换；重试逻辑静默掩盖；dial-wd 线程常态常驻 1 个（每次重连遗留）</td></tr>
+    <tr><td>M4</td><td><span class="tag ok">证伪（降级）</span></td><td>3 世代 6/6 挂载成功、零失败日志；aya ≥5.7 走 bpf_link（退出自动解绑）；内核 6.12 ≥6.6 走 TCX</td></tr>
+    <tr><td>H1 / H3</td><td><span class="tag part">零暴露</span></td><td>splice_total=0、pipe_* 全 0：生产 100% codec（ws），splice 与 legacy 线程泵均未启用</td></tr>
+    <tr><td>M1</td><td><span class="tag part">未触发</span></td><td>日志全史零「组集合变更/重建全部组」；线程无阶梯；16→36 成员走 replace_members（不新建线程）</td></tr>
+    <tr><td>M2 / M3</td><td><span class="tag part">零暴露</span></td><td>udp_nat 全零（无 UDP 代理会话 → 无 reader、无回包 socket）</td></tr>
+    <tr><td>L 系列</td><td><span class="tag ok">量级不可分辨</span></td><td>微量（≤百 KB 级）；本窗口无反向证据，不构成生产暴露</td></tr>
+  </tbody>
+</table>
+
+<h3>8.3 事件窗与旁证</h3>
+<ul>
+  <li><b>00:56–01:10 上游网络事件</b>：dial_errors 全部 1072 发生于此；线程峰 154（relay 会话线程 1MiB 栈 ×~90 + dial-wd 40）；fd 峰 455；~15 分钟内完全自愈——也顺带验证 §9 修复后“卡死线程不累积、资源全回落”。</li>
+  <li><b>H2 影响量级取证</b>：30s 内观察到 5 条新 DoH 连接（≈1 条/6s，折算 ≈1.4 万次重连/天）；每条被看门狗按时（=CONNECT_TIMEOUT=3s）掐断，再由下一查询触发“丢弃→重连”重试。</li>
+  <li><b>内存有界</b>：RSS 平台 46–53 MB（峰 53.5 = 风暴窗）；稳态 VmHWM 55.2 MB；无回不去的高位空增。</li>
+</ul>
+
+<h3>8.4 新观察（非本审计项，建议另立观察）</h3>
+<ul>
+  <li>「<code>reactor: codec 泵失败（ws: 帧被截断）</code>」近期约 30 条/200 行——CF 线路 WS 抖动，逐会话独立回收、无堆积；属上游质量项。</li>
+  <li>DoH「400」响应风暴与网络事件同窗（00:56–01:03），成因未定；建议与 H2 修复后的表现一并复看。</li>
+</ul>
+
+<h2 id="fixbatch">9 · 修复批次与验证（v1.1，已实施未部署）</h2>
+<table>
+  <thead><tr><th>条目</th><th>修法</th><th>文件</th></tr></thead>
+  <tbody>
+    <tr><td>H1</td><td><code>destroy</code> 回收改为 <code>recycle_pipe</code>：<code>pending&gt;0</code> 的管道直接关闭丢弃（不入缓存）；新增 <code>pipe_discarded</code> 计数（status 可见）；新增回归测试 <code>pending_pipe_is_discarded_not_recycled</code></td><td><code>reactor.rs</code>、<code>main.rs</code>（RelayStats/status）</td></tr>
+    <tr><td>H2</td><td>新增 <code>DialWatchdogGuard</code>（作用域结束自动解除）；<code>dial_udp</code> 补对称解除；DoH/DoT 持久连接、订阅拉取、bootstrap 四路径接入</td><td><code>outbound.rs</code>、<code>dnsup.rs</code>、<code>subscribe.rs</code>、<code>bootstrap.rs</code></td></tr>
+    <tr><td>H3</td><td>上方向泵线程的 splice 目的 fd 改用 <code>handle.upstream</code>（RELAY_CONNS 保活至双泵结束），不再依赖 handler 栈上 <code>socket</code> 的号码</td><td><code>main.rs</code></td></tr>
+    <tr><td>M1</td><td><code>GroupRuntime.stop</code> 世代停止位；健康循环主循环/批次/分片睡眠三处检查；组集合重建前停旧世代并记日志</td><td><code>group.rs</code>、<code>main.rs</code></td></tr>
+    <tr><td>M2</td><td><code>udp_nat_retire</code> 共用退役（reader 致命退出即摘表；janitor 同路径）</td><td><code>main.rs</code></td></tr>
+    <tr><td>M3</td><td>回包 socket 表上限 128（<code>REPLY_SOCKET_CAP</code>）+ 逐出计数（status 可见）；Arc 语义保证在用会话不受影响</td><td><code>main.rs</code></td></tr>
+    <tr><td>L1/L2/L5</td><td>cmsg/inotify 缓冲显式对齐（<code>CtlBuf</code>/<code>EvBuf</code>）；<code>recvmmsg</code> 容量守卫语义修正（<code>resize</code>）；kTLS 密钥暂存早退清理</td><td><code>main.rs</code>、<code>watch.rs</code>、<code>outbound.rs</code>、<code>tls.rs</code></td></tr>
+  </tbody>
+</table>
+<p><b>验证</b>：<code>cargo test</code> <b>287/287 通过</b>（基线 286 + 新增 H1 回归 1）；<code>cargo clippy</code> 无新增问题（余 3 条 correctness 为改动前既有：<code>hysteria2.rs:375</code>/<code>tls13.rs:723/808</code>）；OpenWrt x86_64 交叉构建通过（<code>sodama 7.6M · sodama-ebpf 496K</code>）。</p>
+<p><b>部署后验收判据</b>：① DoH 连接生命周期显著 &gt;3s（逐秒端口扫描不再每 3s 更换）；② 空闲时 <code>dial-wd</code> 线程归零；③ <code>status.pipe_discarded</code> 仅异常收尾时缓慢增长（正常应 ≈0）；④ 删除/重命名组后日志出现「已停止 N 个旧世代健康探测线程」且线程数回落；⑤ UDP NAT 场景下 <code>evicted</code>/<code>reply_sockets_evicted</code> 按预期联动。</p>
+
+<footer class="doc">
+  <p>SODAMA · 内存安全与资源生命周期审计报告（unsafe 专项）v1.1 · 2026-10-16 · 基线 <code>dev@d1bdb46</code><br>
+  方法：loader + ebpf-rs 全量人工审读（167 <code>unsafe {}</code> / 19 <code>unsafe fn</code> / 10 <code>unsafe impl</code>）+ 定向模式扫描 + <code>cargo clippy</code> 实跑；关键结论经 aya 0.14.0 源码与内核语义对照复核；<b>v1.1 增补 2d5h39m 生产实况比对（§8）与修复批次（§9）</b>。<br>
+  v1.0 为只读审计（未改代码）；v1.1 的修复批次已实施并通过测试/构建，尚未部署。证据引用格式 <code>文件:行号</code>，分级沿用 <code>docs/README.md</code> 约定（发现条目为「源码实测」，概率/速率类表述为「推断」，§8 数据为生产实测）。</p>
+</footer>
+
+</div>
+</body>
+</html>

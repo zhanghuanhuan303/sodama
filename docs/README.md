@@ -8,8 +8,9 @@
 docs/
 ├── README.md                     # 本文件：索引与约定
 ├── sodama-atlas.html             # ★ 开发研究图集（Atlas）：能力地图 + 架构 + 性能边界 + 方法论 + 踩坑档案 + 第二阶段生产实战 + 余项；Tufte 版式，自包含可离线打开
-├── phase2-devlog.md              # 第二阶段（生产实战轮）开发记录：侦查/修复/验收（§1–§12）+ 附 A 工具 / 附 B 监控台账
+├── phase2-devlog.md              # 第二阶段（生产实战轮）开发记录：侦查/修复/验收（§1–§17）+ 附 A 工具 / 附 B 监控台账
 ├── security-proposal.md          # 安全工程提案 v0.1：威胁模型 / 攻击面清单 / 供应链缺口 + S0–S5 排期（待采纳）
+├── memory-safety-audit.html      # ★ 内存安全与资源生命周期审计（unsafe 专项）v1.1：loader + ebpf-rs 全量 unsafe 审读（167 块/19 fn/10 impl）· 3 高 4 中 13 低 + 已核销清单 + **2d5h39m 生产实况比对（H2 实锤/M4 证伪降级）** + 修复批次（已实施未部署）
 ├── architecture-decision.html    # 决策档案（主文档，自包含可离线打开）
 ├── parity-status.md              # 对标进度：dae（Go）↔ sodama（全 Rust）分域覆盖度
 ├── benchmark-report.html         # ★ 性能与资源边界报告 v3.0（合并版）：吞吐四方对拍 + 四层内存模型 + FD 治理 + 转发原语 + 五万并发压测 + 长稳
@@ -102,8 +103,9 @@ go mod edit -json | python3 -c "import json,sys; d=json.load(sys.stdin); \
 | `architecture-decision.html` | v2.43 · 2026-10-04 | dae `main@e3fee8f`（tag `nightly`） |
 | `parity-status.md` | v2.10 · 2026-10-04 | 同上（P33.2 性能深挖后清点；覆盖度为功能点粗估，逐行附证据） |
 | `sodama-atlas.html` | **v1.1 · 2026-10-11** | **总览入口**：main@1e1906d 基线（第二阶段 §11.7 修复批次后）；汇总 parity-status v2.14 / benchmark-report v3.0 / phase2-devlog §1–§12 / reviews / backlog / ADR-0001..0063，附全部实测数据与口径纪律（§5.3）；新增 §8 第二阶段生产实战轮 |
-| `phase2-devlog.md` | §1–§12 · 2026-10-11 | 第二阶段（生产实战轮，10-08 起）：四轮侦查/修复/验收；**72h 生产测试进行中（§12）** |
+| `phase2-devlog.md` | §1–§17 · 2026-10-16 | 第二阶段（生产实战轮，10-08 起）：侦查/修复/验收；72h 生产测试启动（§12）+ P37/P37b 额度治理（§13–§14）+ AF_XDP 预研（§15）+ 新一轮 72h（§16）+ **审计修复批次与 2d5h39m 生产比对（§17）** |
 | `security-proposal.md` | v0.1 · 2026-10-11 | 评审意见回应稿（**待采纳**）：main@0bcadc6 取证；附录 A 为 backlog 重分类建议（新增 S 类） |
+| `memory-safety-audit.html` | **v1.1 · 2026-10-16** | **unsafe 专项审计 + 生产比对 + 修复批次**：dev@d1bdb46 基线；全量审读 + clippy 实跑；§8 = 2d5h39m 生产数据比对（H2 实锤 3s/1.4万次重连每天；M4 证伪降级；H1/H3/M1/M2/M3 零暴露）；§9 = 修复批次（H1/H2/H3/M1/M2/M3 + L1/L2/L5，287/287 测试、OpenWrt 构建通过，**待部署**） |
 | `benchmark-report.html` | **v3.0 · 2026-10-06** | **现行合并版**：吞吐四方对拍（perf-report）+ 四层内存模型/FD 治理/转发原语/长稳（memory-report-v2.1）+ 五方 RSS 存档（v1）+ 五万并发压测与 fd 硬限修复（本轮）；由 `sodama/lab/perf/gen-benchmark-report.py` 生成 |
 | `memory-report.html` | v1.0 · 2026-10-05 | 已并入 `benchmark-report.html` §6/附录 A · 存档 |
 | `memory-report-v2.html` | v2.1 · 2026-10-05 | 已并入 `benchmark-report.html` §4/§5/§8/§9 · 存档 |
