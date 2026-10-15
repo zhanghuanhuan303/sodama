@@ -5,10 +5,11 @@ use core::ffi::c_void;
 use aya_ebpf::{bpf_printk, programs::TcContext};
 use aya_ebpf_bindings::{
     bindings::{BPF_ANY, TC_ACT_OK, TC_ACT_SHOT},
-    helpers::{bpf_ktime_get_ns, bpf_redirect},
+    helpers::{bpf_ktime_get_ns, bpf_redirect, bpf_skb_change_head, bpf_skb_store_bytes},
 };
 
 use crate::common::*;
+use crate::event::{bump_stat, send_event_limited};
 use crate::maps::*;
 use crate::route::sodama_route;
 
@@ -55,17 +56,21 @@ unsafe fn conn_save(key: &SodaTuple, outbound: u8, mark: u32, must: u8, l4proto:
         is_wan_ingress_direction: 0,
         pad: [0; 3],
     };
-    let _ = conn_state_map.insert(key, &st, BPF_ANY as u64);
+    if let Err(_ret) = conn_state_map.insert(key, &st, BPF_ANY as u64) {
+        /* 表满/更新失败：旧实现静默丢——连接会拿不到缓存路由（下一包重新查规则）。
+         * 对照 dae tproxy.c:2440-2450/2700-2710：计数 + 限速事件。 */
+        bump_stat(SODAMA_STAT_CONN_OVERFLOW);
+        let ty = if l4proto == IPPROTO_TCP {
+            SODAMA_EVENT_TCP_CONN_OVERFLOW
+        } else {
+            SODAMA_EVENT_UDP_CONN_OVERFLOW
+        };
+        send_event_limited(SODAMA_EVENT_RATE_OVERFLOW, ty, outbound, l4proto, Some(key));
+    }
 }
 
 unsafe fn conn_delete(key: &SodaTuple) {
     let _ = conn_state_map.remove(key);
-}
-
-unsafe fn stat_inc(key: u32) {
-    if let Some(v) = sodama_stats_map.get_ptr_mut(key) {
-        *v += 1;
-    }
 }
 
 /// P17b：按 socket cookie 反查进程名（仅 WAN egress 新连接调用；全 0 = 不可得）。
@@ -87,11 +92,20 @@ fn mac_equal(a: &[u8; 6], b: &[u8; 6]) -> bool {
 }
 
 /// 对照 C `sodama_publish_redirect_track`：单写者语义（同发布者续租 / 新鲜期拒绝改绑 / 陈旧允许）。
-unsafe fn publish_redirect_track(ctx: &TcContext, pkt: &SodaParseResult, from_wan: u8) -> i32 {
+///
+/// L3（`link_h_len == 0`）流没有 L2 绑定，MAC 置 0（对照 dae
+/// `fill_redirect_entry_from_forward_packet`，tproxy.c:2151-2164）。
+unsafe fn publish_redirect_track(
+    ctx: &TcContext,
+    pkt: &SodaParseResult,
+    from_wan: u8,
+    link_h_len: u32,
+) -> i32 {
+    let has_l2 = link_h_len == ETH_HLEN;
     let entry = SodaRedirectEntry {
         ifindex: (*ctx.skb.skb).ifindex,
-        smac: pkt.smac,
-        dmac: pkt.dmac,
+        smac: if has_l2 { pkt.smac } else { [0u8; 6] },
+        dmac: if has_l2 { pkt.dmac } else { [0u8; 6] },
         from_wan,
         pad: [0; 3],
         last_seen_ns: bpf_ktime_get_ns(),
@@ -108,8 +122,14 @@ unsafe fn publish_redirect_track(ctx: &TcContext, pkt: &SodaParseResult, from_wa
         if (*existing).last_seen_ns <= entry.last_seen_ns
             && entry.last_seen_ns - (*existing).last_seen_ns < SODAMA_REDIRECT_REBIND_STALE_NS
         {
-            stat_inc(SODAMA_STAT_REBIND_REJECTED);
-            bpf_printk!(c"sodama: redirect rebind rejected\n");
+            bump_stat(SODAMA_STAT_REBIND_REJECTED);
+            send_event_limited(
+                SODAMA_EVENT_RATE_REDIRECT_REBIND,
+                SODAMA_EVENT_REDIRECT_REBIND_REJECTED,
+                0,
+                pkt.l4proto,
+                Some(&pkt.tuples),
+            );
             return 0;
         }
     }
@@ -117,11 +137,67 @@ unsafe fn publish_redirect_track(ctx: &TcContext, pkt: &SodaParseResult, from_wa
     match redirect_track.insert(&pkt.tuples, &entry, BPF_ANY as u64) {
         Ok(()) => 0,
         Err(ret) => {
-            stat_inc(SODAMA_STAT_REDIRECT_UPDATE_FAILED);
-            bpf_printk!(c"sodama: redirect update failed ret=%d\n", ret);
+            bump_stat(SODAMA_STAT_REDIRECT_UPDATE_FAILED);
+            send_event_limited(
+                SODAMA_EVENT_RATE_OVERFLOW,
+                SODAMA_EVENT_REDIRECT_UPDATE_FAILED,
+                0,
+                pkt.l4proto,
+                Some(&pkt.tuples),
+            );
             ret
         }
     }
+}
+
+/// 送控制面的报文改写（对照 dae `rewrite_packet_for_control_plane`，tproxy.c:2253-2279）：
+///  - L2：直接改以太头目的 MAC（直接包访问）；
+///  - L3：包上没有链路头，而 dae0peer 是 veth（以太设备），所以先 `bpf_skb_change_head`
+///    补上 14B 以太头（h_proto = skb->protocol、源 MAC 置 0、目的 = dae0peer MAC）。
+unsafe fn rewrite_packet_for_control_plane(
+    ctx: &TcContext,
+    cfg: &SodaConfig,
+    link_h_len: u32,
+) -> i32 {
+    if link_h_len == ETH_HLEN {
+        if ctx.store(0usize, &cfg.dae0peer_mac, 0).is_err() {
+            return TC_ACT_SHOT as i32;
+        }
+        return 0;
+    }
+    let skb = ctx.skb.skb;
+    let zero_mac = [0u8; 6];
+    let l3proto = (*skb).protocol as u16;
+    if bpf_skb_change_head(skb, ETH_HLEN, 0) != 0 {
+        return TC_ACT_SHOT as i32;
+    }
+    let ret = bpf_skb_store_bytes(
+        skb,
+        12,
+        &l3proto as *const u16 as *const c_void,
+        2,
+        0,
+    );
+    if ret != 0 {
+        return ret as i32;
+    }
+    let ret = bpf_skb_store_bytes(
+        skb,
+        6,
+        zero_mac.as_ptr() as *const c_void,
+        6,
+        0,
+    );
+    if ret != 0 {
+        return ret as i32;
+    }
+    bpf_skb_store_bytes(
+        skb,
+        0,
+        cfg.dae0peer_mac.as_ptr() as *const c_void,
+        6,
+        0,
+    ) as i32
 }
 
 unsafe fn redirect_to_control_plane(
@@ -129,11 +205,13 @@ unsafe fn redirect_to_control_plane(
     pkt: &SodaParseResult,
     cfg: &SodaConfig,
     from_wan: u8,
+    link_h_len: u32,
 ) -> i32 {
-    if ctx.store(0usize, &cfg.dae0peer_mac, 0).is_err() {
-        return TC_ACT_SHOT as i32;
+    let ret = rewrite_packet_for_control_plane(ctx, cfg, link_h_len);
+    if ret != 0 {
+        return ret;
     }
-    if publish_redirect_track(ctx, pkt, from_wan) != 0 {
+    if publish_redirect_track(ctx, pkt, from_wan, link_h_len) != 0 {
         return TC_ACT_SHOT as i32;
     }
     {
@@ -147,7 +225,13 @@ unsafe fn redirect_to_control_plane(
 }
 
 /// 分流主流程（LAN ingress / WAN egress / 单臂共用），对照 C `sodama_split_flow`。
-pub unsafe fn split_flow(ctx: &mut TcContext, pkt: &SodaParseResult, is_wan: u8) -> i32 {
+/// `link_h_len`：以太 14 / L3 0——影响「补链路头」与「redirect_track 是否记 MAC」。
+pub unsafe fn split_flow(
+    ctx: &mut TcContext,
+    pkt: &SodaParseResult,
+    is_wan: u8,
+    link_h_len: u32,
+) -> i32 {
     let Some(cfg) = config_map.get(0) else {
         return TC_ACT_SHOT as i32;
     };
@@ -238,13 +322,22 @@ pub unsafe fn split_flow(ctx: &mut TcContext, pkt: &SodaParseResult, is_wan: u8)
     }
 
     if outbound == SODAMA_OUTBOUND_BLOCK {
+        /* 对照 dae `send_blocked_event`（tproxy.c:836-849）：被阻断的流量不计数，
+         * 只发限速事件——洪泛时每 CPU 每秒最多一条，否则 ringbuf 会被刷满。 */
+        send_event_limited(
+            SODAMA_EVENT_RATE_BLOCKED,
+            SODAMA_EVENT_BLOCKED,
+            outbound,
+            pkt.l4proto,
+            Some(&pkt.tuples),
+        );
         return TC_ACT_SHOT as i32;
     }
     if outbound == SODAMA_OUTBOUND_DIRECT {
         ctx.set_mark(mark);
         return TC_ACT_OK as i32;
     }
-    redirect_to_control_plane(ctx, pkt, &cfg, is_wan)
+    redirect_to_control_plane(ctx, pkt, &cfg, is_wan, link_h_len)
 }
 
 /// 反方向 conntrack 刷新（对照 C `sodama_refresh_reverse_state`）。

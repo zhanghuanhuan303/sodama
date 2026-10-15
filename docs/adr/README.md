@@ -90,6 +90,8 @@
 | [0063](./ADR-0063-p36-rule-sets-user-lists.md) | P36：用户分流名单（`rule_set` + `rules/user_{proxy,direct}.txt`，编辑即热生效）+ 标准格式规则集（Clash rule-provider YAML / sing-box rule-set JSON / 纯文本；非域名条目计数上报；URL 自动下载缓存，`rule_set_update_interval`（0=每次刷新），无缓存硬失败）+ 配置重排（订阅置顶、i3wm 风格六段）+ `domain(ruleset: tag)` 编译展开（空名单哨兵） | 已采纳 | —（用户决策：可读配置/自定域名/独立规则文件+更新地址） |
 | [0064](./ADR-0064-p37-probe-idle-signal-and-sub-fetch-modes.md) | P37（对照 dae/mihomo/sing-box 研究后实施，devlog §13）：A1 状态查询不再打「活跃」信号（探测退避只由流量驱动；`note_watch` 降为显式心跳预留）+ B1 配置热重载对未变源 0 请求（`sub_cache_ttl` 默认 60→1800s，seen→磁盘缓存）+ B2 失败源负缓存（`sub_fail_ttl` 默认 600s）+ B3 自愈只拉到期失败源（`sources_due_for_retry` + `Heal(set)`）+ `SubFetchMode` merge 取宽语义 + C1 `subscriptions[]` 请求计数（`fetches_total`/`fetch_fail_total`/`last_fetch_at`，只由 net 推进） | 已采纳 | —（用户拍板：a1+b+c） |
 
+| [0065](./ADR-0065-l3-link-hdr-ringbuf-events-fentry-accounting-xdp.md) | 数据面对标批次：**L3 链路头程序族**（5 个 `*_l3` 变体 + `--link-hdr auto\|l2\|l3`，按 arphrd 判定；L3 送控制面 `bpf_skb_change_head(+14)`，回程按 `l3_ifindex_map` `bpf_skb_adjust_room(-14)` 剥头）+ **ringbuf 事件通道**（`event_ringbuf` + `SodaEvent` 72B + 5 类事件 + 1s 限速 + 丢弃计数；替代热路径 printk）+ **`skb_send_sock` 记账**（fentry→kprobe 回退；CO-RE 替代 = `loader/src/btfoff.rs` 用户态 BTF 解析写 `trace_param_map`；`offload_guard` 过滤 + `offload_sent` per-CPU 累加 + 键摘除时回收）+ **XDP 计量探针**（`--xdp`，恒 `XDP_PASS`）；含 7 项与 dae 的偏离清单（实测/推断分级） | 已采纳 | —（用户决策：开发缺失功能；backlog C1/C3/C4） |
+
 ## 新增一条 ADR
 
 1. 从上面的编号继续（不要复用）；

@@ -186,7 +186,7 @@ ol.endnotes li{margin-bottom:.5rem}
 <div class="classbar">
   <span class="cls">密级 · 最高</span>
   <span>SODAMA ATLAS · 内部研究档案 · 未经许可不得外传</span>
-  <span class="push">v1.2 · 2026-10-16 · main@97ebe9f</span>
+  <span class="push">v1.3 · 2026-10-16 · main@2026-10-16 数据面对标批次后</span>
 </div>
 
 <div class="page">
@@ -202,7 +202,7 @@ ol.endnotes li{margin-bottom:.5rem}
     <div><dt>周期</dt><dd>2026-10-03 — 2026-10-16（软路由生产实战 + 第二阶段加固 + 审计修复批上线）</dd></div>
     <div><dt>基准机</dt><dd>Arch / Linux 6.18.54-lts / i9-9900KF 8C16T / 31 GB；生产机：OpenWrt Kwrt x86_64 2 核</dd></div>
     <div><dt>对照</dt><dd>dae v2.1.1（上游 Go）· sing-box 1.14.2 · v2ray 5.52.0 · mihomo 1.19.32</dd></div>
-    <div><dt>归档</dt><dd>ADR ×64 · 单测 287 · HTML 报告与数据源见 §9 索引</dd></div>
+    <div><dt>归档</dt><dd>ADR ×65 · 单测 302 · HTML 报告与数据源见 §9 索引</dd></div>
   </dl>
 </header>
 
@@ -216,12 +216,12 @@ ol.endnotes li{margin-bottom:.5rem}
   <div><b>28</b><span>恒定线程数（1k→50k 并发不变）</span></div>
   <div><b>16.9 Gbps</b><span>VLESS + splice 零拷贝吞吐</span></div>
   <div><b>≈52 KB</b><span>每连接内核侧内存（扣除对照）</span></div>
-  <div><b>287</b><span>单元测试通过（审计修复批后）</span></div>
-  <div><b>64</b><span>架构决策记录 ADR</span></div>
+  <div><b>302</b><span>单元测试通过（数据面对标批次后）</span></div>
+  <div><b>65</b><span>架构决策记录 ADR</span></div>
 </div>
 
 <table>
-  <caption>表 0 · 三个口径的完成度（判断值，非代码行数；口径与证据锚点见 <code>docs/parity-status.md</code> v2.14）</caption>
+  <caption>表 0 · 三个口径的完成度（判断值，非代码行数；口径与证据锚点见 <code>docs/parity-status.md</code> v2.15）</caption>
   <thead><tr><th>口径</th><th class="num">完成度</th><th>含义</th></tr></thead>
   <tbody>
     <tr><td>研究目标（可行性验证）</td><td class="num"><strong>100%</strong></td><td>aya 全栈可行、规则逐字节对拍、C 数据面退役、真实节点浏览器可用——四个问题全部闭环</td></tr>
@@ -234,7 +234,7 @@ ol.endnotes li{margin-bottom:.5rem}
   <p><strong>一句话结论。</strong>sodama 以个位数到两位数 MB 的<em class="term">用户态</em>内存与恒定线程数承载高并发连接；真实上限由<strong>内核内存</strong>与<strong>加密协议 CPU</strong>决定，而不是线程或用户态分配器。<span class="sn">这是全篇最重要的口径纪律：<b>用户态优势 ≠ 系统优势</b>。20 000 连接时 sodama 的用户态仅占系统总增量的约 2.5%，其余在内核对象（socket、inode、pipe、dentry）。只报 RSS 是<strong>不完整</strong>的。</span></p>
 </div>
 
-<p>以上为第一阶段收口口径。<strong>v1.1 新增 <a href="#s8">§8 · 第二阶段 · 生产实战轮</a></strong>——真实软路由上的四轮侦查/修复与稳态观测。<strong>v1.2 增量</strong>：探测/订阅治理（CF 额度事故 → 6× 超速归零，ADR-0064）、AF-XDP 预研的条件性否决、<strong>内存安全审计（unsafe 专项）</strong>及其修复批上线——2d5h39m 生产数据比对把「拨号看门狗未解除」实锤为 DoH 连接 3 s 生命周期并已修复、把「退出残留」预测证伪降级；新一轮 72h 生产测试进行中（§8.4–§8.6 与 <code>docs/memory-safety-audit.html</code>）。</p>
+<p>以上为第一阶段收口口径。<strong>v1.1 新增 <a href="#s8">§8 · 第二阶段 · 生产实战轮</a></strong>——真实软路由上的四轮侦查/修复与稳态观测。<strong>v1.2 增量</strong>：探测/订阅治理（CF 额度事故 → 6× 超速归零，ADR-0064）、AF-XDP 预研的条件性否决、<strong>内存安全审计（unsafe 专项）</strong>及其修复批上线——2d5h39m 生产数据比对把「拨号看门狗未解除」实锤为 DoH 连接 3 s 生命周期并已修复、把「退出残留」预测证伪降级；新一轮 72h 生产测试进行中（§8.4–§8.6 与 <code>docs/memory-safety-audit.html</code>）。<strong>v1.3 增量</strong>：<strong>数据面对标批次</strong>——L3 链路头变体（TC 程序 7 → 12）、ringbuf 事件通道、<code>skb_send_sock</code> 记账（fentry/kprobe，用户态 BTF 解析替代 CO-RE）、XDP 计量探针；合计 22 程序 / 22 map，eBPF 数据面覆盖度 ≈65% → <strong>≈85%</strong>（§8.7 与 <code>docs/adr/ADR-0065-l3-link-hdr-ringbuf-events-fentry-accounting-xdp.md</code>）。</p>
 </section>
 
 <nav class="toc">
@@ -257,7 +257,7 @@ ol.endnotes li{margin-bottom:.5rem}
     <li><a href="#s5">工程实践与方法论</a></li>
     <li><a href="#s6">踩坑档案 · 十二则现场笔记</a></li>
     <li><a href="#s7">余项地图 · A–I 类待办与永久边界</a></li>
-    <li><a href="#s8">第二阶段 · 生产实战轮 · 审计修复批收口（2026-10-08 起）</a></li>
+    <li><a href="#s8">第二阶段 · 生产实战轮 · 审计修复批收口 + 数据面对标批次（2026-10-08 起）</a></li>
     <li><a href="#s9">复现与索引 · 命令、ADR、数据源</a></li>
   </ol>
 </nav>
@@ -299,7 +299,7 @@ ol.endnotes li{margin-bottom:.5rem}
   <line x1="214" y1="10" x2="214" y2="400" stroke="#c9c2ae"/>
 
   <text x="208" y="27" text-anchor="end" font-size="10.5" fill="#3d3a33">eBPF 数据面（程序 / hook）</text>
-  <rect x="214" y="16" width="390" height="14" fill="#a0522d"/><text x="611" y="27" font-size="10.5" fill="#3d3a33">65%</text>
+  <rect x="214" y="16" width="510" height="14" fill="#4a7ba7"/><text x="731" y="27" font-size="10.5" fill="#3d3a33">85%</text>
 
   <text x="208" y="53" text-anchor="end" font-size="10.5" fill="#3d3a33">分流主链路</text>
   <rect x="214" y="42" width="570" height="14" fill="#1f4e79"/><text x="791" y="53" font-size="10.5" fill="#3d3a33">95%</text>
@@ -352,7 +352,7 @@ ol.endnotes li{margin-bottom:.5rem}
   <rect x="564" y="416" width="12" height="10" fill="#a0522d"/>
   <text x="582" y="425" font-size="10.5" fill="#3d3a33">&lt; 70%</text>
 </svg>
-<figcaption><b>图 1 · 能力地图。</b>十五个功能域相对上游 dae 的覆盖度。两点值得注意：<b>DNS 子系统（97%）</b>是完成度最高的域，因为其中的 ECS 注入、响应回填与后台刷新属于 sodama 的<em>扩展</em>，上游没有；<b>eBPF 数据面（65%）</b>是最低的域，但它的缺口全部是<em>长尾形态</em>（L2/桥接变体、kprobe/fentry、ringbuf），主路径语义已逐一对齐。</figcaption>
+<figcaption><b>图 1 · 能力地图。</b>十五个功能域相对上游 dae 的覆盖度。两点值得注意：<b>DNS 子系统（97%）</b>是完成度最高的域，因为其中的 ECS 注入、响应回填与后台刷新属于 sodama 的<em>扩展</em>，上游没有；<b>eBPF 数据面（85%）</b>经 2026-10-16 数据面对标批次补齐 L3 变体、ringbuf 事件、fentry/kprobe 记账与 XDP 计量（ADR-0065）后不再是短板；当前最低的域变为<b>部署自动化（70%）</b>——其缺口是打包与发行，与数据面演进无关。</figcaption>
 </figure>
 
 <table class="tight">
@@ -366,7 +366,7 @@ ol.endnotes li{margin-bottom:.5rem}
     <tr><td>转发面</td><td class="num">78%</td><td>relay + 并发上限、UDP NAT（网关侧全链真机验证）、offload 最小实现；缺 backlog fuse / 计费</td></tr>
     <tr><td>配置系统</td><td class="num">73%</td><td>全量解析 + 行级诊断；执行面为子集且 deferred 项显式列出（不静默丢）；余全局健康参数细节</td></tr>
     <tr><td>部署自动化</td><td class="num">70%</td><td>systemd + install.sh + OpenWrt musl 静态交叉构建与 ipk；缺 Docker / 发行包 / shell 补全</td></tr>
-    <tr><td>eBPF 数据面</td><td class="num">65%</td><td>8 程序 / 14 map（BTF）+ cgroup2 六钩子；余 L2/桥接变体、kprobe/fentry、ringbuf</td></tr>
+    <tr><td>eBPF 数据面</td><td class="num">85%</td><td>22 程序 / 22 map（BTF）：12×TC（6 角色 × L2/L3）+ <code>sk_skb</code> offload + 6×cgroup + fentry + kprobe + xdp；余 <code>lan_egress</code> 角色、记账 per-key 背压 fuse、事件类型 3/5/6/7/9。<b>未实测边界：本机无 CAP_BPF，verifier 接受度与运行时行为待 lab/生产回验</b></td></tr>
   </tbody>
 </table>
 
@@ -386,7 +386,7 @@ ol.endnotes li{margin-bottom:.5rem}
   <text x="40" y="92" font-size="10" letter-spacing="0.16em" fill="#7a1f1f">内核态 · KERNEL</text>
 
   <rect x="40" y="100" width="560" height="175" fill="#ffffff" stroke="#3d3a33" stroke-width="1.4"/>
-  <text x="60" y="124" font-size="12.5" fill="#151515">eBPF 数据面 · TCX · 8 程序 / 14 map（BTF）</text>
+  <text x="60" y="124" font-size="12.5" fill="#151515">eBPF 数据面 · TCX · 22 程序 / 22 map（BTF）</text>
   <rect x="60" y="140" width="520" height="32" fill="#eef4ee" stroke="#2e7d4f"/>
   <text x="72" y="161" font-size="11.5" fill="#151515">直连 — LPM 路由位图命中 → 内核直接转发（0 用户态 CPU）</text>
   <rect x="60" y="180" width="520" height="32" fill="#eef1f7" stroke="#1f4e79"/>
@@ -402,7 +402,7 @@ ol.endnotes li{margin-bottom:.5rem}
   <text x="640" y="208" font-size="10.8" fill="#3d3a33">sockmap key 1 / 2 / 3（v4·v6·UDP）</text>
   <text x="640" y="228" font-size="10.8" fill="#3d3a33">wan_egress · pname 采集</text>
   <text x="640" y="248" font-size="10.8" fill="#3d3a33">dns 域位图 · 规则统计计数</text>
-  <text x="640" y="268" font-size="10.8" fill="#3d3a33">ringbuf / printk 门控（默认关）</text>
+  <text x="640" y="268" font-size="10.8" fill="#3d3a33">event_ringbuf · printk 门控（默认关）</text>
 
   <line x1="230" y1="275" x2="230" y2="312" stroke="#3d3a33" stroke-width="1.2"/>
   <polygon points="226,310 234,310 230,317" fill="#3d3a33"/>
@@ -438,7 +438,7 @@ ol.endnotes li{margin-bottom:.5rem}
 </figure>
 
 <h3>3.1 · 内核态数据面</h3>
-<p>8 个 eBPF 程序（7 个 TC 含单臂 dual-role 变体 + 1 个 <code>sk_skb</code> offload）与 14 个 BTF map，约 1 100 行 Rust。<span class="sn">上游是 23 个程序 / 24 map / 4 403 行 C。数量差异不代表能力差异的同等比例：上游的 13 个 TC 变体中有大量 L2/桥接组合，而 sodama 用单臂 dual-role 一个程序覆盖了 LAN 与 WAN 两个方向。</span>生命周期用 <strong>TCX</strong> 而非传统 cls_bpf：挂钩随进程退出自动摘除，回滚天然安全——这条设计在后续的生产事故中直接救了场（见 §6 第 1 则）。</p>
+<p>22 个 eBPF 程序（12×TC：6 角色 × L2/L3，含单臂 dual-role 变体 + 1 个 <code>sk_skb</code> offload + 6×cgroup + 1×fentry + 1×kprobe + 1×xdp）与 22 个 BTF map，约 2.1k 行 Rust（2026-10-16 数据面对标批次后，ADR-0065）。<span class="sn">上游是 23 个程序 / 24 map / 4 403 行 C——本批次后 sodama 数量上趋于对齐，但组合方式不同：上游 13 个 TC 变体含大量 L2/桥接组合，sodama 用 6 角色 × L2/L3 的 12 个 TC 程序覆盖主形态（余 <code>lan_egress</code> 角色）。</span>生命周期用 <strong>TCX</strong> 而非传统 cls_bpf：挂钩随进程退出自动摘除，回滚天然安全——这条设计在后续的生产事故中直接救了场（见 §6 第 1 则）。</p>
 
 <h3>3.2 · 用户态：从「每连接一线程」到 Reactor 池</h3>
 <p>最初的转发实现是每连接 1–2 个 OS 线程的泵模型。它在 64 并发时工作良好，在 10 000 并发时是灾难：20 012 个线程、527.4 MB。M4 引入 epoll worker 池（默认 16 worker，上限按核数）后，同一负载降到 <strong>29 线程 / 34.8 MB</strong>。<sup class="fnref"><a href="#fn7">7</a></sup>关键在于 codec 会话也被搬进了 worker 内：每条 offload 连接占用 <strong>0 个线程</strong>。</p>
@@ -797,7 +797,7 @@ ol.endnotes li{margin-bottom:.5rem}
 <h2><span class="num">§5</span>工程实践与方法论</h2>
 
 <h3>5.1 · 三级验收：单测 / lab 专项 / 跨实现逐字节</h3>
-<p>单元测试（10-06 基线 268 项、修复批次后 274+）只证明函数级行为。真正的信心来自第二级与第三级：<strong>lab 专项</strong>在 netns 里跑真实拓扑（双拓扑 × 九用例、嗅探 punt 三路径、UDP v6、DoH-h2、ECS 回填与刷新、Vision XTLS 状态机……）；<strong>跨实现逐字节</strong>则把产物与另一个独立实现对齐——规则编译输出与 Go 版对拍 5/5，Vision 帧层与 Xray 夹具四模式逐字节，TLS 记录层与 Go/quic-go 参考服务端互操作，shadow-tls v1/v2/v3 与 sing-shadowtls 三版交叉。<span class="sn">为什么「跨实现」比「自测」重要：自测只能证明<b>自洽</b>，跨实现才能证明<b>正确</b>。一个编码器只要编码与解码互为逆运算，就能通过所有自测，同时和世界上其他所有实现都不兼容。</span></p>
+<p>单元测试（10-06 基线 268 项 → 数据面对标批次后 302 项）只证明函数级行为。真正的信心来自第二级与第三级：<strong>lab 专项</strong>在 netns 里跑真实拓扑（双拓扑 × 九用例、嗅探 punt 三路径、UDP v6、DoH-h2、ECS 回填与刷新、Vision XTLS 状态机……）；<strong>跨实现逐字节</strong>则把产物与另一个独立实现对齐——规则编译输出与 Go 版对拍 5/5，Vision 帧层与 Xray 夹具四模式逐字节，TLS 记录层与 Go/quic-go 参考服务端互操作，shadow-tls v1/v2/v3 与 sing-shadowtls 三版交叉。<span class="sn">为什么「跨实现」比「自测」重要：自测只能证明<b>自洽</b>，跨实现才能证明<b>正确</b>。一个编码器只要编码与解码互为逆运算，就能通过所有自测，同时和世界上其他所有实现都不兼容。</span></p>
 
 <h3>5.2 · 夹具工程学</h3>
 <p>三次踩坑把夹具从「辅助工具」提升为「需要被验证的被测对象」：</p>
@@ -920,7 +920,7 @@ ol.endnotes li{margin-bottom:.5rem}
   <tbody>
     <tr><td class="c">A</td><td>工程化与发布</td><td>Docker 镜像 · 发行包（tarball）· 发行 CI · 版本与 CHANGELOG · shell 补全 · Makefile · PKGBUILD · 许可证一致性审计（源码头 AGPL/GPL 不一致）· 升级回滚</td><td class="c">最高</td></tr>
     <tr><td class="c">B</td><td>出站协议长尾</td><td>其余 SIP003 插件（simple-obfs / v2ray-plugin）· SSR <code>auth_*</code>/<code>obfs_*</code> 全家族与 UDP · ECH 前置条件 · rustls 路径 uTLS · ML-DSA / gecko</td><td class="c">中</td></tr>
-    <tr><td class="c">C</td><td>eBPF 数据面</td><td>L2 / 桥接程序族 · bind 与 sock_addr 重定向用例 · ringbuf 事件通道 · XDP 路径调研</td><td class="c">中</td></tr>
+    <tr><td class="c">C</td><td>eBPF 数据面</td><td>✅ 已完成（2026-10-16，ADR-0065）：L3 链路头变体（12×TC）· ringbuf 事件通道 · <code>skb_send_sock</code> fentry/kprobe 记账 · XDP 计量探针；余：<code>lan_egress</code> 角色 · 记账 per-key 背压 fuse · bind 与 sock_addr 重定向用例</td><td class="c">中</td></tr>
     <tr><td class="c">D</td><td>配置系统</td><td>全局健康检查参数全量 · <code>config_merger</code> deferred 收尾 · 组级 dialer override 细节</td><td class="c">中</td></tr>
     <tr><td class="c">E</td><td>转发面</td><td>backlog fuse / 连接计费 · offload fuse 失效路径与统计</td><td class="c">中</td></tr>
     <tr><td class="c">F</td><td>嗅探 / IPv6</td><td>QUIC 观测 → UDP 域名拨号 · ICMPv6 error 转发 · IPv6 分片重组</td><td class="c">低</td></tr>
@@ -974,6 +974,14 @@ ol.endnotes li{margin-bottom:.5rem}
 <p>v1.2 的收口工作是一次<strong>unsafe 专项审计</strong>：loader + ebpf-rs 全部 167 个 <code>unsafe {}</code> / 19 个 <code>unsafe fn</code> / 10 个 <code>unsafe impl</code> 逐处人工审读 + 定向模式扫描 + clippy，产出 3 高 / 4 中 / 13 低与完整「已核销清单」（<code>docs/memory-safety-audit.html</code> v1.1）。<span class="sn">审读纪律与第一阶段相同：每条发现给出行号级证据与复核指引；「查过没问题」的位置同样入册，使覆盖范围可证。</span></p>
 <p>审计结论随后用生产引擎 <strong>2d5h39m</strong>（10-13 23:41 → 10-16 05:44）真实数据逐项比对：<strong>H2（拨号看门狗未解除）被实锤</strong>——逐秒扫描显示 DoH 持久连接恰好 3 s 生命周期（≈1.4 万次重连/天，重试逻辑静默掩盖）；<strong>M4（退出残留）被证伪降级</strong>——aya ≥5.7 走 <code>bpf_link_create</code>，进程退出自动解绑，三个世代 6/6 挂载零失败；H1/H3（splice 管道 / 线程泵）与 M1（组世代线程）、M2/M3（UDP NAT 表）生产零暴露。</p>
 <p>修复批（H1/H2/H3 + M1/M2/M3 + L1/L2/L5 加固）于 2026-10-16 05:44 上线（<code>main@97ebe9f</code>，287/287 测试、OpenWrt 构建通过）：部署回验——DoH 连接 40 s 逐秒扫描端口全程不变（对照修复前「恰好 3 s 一换」）、空闲 <code>dial-wd</code> 线程 0、新观测计数（<code>pipe_discarded</code> / <code>reply_sockets_evicted</code>）在位。<strong>新一轮 72h 生产测试</strong>已在同一批次上启动（devlog §18）。</p>
+
+<h3>8.7 · 数据面对标批次：L3 · ringbuf 事件 · fentry/kprobe 记账 · XDP（§19，ADR-0065）</h3>
+<p>对照 dae 的数据面，<code>docs/parity-status.md</code> 域 1 曾列三处缺口（backlog C1/C3/C4：L2/桥接程序族、ringbuf 事件通道、XDP 调研），另加 offload 缺「内核路径真实推送字节」的计量。2026-10-16 的<strong>数据面对标批次</strong>逐一处理：数据面程序到 <strong>22</strong>（12×TC + <code>sk_skb</code> offload + 6×cgroup + fentry + kprobe + xdp 计量）、map 到 <strong>22</strong>（BTF），域 1 覆盖度 ≈65% → <strong>≈85%</strong>。决策要点、7 项对 dae 的显式偏离与验收命令见 <code>docs/adr/ADR-0065-l3-link-hdr-ringbuf-events-fentry-accounting-xdp.md</code>，过程记录见 <code>docs/phase2-devlog.md</code> §19。<span class="sn">未实测边界：本机无 CAP_BPF / 免密 sudo，<b>没有任何程序被加载进内核</b>——verifier 接受度、fentry 在生产 6.12 内核的挂载与 kprobe 回退是否触发、L3 桥接/tun 拓扑端到端全部是<b>推断</b>（验收命令见 ADR-0065 §验证方式）；域 1 的 ≈85% 覆盖度即在此边界内记入。</span></p>
+<p><strong>L3 链路头变体。</strong>新增 5 个 <code>*_l3</code> 程序（<code>lan_ingress</code> / <code>wan_egress</code> / <code>wan_ingress</code> / <code>wan_lan_ingress</code> / <code>lan_wan_egress</code>），TC 程序族到 <strong>12 个</strong>（6 角色 × L2/L3）；挂载选择 <code>--link-hdr auto|l2|l3</code>（默认 auto）按 <code>/sys/class/net/&lt;if&gt;/type</code> 判定（对照 dae <code>linkHdrLen()</code>，<code>control_plane_core_bind.go:61-77</code>）。前向：L3 流送控制面前 <code>bpf_skb_change_head(+14)</code> + <code>bpf_skb_store_bytes</code> 补出以太头；回程：按新 map <code>l3_ifindex_map</code> 命中后 <code>bpf_skb_adjust_room(-14, BPF_ADJ_ROOM_MAC)</code> 剥头再重定向回原接口。这是对 dae 的<strong>显式偏离</strong>——dae 的 <code>tproxy_dae0_ingress</code> 对 L3 目标接口的回程包会多留 14 B 以太头（含 L3 回程续租语义等共 7 项差异，逐项见 ADR-0065 偏离清单）。</p>
+<p><strong>ringbuf 事件通道。</strong><code>event_ringbuf</code>（256 KiB）+ <code>SodaEvent</code>（72 B，对照 <code>struct dae_event</code>）+ 5 类事件（blocked / UDP 溢出 / TCP 溢出 / rebind 拒斥 / redirect 更新失败；类型 3/5/6/7/9 保留未实现）+ 1 s/键限速 + 丢弃计数；热路径 printk 全部退出（<code>--ebpf-debug</code> 门控保留）。用户态常驻 <code>ebpf-events</code> 线程消费：1 条/秒/类型日志限速，status 增 <code>events</code>（consumed/suppressed/by_type/dropped_kernel）、metrics 增 9 项。<strong>限制</strong>：内核侧限速是 per-CPU 的（上界 = CPU 数/秒/键），dae 是全局 CAS 严格 1 条/秒——原因是 bpf 目标无 64 位原子 RMW（<code>rustc --print cfg --target bpfel-unknown-none</code> 实测只给 <code>target_has_atomic_load_store</code>）。</p>
+<p><strong><code>skb_send_sock</code> 记账。</strong>fentry 优先、kprobe 回退挂同一函数（共用 <code>account()</code> 主体）；aya 无 CO-RE 字段访问，替代物是 loader 侧 <code>btfoff.rs</code> 的最小 BTF 解析器（纯 std，从 <code>/sys/kernel/btf/vmlinux</code> 解出 <code>sk_buff</code> 字段偏移写 <code>trace_param_map</code>，数据面用 <code>bpf_probe_read_kernel</code> 读）——真机 6.18 解得 <code>network_header=184 / transport_header=182 / tail=188 / head=200</code>，与 <code>pahole</code> 逐项一致。先查 <code>offload_guard</code> 过滤（只记本进程注册的 offload 键），再 per-CPU 累加 <code>offload_sent</code>；键摘除时回收进 <code>status.offload_sent.{reclaimed_bytes, kernel_bytes, account_drops}</code>。<strong>边界</strong>：只做计量，未做 dae 的 per-key 背压 fuse（登记为余项）。</p>
+<p><strong>XDP 计量探针。</strong><code>sodama_xdp_observe</code> 恒返回 <code>XDP_PASS</code>、只计数（包 / 字节 / IPv4 / IPv6 / 其它），<code>--xdp &lt;iface&gt;</code> 可选挂载、失败仅告警；<code>status.xdp</code> 区分「0 包」与「没有探针」。定位是 C4 的<strong>最小计量探针</strong>——数据面搬 XDP 仍维持 §8.3 的否决。</p>
+<p><strong>实测口径（本机）。</strong>数据面构建通过 + section/符号/map 容量核对（<code>event_ringbuf</code>=262144、<code>event_rate_map</code>=259、<code>l3_ifindex_map</code>=64、<code>offload_sent</code>=8192、<code>xdp_stats_map</code>=8、<code>sodama_stats_map</code>=16；<code>SodaEvent</code>=72 B）；<code>cargo test</code> <strong>302/302</strong>；musl x86_64 交叉构建 <code>sodama 7.7M · sodama-ebpf 752K</code>（eBPF 对象 496K → 752K）；clippy 无新增 error。<strong>可证明部分止于构建与静态核对</strong>——内核内行为全部未实测（见侧注），验收命令见 ADR-0065 §验证方式。本批先入库、暂未部署：生产部署会切断当前 72h 窗口（§8.6 世代）并重置计数，时机由用户决定（devlog §19）。</p>
 </section>
 
 <section id="s9">
@@ -1001,7 +1009,7 @@ sudo lab/perf/soak-curve.sh run 3600
 # OpenWrt 交叉构建（musl 静态）
 lab/build-openwrt.sh --arch x86_64</code></pre>
 
-<h3>9.2 · ADR 索引（63 篇）</h3>
+<h3>9.2 · ADR 索引（65 篇）</h3>
 <p>ADR 记录「<em>为什么这么做</em>」，<code>parity-status.md</code> 记录「<em>做到了哪里</em>」；两处不一致时以 ADR + NOTES 实测为准。</p>
 
 <table class="tight">
@@ -1016,6 +1024,7 @@ lab/build-openwrt.sh --arch x86_64</code></pre>
     <tr><td>DNS 深化</td><td>0034–0040</td><td>DoT/DoH · DoQ · dns.routing · 名单文件 · ECS 与 sip · 应答侧 sip 与 bench · pname 与并发</td></tr>
     <tr><td>协议细节与扩展</td><td>0041–0056</td><td>REALITY+Vision · 批量收尾 · 多组分派 · QUIC SNI · sniff-punt · UDP v6 · sticky/H2/bootstrap · 指纹对齐 · naive · HTTP/3 · juicity · ecs_cache · optimistic refresh · SSR · shadow-tls · <b>ECH 边界</b></td></tr>
     <tr><td>性能与配置阶段</td><td>0057–0063</td><td>M3 Vision over TLS · <b>M4 Reactor</b> · I6 零线程握手 · P33 运行参数热更新 · P34 订阅顺序与默认配置 · P35 inotify 与唯一事实来源 · P36 规则集与用户名单</td></tr>
+    <tr><td>生产治理与数据面对标</td><td>0064–0065</td><td>P37 探测活跃信号与订阅拉取模式 · 数据面对标批次：L3 链路头 · ringbuf 事件 · fentry/kprobe 记账 · XDP 计量</td></tr>
   </tbody>
 </table>
 
@@ -1024,13 +1033,15 @@ lab/build-openwrt.sh --arch x86_64</code></pre>
   <caption>表 7 · 本图集引用的工件</caption>
   <thead><tr><th>工件</th><th>内容</th></tr></thead>
   <tbody>
-    <tr><td><code>docs/parity-status.md</code> v2.14</td><td>15 域对标 + 三个口径 + 优势项 + Top 缺口</td></tr>
+    <tr><td><code>docs/parity-status.md</code> v2.15（2026-10-16）</td><td>15 域对标 + 三个口径 + 优势项 + Top 缺口（数据面对标批次后：域 1 ≈85%）</td></tr>
     <tr><td><code>docs/benchmark-report.html</code> v3.0</td><td>合并版《性能与资源边界报告》：吞吐/内存四层/FD/五万并发/长稳</td></tr>
-    <tr><td><code>docs/phase2-devlog.md</code> §1–§18</td><td>第二阶段 · 生产实战轮：四轮侦查/修复/验收 + P37/P37b 治理 + 审计修复批上线回验与两轮 72h 记分板 + 附 A/B 台账</td></tr>
+    <tr><td><code>docs/phase2-devlog.md</code> §1–§19</td><td>第二阶段 · 生产实战轮：四轮侦查/修复/验收 + P37/P37b 治理 + 审计修复批上线回验与两轮 72h 记分板 + 数据面对标批次 + 附 A/B 台账</td></tr>
+    <tr><td><code>docs/phase2-devlog.md</code> §19</td><td>数据面对标批次：侦查（dae L2/L3 语义 · 事件通道 · 记账 · aya 约束）/ 实施 / 验收 / <strong>未实测边界</strong></td></tr>
     <tr><td><code>docs/memory-safety-audit.html</code> v1.1</td><td>内存安全审计（unsafe 专项）：167/19/10 审读 + 2d5h39m 生产比对（H2 实锤 / M4 证伪）+ 修复批与部署回验</td></tr>
     <tr><td><code>docs/af-xdp-research.md</code></td><td>AF-XDP 可行性预研：硬件/瓶颈/架构三层否决 + 重评估判据</td></tr>
     <tr><td><code>docs/dae-optimization-research.md</code></td><td>面向 dae 的优化与创新研究：已做/能做清单、迁移路线、负面结论</td></tr>
     <tr><td><code>docs/adr/ADR-0064-p37-probe-idle-signal-and-sub-fetch-modes.md</code></td><td>P37：探测活跃信号与订阅拉取模式（A1/B1–B3/C1）</td></tr>
+    <tr><td><code>docs/adr/ADR-0065-l3-link-hdr-ringbuf-events-fentry-accounting-xdp.md</code></td><td>本批次决策 + 7 项偏离清单 + 验证方式：L3 链路头 · ringbuf 事件 · <code>skb_send_sock</code> 记账 · XDP 计量</td></tr>
     <tr><td><code>docs/reviews/2026-10-05-i1-system-memory-data.md</code></td><td>系统内存四层模型原始数据与口径</td></tr>
     <tr><td><code>docs/reviews/2026-10-05-memory-final-review-a.md</code> / <code>-b.md</code></td><td>第三方评审原文（含 pipe 容量推算质疑）</td></tr>
     <tr><td><code>docs/reviews/2026-10-05-i3-forwarding-primitives.md</code></td><td>splice / copy pump / io_uring 三档选型</td></tr>
@@ -1047,7 +1058,7 @@ lab/build-openwrt.sh --arch x86_64</code></pre>
 <section id="endnotes">
 <h2><span class="num">附</span>尾注</h2>
 <ol class="endnotes">
-  <li id="fn1"><code>docs/parity-status.md</code> v2.14（2026-10-08）——15 域对照、三个口径、优势项与 Top 缺口；覆盖度定义与维护规则见该文「维护说明」。</li>
+  <li id="fn1"><code>docs/parity-status.md</code> v2.15（2026-10-16）——15 域对照、三个口径、优势项与 Top 缺口（数据面对标批次后：域 1 ≈85%）；覆盖度定义与维护规则见该文「维护说明」。</li>
   <li id="fn2"><code>docs/benchmark-report.html</code> v3.0《性能与资源边界报告》（合并版，2026-10-06）——吞吐四方对拍、内存四层模型、FD 治理、五万并发压测、长稳与有界性。</li>
   <li id="fn3"><code>docs/reviews/2026-10-05-i1-system-memory-data.md</code>——系统内存基准（四层模型）数据与口径，含 pipe 容量的实测回应（§5.1）。</li>
   <li id="fn4"><code>docs/perf-report.md</code>（并入 v3.0 报告 §3 + 附录 A）——四方吞吐/延迟、并发扩展、perf 热点剖面、M1/M2 优化前后、夹具校准。</li>
@@ -1056,13 +1067,13 @@ lab/build-openwrt.sh --arch x86_64</code></pre>
   <li id="fn7"><code>docs/adr/ADR-0058-m4-reactor.md</code>——epoll worker 池、stage 1/2 划分、io_uring A/B 结论与关闭开关。</li>
   <li id="fn8"><code>docs/adr/ADR-0025-remove-c-datapath.md</code>——C 数据面退役；配合 ADR-0023/0024 的两阶段迁移。</li>
   <li id="fn9"><code>docs/adr/ADR-0062-p35-inotify-fast-reload-config-source-of-truth.md</code>——配置文件作为唯一事实来源与 inotify 毫秒级热驱动；配合 ADR-0061/0063。</li>
-  <li id="fn10"><code>docs/phase2-devlog.md</code>（§1–§18，2026-10-08 起）——第二阶段 · 生产实战轮：四轮侦查/修复/验收的完整证据、P37/P37b 治理、审计修复批上线回验与两轮 72h 生产测试记分板、附 A/B 台账。</li>
+  <li id="fn10"><code>docs/phase2-devlog.md</code>（§1–§19，2026-10-08 起）——第二阶段 · 生产实战轮：四轮侦查/修复/验收的完整证据、P37/P37b 治理、审计修复批上线回验与两轮 72h 生产测试记分板、数据面对标批次与其未实测边界（§19）、附 A/B 台账。</li>
 </ol>
 </section>
 
 <div class="colophon">
-  <p><strong>SODAMA ATLAS</strong> · 全 Rust 代理数据面开发研究图集 · v1.2 · 2026-10-16 · 对应代码 <code>main@97ebe9f</code>（内存安全审计修复批上线后）。</p>
-  <p>v1.1 增量：<a href="#s8">§8 · 第二阶段 · 生产实战轮</a>——四轮生产侦查/修复的收口结论与修复后稳态；原始证据见 <code>docs/phase2-devlog.md</code>。<br>v1.2 增量：§8.4–§8.6——P37/P37b 探测与订阅治理（ADR-0064）、AF-XDP 预研否决、内存安全审计（unsafe 专项）与修复批上线回验、新一轮 72h 生产测试进行中。</p>
+  <p><strong>SODAMA ATLAS</strong> · 全 Rust 代理数据面开发研究图集 · v1.3 · 2026-10-16 · 对应代码 <code>main@2026-10-16 数据面对标批次后</code>（内存安全审计修复批上线后 + 本批次入库）。</p>
+  <p>v1.1 增量：<a href="#s8">§8 · 第二阶段 · 生产实战轮</a>——四轮生产侦查/修复的收口结论与修复后稳态；原始证据见 <code>docs/phase2-devlog.md</code>。<br>v1.2 增量：§8.4–§8.6——P37/P37b 探测与订阅治理（ADR-0064）、AF-XDP 预研否决、内存安全审计（unsafe 专项）与修复批上线回验、新一轮 72h 生产测试进行中。<br>v1.3 增量：§8.7——数据面对标批次：L3 链路头变体（TC 7 → 12）、ringbuf 事件通道、<code>skb_send_sock</code> fentry/kprobe 记账、XDP 计量探针（ADR-0065、devlog §19）——合计 22 程序 / 22 map，eBPF 数据面覆盖度 ≈65% → ≈85%（带未实测边界）。</p>
   <p>本图集为单文件 HTML，样式与图表全部内联（SVG），无外部依赖。排版遵循 Tufte 式书卷原则：正文窄栏、边注旁置、数据优先、表格无竖线、图表与正文同宽、克制用色。</p>
   <p>所有数字均为本机或真实环境实测，未做外推；所有「未做」项均显式登记。口径与边界见 §5.3。项目以 AGPL-3.0 授权（许可证头一致性审计待办，见 §7 A8）。</p>
 </div>
@@ -1073,7 +1084,7 @@ lab/build-openwrt.sh --arch x86_64</code></pre>
 <div class="classbar bottom">
   <span class="cls">密级 · 最高</span>
   <span>SODAMA ATLAS · 内部研究档案 · 未经许可不得外传</span>
-  <span class="push">v1.2 · 2026-10-16</span>
+  <span class="push">v1.3 · 2026-10-16</span>
 </div>
 
 </body>

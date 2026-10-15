@@ -45,14 +45,14 @@ G1 同机 + 真实节点口径均已交付。以下为余项。
 | B4 | rustls 路径 uTLS（naive h2/h3、DoH h2/h3 等指纹） | P24 边界（ADR-0048） | 与自实现 CH 同款的指纹对齐测试 |
 | B5 | ML-DSA / gecko（hysteria2 混淆/后量子） | hy2 v0 边界（ADR-0020） | 与 Go 客户端参数级互通 |
 
-## C. eBPF 数据面（对标 dae ≈65%）
+## C. eBPF 数据面（对标 dae ≈85%，2026-10-16 数据面对标批次后）
 
 | # | 事项 | 现状 | 验收标准 |
 |---|---|---|---|
-| C1 | L2/桥接程序族（TC L2 变体） | 8 程序（7×TC + sk_skb） | 桥接拓扑 lab 用例 |
+| C1 | L2/桥接程序族（TC L2 变体） | **L3 变体已补齐（2026-10-16，ADR-0065）**：5 个 `*_l3` 程序（lan_ingress / wan_egress / wan_ingress / wan_lan_ingress / lan_wan_egress）+ `--link-hdr auto\|l2\|l3`（按 arphrd 自动判定，对照 dae `linkHdrLen()`）+ L3 补头/剥头；共 12 个 TC 程序（6 角色 ×2）+ sk_skb offload。余：`lan_egress` 角色（dae 的容器/独立 netns 出口用法）未实现 | 桥接/ tun 拓扑 lab 用例（**待实测**：本机无 CAP_BPF，见 ADR-0065 §验证方式） |
 | C2 | cgroup 钩子（connect/bind/sendmsg…） | **6/6 已挂载**（sock_create/release、connect4/6、sendmsg4/6；P17b）——用于 pname 采集与 `pname()` 规则（WAN egress 新连接，见 `status` hooks）；bind 与 sock_addr 重定向用例未做 | 至少 connect/bind 两钩子的 sock_addr 重定向用例 |
-| C3 | ringbuf 事件通道 | 用 printk 调试 | 高频事件可采样上报，替代 printk |
-| C4 | XDP 可选路径调研 | 未做 | 调研报告（收益/兼容性）即可 |
+| C3 | ringbuf 事件通道 | ✅ **已完成（2026-10-16，ADR-0065）**：`event_ringbuf`（256KiB）+ `SodaEvent` 72B（对照 `struct dae_event`）+ 5 类事件（blocked/溢出×2/rebind/redirect 失败）+ 1s/键限速 + 丢弃计数；热路径 printk 退出（保留 `--ebpf-debug` 门控）；loader 常驻消费线程（1 条/秒/类型日志限速）+ status `events` + 9 个 metrics；**并批次交付 `skb_send_sock` 记账**（fentry→kprobe 回退 + 用户态 BTF 解析替代 CO-RE + `offload_sent` 键摘除时回收） | 高频事件可采样上报（已具备）；待生产回验：`status.events`/`offload_sent.*` 随流量增长且 `dropped_kernel` 有界 |
+| C4 | XDP 可选路径调研 | ✅ **已完成（2026-10-16）**：调研结论沿用 devlog §15（AF_XDP/数据面搬 XDP 否决），按 backlog 建议落**最小计量探针** `sodama_xdp_observe`（`--xdp <iface>` 可选挂载，恒 `XDP_PASS`、只计数不干预；status `xdp` + 2 个 metrics） | 调研报告（收益/兼容性）已具备；待实测：软路由网卡上的 native/generic 可用性与计数准确性 |
 
 ## D. 配置系统（≈65%）
 

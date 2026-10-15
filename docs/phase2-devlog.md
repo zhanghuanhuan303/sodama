@@ -1131,6 +1131,64 @@ worker 停摆现象加诊断日志后未再复现；全链路日志（“后台�
   5. 常规判据（同 §16）：探测节奏/CF 额度、订阅计数、内存与线程有界、stragglers=0。
 - 数据回填：按 §12 协议；本代起点 2026-10-16 05:44（health/mem-track 持续运行）。
 
+## 19 · 数据面对标批次：L3 变体 · ringbuf 事件 · skb_send_sock 记账 · XDP 计量（2026-10-16）
+
+对应 `docs/backlog.md` C1/C3/C4 与 `docs/parity-status.md` 域 1 的余项；决策与偏离清单见 ADR-0065。
+
+### 侦查（源码实测，均有行号）
+
+1. **dae 的 L2/L3 语义**：同一逻辑传不同 `link_h_len`（以太 14 / 无链路头 0），程序成对存在
+   （`SEC("tc/lan_ingress_l2")` / `_l3`）；选择逻辑在 Go 侧 `linkHdrLen()`
+   （`dae/control/control_plane_core_bind.go:61-77`：netlink `EncapType` 的
+   `none`/`ipip`/`ppp`/`tun` → 0，`ether` → 14，其它告警后按 14），再在 `:256-273` 选程序变体。
+   L3 的 v4/v6 判定用 `skb->protocol`（`kern/tproxy.c:1103`），送控制面前补以太头
+   （`rewrite_packet_for_control_plane:2253-2279`），redirect_track 不记 MAC
+   （`fill_redirect_entry_from_forward_packet:2151-2164`）。
+2. **dae 的事件通道**：`event_ringbuf` 256KiB + `struct dae_event` 72B +
+   `send_dae_event`（reserve 写、败则 `BPF_STATS_EVENT_DROP`）+ `blocked_event_rate_limited`
+   （全局 ARRAY、CAS 抢槽、读后取时、1s 窗口、键 256/257/258）——`kern/tproxy.c:611-875`。
+3. **dae 的 offload 记账**：fentry 与 kprobe 双形态挂 `skb_send_sock`（非 `_locked`；后者只有
+   xfrm/espintcp 调用），按 skb 的 `network_header`/`transport_header`/`tail`/`head` 重建重定向前
+   四元组；键布局与 verdict 的 `peer_key` 同构，Go 侧用同一对键做背压 fuse；fentry 在无
+   `CONFIG_DYNAMIC_FTRACE` 或被直接调用/trampoline 占用时会 EBUSY → kprobe 回退
+   （`kern/tproxy.c:4360-4393`、`kern/include/tcp_offload.h`、`control/tcp_offload_hook.go`）。
+4. **aya 生态的硬约束**（逐个源码核实）：aya-ebpf 无 `bpf_core_read`/`BpfCoreAccessors`；
+   bpf 目标无 `target_has_atomic="64"`（`rustc +nightly --print cfg --target bpfel-unknown-none`
+   实测只有 `target_has_atomic_load_store`）→ Rust 侧做不了 dae 的 CAS 限速；
+   `RingBuf::reserve/output`、`FEntry/KProbe/Xdp::attach`、`PerCpuHashMap::get/remove` 等 API 齐备。
+
+### 实施
+
+- **数据面（`sodama/ebpf-rs/src/`）**：新增 `event.rs`（事件+限速）、`trace.rs`（fentry+kprobe 记账）、
+  `xdp.rs`（计量探针）；`parse.rs` 拆为 `parse_ip_at(ctx, link_h_len)`（L2 读以太类型、L3 读
+  `skb->protocol`，MAC 置 0）；`flow.rs` 的 `split_flow`/`redirect_to_control_plane`/
+  `publish_redirect_track` 带 `link_h_len`（L3 补头 + MAC 置 0）；`progs.rs` 落 5 个 `*_l3` 变体
+  + 回程按 `l3_ifindex_map` 剥头；`maps.rs` 新增 4 map、`sodama_stats_map` 容量 5→16（键 5 event_drops
+  / 6 offload_sent_bytes / 7 conn_overflow / 8 account_drops）。
+- **用户态（`sodama/loader/src/`）**：新增 `btfoff.rs`（纯 std BTF 解析，输出 `sk_buff` 字段偏移；
+  匿名 struct/union 递归）；`main.rs` 增 `--link-hdr auto|l2|l3`（默认 auto，按
+  `/sys/class/net/<if>/type` 判定 → 选 `_l3` 变体 + 写 `l3_ifindex_map`）、`--xdp`（可选挂载）、
+  `attach_offload_accounting`（BTF → `trace_param_map` → fentry→kprobe 回退）、
+  事件消费线程（poll+排空、1 条/秒/类型日志限速）、`offload_sent_reclaim`（键摘除时汇总）、
+  status 新增 `events`/`offload_sent`/`xdp` 三块 + 9 个 metrics 计数。
+
+### 验收（本机已实测）
+
+| 项 | 结果 |
+|---|---|
+| 数据面构建 | `cargo +nightly build --release` 通过；section `fentry/skb_send_sock`/`kprobe/skb_send_sock`/`xdp` 均在（`llvm-readelf`）；5 个 `*_l3` 符号在（`llvm-nm`） |
+| map 容量与结构 | `bpftool btf dump`：`event_ringbuf`=262144、`event_rate_map`=259、`l3_ifindex_map`=64、`offload_sent`=8192、`xdp_stats_map`=8、`sodama_stats_map`=16；`SodaEvent`=72B、`SodaTraceParam`=16B |
+| BTF 解析 | 302 tests passed（含 `btfoff` 14 项）；真机 `/sys/kernel/btf/vmlinux` 解出 `network_header=184, transport_header=182, tail=188, head=200`，与 `pahole` 逐项一致 |
+| 构建与 CLI | musl 交叉（x86_64）通过：`sodama 7.7M · sodama-ebpf 752K`；`--help`/`--link-hdr bogus` 行为正确；clippy 无新增 error |
+
+### 未实测（诚实边界）
+
+- 本机无 CAP_BPF/免密 sudo → **没有把任何程序加载进内核**：verifier 接受度（尤其
+  `bpf_skb_adjust_room(-14, BPF_ADJ_ROOM_MAC)` 剥头、fentry/kprobe 的
+  `bpf_probe_read_kernel` 路径）、fentry 在生产内核（6.12）的挂载与 kprobe 回退、
+  L3 桥接/tun 拓扑端到端——全部标注为**推断**，验收命令见 ADR-0065 §验证方式。
+- 生产部署会切断当前 72h 窗口（§18 世代）并重置计数，故本批先入库、部署时机由用户决定。
+
 ---
 
 ## 附 A · 路由器侧工具清单（**不入库**，仅存在于软路由）

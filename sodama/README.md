@@ -48,7 +48,8 @@ P6（suspend/reload/metrics/sysdump/日志轮转/整配置热重载）已完成*
 - **P4 转发面**：TCP relay（`--dialer direct|socks5://…|ss://…|trojan://…|vless://…|vmess://…`，
   host ns 拨号 + `SO_MARK` 防自环 + 双向泵送/半关闭 + janitor）；UDP NAT（按 (client, orig_dst)
   会话，回包源地址保持原始目的地址）；TCP offload（`fast_sock` + `sk_skb` 内核对拼，最小实现：
-  无 fuse/计费）
+  无 fuse/计费；**对标批起有内核路径字节计量**：`skb_send_sock` 的 fentry/kprobe 探针 + 键摘除时回收，
+  `status.offload_sent.{reclaimed_bytes,kernel_bytes}`）
 - **P5-G1 原生协议栈**：shadowsocks classic AEAD（SIP004；TCP 分块 0x3FFF + UDP 包；
   `aes-256-gcm` / `chacha20-ietf-poly1305`）与 trojan（rustls 0.23 + CONNECT 头）；
   **协议与 offload 互斥**（AEAD/TLS 帧不交给内核拼接，带 `--offload` 也 `offloaded_total=0`）；
@@ -274,14 +275,26 @@ P6（suspend/reload/metrics/sysdump/日志轮转/整配置热重载）已完成*
   （loader 去掉 `--ebpf-offload`；lab/bench 删 `offload-rs`/`rs-up`/`rs-dual-up` 入口）；
   `lab/lab.sh build` 只构建 Rust 对象；复跑：标准/单臂 verify 均 9/9、DNS/转发面/协议栈抽查、
   `cargo test` 73/73、offload 基准 12.4Gbps/19µs（见 ADR-0025、NOTES §11.15）
+- **数据面对标批次（完成，2026-10-16）**：补齐 `docs/backlog.md` C1/C3/C4——
+  **L3 链路头变体**（5 个 `*_l3` 程序 + `--link-hdr auto|l2|l3`，按 `/sys/class/net/<if>/type`
+  自动判定，对照 dae `linkHdrLen()`；L3 送控制面 `bpf_skb_change_head(+14)` 补以太头，
+  回程按 `l3_ifindex_map` 用 `bpf_skb_adjust_room(-14)` 剥头）；
+  **ringbuf 事件通道**（`event_ringbuf` + `SodaEvent` 72B + 5 类事件 + 1s/键限速 + 丢弃计数，
+  替代热路径 printk；`status.events` + 事件日志限速 1 条/秒/类型）；
+  **`skb_send_sock` 记账**（fentry→kprobe 回退；用户态 BTF 解析（`loader/src/btfoff.rs`）
+  写 `sk_buff` 字段偏移替代 CO-RE；`offload_guard` 过滤 + `offload_sent` 累加 + 键摘除时回收）；
+  **XDP 计量探针**（`--xdp <iface>` 可选，恒 `XDP_PASS`、只计数不干预）。
+  实测：22 程序/22 map、`cargo test` 302/302、musl x86_64 交叉构建通过（`sodama 7.7M · sodama-ebpf 752K`）；
+  **未实测**：本机无 CAP_BPF，verifier/运行时/L3 拓扑待 lab 回验（见 ADR-0065、devlog §19）
 
 原理与 dae 源码对照见 [NOTES.md](./NOTES.md)。
 
 ## 目录
 
 ```
-ebpf-rs/src/         Rust/aya-ebpf 数据面（唯一）：8 个 tc 程序 + 6 个 cgroup 程序（P17b pname 采集）
-                     + 规则 VM + conn_state + 单写者 + sk_skb offload；BTF maps（含 map-in-map）
+ebpf-rs/src/         Rust/aya-ebpf 数据面（唯一）：12 个 TC 程序（6 角色 × L2/L3）+ 6 个 cgroup 程序
+                     （P17b pname 采集）+ sk_skb offload + fentry/kprobe 记账 + xdp 计量
+                     + 规则 VM + conn_state + 单写者；BTF maps（含 map-in-map）
 loader/src/main.rs   Rust + aya：加载、挂钩子、setns、tproxy/UDP socket、规则下发/热重载、
                      relay/Dialer、UDP NAT、offload 注册、janitor、只读状态面、DNS 线程
 loader/src/rules.rs  迷你规则解析 + 编译（match_set 编码 + LPM trie + regex 编译 + dump/对拍；P19 组名→outbound 索引）
@@ -354,7 +367,7 @@ lab/http_connect_server.py P18e：独立实现的 HTTP CONNECT 代理（可选 B
 lab/rules.gateway.dae P13：网关模式规则（DNS must 置顶、无私网 sip、QUIC block、fallback proxy）
 lab/gateway.dae      P18c：网关模式配置（同规则的 routing + DNS 进控制面 → 国内走本地明文/其余 DoH + 广告拦截）
 lab/blocklist.txt    P18c：自定义 DNS 拦截名单（qname(file:) 读取；默认全部注释）
-ebpf-rs/             P9：完整 Rust 数据面（7 classifier + offload verdict + 规则 VM；BTF maps；
+ebpf-rs/             P9：完整 Rust 数据面（12 TC（6 角色×L2/L3）+ offload verdict + 规则 VM；BTF maps；
                      不属主 workspace，构建：lab/build-ebpf-rs.sh，产物 target/bpfel-unknown-none/release/）
 lab/wan_echo.py      WAN 侧 echo（9999/8080 TCP；8082 纯回显；9998 UDP）
 lab/client_probe.py  客户端探针

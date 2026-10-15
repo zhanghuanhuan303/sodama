@@ -58,6 +58,17 @@ pub const SODAMA_STAT_REDIRECT_UPDATE_FAILED: u32 = 1;
 pub const SODAMA_STAT_OFFLOAD_REDIRECTS: u32 = 2;
 pub const SODAMA_STAT_OFFLOAD_VERDICTS: u32 = 3;
 pub const SODAMA_STAT_PNAME_HITS: u32 = 4;
+/// C3：事件无法入 ringbuf（满）被丢弃的次数（对照 dae `BPF_STATS_EVENT_DROP`）。
+pub const SODAMA_STAT_EVENT_DROPS: u32 = 5;
+/// 对标批：fentry/kprobe `skb_send_sock` 记录的 offload 推送字节总数（按 CPU 分桶）。
+pub const SODAMA_STAT_OFFLOAD_SENT_BYTES: u32 = 6;
+/// 对标批：conn_state_map 写入失败（表满）次数（对照 dae `BPF_STATS_UDP/TCP_CONN_OVERFLOW`
+/// 的合并计数；sodama 不拆分 TCP/UDP 两个键，事件里按 l4proto 区分）。
+pub const SODAMA_STAT_CONN_OVERFLOW: u32 = 7;
+/// 对标批：`offload_sent` 记账写入失败（表满）次数——记账丢失必须可数。
+pub const SODAMA_STAT_ACCOUNT_DROPS: u32 = 8;
+/// `sodama_stats_map` 容量（已用键 0..=8，留余量给后续批次）。
+pub const SODAMA_STAT_MAP_SIZE: u32 = 16;
 
 pub const IPPROTO_TCP: u8 = 6;
 pub const IPPROTO_UDP: u8 = 17;
@@ -223,6 +234,65 @@ pub struct SodaDnsSenderPname {
     pub _pad2: [u8; 6],
     pub ts_ns: u64,
 }
+
+/// 事件类型（对照 dae `enum dae_event_type` 的编号；仅实现子集，未实现的编号保留不占用）。
+/// 未实现：3=BLOCKED_ALIVE（sodama 数据面无 outbound 存活态）、5=SYN_REBIND_REJECTED、
+/// 6/7/9（dae 侧为保留/计数替代或数据面代次概念）。
+pub const SODAMA_EVENT_BLOCKED: u32 = 0;
+pub const SODAMA_EVENT_UDP_CONN_OVERFLOW: u32 = 1;
+pub const SODAMA_EVENT_TCP_CONN_OVERFLOW: u32 = 2;
+pub const SODAMA_EVENT_REDIRECT_REBIND_REJECTED: u32 = 4;
+pub const SODAMA_EVENT_REDIRECT_UPDATE_FAILED: u32 = 8;
+
+/// 事件限速键（对照 dae `EVENT_RATE.{blocked,redirect_rebind,overflow}_key`；
+/// 0..=255 保留给 per-outbound 事件，sodama 暂未实现 BLOCKED_ALIVE）。
+pub const SODAMA_EVENT_RATE_BLOCKED: u32 = 256;
+pub const SODAMA_EVENT_RATE_REDIRECT_REBIND: u32 = 257;
+pub const SODAMA_EVENT_RATE_OVERFLOW: u32 = 258;
+/// 事件限速键域大小（含 0..=258）。
+pub const SODAMA_EVENT_RATE_KEY_MAX: u32 = 258;
+/// 限速窗口：每键每窗口最多一条（对照 dae `EVENT_RATE.window_ns` = 1s）。
+pub const SODAMA_EVENT_RATE_WINDOW_NS: u64 = 1_000_000_000;
+
+/// `event_rate_map` 容量（键 0..=258）。
+pub const SODAMA_EVENT_RATE_MAP_SIZE: u32 = SODAMA_EVENT_RATE_KEY_MAX + 1;
+
+/// C3：数据面事件（72 字节，字段布局对照 dae `struct dae_event`；
+/// `pid/pname` 暂置 0——sodama 的 pname 采集在 cgroup 钩子，TC 路径不可得）。
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct SodaEvent {
+    pub timestamp: u64,
+    pub type_: u32,
+    pub pid: u32,
+    pub pname: [u8; 16],
+    pub outbound: u8,
+    pub l4proto: u8,
+    pub pad: [u8; 2],
+    pub sip: [u8; 16],
+    pub dip: [u8; 16],
+    pub sport: u16,
+    pub dport: u16,
+}
+
+/// 对标批：fentry/kprobe 记账所需的 `struct sk_buff` 字段偏移（字节）。
+/// loader 在加载时从 `/sys/kernel/btf/vmlinux` 解出真实偏移后写入——aya-ebpf 不提供
+/// CO-RE field access，故用「用户态 BTF 解析 + map 传参」替代 `BPF_CORE_READ_INTO`
+/// （dae 用的是 clang CO-RE，见 `include/tcp_offload.h:tcp_offload_skb_key`）。
+pub struct SodaTraceParam {
+    pub network_header: u32,
+    pub transport_header: u32,
+    pub tail: u32,
+    pub head: u32,
+}
+
+/// C4：XDP 计量探针的计数键（per-CPU array）。
+pub const SODAMA_XDP_PACKETS: u32 = 0;
+pub const SODAMA_XDP_BYTES: u32 = 1;
+pub const SODAMA_XDP_IPV4: u32 = 2;
+pub const SODAMA_XDP_IPV6: u32 = 3;
+pub const SODAMA_XDP_OTHER: u32 = 4;
+pub const SODAMA_XDP_MAP_SIZE: u32 = 8;
 
 #[repr(C)]
 #[derive(Clone, Copy)]

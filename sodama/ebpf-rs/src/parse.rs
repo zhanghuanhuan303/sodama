@@ -1,16 +1,53 @@
 //! 报文解析（与 C `parse_v4`/`load_l4` 等价，全部走 `bpf_skb_load_bytes`）。
+//!
+//! 链路头长度（`link_h_len`）对标 dae：以太 14B / 无链路头（tun/ppp/ipip/none）0B
+//! （dae `linkHdrLen()`：`control/control_plane_core_bind.go:61-77`）。L2/L3 用同一套
+//! 逻辑解析，只是起始偏移不同（dae `parse_transport_fast`，`kern/tproxy.c:1056-1105`）。
 
 use aya_ebpf::programs::TcContext;
 
 use crate::common::*;
 
+/// 统一的 v4/v6 解析入口（TC classifier 用，链路头 14B）。
 #[inline(always)]
-pub fn parse_v4(ctx: &TcContext) -> Option<SodaParseResult> {
-    let eth: EthHdr = ctx.load(0).ok()?;
-    if eth.h_proto != ETH_P_IP.to_be() {
+pub fn parse_ip(ctx: &TcContext) -> Option<SodaParseResult> {
+    parse_ip_at(ctx, ETH_HLEN)
+}
+
+/// 按链路头长度解析：`link_h_len == ETH_HLEN` 取以太类型字段判定 v4/v6；
+/// `link_h_len == 0`（L3 设备）取 `skb->protocol`，地址/端口布局不变，MAC 置 0。
+#[inline(always)]
+pub fn parse_ip_at(ctx: &TcContext, link_h_len: u32) -> Option<SodaParseResult> {
+    let mut smac = [0u8; 6];
+    let mut dmac = [0u8; 6];
+    /* proto 的取值口径与 dae 一致：L2 直接读以太类型字段；L3 读 skb->protocol
+     * （内核把该字段按网络序映射成与以太类型字段**同一字节形态**的 u16，故两者
+     * 可直接比较、也可原样写入补出的以太头，见 kern/tproxy.c:1103/2261）。 */
+    let proto = if link_h_len == ETH_HLEN {
+        let eth: EthHdr = ctx.load(0).ok()?;
+        smac = eth.h_source;
+        dmac = eth.h_dest;
+        eth.h_proto
+    } else {
+        unsafe { (*ctx.skb.skb).protocol as u16 }
+    };
+
+    let mut out = if proto == ETH_P_IP.to_be() {
+        parse_v4_at(ctx, link_h_len)?
+    } else if proto == ETH_P_IPV6.to_be() {
+        parse_v6_at(ctx, link_h_len)?
+    } else {
         return None;
-    }
-    let iph: IpHdr = ctx.load(ETH_HLEN as usize).ok()?;
+    };
+    out.smac = smac;
+    out.dmac = dmac;
+    Some(out)
+}
+
+/// IPv4 解析：`off` = 链路头长度（以太 14 / L3 0）。
+#[inline(always)]
+pub fn parse_v4_at(ctx: &TcContext, link_h_len: u32) -> Option<SodaParseResult> {
+    let iph: IpHdr = ctx.load(link_h_len as usize).ok()?;
     if (iph.vihl >> 4) != 4 {
         return None;
     }
@@ -30,28 +67,22 @@ pub fn parse_v4(ctx: &TcContext) -> Option<SodaParseResult> {
     out.l4proto = iph.protocol;
     out.is_v4 = 1;
     out.dscp = (iph.tos >> 2) & 0x3f;
-    out.smac = eth.h_source;
-    out.dmac = eth.h_dest;
 
-    load_l4(ctx, ETH_HLEN + ihl, iph.protocol, &mut out)?;
+    load_l4(ctx, link_h_len + ihl, iph.protocol, &mut out)?;
     Some(out)
 }
 
 /// IPv6 解析：固定头 + 跳过 hop-by-hop/routing/dest-opts 扩展头（最多 4 个）；
 /// 分片（44）与其余扩展头不处理（返回 None，交内核原路径）。
 #[inline(always)]
-pub fn parse_v6(ctx: &TcContext) -> Option<SodaParseResult> {
-    let eth: EthHdr = ctx.load(0).ok()?;
-    if eth.h_proto != ETH_P_IPV6.to_be() {
-        return None;
-    }
-    let iph: Ipv6Hdr = ctx.load(ETH_HLEN as usize).ok()?;
+pub fn parse_v6_at(ctx: &TcContext, link_h_len: u32) -> Option<SodaParseResult> {
+    let iph: Ipv6Hdr = ctx.load(link_h_len as usize).ok()?;
     let word = u32::from_be(iph.vtc_flow);
     if (word >> 28) != 6 {
         return None;
     }
     let mut next = iph.next_header;
-    let mut off = ETH_HLEN + 40;
+    let mut off = link_h_len + 40;
     let mut hops = 0u8;
     while next == 0x00 || next == 0x2b || next == 0x3c {
         if hops >= 4 {
@@ -82,24 +113,9 @@ pub fn parse_v6(ctx: &TcContext) -> Option<SodaParseResult> {
     out.l4proto = next;
     out.is_v4 = 0;
     out.dscp = ((word >> 22) & 0x3f) as u8;
-    out.smac = eth.h_source;
-    out.dmac = eth.h_dest;
 
     load_l4(ctx, off, next, &mut out)?;
     Some(out)
-}
-
-/// 统一的 v4/v6 解析入口（TC classifier 用）。
-#[inline(always)]
-pub fn parse_ip(ctx: &TcContext) -> Option<SodaParseResult> {
-    let eth: EthHdr = ctx.load(0).ok()?;
-    if eth.h_proto == ETH_P_IP.to_be() {
-        parse_v4(ctx)
-    } else if eth.h_proto == ETH_P_IPV6.to_be() {
-        parse_v6(ctx)
-    } else {
-        None
-    }
 }
 
 #[inline(always)]

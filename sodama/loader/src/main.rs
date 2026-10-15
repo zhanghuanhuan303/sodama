@@ -37,16 +37,18 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use aya::maps::lpm_trie::Key;
-use aya::maps::{Array, ArrayOfMaps, HashMap, LpmTrie, MapData, SockHash, SockMap};
+use aya::maps::{Array, ArrayOfMaps, HashMap, LpmTrie, MapData, PerCpuHashMap, RingBuf, SockHash, SockMap};
 use aya::programs::tc::{self, TcAttachType};
 use aya::programs::{CgroupAttachMode, CgroupSock, CgroupSockAddr, SchedClassifier, SkSkb};
 use aya::programs::{CgroupSockAddrAttachType, CgroupSockAttachType};
-use aya::Ebpf;
+use aya::programs::{FEntry, KProbe, Xdp, XdpMode};
+use aya::{Btf, Ebpf};
 use serde_json::json;
 
 mod anytls;
 mod bootstrap;
 mod brutal;
+mod btfoff;
 mod bufpool;
 mod config;
 mod dns;
@@ -286,6 +288,9 @@ struct RelayStats {
     /// M4：交给 Reactor 的 codec 会话数（每连接 0 线程）。
     /// 生产实测（2026-10-08）旧实现下恒为 0：组拨号未声明 reactor 能力。
     reactor_codec_sessions: AtomicU64,
+    /// 对标批：offload 会话在内核路径真实推送的字节（`skb_send_sock` fentry/kprobe
+    /// 记账，per-CPU 分桶；用户态在键摘除时汇总 `offload_sent` 得到）。
+    offload_sent_bytes: AtomicU64,
 }
 static RELAY_STATS: RelayStats = RelayStats {
     conns_total: AtomicU64::new(0),
@@ -305,6 +310,7 @@ static RELAY_STATS: RelayStats = RelayStats {
     pipe_discarded: AtomicU64::new(0),
     limit_rejected: AtomicU64::new(0),
     reactor_codec_sessions: AtomicU64::new(0),
+    offload_sent_bytes: AtomicU64::new(0),
 };
 
 // ---- P-AI：按域名统计（面板「AI 流量」卡片的数据源） ------------------------
@@ -528,6 +534,11 @@ fn fd_pressure() -> bool {
 static RELAY_OFFLOAD: OnceLock<Mutex<SockHash<MapData, SodaTuple>>> = OnceLock::new();
 /// P8：Rust/aya-ebpf offload 对象的预检镜像（HASH map，与 fast_sock 同步双写）。
 static RELAY_OFFLOAD_GUARD: OnceLock<Mutex<HashMap<MapData, SodaTuple, u8>>> = OnceLock::new();
+/// 对标批：`offload_sent` 记账表（key = fast_sock 键，value = 该键方向被内核推送的
+/// 字节，per-CPU）。键摘除时汇总并删除；对照 dae `control/kern/tproxy.c:276-287`
+/// 的 `tcp_offload_sent`（记账在 `tproxy.c:4324-4393`；其 per-key 背压 fuse 未实现，
+/// 本表只做归因计量）。
+static OFFLOAD_SENT: OnceLock<Mutex<PerCpuHashMap<MapData, SodaTuple, u64>>> = OnceLock::new();
 
 // ---- P4b：UDP NAT ----
 
@@ -905,6 +916,225 @@ struct SodaConnState {
 }
 unsafe impl aya::Pod for SodaConnState {}
 
+/// 与 ebpf-rs/src/common.rs 的 `SodaTraceParam` 同位（16 字节）。
+/// 字段= `struct sk_buff` 的字节偏移（用户态 BTF 解出后写入；a/k/a «CO-RE 替代»）。
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+struct TraceParam {
+    network_header: u32,
+    transport_header: u32,
+    tail: u32,
+    head: u32,
+}
+unsafe impl aya::Pod for TraceParam {}
+
+/// C3：与 ebpf-rs/src/common.rs 的 `SodaEvent` 同位（72 字节）。
+/// 字段布局对照 dae `struct dae_event`（`kern/tproxy.c:694-703`）。
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+struct SodaEvent {
+    timestamp: u64,
+    type_: u32,
+    pid: u32,
+    pname: [u8; 16],
+    outbound: u8,
+    l4proto: u8,
+    pad: [u8; 2],
+    sip: [u8; 16],
+    dip: [u8; 16],
+    sport: u16,
+    dport: u16,
+}
+unsafe impl aya::Pod for SodaEvent {}
+
+/// 事件类型常量（与 ebpf-rs/src/common.rs 逐位对齐）。
+const EV_BLOCKED: u32 = 0;
+const EV_UDP_CONN_OVERFLOW: u32 = 1;
+const EV_TCP_CONN_OVERFLOW: u32 = 2;
+const EV_REDIRECT_REBIND_REJECTED: u32 = 4;
+const EV_REDIRECT_UPDATE_FAILED: u32 = 8;
+
+/// 事件类型名（日志/status 用；未实现的编号保留为 unknown）。
+fn event_type_name(t: u32) -> &'static str {
+    match t {
+        EV_BLOCKED => "blocked",
+        EV_UDP_CONN_OVERFLOW => "udp_conn_overflow",
+        EV_TCP_CONN_OVERFLOW => "tcp_conn_overflow",
+        EV_REDIRECT_REBIND_REJECTED => "redirect_rebind_rejected",
+        EV_REDIRECT_UPDATE_FAILED => "redirect_update_failed",
+        _ => "unknown",
+    }
+}
+
+/// C3：事件通道消费侧计数。5 个槽位对应 5 个已知类型（`EV_*` 是位标志而非连续序号，
+/// 经 `event_type_slot` 归一）；未知类型与长度异常的记录单独归入 unknown——对照
+/// dae `control/event_ringbuf.go` 的 default 分支：ABI 漂移不得被静默丢弃。
+static EVENTS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static EVENT_COUNTS: [AtomicU64; 5] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+static EVENT_SUPPRESSED: [AtomicU64; 5] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+/// 每类型最近一条日志的 monotonic ns：用户态限速 1 条/秒/类型（未知类型更严），
+/// 其余只计数——内核侧已限速，这里兜底 ABI 漂移/损坏数据打爆日志的可能。
+static EVENT_LAST_LOG_NS: [AtomicU64; 5] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+static EVENT_UNKNOWN_TOTAL: AtomicU64 = AtomicU64::new(0);
+static EVENT_UNKNOWN_SUPPRESSED: AtomicU64 = AtomicU64::new(0);
+static EVENT_UNKNOWN_LAST_LOG_NS: AtomicU64 = AtomicU64::new(0);
+
+/// 已知事件类型 → 槽位（`EV_*` 是位标志，值不连续，不能直接当下标）。
+fn event_type_slot(t: u32) -> Option<usize> {
+    match t {
+        EV_BLOCKED => Some(0),
+        EV_UDP_CONN_OVERFLOW => Some(1),
+        EV_TCP_CONN_OVERFLOW => Some(2),
+        EV_REDIRECT_REBIND_REJECTED => Some(3),
+        EV_REDIRECT_UPDATE_FAILED => Some(4),
+        _ => None,
+    }
+}
+
+/// C3：打印事件地址（与 `tuple_hex` 同口径：IPv4 为 v4-mapped → 点分十进制；
+/// 其余按 IPv6 RFC 5952 风格压缩——日志里可读优先）。
+fn format_event_addr(a: &[u8; 16]) -> String {
+    if a[..10].iter().all(|b| *b == 0) && a[10] == 0xff && a[11] == 0xff {
+        return format!("{}.{}.{}.{}", a[12], a[13], a[14], a[15]);
+    }
+    let groups: [u16; 8] = std::array::from_fn(|i| u16::from_be_bytes([a[2 * i], a[2 * i + 1]]));
+    // 最长全零段（RFC 5952：≥2 组才折叠；同长取最靠前）。
+    let (mut best_start, mut best_len) = (0usize, 0usize);
+    let (mut cur_start, mut cur_len) = (0usize, 0usize);
+    for (i, g) in groups.iter().enumerate() {
+        if *g == 0 {
+            if cur_len == 0 {
+                cur_start = i;
+            }
+            cur_len += 1;
+            if cur_len > best_len {
+                best_start = cur_start;
+                best_len = cur_len;
+            }
+        } else {
+            cur_len = 0;
+        }
+    }
+    let mut out = String::new();
+    let mut i = 0;
+    while i < 8 {
+        if best_len >= 2 && i == best_start {
+            out.push_str("::");
+            i += best_len;
+            continue;
+        }
+        if !out.is_empty() && !out.ends_with(':') {
+            out.push(':');
+        }
+        out.push_str(&format!("{:x}", groups[i]));
+        i += 1;
+    }
+    out
+}
+
+/// C3：打印一条设备事件（tuple 形态对照 dae `control/event_ringbuf.go:228-235`
+/// 的 reportDatapathEventAt；不打印 pid/pname——内核侧当前恒为 0/空，只会制造噪声）。
+/// 限速在调用方完成。
+fn log_soda_event(ev: &SodaEvent) {
+    let slot = event_type_slot(ev.type_);
+    let (last, suppressed, window_ns) = match slot {
+        Some(i) => (&EVENT_LAST_LOG_NS[i], &EVENT_SUPPRESSED[i], 1_000_000_000u64),
+        // 未知类型：限速更严（1 条/10s），避免损坏数据/ABI 漂移洪泛。
+        None => (
+            &EVENT_UNKNOWN_LAST_LOG_NS,
+            &EVENT_UNKNOWN_SUPPRESSED,
+            10_000_000_000u64,
+        ),
+    };
+    let now = monotonic_now_ns();
+    if now.saturating_sub(last.load(Ordering::Relaxed)) < window_ns {
+        suppressed.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    last.store(now, Ordering::Relaxed);
+    let n = suppressed.swap(0, Ordering::Relaxed);
+    let l4 = match ev.l4proto {
+        6 => "tcp",
+        17 => "udp",
+        _ => "?",
+    };
+    let name = match slot {
+        Some(_) => event_type_name(ev.type_).to_string(),
+        None => format!("unknown type=0x{:x}", ev.type_),
+    };
+    let mut msg = format!(
+        "event: {name} outbound=0x{:x} {l4} sip={} sport={} -> dip={} dport={}",
+        ev.outbound,
+        format_event_addr(&ev.sip),
+        ev.sport,
+        format_event_addr(&ev.dip),
+        ev.dport
+    );
+    if n > 0 {
+        msg.push_str(&format!("（本秒抑制 {n} 条）"));
+    }
+    log(&msg);
+}
+
+/// C3：`event_ringbuf` 常驻消费者（专用线程；对照 dae `control/event_ringbuf.go`
+/// 的消费循环）。逐事件只做计数与限速日志，不做任何阻塞/逐包输出。
+fn ebpf_event_loop(mut rb: RingBuf<MapData>) -> ! {
+    const POLL_TIMEOUT_MS: libc::c_int = 500;
+    loop {
+        let mut pfd = libc::pollfd {
+            fd: rb.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // poll 失败（EINTR/异常 fd）不退出：睡 100ms 防自旋后重试——
+        // 消费线程静默消失比短暂重试更糟（事件全丢且无人知道）。
+        if unsafe { libc::poll(&mut pfd, 1, POLL_TIMEOUT_MS) } < 0 {
+            std::thread::sleep(Duration::from_millis(100));
+            continue;
+        }
+        while let Some(item) = rb.next() {
+            let bytes: &[u8] = &item;
+            if bytes.len() != std::mem::size_of::<SodaEvent>() {
+                // 长度不符 = 两侧镜像漂移（或内核侧损坏数据）：计入 unknown，不 panic。
+                EVENTS_TOTAL.fetch_add(1, Ordering::Relaxed);
+                EVENT_UNKNOWN_TOTAL.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+            // ringbuf 记录按 8B 对齐、SodaEvent 为 #[repr(C)] 纯值类型（无内部指针），
+            // 故 unaligned 读安全（与 aya Pod 的字节视图语义一致）。
+            let ev = unsafe { core::ptr::read_unaligned(bytes.as_ptr() as *const SodaEvent) };
+            EVENTS_TOTAL.fetch_add(1, Ordering::Relaxed);
+            match event_type_slot(ev.type_) {
+                Some(i) => {
+                    EVENT_COUNTS[i].fetch_add(1, Ordering::Relaxed);
+                }
+                None => {
+                    EVENT_UNKNOWN_TOTAL.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            log_soda_event(&ev);
+        }
+    }
+}
+
 /// 与 ebpf-rs/src/common.rs 的 `SodaRoutingEpochIp` 同位（20 字节）。
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -1192,6 +1422,10 @@ struct Args {
     forward: Option<String>,
     /// P4c：启用 TCP relay offload（fast_sock + sk_skb）
     offload: bool,
+    /// 对标批：链路头模式（auto=按接口 sysfs arphrd 类型逐接口判定，对照 dae `linkHdrLen()`）
+    link_hdr: LinkHdrMode,
+    /// C4：XDP 计量探针的接口（可重复；默认空 = 不挂。探针恒 XDP_PASS，只计数）
+    xdp: Vec<String>,
     /// M1：relay splice 零拷贝（Direct / VLESS 明文；默认开，`--no-splice` 关）
     splice: bool,
     /// M1：eBPF 热路径调试打印（默认关；`--ebpf-debug` 置 control_flags 位）
@@ -1408,8 +1642,11 @@ fn usage() -> ! {
                                  global.geodata_dir（逗号分隔）；优先于 DAE_LOCATION_ASSET）
            --listen-socks <addr>    P12：本地 SOCKS5 入口（浏览器测试用；不加载 eBPF、不需 root）\n\
            --udp-idle-timeout <s>   P4：UDP NAT 会话空闲秒数（默认 60）\n\
-           --forward <url>       旧写法：等价于 --dialer socks5://host:port\n\
-           --offload             P4c：启用 TCP relay offload（内核对拼，需 --dialer）\n\
+           --forward <url>       旧写法：等价于 --dialer socks5://host:port
+           --offload             P4c：启用 TCP relay offload（内核对拼，需 --dialer）
+           --link-hdr <mode>     链路头模式 auto|l2|l3（默认 auto：按接口 arphrd 类型逐接口判定，
+                                 tun/ppp/ipip/none → 无链路头 l3 变体；对照 dae linkHdrLen()）
+           --xdp <ifname>        C4：XDP 计量探针接口（可重复；仅计数、恒 XDP_PASS，供实测调研）
            --no-splice           M1：关闭 relay splice 零拷贝（默认开：Direct/VLESS 明文）\n\
            --ebpf-debug          M1：eBPF 热路径调试打印（默认关）\n\
            --ktls                M2：尝试 kTLS（内核 TLS，实验；需 TLS1.3）\n\
@@ -1478,6 +1715,8 @@ fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
         udp_idle_timeout: None,
         forward: None,
         offload: false,
+        link_hdr: LinkHdrMode::Auto,
+        xdp: Vec::new(),
         splice: true,
         ebpf_debug: false,
         ktls: false,
@@ -1533,6 +1772,16 @@ fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
             "--udp-idle-timeout" => args.udp_idle_timeout = Some(next()?.parse()?),
             "--forward" => args.forward = Some(next()?),
             "--offload" => args.offload = true,
+            "--link-hdr" => {
+                let v = next()?;
+                args.link_hdr = match v.as_str() {
+                    "auto" => LinkHdrMode::Auto,
+                    "l2" => LinkHdrMode::L2,
+                    "l3" => LinkHdrMode::L3,
+                    other => return Err(format!("--link-hdr 取值非法: {other}（auto|l2|l3）").into()),
+                };
+            }
+            "--xdp" => args.xdp.push(next()?),
             "--no-splice" => args.splice = false,
             "--ebpf-debug" => args.ebpf_debug = true,
             "--ktls" => args.ktls = true,
@@ -1794,6 +2043,76 @@ fn make_transparent_listener6(port: u16) -> Result<TcpListener, Box<dyn std::err
     Ok(fd.into())
 }
 
+/// 链路头模式（`--link-hdr`）。
+/// 对照 dae：接口链路头长度由控制面按 netlink `Link.Attrs().EncapType` 判定
+/// （`dae/control/control_plane_core_bind.go:61-77`：none/ipip/ppp/tun → 0，ether → 14，
+/// 其它告警后按 14），再据此选 `_l2`/`_l3` 程序变体（同文件 :256-273）。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LinkHdrMode {
+    /// 逐接口按 sysfs arphrd 类型判定（默认）
+    Auto,
+    /// 强制以太（链路头 14B）
+    L2,
+    /// 强制无链路头（链路头 0B）
+    L3,
+}
+
+/// 接口链路头长度（字节）。
+///
+/// 事实来源：`/sys/class/net/<if>/type` 就是 netlink 的 `IFLA_ARPHRD`（同一字段），
+/// 故 dae 的 EncapType 判定可用它等价实现（sodama 不引 netlink 依赖）：
+///   ARPHRD_ETHER(1) → 14
+///   ARPHRD_PPP(512) / ARPHRD_TUNNEL(768) / ARPHRD_TUNNEL6(769) / ARPHRD_NONE(65534，tun) → 0
+///   其它/读不到 → 14 + 告警（同 dae 默认分支）
+fn link_hdr_len(ifname: &str, mode: LinkHdrMode) -> u32 {
+    match mode {
+        LinkHdrMode::L2 => 14,
+        LinkHdrMode::L3 => 0,
+        LinkHdrMode::Auto => {
+            let path = format!("/sys/class/net/{ifname}/type");
+            match std::fs::read_to_string(&path) {
+                Ok(s) => match s.trim() {
+                    "1" => 14,
+                    "512" | "768" | "769" | "65534" => 0,
+                    other => {
+                        log(&format!(
+                            "link-hdr: 接口 {ifname} 类型 {other} 未识别（{path}），按以太（14B）处理"
+                        ));
+                        14
+                    }
+                },
+                Err(e) => {
+                    log(&format!(
+                        "link-hdr: 读 {path} 失败（{e}），按以太（14B）处理；可用 --link-hdr 覆盖"
+                    ));
+                    14
+                }
+            }
+        }
+    }
+}
+
+/// 按链路头长度选 TC 程序名：无链路头 → `_l3` 后缀变体。
+fn tc_prog_name(base: &str, l3: bool) -> String {
+    if l3 {
+        format!("{base}_l3")
+    } else {
+        base.to_string()
+    }
+}
+
+/// 把 L3 接口的 ifindex 登记进 `l3_ifindex_map`（回程路径 `sodama0_ingress` 据此剥链路头）。
+fn register_l3_ifindex(ebpf: &mut Ebpf, ifname: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let idx = if_nametoindex(ifname)?;
+    let map = ebpf
+        .map_mut("l3_ifindex_map")
+        .ok_or("map l3_ifindex_map not found（对象版本过旧？）")?;
+    let mut hm: HashMap<_, u32, u8> = HashMap::try_from(map)?;
+    hm.insert(idx, 1u8, 0)?;
+    log(&format!("link-hdr: {ifname} 登记为 L3（ifindex={idx}）"));
+    Ok(())
+}
+
 fn attach(
     ebpf: &mut Ebpf,
     name: &str,
@@ -1812,6 +2131,152 @@ fn attach(
     log(&format!("attached {name} to {ifname} ({attach_type:?})"));
     if let Ok(mut hooks) = HOOKS.lock() {
         hooks.push(format!("{name}@{ifname}"));
+    }
+    Ok(())
+}
+
+/// 对标批：把 `struct sk_buff` 字段偏移写入数据面（`trace_param_map`）。
+///
+/// aya-ebpf 没有 CO-RE field access，数据面的 `skb_send_sock` 探针需要运行内核的真实
+/// 偏移（dae 用 clang CO-RE 读同一批字段，见 `kern/include/tcp_offload.h`）。
+/// 解析失败（无 BTF / 内核未开 BTF）时返回 None：调用方跳过探针挂载并计数。
+fn write_trace_params(ebpf: &mut Ebpf) -> Option<btfoff::SkBuffOffsets> {
+    let off = match btfoff::sk_buff_offsets() {
+        Ok(o) => o,
+        Err(e) => {
+            log(&format!("offload 记账: BTF 解析失败（{e}），跳过 skb_send_sock 探针"));
+            return None;
+        }
+    };
+    let map = match ebpf.map_mut("trace_param_map") {
+        Some(m) => m,
+        None => {
+            log("offload 记账: 对象缺 trace_param_map，跳过探针");
+            return None;
+        }
+    };
+    let mut arr: Array<_, TraceParam> = match Array::try_from(map) {
+        Ok(a) => a,
+        Err(e) => {
+            log(&format!("offload 记账: trace_param_map 类型不符（{e}）"));
+            return None;
+        }
+    };
+    let v = TraceParam {
+        network_header: off.network_header,
+        transport_header: off.transport_header,
+        tail: off.tail,
+        head: off.head,
+    };
+    if let Err(e) = arr.set(0, v, 0) {
+        log(&format!("offload 记账: 写 trace_param_map 失败（{e}）"));
+        return None;
+    }
+    log(&format!(
+        "offload 记账: sk_buff 偏移 nh={} th={} tail={} head={}（vmlinux BTF）",
+        v.network_header, v.transport_header, v.tail, v.head
+    ));
+    Some(off)
+}
+
+/// 对标批：挂载 offload 字节记账探针——优先 fentry，失败回退 kprobe。
+///
+/// 对照 dae `tcp_offload_hook.go` 的选用逻辑：fentry 在部分内核/固件上不可用
+/// （无 CONFIG_DYNAMIC_FTRACE → 入口不是 5 字节 NOP；或目标已被其它 trampoline/直接
+/// 调用占用 → EBUSY），kprobe 能挂在任意指令边界上。
+/// 只在 `--offload` 下挂（记账只对 offload 会话有意义）。
+fn attach_offload_accounting(ebpf: &mut Ebpf) {
+    if write_trace_params(ebpf).is_none() {
+        return;
+    }
+
+    let btf = match Btf::from_sys_fs() {
+        Ok(b) => b,
+        Err(e) => {
+            log(&format!(
+                "offload 记账: 读 /sys/kernel/btf/vmlinux 失败（{e}），跳过 fentry 直接试 kprobe"
+            ));
+            attach_offload_kprobe(ebpf);
+            return;
+        }
+    };
+
+    let fe_ret = (|| -> Result<(), Box<dyn std::error::Error>> {
+        let p: &mut FEntry = ebpf
+            .program_mut("skb_send_sock_account")
+            .ok_or("program skb_send_sock_account not found")?
+            .try_into()?;
+        p.load("skb_send_sock", &btf)?;
+        let link = p.attach()?;
+        // 与本进程同生命周期：drop 即摘钩（与 TC 钩子同一策略）。
+        std::mem::forget(link);
+        Ok(())
+    })();
+    match fe_ret {
+        Ok(()) => {
+            log("offload 记账: fentry/skb_send_sock 已挂载（零开销探针）");
+            if let Ok(mut hooks) = HOOKS.lock() {
+                hooks.push("skb_send_sock_account@fentry".into());
+            }
+        }
+        Err(e) => {
+            log(&format!(
+                "offload 记账: fentry 挂载失败（{e}），回退 kprobe/skb_send_sock"
+            ));
+            attach_offload_kprobe(ebpf);
+        }
+    }
+}
+
+/// kprobe 回退形态（与 fentry 共用记账主体，两者只在触发点上有别）。
+fn attach_offload_kprobe(ebpf: &mut Ebpf) {
+    let r = (|| -> Result<(), Box<dyn std::error::Error>> {
+        let p: &mut KProbe = ebpf
+            .program_mut("skb_send_sock_account_kprobe")
+            .ok_or("program skb_send_sock_account_kprobe not found")?
+            .try_into()?;
+        p.load()?;
+        let link = p.attach("skb_send_sock", 0)?;
+        std::mem::forget(link);
+        Ok(())
+    })();
+    match r {
+        Ok(()) => {
+            log("offload 记账: kprobe/skb_send_sock 已挂载（fentry 的回退路径）");
+            if let Ok(mut hooks) = HOOKS.lock() {
+                hooks.push("skb_send_sock_account_kprobe@kprobe".into());
+            }
+        }
+        Err(e) => log(&format!(
+            "offload 记账: kprobe 也失败（{e}）；offload 字节记账不可用（计量降级）"
+        )),
+    }
+}
+
+/// C4：XDP 计量探针（可选）。**挂载失败不影响主路径**——它只是计量。
+fn attach_xdp_probes(ebpf: &mut Ebpf, ifaces: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    if ifaces.is_empty() {
+        return Ok(());
+    }
+    let prog: &mut Xdp = ebpf
+        .program_mut("sodama_xdp_observe")
+        .ok_or("program sodama_xdp_observe not found（对象版本过旧？）")?
+        .try_into()?;
+    prog.load()?;
+    for iface in ifaces {
+        // Default：内核自选模式（驱动支持则 native，否则 generic）。
+        match prog.attach(iface, XdpMode::Default) {
+            Ok(link) => {
+                std::mem::forget(link);
+                log(&format!(
+                    "attached sodama_xdp_observe to {iface} (xdp, 仅计量)"
+                ));
+                if let Ok(mut hooks) = HOOKS.lock() {
+                    hooks.push(format!("sodama_xdp_observe@{iface}"));
+                }
+            }
+            Err(e) => log(&format!("xdp: 挂载到 {iface} 失败（{e}），跳过（不影响转发）")),
+        }
     }
     Ok(())
 }
@@ -2375,6 +2840,9 @@ fn offload_watch_register(e: OffloadWatchEntry) {
 /// offload 连接收尾：注销 fast_sock/guard 键 + 从 relay 注册表摘除。
 fn offload_watch_cleanup(id: u64, keys: &Option<(SodaTuple, SodaTuple)>) {
     if let Some((k_up, k_cl)) = keys {
+        // 对标批：摘键前汇总内核路径推送字节（两键各自归因，日志报总量）。
+        // 与数据面存在竞态：读后到 remove 前可能仍有记账增量——接受的小误差。
+        let sent = offload_sent_reclaim(k_up) + offload_sent_reclaim(k_cl);
         offload_guard_remove(k_up);
         offload_guard_remove(k_cl);
         if let Some(map) = RELAY_OFFLOAD.get() {
@@ -2383,7 +2851,9 @@ fn offload_watch_cleanup(id: u64, keys: &Option<(SodaTuple, SodaTuple)>) {
                 let _ = m.remove(k_cl);
             }
         }
-        log(&format!("offload: #{id} 已注销 fast_sock 键"));
+        log(&format!(
+            "offload: #{id} 已注销 fast_sock 键（内核路径推送 {sent} B）"
+        ));
     }
     relay_finish(id);
 }
@@ -2656,6 +3126,42 @@ fn offload_guard_remove(key: &SodaTuple) {
             let _ = g.remove(key);
         }
     }
+}
+
+/// 对标批：汇总并清掉某 fast_sock 键在 `offload_sent` 里的记账（per-CPU 求和）。
+/// 返回本次回收字节；累计到 `RELAY_STATS.offload_sent_bytes`。
+/// 注意：读与 remove 之间数据面仍可能继续累加（已建立的推送不受用户态摘键影响），
+/// 这部分尾账随 remove 一并丢弃——接受的小误差（对照 dae 的 per-key fuse 未实现，
+/// 本表只做归因计量）。
+fn offload_sent_reclaim(key: &SodaTuple) -> u64 {
+    let Some(m) = OFFLOAD_SENT.get() else {
+        return 0;
+    };
+    let Ok(mut m) = m.lock() else { return 0 };
+    // 无流量时键不存在（KeyNotFound）是正常路径，静默按 0 计。
+    let bytes = m
+        .get(key, 0)
+        .map(|v| v.iter().copied().sum::<u64>())
+        .unwrap_or(0);
+    match m.remove(key) {
+        Ok(()) => {}
+        // 键本就不存在（无流量/已摘）：与 get 的 KeyNotFound 一样不是错误。
+        Err(aya::maps::MapError::SyscallError(e))
+            if e.io_error.raw_os_error() == Some(libc::ENOENT) => {}
+        // 其余错误只记一次：不能因为滚动日志把真实簿记问题淹没。
+        Err(e) => {
+            static LOGGED: AtomicBool = AtomicBool::new(false);
+            if !LOGGED.swap(true, Ordering::Relaxed) {
+                log(&format!("offload_sent: 记账键回收失败（{e}），后续同类只静默忽略"));
+            }
+        }
+    }
+    if bytes > 0 {
+        RELAY_STATS
+            .offload_sent_bytes
+            .fetch_add(bytes, Ordering::Relaxed);
+    }
+    bytes
 }
 
 /// P7：offload 注册前的「前缀排空」——把 socket 接收队列里已有的数据经用户态
@@ -3243,6 +3749,8 @@ fn handle_relay_conn(mut client: TcpStream) {
     // P7：注销 fast_sock 键（sockmap 条目持有 socket 引用，不删会泄漏）；
     // P8：guard 镜像先摘，再摘 fast_sock。
     if let Some((k_up, k_cl)) = offload_keys {
+        // 对标批：摘键前汇总该会话在内核路径被推送的字节（两个方向合计）。
+        let sent = offload_sent_reclaim(&k_up) + offload_sent_reclaim(&k_cl);
         offload_guard_remove(&k_up);
         offload_guard_remove(&k_cl);
         if let Some(map) = RELAY_OFFLOAD.get() {
@@ -3251,7 +3759,9 @@ fn handle_relay_conn(mut client: TcpStream) {
                 let _ = m.remove(&k_cl);
             }
         }
-        log(&format!("offload: {target} 已注销 fast_sock 键"));
+        log(&format!(
+            "offload: {target} 已注销 fast_sock 键（内核路径推送 {sent} B）"
+        ));
     }
     pump_done();
 }
@@ -5313,6 +5823,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // C3：事件 ringbuf 消费线程（独立持 map，不与 Ebpf 其他 Reader 争借）。
+    // 失败只降级到「事件丢失且可见日志」：blocked/overflow 等观测不参与转发决策。
+    if let Some(md) = ebpf.take_map("event_ringbuf") {
+        match RingBuf::<MapData>::try_from(md) {
+            Ok(rb) => {
+                if let Err(e) = std::thread::Builder::new()
+                    .name("ebpf-events".into())
+                    .spawn(move || ebpf_event_loop(rb))
+                {
+                    log(&format!("event_ringbuf: 消费线程创建失败（{e}），事件通道不可用"));
+                }
+            }
+            Err(e) => log(&format!("event_ringbuf: RingBuf 打开失败（{e}），事件通道不可用")),
+        }
+    } else {
+        log("event_ringbuf: 对象不含该 map，事件通道不可用");
+    }
+
     // P19：把 conn_state_map 的 fd dup 一份给 relay/UDP 线程
     // （按 5 元组回读该连接选中的用户组；组索引由规则编译写入）。
     if let Some(map) = ebpf.map("conn_state_map") {
@@ -5338,32 +5866,49 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ---------- 1) host netns：LAN ingress / WAN egress+ingress / dae0 ingress ----------
     let dae0_ifindex = if_nametoindex(&args.dae0)?;
     for iface in &args.lan {
+        let l3 = link_hdr_len(iface, args.link_hdr) == 0;
+        if l3 {
+            register_l3_ifindex(&mut ebpf, iface)?;
+        }
         attach(
             &mut ebpf,
-            "sodama_lan_ingress",
+            &tc_prog_name("sodama_lan_ingress", l3),
             iface,
             TcAttachType::Ingress,
         )?;
     }
     for iface in &args.wan {
-        attach(&mut ebpf, "sodama_wan_egress", iface, TcAttachType::Egress)?;
+        let l3 = link_hdr_len(iface, args.link_hdr) == 0;
+        if l3 {
+            register_l3_ifindex(&mut ebpf, iface)?;
+        }
         attach(
             &mut ebpf,
-            "sodama_wan_ingress",
+            &tc_prog_name("sodama_wan_egress", l3),
+            iface,
+            TcAttachType::Egress,
+        )?;
+        attach(
+            &mut ebpf,
+            &tc_prog_name("sodama_wan_ingress", l3),
             iface,
             TcAttachType::Ingress,
         )?;
     }
     for iface in &args.dual {
+        let l3 = link_hdr_len(iface, args.link_hdr) == 0;
+        if l3 {
+            register_l3_ifindex(&mut ebpf, iface)?;
+        }
         attach(
             &mut ebpf,
-            "sodama_wan_lan_ingress",
+            &tc_prog_name("sodama_wan_lan_ingress", l3),
             iface,
             TcAttachType::Ingress,
         )?;
         attach(
             &mut ebpf,
-            "sodama_lan_wan_egress",
+            &tc_prog_name("sodama_lan_wan_egress", l3),
             iface,
             TcAttachType::Egress,
         )?;
@@ -5374,6 +5919,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &args.dae0,
         TcAttachType::Ingress,
     )?;
+
+    // C4：XDP 计量探针（可选；仅计数、恒 XDP_PASS，不改变转发行为）
+    attach_xdp_probes(&mut ebpf, &args.xdp)?;
 
     // P17b：pname 采集（cgroup2）。失败不致命（规则不命中，同 dae）。
     attach_pname_hooks(&mut ebpf);
@@ -5577,7 +6125,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let _ = RELAY_OFFLOAD_GUARD.set(Mutex::new(guard));
                 }
             }
+            // 对标批：offload_sent 记账表（键摘除时由 relay/watchdog 汇总回收）
+            if let Some(s) = ebpf.take_map("offload_sent") {
+                if let Ok(sent) = PerCpuHashMap::<MapData, SodaTuple, u64>::try_from(s) {
+                    let _ = OFFLOAD_SENT.set(Mutex::new(sent));
+                }
+            }
             log("TCP offload 已启用（fast_sock + offload_guard + sk_skb/stream_verdict）");
+            // 对标批：skb_send_sock 字节记账（fentry → kprobe 回退；需 BTF，失败仅降级计量）
+            attach_offload_accounting(&mut ebpf);
         }
         let (relay_tx, relay_rx) = std::sync::mpsc::channel::<TcpStream>();
         let _ = TCP_RELAY_TX.set(relay_tx);
@@ -7563,7 +8119,7 @@ fn print_status_human(raw: &str) -> Result<(), Box<dyn std::error::Error>> {
             println!("  {key}: {x}");
         }
     }
-    for key in ["rules", "maps", "stats", "hooks", "config"] {
+    for key in ["rules", "maps", "stats", "hooks", "config", "events", "offload_sent", "xdp"] {
         if let Some(x) = v.get(key) {
             println!("  {key}: {x}");
         }
@@ -7642,14 +8198,29 @@ fn read_pname_hits(ebpf: &mut Ebpf) -> u64 {
         .unwrap_or(0)
 }
 
-fn read_stats(ebpf: &mut Ebpf) -> (u64, u64, u64, u64) {
+/// 对标批：`sodama_stats_map` 全量快照（per-CPU 求和；键序对照 ebpf-rs/src/common.rs
+/// 的 SODAMA_STAT_*：0=rebind_rejected 1=redirect_update_failed 2=offload_redirects
+/// 3=offload_verdicts 5=event_drops 6=offload_sent_bytes 7=conn_overflow 8=account_drops）。
+#[derive(Default)]
+struct EbpfStats {
+    rebind_rejected: u64,
+    redirect_update_failed: u64,
+    offload_redirects: u64,
+    offload_verdicts: u64,
+    event_drops: u64,
+    offload_sent_bytes: u64,
+    conn_overflow: u64,
+    account_drops: u64,
+}
+
+fn read_stats(ebpf: &mut Ebpf) -> EbpfStats {
     use aya::maps::PerCpuArray;
     let Some(map) = ebpf.map_mut("sodama_stats_map") else {
-        return (0, 0, 0, 0);
+        return EbpfStats::default();
     };
     let arr: PerCpuArray<_, u64> = match PerCpuArray::try_from(map) {
         Ok(a) => a,
-        Err(_) => return (0, 0, 0, 0),
+        Err(_) => return EbpfStats::default(),
     };
     let get = |i: u32| {
         arr.get(&i, 0)
@@ -7657,7 +8228,30 @@ fn read_stats(ebpf: &mut Ebpf) -> (u64, u64, u64, u64) {
             .unwrap_or(0)
     };
     // P9：offload verdict/redirect 计数与数据面同属一个对象（索引 2/3）。
-    (get(0), get(1), get(2), get(3))
+    EbpfStats {
+        rebind_rejected: get(0),
+        redirect_update_failed: get(1),
+        offload_redirects: get(2),
+        offload_verdicts: get(3),
+        event_drops: get(5),
+        offload_sent_bytes: get(6),
+        conn_overflow: get(7),
+        account_drops: get(8),
+    }
+}
+
+/// C4：XDP 计量探针的计数（包/字节/IPv4/IPv6/其它，键序对照 SODAMA_XDP_*）。
+/// map 不存在（未挂载）→ None，让 status 区分「0 包」与「没有探针」。
+fn read_xdp_stats(ebpf: &mut Ebpf) -> Option<(u64, u64, u64, u64, u64)> {
+    use aya::maps::PerCpuArray;
+    let map = ebpf.map_mut("xdp_stats_map")?;
+    let arr: PerCpuArray<_, u64> = PerCpuArray::try_from(map).ok()?;
+    let get = |i: u32| {
+        arr.get(&i, 0)
+            .map(|values| values.iter().copied().sum::<u64>())
+            .unwrap_or(0)
+    };
+    Some((get(0), get(1), get(2), get(3), get(4)))
 }
 
 /// P19：单个组的 JSON（status 的 `group` 与 `groups[]` 共用）。
@@ -7728,6 +8322,42 @@ fn rule_sets_json() -> serde_json::Value {
     serde_json::Value::Array(arr)
 }
 
+/// C3：事件通道状态（status/metrics 共用；`by_type` 覆盖 5 个已知类型 + unknown）。
+/// `suppressed` 是各类日志限速抑制数之和（“真实事件数”看 consumed/by_type）。
+fn events_json(stats: &EbpfStats) -> serde_json::Value {
+    let mut by_type = serde_json::Map::new();
+    for (slot, t) in [
+        EV_BLOCKED,
+        EV_UDP_CONN_OVERFLOW,
+        EV_TCP_CONN_OVERFLOW,
+        EV_REDIRECT_REBIND_REJECTED,
+        EV_REDIRECT_UPDATE_FAILED,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        by_type.insert(
+            event_type_name(t).to_string(),
+            json!(EVENT_COUNTS[slot].load(Ordering::Relaxed)),
+        );
+    }
+    by_type.insert(
+        "unknown".to_string(),
+        json!(EVENT_UNKNOWN_TOTAL.load(Ordering::Relaxed)),
+    );
+    let suppressed = EVENT_SUPPRESSED
+        .iter()
+        .map(|c| c.load(Ordering::Relaxed))
+        .sum::<u64>()
+        + EVENT_UNKNOWN_SUPPRESSED.load(Ordering::Relaxed);
+    json!({
+        "consumed": EVENTS_TOTAL.load(Ordering::Relaxed),
+        "suppressed": suppressed,
+        "by_type": by_type,
+        "dropped_kernel": stats.event_drops,
+    })
+}
+
 /// P6：状态面主查询体（status / metrics 共用数据源）。
 fn status_json(ebpf: &mut Ebpf) -> serde_json::Value {
     // P37（2026-10-13 / A1）：状态查询**不再**回写「有人在看」信号。
@@ -7743,8 +8373,8 @@ fn status_json(ebpf: &mut Ebpf) -> serde_json::Value {
     let pname_hits = read_pname_hits(ebpf);
     // P7：offload 键计数（0 = 无泄漏；连接回收后必须归零）
     let fast_sock = count_fast_sock(ebpf);
-    let (rebind_rejected, redirect_update_failed, offload_redirects, offload_verdicts) =
-        read_stats(ebpf);
+    let stats = read_stats(ebpf);
+    let xdp = read_xdp_stats(ebpf);
     let cache = match DNS_CACHE.lock() {
         Ok(c) => (
             c.len(),
@@ -7891,10 +8521,25 @@ fn status_json(ebpf: &mut Ebpf) -> serde_json::Value {
         "rules": rules_state.as_ref().map(|c| json!({"count": c.sets.len()})),
         "maps": {"conn_state": conn_state, "redirect_track": redirect_track, "domain_routing": domain_routing, "fast_sock": fast_sock},
         "stats": {
-            "rebind_rejected": rebind_rejected,
-            "redirect_update_failed": redirect_update_failed,
-            "offload_redirects": offload_redirects,
-            "offload_verdicts": offload_verdicts,
+            "rebind_rejected": stats.rebind_rejected,
+            "redirect_update_failed": stats.redirect_update_failed,
+            "offload_redirects": stats.offload_redirects,
+            "offload_verdicts": stats.offload_verdicts,
+            "conn_overflow": stats.conn_overflow,
+            "event_drops": stats.event_drops,
+        },
+        "events": events_json(&stats),
+        "offload_sent": {
+            "reclaimed_bytes": RELAY_STATS.offload_sent_bytes.load(Ordering::Relaxed),
+            "kernel_bytes": stats.offload_sent_bytes,
+            "account_drops": stats.account_drops,
+        },
+        // C4：未挂载 XDP 探针时为 null（区分「0 包」与「没探针」）
+        "xdp": match xdp {
+            Some((packets, bytes, ipv4, ipv6, other)) => json!({
+                "packets": packets, "bytes": bytes, "ipv4": ipv4, "ipv6": ipv6, "other": other,
+            }),
+            None => serde_json::Value::Null,
         },
         "dns": {
             "upstream": upstream().map(|u| u.addr().to_string()),
@@ -8224,6 +8869,29 @@ fn metrics_text(v: &serde_json::Value) -> String {
         "sodama_offload_verdicts",
         get(v, &["stats", "offload_verdicts"]),
     );
+    // C3/对标批/C4：事件通道、offload 记账、XDP 计量（未挂载时相关值为 0）
+    for (name, path) in [
+        ("sodama_events_total", ["events", "consumed"]),
+        ("sodama_events_suppressed", ["events", "suppressed"]),
+        ("sodama_event_drops", ["events", "dropped_kernel"]),
+        ("sodama_conn_overflow", ["stats", "conn_overflow"]),
+        (
+            "sodama_offload_sent_bytes_reclaimed",
+            ["offload_sent", "reclaimed_bytes"],
+        ),
+        (
+            "sodama_offload_sent_bytes_kernel",
+            ["offload_sent", "kernel_bytes"],
+        ),
+        (
+            "sodama_offload_account_drops",
+            ["offload_sent", "account_drops"],
+        ),
+        ("sodama_xdp_packets", ["xdp", "packets"]),
+        ("sodama_xdp_bytes", ["xdp", "bytes"]),
+    ] {
+        emit(&mut s, "counter", name, get(v, &path));
+    }
     let dialer = v
         .get("dialer")
         .and_then(|x| x.as_str())
@@ -8311,17 +8979,20 @@ fn handle_status_query(cmd: &str, ebpf: &mut Ebpf, args: &Args) -> String {
             let domain_routing =
                 count_map::<SodaEpochIp, SodaDomainRouting>(ebpf, "domain_routing_map");
             let fast_sock = count_fast_sock(ebpf);
-            let (rebind_rejected, redirect_update_failed, offload_redirects, offload_verdicts) =
-                read_stats(ebpf);
+            let stats = read_stats(ebpf);
             json!({
                 "conn_state": conn_state,
                 "redirect_track": redirect_track,
                 "domain_routing": domain_routing,
                 "fast_sock": fast_sock,
-                "rebind_rejected": rebind_rejected,
-                "redirect_update_failed": redirect_update_failed,
-                "offload_redirects": offload_redirects,
-                "offload_verdicts": offload_verdicts,
+                "rebind_rejected": stats.rebind_rejected,
+                "redirect_update_failed": stats.redirect_update_failed,
+                "offload_redirects": stats.offload_redirects,
+                "offload_verdicts": stats.offload_verdicts,
+                "event_drops": stats.event_drops,
+                "conn_overflow": stats.conn_overflow,
+                "offload_sent_bytes": stats.offload_sent_bytes,
+                "account_drops": stats.account_drops,
             })
             .to_string()
         }
@@ -8458,5 +9129,17 @@ mod tests {
         assert!(!set.by_tag.contains_key("bad"));
         assert_eq!(set.legacy.url, "udp://127.0.0.1:53");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- C3/对标批：eBPF 用户态镜像结构尺寸自检 ----
+
+    /// 两侧镜像（ebpf-rs/src/common.rs ↔ loader）一旦漂移，事件解码会按错位字节读、
+    /// ringbuf 长度校验失效；用尺寸断言把漂移钉死在测试里（dae 靠 C/Go 同仓编译
+    /// 保证 ABI，而这里是两个独立构建单元，只能显式自检）。
+    #[test]
+    fn ebpf_mirror_struct_sizes() {
+        assert_eq!(std::mem::size_of::<SodaEvent>(), 72);
+        assert_eq!(std::mem::size_of::<TraceParam>(), 16);
+        assert_eq!(std::mem::size_of::<SodaTuple>(), 40);
     }
 }

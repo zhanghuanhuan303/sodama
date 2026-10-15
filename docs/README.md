@@ -7,8 +7,8 @@
 ```
 docs/
 ├── README.md                     # 本文件：索引与约定
-├── sodama-atlas.html             # ★ 开发研究图集（Atlas）v1.2：能力地图 + 架构 + 性能边界 + 方法论 + 踩坑档案 + 第二阶段生产实战 + 审计修复批收口 + 余项；Tufte 版式，自包含可离线打开
-├── phase2-devlog.md              # 第二阶段（生产实战轮）开发记录：侦查/修复/验收（§1–§18）+ 附 A 工具 / 附 B 监控台账
+├── sodama-atlas.html             # ★ 开发研究图集（Atlas）v1.3：能力地图 + 架构 + 性能边界 + 方法论 + 踩坑档案 + 第二阶段生产实战 + 审计修复批收口 + 数据面对标批次 + 余项；Tufte 版式，自包含可离线打开
+├── phase2-devlog.md              # 第二阶段（生产实战轮）开发记录：侦查/修复/验收（§1–§19）+ 附 A 工具 / 附 B 监控台账
 ├── security-proposal.md          # 安全工程提案 v0.1：威胁模型 / 攻击面清单 / 供应链缺口 + S0–S5 排期（待采纳）
 ├── memory-safety-audit.html      # ★ 内存安全与资源生命周期审计（unsafe 专项）v1.1：loader + ebpf-rs 全量 unsafe 审读（167 块/19 fn/10 impl）· 3 高 4 中 13 低 + 已核销清单 + **2d5h39m 生产实况比对（H2 实锤/M4 证伪降级）** + 修复批次（已实施未部署）
 ├── architecture-decision.html    # 决策档案（主文档，自包含可离线打开）
@@ -23,7 +23,7 @@ docs/
 ├── reviews/                      # 第三方评审存档（原文）+ 工程方采纳提案（I1–I5）
 ├── optimization-roadmap.md       # 优化方向（数据驱动，O1–O10 优先级与验收）
 ├── dae-optimization-research.md  # ★ 面向 dae 的优化与创新研究：已做/能做清单、三条迁移路线、负面结论（dev 分支）
-├── adr/                          # 已采纳决策记录（ADR-0001..0063）
+├── adr/                          # 已采纳决策记录（ADR-0001..0065）
 ├── modules/                      # 模块级规格（tuic-v5-client-spec.md / hysteria2-client-spec.md，由源码研究产出）
 └── migration/                    # (待建) 迁移日志与对拍报告
 ```
@@ -37,7 +37,7 @@ docs/
 | VLESS 提案 | `vless-proposal.html` | VLESS（明文/TLS）四方实测 + perf 剖面 + 分阶段优化提案（自包含，可离线打开） |
 | 内存终测 | `memory-report.html` v1 / `memory-report-v2.html` v2.1 | v1：五方 RSS 对照（存档）；v2.1：四层模型系统内存（内核侧/Slab 归因/FD 治理/转发原语/I6 零线程 + 60 min 长稳），送审版 |
 | **性能与资源边界（现行）** | `benchmark-report.html` | **v3.0 合并版**：吞吐四方对拍 + 四层内存模型 + FD 治理 + 转发原语对照 + **五万并发压测** + 长稳；自包含可离线打开（旧三份报告已并入，保留存档） |
-| **开发研究图集（总览入口）** | `sodama-atlas.html` | **Atlas v1.2**：从「为什么重写」到「审计修复批上线」的完整叙事——能力地图（15 域）、架构总览、性能与资源边界（内联 SVG 图）、工程方法论、踩坑档案、**第二阶段 · 生产实战轮（§8.1–§8.6：四轮修复 / P37 治理 / AF-XDP 否决 / 内存安全审计与修复批 / 两轮 72h）**、A–I 类余项地图、ADR 与数据源索引；Tufte 书卷版式，自包含可离线打开 |
+| **开发研究图集（总览入口）** | `sodama-atlas.html` | **Atlas v1.3**：从「为什么重写」到「数据面对标批次（L3/ringbuf/fentry/XDP）」的完整叙事——能力地图（15 域）、架构总览、性能与资源边界（内联 SVG 图）、工程方法论、踩坑档案、**第二阶段 · 生产实战轮（§8.1–§8.7：四轮修复 / P37 治理 / AF-XDP 否决 / 内存安全审计与修复批 / 两轮 72h / 数据面对标批次）**、A–I 类余项地图、ADR 与数据源索引；Tufte 书卷版式，自包含可离线打开 |
 | 第二阶段开发记录 | `phase2-devlog.md` | 生产实战轮逐条记录（问题 → 侦查 → 结论 → 动作 → 验收）：四轮侦查/修复 + **72h 生产测试（进行中，§12）** + 附 A/B 台账 |
 | 安全工程提案 | `security-proposal.md` | 攻击面取证（9 类输入 × 解析器 × 防线）+ 供应链 6 项缺口 + S0–S5 排期（fuzz ≥8 目标 / QEMU 特权加载 CI / cargo-deny / panic 面），**待采纳** |
 | 项目总结 | `project-summary.html` | 整体工程总结：阶段历程/架构总览/对标完成度/性能与内存汇总/工程质量/部署生态/后续路线（自包含，可离线打开） |
@@ -101,9 +101,9 @@ go mod edit -json | python3 -c "import json,sys; d=json.load(sys.stdin); \
 | 文档 | 版本 | 基于 |
 |---|---|---|
 | `architecture-decision.html` | v2.43 · 2026-10-04 | dae `main@e3fee8f`（tag `nightly`） |
-| `parity-status.md` | v2.10 · 2026-10-04 | 同上（P33.2 性能深挖后清点；覆盖度为功能点粗估，逐行附证据） |
-| `sodama-atlas.html` | **v1.2 · 2026-10-16** | **总览入口**：main@97ebe9f 基线（审计修复批上线后）；汇总 parity-status v2.14 / benchmark-report v3.0 / memory-safety-audit v1.1 / phase2-devlog §1–§18 / reviews / backlog / ADR-0001..0064，附全部实测数据与口径纪律（§5.3）；v1.2 新增 §8.4–§8.6（P37 治理 / AF-XDP 否决 / 审计修复批与新一轮 72h） |
-| `phase2-devlog.md` | §1–§18 · 2026-10-16 | 第二阶段（生产实战轮，10-08 起）：侦查/修复/验收；P37/P37b 额度治理（§13–§14）+ AF-XDP 预研（§15）+ 72h 测试（§16）+ **审计修复批次与 2d5h39m 生产比对（§17）** + **修复批上线回验与新一轮 72h 启动（§18，进行中）** |
+| `parity-status.md` | v2.15 · 2026-10-16 | 同上（数据面对标批次后清点：域 1 ≈65%→≈85%；覆盖度为功能点粗估，逐行附证据） |
+| `sodama-atlas.html` | **v1.3 · 2026-10-16** | **总览入口**：数据面对标批次后基线；汇总 parity-status v2.15 / benchmark-report v3.0 / memory-safety-audit v1.1 / phase2-devlog §1–§19 / reviews / backlog / ADR-0001..0065，附全部实测数据与口径纪律（§5.3）；v1.3 新增 §8.7（L3 变体 / ringbuf 事件 / fentry-kprobe 记账 / XDP 计量） |
+| `phase2-devlog.md` | §1–§19 · 2026-10-16 | 第二阶段（生产实战轮，10-08 起）：侦查/修复/验收；P37/P37b 额度治理（§13–§14）+ AF-XDP 预研（§15）+ 72h 测试（§16）+ **审计修复批次与 2d5h39m 生产比对（§17）** + **修复批上线回验与新一轮 72h 启动（§18）** + **数据面对标批次（§19）** |
 | `security-proposal.md` | v0.1 · 2026-10-11 | 评审意见回应稿（**待采纳**）：main@0bcadc6 取证；附录 A 为 backlog 重分类建议（新增 S 类） |
 | `memory-safety-audit.html` | **v1.1 · 2026-10-16** | **unsafe 专项审计 + 生产比对 + 修复批次（已部署并回验）**：dev@d1bdb46 基线；全量审读 + clippy 实跑；§8 = 2d5h39m 生产数据比对（H2 实锤 3s/1.4万次重连每天；M4 证伪降级；H1/H3/M1/M2/M3 零暴露）；§9 = 修复批次（H1/H2/H3/M1/M2/M3 + L1/L2/L5，287/287 测试、OpenWrt 构建通过，**2026-10-16 05:44 部署**：DoH 连接 40s 端口不变、空闲 dial-wd=0）；新一轮 72h 进行中（devlog §18） |
 | `benchmark-report.html` | **v3.0 · 2026-10-06** | **现行合并版**：吞吐四方对拍（perf-report）+ 四层内存模型/FD 治理/转发原语/长稳（memory-report-v2.1）+ 五方 RSS 存档（v1）+ 五万并发压测与 fd 硬限修复（本轮）；由 `sodama/lab/perf/gen-benchmark-report.py` 生成 |
