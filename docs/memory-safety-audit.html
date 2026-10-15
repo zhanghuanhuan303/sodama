@@ -70,7 +70,7 @@
 <header class="doc">
   <div class="kicker">SODAMA · 技术报告 · 代码审计</div>
   <h1>内存安全与资源生命周期审计报告<span class="badge">unsafe 专项 · v1.1</span></h1>
-  <p class="subtitle">loader + ebpf-rs 全量 <code>unsafe</code> 人工审读 · 泄漏/UB/资源保留三类风险 · 发现清单与已核销清单 · 修复优先级 · <b>2d5h39m 生产实况比对</b> · 修复批次已落地（未部署，§9）</p>
+  <p class="subtitle">loader + ebpf-rs 全量 <code>unsafe</code> 人工审读 · 泄漏/UB/资源保留三类风险 · 发现清单与已核销清单 · 修复优先级 · <b>2d5h39m 生产实况比对</b> · 修复批次已部署并回验（§9）</p>
   <div class="meta">
     <div><b>日期</b>：2026-10-16</div>
     <div><b>对象</b>：sodama（Rust 重写 dae；eBPF 数据面 + 用户态 loader）</div>
@@ -125,7 +125,7 @@
 </table>
 <p class="small">严重度口径：<b>高</b>=确认的正确性/数据安全缺陷或可触发的资源误用；<b>中</b>=条件触发的泄漏/保留，或与额度/稳定性目标冲突；<b>低</b>=形式 UB、脆弱不变量、微量有界保留与加固项。<b>「置信度」指机制判定把握</b>，不代表已运行时复现。</p>
 <div class="callout">
-  <p><b>v1.1 修订摘要</b>：本报告 v1.0 发布后完成两项后续工作——① 以生产引擎 <b>2d5h39m</b> 真实数据逐项比对（§8）：<b>H2 生产确认（实锤）</b>、<b>M4 证伪降级</b>（上表与 §3 已同步修订）、H1/H3/M1/M2/M3 本负载零暴露；② 修复批次落地（§9）：H1/H2/H3/M1/M2/M3 + L1/L2/L5 加固，<code>cargo test 287/287</code>、OpenWrt x86_64 构建通过，<b>尚未部署</b>。</p>
+  <p><b>v1.1 修订摘要</b>：本报告 v1.0 发布后完成两项后续工作——① 以生产引擎 <b>2d5h39m</b> 真实数据逐项比对（§8）：<b>H2 生产确认（实锤）</b>、<b>M4 证伪降级</b>（上表与 §3 已同步修订）、H1/H3/M1/M2/M3 本负载零暴露；② 修复批次落地（§9）：H1/H2/H3/M1/M2/M3 + L1/L2/L5 加固，<code>cargo test 287/287</code>、OpenWrt x86_64 构建通过，<b>已于 2026-10-16 05:44 部署并完成首轮回验</b>（DoH 连接 40s 端口不变 / 空闲 dial-wd=0），新一轮 72h 生产测试已启动（devlog §18）。</p>
 </div>
 
 <h3>目录</h3>
@@ -423,7 +423,7 @@ error: could not compile `sodama` (bin "sodama") due to 3 previous errors</pre>
   <li>DoH「400」响应风暴与网络事件同窗（00:56–01:03），成因未定；建议与 H2 修复后的表现一并复看。</li>
 </ul>
 
-<h2 id="fixbatch">9 · 修复批次与验证（v1.1，已实施未部署）</h2>
+<h2 id="fixbatch">9 · 修复批次与验证（v1.1，已部署并回验）</h2>
 <table>
   <thead><tr><th>条目</th><th>修法</th><th>文件</th></tr></thead>
   <tbody>
@@ -438,11 +438,12 @@ error: could not compile `sodama` (bin "sodama") due to 3 previous errors</pre>
 </table>
 <p><b>验证</b>：<code>cargo test</code> <b>287/287 通过</b>（基线 286 + 新增 H1 回归 1）；<code>cargo clippy</code> 无新增问题（余 3 条 correctness 为改动前既有：<code>hysteria2.rs:375</code>/<code>tls13.rs:723/808</code>）；OpenWrt x86_64 交叉构建通过（<code>sodama 7.6M · sodama-ebpf 496K</code>）。</p>
 <p><b>部署后验收判据</b>：① DoH 连接生命周期显著 &gt;3s（逐秒端口扫描不再每 3s 更换）；② 空闲时 <code>dial-wd</code> 线程归零；③ <code>status.pipe_discarded</code> 仅异常收尾时缓慢增长（正常应 ≈0）；④ 删除/重命名组后日志出现「已停止 N 个旧世代健康探测线程」且线程数回落；⑤ UDP NAT 场景下 <code>evicted</code>/<code>reply_sockets_evicted</code> 按预期联动。</p>
+<p><b>部署回验（2026-10-16 05:44，新世代，dev@171e7e6）</b>：① <b>H2 生效</b>——223.5.5.5:443 连接 40s 逐秒扫描端口全程不变（修复前恰好 3s 一换）；② 空闲 <code>dial-wd</code> 线程 = 0（修复前常态 ≥1）；③ <code>pipe_discarded</code>/<code>reply_sockets_evicted</code> 计数就位；④ 部署 md5 一致（<code>a5aa0d09…</code>）、pname 6/6、就绪 6s。新一轮 72h 生产测试在同一批次上启动（devlog §18），持续回填 ③④⑤ 与 H2 长稳数据。</p>
 
 <footer class="doc">
   <p>SODAMA · 内存安全与资源生命周期审计报告（unsafe 专项）v1.1 · 2026-10-16 · 基线 <code>dev@d1bdb46</code><br>
   方法：loader + ebpf-rs 全量人工审读（167 <code>unsafe {}</code> / 19 <code>unsafe fn</code> / 10 <code>unsafe impl</code>）+ 定向模式扫描 + <code>cargo clippy</code> 实跑；关键结论经 aya 0.14.0 源码与内核语义对照复核；<b>v1.1 增补 2d5h39m 生产实况比对（§8）与修复批次（§9）</b>。<br>
-  v1.0 为只读审计（未改代码）；v1.1 的修复批次已实施并通过测试/构建，尚未部署。证据引用格式 <code>文件:行号</code>，分级沿用 <code>docs/README.md</code> 约定（发现条目为「源码实测」，概率/速率类表述为「推断」，§8 数据为生产实测）。</p>
+  v1.0 为只读审计（未改代码）；v1.1 修复批次已通过测试/构建，并已部署（2026-10-16 05:44，dev@171e7e6）完成首轮回验；新一轮 72h 生产测试进行中（devlog §18）。证据引用格式 <code>文件:行号</code>，分级沿用 <code>docs/README.md</code> 约定（发现条目为「源码实测」，概率/速率类表述为「推断」，§8 数据为生产实测）。</p>
 </footer>
 
 </div>
