@@ -14,7 +14,7 @@ docs/
 ├── architecture-decision.html    # 决策档案（主文档，自包含可离线打开）
 ├── parity-status.md              # 对标进度：dae（Go）↔ sodama（全 Rust）分域覆盖度
 ├── benchmark-report.html         # ★ 性能与资源边界报告 v3.0（合并版）：吞吐四方对拍 + 四层内存模型 + FD 治理 + 转发原语 + 五万并发压测 + 长稳
-├── benchmark-report-v4.html      # ★ 性能与资源边界报告 v4.0 · 本机全量强度轮（2026-10-16）：补全后数据面复测 + 三专题回归分析（R11 拒载 · lab offload 口径 · ss/UDP 二分）；数据源 docs/reviews/2026-10-16-local-full-bench/
+├── benchmark-report-v4.html      # ★ 性能与资源边界报告 v4.1 · 本机全量强度轮 + 真实 CF 节点公网轮（2026-10-16～17）：补全后数据面复测 + 四专题回归分析（R11 拒载 · lab offload 口径 · ss/UDP 二分 · real.sh 口径）；数据源 docs/reviews/2026-10-16-local-full-bench/ 与 docs/reviews/2026-10-17-real-node-cf-edge/
 ├── perf-report.md                # （已并入 benchmark-report.html）性能对比 · 历史存档
 ├── vless-proposal.html           # VLESS 性能实测与优化提案（自包含 HTML，可离线打开）
 ├── memory-report.html            # （已并入 benchmark-report.html）内存终测 v1.0 五方 RSS · 历史存档
@@ -107,7 +107,7 @@ go mod edit -json | python3 -c "import json,sys; d=json.load(sys.stdin); \
 | `phase2-devlog.md` | §1–§19 · 2026-10-16 | 第二阶段（生产实战轮，10-08 起）：侦查/修复/验收；P37/P37b 额度治理（§13–§14）+ AF-XDP 预研（§15）+ 72h 测试（§16）+ **审计修复批次与 2d5h39m 生产比对（§17）** + **修复批上线回验与新一轮 72h 启动（§18）** + **数据面对标批次（§19）** |
 | `security-proposal.md` | v0.1 · 2026-10-11 | 评审意见回应稿（**待采纳**）：main@0bcadc6 取证；附录 A 为 backlog 重分类建议（新增 S 类） |
 | `memory-safety-audit.html` | **v1.1 · 2026-10-16** | **unsafe 专项审计 + 生产比对 + 修复批次（已部署并回验）**：dev@d1bdb46 基线；全量审读 + clippy 实跑；§8 = 2d5h39m 生产数据比对（H2 实锤 3s/1.4万次重连每天；M4 证伪降级；H1/H3/M1/M2/M3 零暴露）；§9 = 修复批次（H1/H2/H3/M1/M2/M3 + L1/L2/L5，287/287 测试、OpenWrt 构建通过，**2026-10-16 05:44 部署**：DoH 连接 40s 端口不变、空闲 dial-wd=0）；新一轮 72h 进行中（devlog §18） |
-| `benchmark-report-v4.html` | **v4.0 · 2026-10-16/17** | **本机全量强度轮**：main@e5db7fd + R11 修复基线；四方吞吐（vless/ss/tls）/ 并发扩展 / 内存五方 / 四层 100→50k / UDP / codec 压 / 60min 长稳；含 R11 验证器拒载修复、lab offload 口径修正、ss reactor-codec 回归二分（b030f90）、UDP GSO 回归二分（e5db7fd）；原始数据 `reviews/2026-10-16-local-full-bench/` |
+| `benchmark-report-v4.html` | **v4.1 · 2026-10-16/17** | **本机全量强度轮 + 真实 CF 节点公网轮**：main@e5db7fd + 四项修复基线；四方吞吐（vless/ss/tls）/ 并发扩展 / 内存五方 / 四层 100→50k / UDP / codec 压 / 60min 长稳；含 R11 验证器拒载修复、lab offload 口径修正、ss reactor-codec 回归二分（b030f90）、UDP GSO 回归二分（e5db7fd）；**§11 真实订阅节点（CF 边缘 worker）公网轮**：17 轮 ×（sodama/dae/sing-box/direct），进程口径 sodama 较 dae −31%、较 sing-box −28%；原始数据 `reviews/2026-10-16-local-full-bench/`、`reviews/2026-10-17-real-node-cf-edge/` |
 | `benchmark-report.html` | **v3.0 · 2026-10-06** | **现行合并版**：吞吐四方对拍（perf-report）+ 四层内存模型/FD 治理/转发原语/长稳（memory-report-v2.1）+ 五方 RSS 存档（v1）+ 五万并发压测与 fd 硬限修复（本轮）；由 `sodama/lab/perf/gen-benchmark-report.py` 生成 |
 | `memory-report.html` | v1.0 · 2026-10-05 | 已并入 `benchmark-report.html` §6/附录 A · 存档 |
 | `memory-report-v2.html` | v2.1 · 2026-10-05 | 已并入 `benchmark-report.html` §4/§5/§8/§9 · 存档 |

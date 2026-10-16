@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>性能与资源边界报告 v4.0 · 本机全量强度轮（2026-10-16）</title>
+<title>性能与资源边界报告 v4.1 · 本机全量强度轮 + 真实 CF 节点公网轮（2026-10-16～17）</title>
 <style>
 :root{
   --ink:#1a1d21; --muted:#5a6570; --rule:#d9dee4; --rule-soft:#e8ecf0;
@@ -55,16 +55,16 @@ footer.doc{margin-top:56px;padding-top:18px;border-top:1px solid var(--rule);fon
 <div class="wrap">
 
 <header class="doc">
-  <div class="kicker">SODAMA BENCHMARK · LOCAL FULL-INTENSITY ROUND</div>
-  <h1>性能与资源边界报告 v4.0 · 本机全量强度轮</h1>
-  <p class="subtitle">补全后 eBPF 数据面（A2 批次收口）+ 2 项修复 · 网络切换（不经软路由）后本机复测 · 与 dae v2.1.1 等四方同台</p>
+  <div class="kicker">SODAMA BENCHMARK · LOCAL FULL-INTENSITY ROUND + REAL-EDGE ROUND</div>
+  <h1>性能与资源边界报告 v4.1 · 本机全量强度轮 + 真实 CF 节点公网轮</h1>
+  <p class="subtitle">补全后 eBPF 数据面（A2 批次收口）+ 4 项修复 · 网络切换（不经软路由）后本机复测 · 与 dae v2.1.1 等四方同台 · <b>§11 真实 CF 边缘订阅节点公网轮</b></p>
   <div class="meta">
     <div><b>日期</b> 2026-10-16～17</div>
     <div><b>机器</b> Arch · 6.18.54-2-lts · i9-9900KF 8C16T · 31 GB（同 atlas 基准机）</div>
     <div><b>构建</b> main@e5db7fd + <code>flow.rs</code> conn_save 参数打包修复（见 §8.1）</div>
     <div><b>对照</b> dae v2.1.1 · sing-box 1.14.2 · v2ray 5.52.0 · mihomo 1.19.32</div>
-    <div><b>口径</b> 全部 <code>SKIP_NET_OFFLOAD=1</code>（理由见 §8.2）；netns 本机对拍</div>
-    <div><b>数据源</b> <code>docs/reviews/2026-10-16-local-full-bench/</code></div>
+    <div><b>口径</b> 本机轮 <code>SKIP_NET_OFFLOAD=1</code>（理由见 §8.2）；netns 本机对拍；§11 为真实公网 tproxy 轮</div>
+    <div><b>数据源</b> <code>docs/reviews/2026-10-16-local-full-bench/</code> · §11：<code>docs/reviews/2026-10-17-real-node-cf-edge/</code></div>
   </div>
 </header>
 
@@ -82,6 +82,7 @@ footer.doc{margin-top:56px;padding-top:18px;border-top:1px solid var(--rule);fon
 <tr><td>UDP（20k pps）</td><td>sodama 代理路径<b>失效</b>（上行 100% 转发、回程全灭）<span class="tag bad">回归</span></td><td>二分定位到 <code>e5db7fd</code> 的 UDP GSO（§8.4）；A2 前构建零丢包</td></tr>
 <tr><td>长稳 60 min</td><td>RSS +17.6% <span class="tag bad">FAIL</span>（单次 4.5 MB 阶梯，非持续泄漏形态）；Slab +0.26% / SUnrec +0.88% / fd 无增长 / 零失败；RTT p50 中位 44 µs</td><td>atlas 60min 轮 +3.1% PASS —— <b>本轮 RSS 未过 ±5% 线（项目首次）</b>，见 §6</td></tr>
 <tr><td>宿主加载性</td><td>补全批次 <code>e87ea69</code> 起 eBPF 对象被 6.18 验证器拒载（R11）；<b>已修复</b>，<code>verify 12/12</code> 全绿</td><td>新增发现（atlas 内核级验收在 QEMU 7.2.8，宿主未覆盖）</td></tr>
+<tr><td>真实节点公网轮 <span class="tag new">新增</span></td><td>17 轮 ×（sodama/dae/sing-box/direct）：吞吐 <b>19.3 / 18.6 / 19.3 / 36.0 Mbps</b>（节点出口 ≈19 Mbps 为共同上限）；每 GB 总 CPU（进程+内核侧）<b>12.6k / 24.4k / 28.8k / 13.2k ms</b></td><td>首次公网口径（§11）；进程口径 sodama 较 dae <b>−31%</b>、较 sing-box <b>−28%</b></td></tr>
 </tbody>
 </table>
 <div class="callout warn">
@@ -91,7 +92,7 @@ footer.doc{margin-top:56px;padding-top:18px;border-top:1px solid var(--rule);fon
 <h2 id="s2">§2 方法学</h2>
 <h3>2.1 环境与口径</h3>
 <ul>
-<li>全部测试在 netns 拓扑（client ns — 网关 — WAN ns）内完成，与公网路径无关；机器已切换到不经软路由的网络（wlan0 直连），对 netns 数字无影响。真实公网口径（real.sh，atlas §4.5）需节点 URL，本轮未采集。</li>
+<li>全部测试在 netns 拓扑（client ns — 网关 — WAN ns）内完成，与公网路径无关；机器已切换到不经软路由的网络（wlan0 直连），对 netns 数字无影响。真实公网口径（real.sh）见 §11（2026-10-17 订阅到位后补测）。</li>
 <li>夹具：<code>lab/bench_io</code>（48 MB × 4 流全双工；lat 500 次）、<code>conn_scale</code>（hold/churn）、<code>echo_server</code>（万级连接）。direct 口径受夹具 ≈24.5 Gbps 上限约束（64×1 MB 口径可达 38.7 G）。</li>
 <li>ss 上游为 <code>ssserver</code> 1.25.0（shadowsocks-rust）；Python 上游有 GIL ≈2.4 Gbps 上限，仅作功能对照。</li>
 <li>CPU 列 = 被测进程 utime+stime 增量（realfile <code>/proc/pid/stat</code>，10 ms 粒度）；RSS/线程为负载期值。</li>
@@ -483,13 +484,57 @@ sudo lab/perf/soak-curve.sh run 3600
 
 <h2 id="s10">§10 数据源与后续建议</h2>
 <ul>
-<li>原始数据：<code>docs/reviews/2026-10-16-local-full-bench/</code>（16 个 TSV + README）。</li>
-<li>建议后续动作（按优先级）：① UDP GSO 修复 + 高 pps 门禁（阻塞性功能缺陷）；② ss reactor codec 调度修复（对照 M1 线程泵路径回归验证）；③ 长稳 RSS 阶梯复测（§6，2–3 h + smaps）；④ R11 修复入库；⑤ lab offload 口径固化（§8.2）；⑥ run.sh 增加实现就绪判定（§2.3）；⑦ 真实公网口径轮（real.sh）待节点 URL 后补测。</li>
-<li>本轮未覆盖：真实公网节点（需 URL）、72 h 长稳（60 min 已完成，见 §6）、OpenWrt 生产机复测（真机 CPU/内存口径见 atlas §4.7，不因本轮而变）。</li>
+<li>原始数据：<code>docs/reviews/2026-10-16-local-full-bench/</code>（16 个 TSV + README）；§11 真实节点轮：<code>docs/reviews/2026-10-17-real-node-cf-edge/</code>（2 个 TSV + README + summary + evidence）。</li>
+<li>建议后续动作（按优先级）：① UDP GSO 修复 + 高 pps 门禁（阻塞性功能缺陷）；② ss reactor codec 调度修复（对照 M1 线程泵路径回归验证）；③ 长稳 RSS 阶梯复测（§6，2–3 h + smaps）；④ R11 修复入库；⑤ lab offload 口径固化（§8.2）；⑥ run.sh 增加实现就绪判定（§2.3）；⑦ 真实公网口径轮（real.sh）<b>已完成</b>（§11）；⑧ 节点出口池抖动口径固化（固定健康出口 + 短传输判定 + 单轮重试，已入 real.sh）。</li>
+<li>未覆盖项：真实公网口径已补（§11）；仍未覆盖 72 h 长稳（60 min 已完成，见 §6）、OpenWrt 生产机复测（真机 CPU/内存口径见 atlas §4.7，不因本轮而变）。</li>
+</ul>
+
+<h2 id="s11">§11 真实 CF 边缘节点公网轮（2026-10-17）</h2>
+<p>订阅节点 URL 到位后，用 <code>lab/perf/real.sh</code> 在本机新网络（wlan0 直连、不经软路由）跑公网口径轮：client ns → 被测实现（透明代理）→ 宿主 wlan0 → <b>真实 CF 边缘节点（异机）</b> → 公网目标。三方实现 + 直连基线<b>各 17 轮</b>，同一时段、同一节点后端、同一出口、同一目标串行测量（顺序 sodama → dae → singbox → direct）。原始数据：<code>docs/reviews/2026-10-17-real-node-cf-edge/</code>。</p>
+
+<h3>11.1 订阅与节点特性（为什么需要适配）</h3>
+<ul>
+<li>订阅（base64）解码为 <b>20 个 VLESS+WS+TLS 节点</b>：<code>host/sni=sub3.example.com</code>、<code>fp=chrome</code>、<code>path=/proxyip=&lt;8 个 IP&gt;</code>，端口 ∈ {2053, 2083, 2087, 2096, 8443}，20 个不同 CF 边缘 IP。链路 RTT ≈ 180–190 ms。</li>
+<li><b>worker 只接受域名目标</b>：以 IP 为目的地的请求被直接关连接（上一轮实测，WS Close 帧 <code>\x88\x00</code>）。因此三方对比实现（sodama/dae/sing-box；v2ray 仅作参考客户端）都必须「嗅探 SNI/Host → 域名拨号」——这本身是各家能力的真实对照点。sodama 用 <code>--dial-mode domain+</code>（严格档 <code>domain</code> 对未知域名首连按 IP 拨出，会被 worker 拒），dae 用 <code>dial_mode: domain+</code>、<code>sniffing_timeout: 500ms</code>，日志证据见数据目录 <code>evidence.txt</code>。</li>
+<li><b>sing-box 1.14 无等价能力</b>：<code>sniff</code> action 在 1.14 只剩 <code>sniffer</code>/<code>timeout</code>；1.11 起的 <code>sniff_override_destination</code> 仅为遗留 no-op（<code>schema:"omit"</code>，且 <code>RuleActionSniff.OverrideDestination</code> 在构造时从不被赋值），嗅探结果<b>不会</b>回写拨号目标（源码事实与逐项实测见 <code>evidence.txt</code> §2）。本轮改用 route action 的 <code>override_address</code>（<code>badoption.Addr</code> 支持域名）静态指定目标域名，并保留 sniff 规则以对齐嗅探工作量。</li>
+<li>固定后端：<code>real.sh prepare</code> 将节点固定到一个 TCP 可连的 CF 边缘（<code>203.0.113.123:2053</code>），三方共用；出口取路径参数里实测健康的单一 <code>proxyip</code>（见 11.4）。</li>
+</ul>
+
+<h3>11.2 目标选择（影响可比性，实测记录）</h3>
+<table>
+<thead><tr><th>目标</th><th>宿主机直连</th><th>经节点</th><th>结论</th></tr></thead>
+<tbody>
+<tr><td><code>cachefly.cachefly.net/5mb.test</code></td><td>✗ TCP 不可达</td><td>间歇 <code>403</code>（<code>server: CFS 1124</code>、<code>x-cf-quota-max-delivery-conns: 500</code>）</td><td>否决：无直连基线 + 出口 IP 配额限流</td></tr>
+<tr><td><code>speed.cloudflare.com/__down</code></td><td>200 / 10.8 Mbps</td><td>✗ 20 s 超时</td><td>否决：worker→CF 出网异常</td></tr>
+<tr><td><code>proof.ovh.net/files/10Mb.dat</code></td><td>200 / 26–50 Mbps</td><td><b>200 / 17–20 Mbps</b>，无配额迹象</td><td><b>采用</b></td></tr>
+</tbody>
+</table>
+
+<h3>11.3 结果（17 轮中位 / 合计口径）</h3>
+<table>
+<thead><tr><th>实现</th><th class="num">吞吐 Mbps 中位 [min,max]</th><th class="num">进程 CPU ms/GB</th><th class="num">内核侧净 CPU ms/GB（90%CI）</th><th class="num">合计 ms/GB</th><th class="num">vs sodama</th></tr></thead>
+<tbody>
+<tr><td><b>sodama</b> <span class="tag new">本测</span></td><td class="num"><b>19.3</b> [17.5, 19.7]</td><td class="num"><b>2 952</b></td><td class="num">9 690 [4 179, 14 576]</td><td class="num"><b>12 642</b></td><td class="num">base</td></tr>
+<tr><td>dae v2.1.1</td><td class="num">18.6 [17.1, 19.7]</td><td class="num">4 266</td><td class="num">20 165 [11 371, 29 263]</td><td class="num">24 431</td><td class="num">+93%</td></tr>
+<tr><td>sing-box 1.14.2</td><td class="num">19.3 [16.9, 20.3]</td><td class="num">4 111</td><td class="num">24 659 [15 528, 34 257]</td><td class="num">28 770</td><td class="num">+128%</td></tr>
+<tr><td>direct（无代理基线）</td><td class="num">36.0 [26.0, 49.8]</td><td class="num">0</td><td class="num">13 210 [8 253, 18 652]</td><td class="num">13 210</td><td class="num">—</td></tr>
+</tbody>
+</table>
+<p><b>读数</b>：① 三方代理吞吐相当（18.6–19.3 Mbps，中位差 ≤4%）——<b>节点出口带宽（≈2.3–2.5 MB/s）是共同上限</b>，直连基线 36 Mbps 说明瓶颈既不在本机也不在本地网络；② 进程口径（<code>/proc/&lt;pid&gt;/task/*/schedstat</code>，ns 级）sodama 比 dae 低 <b>31%</b>、比 sing-box 低 <b>28%</b>（每 GB）；③ 内核侧口径（<code>/proc/stat</code> 的 system+irq+softirq，逐轮扣除前置 1 s 空闲基线）给出 sodama ≈ dae 的 0.48×、sing-box 的 0.39×（点估计），<b>该口径 CI 较宽（与 dae 略有重叠）</b>，其用途是给 sodama 的 eBPF 工作量一个上界估计；两个口径排序一致。</p>
+<div class="callout">
+  <p><b>为什么可以这样比</b>：sodama 的转发在 eBPF 里完成，进程口径天然漏计其内核工作量——这正是内核侧口径存在的理由。即使把内核侧全部计入，sodama 每 GB 总 CPU（12.6k ms）仍显著低于 dae（24.4k）与 sing-box（28.8k）；同时该值与本轮无代理直连基线（13.2k ms/GB，跑在 2 倍速率上）同量级，说明该负载下（≈19 Mbps）代理引入的额外 CPU 成本可忽略。</p>
+</div>
+<p class="small">交叉验证：同夜更早一次 17 轮（出口池未固定、条件更差；sing-box 有 2 轮短传输未剔除）进程口径为 sodama 2 947 / dae 4 465 / sing-box 4 374 ms/GB，排序与量级一致（<code>real-final.tsv</code>）。</p>
+
+<h3>11.4 节点侧抖动与处置（复现要点）</h3>
+<ul>
+<li><b>出口池抖动</b>：默认 8 出口路径下，v2ray 参考客户端 20 轮中 <b>17 轮</b>传输被截断（<code>SSL routines::unexpected eof while reading</code>，体积 16 KB–1.5 MB，耗时 2.3–3.0 s）；换 CF 边缘 IP 无效（多边缘均 1–2/4 失败）→ 问题在出口池。逐出口单测后固定健康出口（203.0.113.68，2.41/2.42 MB/s），残余失败率降至 ~25%（节点侧固有）。</li>
+<li><b>脚本处置</b>：本轮给 <code>real.sh</code> 增加 ① 短传输判定 <code>TARGET_EXPECT_BYTES</code>（curl 对截断的 TLS 会话仍可能返回 200）、② 单轮最多 <code>ROUND_ATTEMPTS</code> 次重试，两者否则会把「截断轮」计成低吞吐低 CPU 的伪样本（本轮第一次 17 轮就因此丢掉 dae/singbox 的数据）。</li>
+<li><b>其他坑</b>：<code>/tmp</code> 为 sticky + world-writable，宿主 <code>fs.protected_regular=2</code> 会拒绝 root 以 O_CREAT 打开他人拥有的常规文件——生成配置前先 <code>rm -f</code>（已入 <code>gen_singbox_cfg</code>/<code>gen_dae_cfg</code>）；dae 数据重建会清掉 <code>dae0</code>，<code>real.sh</code> 已有重建分支。</li>
 </ul>
 
 <footer class="doc">
-  <p>性能与资源边界报告 v4.0 · 2026-10-16 本机全量强度轮 · 数据目录 <code>docs/reviews/2026-10-16-local-full-bench/</code> · 图集口径见 <code>docs/sodama-atlas.html</code> §4 与 <code>docs/benchmark-report.html</code> v3.0。</p>
+  <p>性能与资源边界报告 v4.1 · 2026-10-16～17 本机全量强度轮 + 真实 CF 节点公网轮 · 数据目录 <code>docs/reviews/2026-10-16-local-full-bench/</code>、<code>docs/reviews/2026-10-17-real-node-cf-edge/</code> · 图集口径见 <code>docs/sodama-atlas.html</code> §4 与 <code>docs/benchmark-report.html</code> v3.0。</p>
   <p>所有数字均为本轮实测；未复现项与不确定项已显式标注（如 v2ray direct 行为、ss 慢轮的调度解释为待证假说）。</p>
 </footer>
 

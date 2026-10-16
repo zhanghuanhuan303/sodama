@@ -1,0 +1,108 @@
+# 2026-10-17 真实 CF 边缘节点公网轮 · 证据与探测记录
+
+> 日志片段已脱敏（节点 URL 中的 UUID 等凭据不出现；CF 边缘 IP 属公开路由信息，保留以便复现）。
+
+## 1. 三方「嗅探 → 域名拨号」日志证据（目标 proof.ovh.net，客户端原始目标是 IP 203.0.113.211）
+
+### sodama（`dev@9f1179a`，`--dial-mode domain+ --sniffing-timeout-ms 500`）
+
+```
+[sodama] 2026-10-17 02:19:59 dial_mode: domain+（嗅探上限 500ms；命中 SNI/Host 则域名交节点远端解析）
+[sodama] 2026-10-17 02:20:03 RELAY proof.ovh.net:443（远端解析） established（vless://203.0.113.123:2053?security=tls&type=ws&flow=）
+[sodama] 2026-10-17 02:20:08 RELAY proof.ovh.net:443（远端解析） established（vless://203.0.113.123:2053?security=tls&type=ws&flow=）
+```
+
+说明：`RELAY … （远端解析）` 即上行目标为域名、由节点侧解析（worker 只接受 domain）。
+
+### dae v2.1.1（`dial_mode: domain+`、`sniffing_timeout: 500ms`）
+
+```
+[2026-10-17 02:00:31] DEBUG Rewrite dial target to domain from=203.0.113.211:443 to=proof.ovh.net:443
+[2026-10-17 02:00:31] DEBUG 10.0.0.2:42422 <-> proof.ovh.net:443 dialer=real dscp=0 ip=203.0.113.211:443 mac=02:00:00:00:00:42 network=tcp4 outbound=proxy pname= policy=min_moving_avg sniffed=proof.ovh.net
+```
+
+### sing-box 1.14.2（sniff action + route action `override_address`）
+
+```
+DEBUG[0002] [3374820053 0ms] router: sniffed protocol: tls, domain: proof.ovh.net
+INFO[0002] [3374820053 1ms] outbound/vless[proxy]: outbound connection to proof.ovh.net:443
+INFO[0003] [3374820053 769ms] outbound/vless[proxy]: outbound connection to proof.ovh.net:443
+```
+
+## 2. sing-box 1.14 源码事实：嗅探结果无法回写拨号目标
+
+对照源码 `SagerNet/sing-box@v1.14.2`（安装版 `sing-box version 1.14.2`）：
+
+| 位置 | 事实 |
+|---|---|
+| `option/rule_action.go` | `type RouteActionSniff struct { Sniffer badoption.Listable[string]; Timeout badoption.Duration }` —— sniff action **只有** `sniffer` 与 `timeout` 两个字段 |
+| `option/inbound.go:73` | `SniffOverrideDestination bool \`json:"sniff_override_destination,omitempty" schema:"omit"\``，位于 `// Deprecated: Use rule action instead` 的 `InboundOptions`；`schema:"omit"` = 已从 schema 移除 |
+| `route/rule/rule_action.go:516` | `RuleActionSniff.OverrideDestination bool  // Deprecated`；`NewRuleAction()` 构造该结构体时只赋 `SnifferNames`/`Timeout`，**该字段在 1.14.2 中从不被赋值** |
+| `route/route.go:367/754/878` | 仅在 `if action.OverrideDestination && M.IsDomainName(metadata.Domain)` 时把 destination 改写成嗅探到的域名；因上一层永不置位，**1.14 中嗅探不会改写拨号目标** |
+
+实测：`sing-box check` 对以下写法均报 `json: unknown field`
+（`route.sniff_override_destination` / rule 级 / `action: "sniff"` 内联 `override_destination`）。
+`action: "route"` + `override_address: "<域名>"` 合法且生效（`badoption.Addr` 支持域名）——
+本轮 sing-box 即用此法出域名，并保留 sniff 规则以对齐嗅探工作量。
+
+结论：sing-box ≥1.11 起，透明代理场景「嗅探域名 → 回写拨号目标」的能力被移除且无等价 rule action；
+生产上只能靠 FakeIP（DNS 劫持 + fake-ip 反查）或 `override_address` 静态指定。
+
+## 3. worker 只接受域名目标（上一轮实测）
+
+- 以 IP 为 VLESS 目的地拨出时，worker 直接回收连接（WS Close 帧 `\x88\x00`，无 HTTP 响应）。
+- 三方实现因此均必须「嗅探 SNI/Host → 域名拨号」；sodama 用 `--dial-mode domain+`
+  （`domain` 严格档对未知域名首连会按 IP 拨出，故取 `domain+`），dae 用 `dial_mode: domain+`。
+
+## 4. 目标探测（2026-10-17 02:0x，wlan0 直连）
+
+| 目标 | 宿主机直连 | 经节点（v2ray 参考客户端） |
+|---|---|---|
+| `http://cachefly.cachefly.net/5mb.test` | ✗ TCP 不可达 | 200 但配额限流（下节） |
+| `https://speed.cloudflare.com/__down?bytes=5242880` | 200 / 10.8 Mbps | ✗ 20 s 超时（worker→CF 出网异常） |
+| `https://proof.ovh.net/files/10Mb.dat` | 200 / 18–32 Mbps（26.0–49.8 全轮口径） | **200 / 17–20 Mbps（选定）** |
+| `http://ipv4.download.thinkbroadband.com/5MB.zip` | 403（拒 UA/IP） | ✗ 连接被断 |
+| `http://speedtest.tele2.net/5MB.zip` | ✗ 超时 | 截断（`rc=18`） |
+| `http://mirror.nl.leaseweb.net/…` / `https://speedtest.ams1.nl.leaseweb.net/…` | 404 | ✗（`rc=35`/404） |
+
+CacheFly 配额 403 响应头（经节点，22 B body `<h1>Access Denied</h1>`）：
+
+```
+HTTP/1.1 403 Forbidden
+content-type: text/html
+transfer-encoding: chunked
+x-cf-quota-max-delivery-conns: 500
+server: CFS 1124
+```
+
+## 5. 出口池抖动的量化（v2ray 参考客户端，目标 proof.ovh.net/files/10Mb.dat）
+
+- **默认 8 出口路径**（原始订阅 path），固定边缘 `203.0.113.123:2053`：
+  20 轮 → 完整 **3**、截断 **17**（`rc=56 OpenSSL SSL_read: … unexpected eof while reading`，
+  体积 16 KB–1.5 MB，耗时 2.3–3.0 s）。
+- 换 CF 边缘（`203.0.113.93:2096` / `203.0.113.147:2087` / `203.0.113.232:2083` / `203.0.113.121:2053`）
+  仍间歇截断（各 2–4 轮中 1–2 轮失败）→ **不是单一边缘问题**，出口池中部分出口不可用。
+- **单出口路径**（`path=/proxyip=<单 IP>`）逐一探测 8 个出口 ×2 轮：
+  `203.0.113.79` 2/2、`203.0.113.244` 2/2、`203.0.113.68` 2/2（2.41/2.42 MB/s）、
+  `203.0.113.236` 2/2；`203.0.113.145`、`203.0.113.214` 0/2；`203.0.113.215`、`203.0.113.61` 1/2。
+- 固定健康出口后再测 4 轮：3/4 完整（残余 ~25% 为节点侧固有抖动）→ 脚本以「短传输判失败 + 每轮
+  最多 6 次重试」消化。
+
+## 6. 主数据集原始行（`real-final3.tsv`，节选：每实现前 3 轮）
+
+```
+sodama	19.4	31.6	10485760	4.319201	460.0	90.0
+sodama	19.2	30.8	10485760	4.359663	470.0	60.0
+sodama	19.7	31.6	10485760	4.248262	500.0	70.0
+dae	19.6	44.6	10485760	4.275960	380.0	50.0
+dae	18.2	45.1	10485760	4.599535	520.0	50.0
+dae	18.6	48.4	10485760	4.506584	400.0	70.0
+singbox	19.6	60.3	10485760	4.288215	520.0	70.0
+singbox	19.3	41.6	10485760	4.340115	760.0	80.0
+singbox	18.3	44.0	10485760	4.585835	640.0	80.0
+direct	49.8	0.0	10485760	1.682872	750.0	210.0
+direct	44.4	0.0	10485760	1.888872	200.0	130.0
+direct	36.7	0.0	10485760	2.288738	310.0	100.0
+```
+
+列：`impl  mbps  cpu_ms(进程)  bytes  seconds  kern_ms(轮内)  base_ms(前置 1s 空闲)`
