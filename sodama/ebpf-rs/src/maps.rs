@@ -15,10 +15,16 @@ use crate::common::*;
 pub static config_map: Array<SodaConfig, 1> = Array::new();
 
 #[btf_map]
-pub static lpm_array_map: ArrayOfMaps<LpmTrie<[u8; 16], u32, 2_048_000>, 128> = ArrayOfMaps::new();
+pub static lpm_array_map: ArrayOfMaps<
+    LpmTrie<[u8; 16], u32, 2_048_000>,
+    { (SODAMA_EPOCH_SLOT_NUM * SODAMA_MAX_MATCH_SET_LEN + 8) as usize },
+> = ArrayOfMaps::new();
 
 #[btf_map]
-pub static routing_map: Array<SodaMatchSet, 128> = Array::new();
+pub static routing_map: Array<
+    SodaMatchSet,
+    { (SODAMA_EPOCH_SLOT_NUM * SODAMA_MAX_MATCH_SET_LEN) as usize },
+> = Array::new();
 
 #[btf_map]
 pub static routing_meta_map: Array<u32, 2> = Array::new();

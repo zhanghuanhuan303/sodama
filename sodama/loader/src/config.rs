@@ -1699,32 +1699,114 @@ fn first_val(p: &Param) -> Option<String> {
 
 /// 组名 → 数据面 outbound 文本。P19 起已定义的组**直通组名**（编译期再解析为索引）；
 /// 未定义的组名保持 K3 兼容行为回退 proxy（并在映射表中标明）。
+///
+/// 能力缺口 #1：实现 dae `patchMustOutbound`（`dae/config/patch.go:71-95`）的
+/// `must_<名称>` 前缀糖——等价于 `<名称>(must)`（`must_rules` 保留不展开）：
+/// `(must)` 表示「必须走该出站且**不劫持/处理 DNS**」（数据面 MUST 位，见
+/// `route.rs`；对照 `dae/docs/zh/configuration/routing.md`：「direct 会劫持并处理 DNS
+/// 请求（用于分流），must_direct 不会」）。早期版本只特判 `must_direct`，其余
+/// `must_<组名>` 落入兜底分支**静默变成 proxy**——写 `must_proxy` 的流量被当成
+/// `proxy` 处理并劫持 DNS，语义错且不报错。
 fn map_outbound(
     cfg_name: &str,
     defined: &std::collections::HashSet<String>,
     extract: &mut RoutingExtract,
 ) -> String {
+    // dae：must_<name>（must_rules 保留）→ <name>(must)；内层名称仍按
+    // 「已定义直通 / 未定义回退 proxy」解析，但映射表只记配置层原名→最终文本一条。
+    if let Some(rest) = cfg_name.strip_prefix("must_") {
+        if rest != "rules" {
+            let inner = match rest {
+                "direct" => "direct".to_string(),
+                "block" => "block".to_string(),
+                other if defined.contains(other) => other.to_string(),
+                _ => "proxy".to_string(),
+            };
+            let mapped = append_must(&inner);
+            record_outbound_map(extract, cfg_name, &mapped);
+            return mapped;
+        }
+    }
     match cfg_name {
+        // dae 保留字：must_rules 是 built-in 出站（数据面置 MUST 状态位），不属于组名。
         "direct" => "direct".into(),
         "block" => "block".into(),
-        "must_direct" => "direct(must)".into(),
+        "must_rules" => "must_rules".into(),
         other if defined.contains(other) => {
-            if !extract.outbound_map.iter().any(|(k, _)| k == other) {
-                extract
-                    .outbound_map
-                    .push((other.to_string(), other.to_string()));
-            }
+            record_outbound_map(extract, other, other);
             other.to_string()
         }
         other => {
-            if !extract.outbound_map.iter().any(|(k, _)| k == other) {
-                extract
-                    .outbound_map
-                    .push((other.to_string(), "proxy".into()));
-            }
+            record_outbound_map(extract, other, "proxy");
             "proxy".into()
         }
     }
+}
+
+/// 给已映射的 outbound 文本追加 `(must)`（已是 must 则不重复）。
+fn append_must(mapped: &str) -> String {
+    if mapped.ends_with("(must)") {
+        mapped.to_string()
+    } else {
+        format!("{mapped}(must)")
+    }
+}
+
+fn record_outbound_map(extract: &mut RoutingExtract, from: &str, to: &str) {
+    if !extract.outbound_map.iter().any(|(k, _)| k == from) {
+        extract.outbound_map.push((from.to_string(), to.to_string()));
+    }
+}
+
+/// 把配置规则 outbound 上解析出的参数（`must` / `mark: 0x…`）翻译进数据面规则文本。
+/// 与 dae 等价：`must_<组名>` ≡ `<组名>(must)`；不认识的参数返回 Err（调用方把
+/// 整条规则记入 deferred，绝不静默丢参数——早期版本在 --config 路径把函数式参数
+/// `(must)`/`(mark: …)` 直接丢掉，配置写 `alt(must)` 实际按 `alt` 编译）。
+fn apply_outbound_params(mapped: String, params: &[Param]) -> Result<String, String> {
+    let mut extra: Vec<String> = Vec::new();
+    for p in params {
+        match (p.key.as_deref(), p.val.as_deref()) {
+            (None, Some("must")) => extra.push("must".to_string()),
+            (Some("mark"), Some(v)) => extra.push(format!("mark: {v}")),
+            (None, None) => {}
+            (None, Some(other)) => {
+                return Err(format!("outbound 参数 `{other}` 暂不支持"));
+            }
+            (Some(k), v) => {
+                return Err(format!(
+                    "outbound 参数 `{k}: {}` 暂不支持",
+                    v.unwrap_or_default()
+                ));
+            }
+        }
+    }
+    if extra.is_empty() {
+        return Ok(mapped);
+    }
+    // 合并已带的参数（must_ 前缀糖可能已产生 `(must)`），去重保序。
+    let (base, mut all) = split_outbound_params(&mapped);
+    for e in extra {
+        if !all.contains(&e) {
+            all.push(e);
+        }
+    }
+    Ok(format!("{base}({})", all.join(", ")))
+}
+
+/// 把 `name(a, b)` 拆成（`name`, [a, b]）；无参数时返回（原名, []）。
+fn split_outbound_params(mapped: &str) -> (String, Vec<String>) {
+    if let Some(i) = mapped.find('(') {
+        if mapped.ends_with(')') && i > 0 {
+            let base = mapped[..i].to_string();
+            let params = mapped[i + 1..mapped.len() - 1]
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            return (base, params);
+        }
+    }
+    (mapped.to_string(), Vec::new())
 }
 
 /// 把 `routing` 段翻译成 sodama 数据面能编译的子集。
@@ -1760,19 +1842,42 @@ pub fn extract_routing(cfg: &Config) -> Result<RoutingExtract, Vec<Diag>> {
                     continue;
                 }
                 let outbound = map_outbound(&rule.outbound.name, &defined, &mut extract);
+                let outbound = match apply_outbound_params(outbound, &rule.outbound.params) {
+                    Ok(o) => o,
+                    Err(reason) => {
+                        // 不静默丢参数：不认识的 outbound 参数整条规则进 deferred。
+                        extract.deferred.push(DeferredRule {
+                            loc: rule.loc.clone(),
+                            rule: rule_text(rule),
+                            reason,
+                        });
+                        continue;
+                    }
+                };
                 extract
                     .supported
                     .push(format!("{} -> {}", parts.join(" && "), outbound));
             }
             Item::Param(p) if p.key.as_deref() == Some("fallback") => {
-                let Some(name) = p.val.clone().or_else(|| {
-                    p.funcs
-                        .as_ref()
-                        .and_then(|fs| fs.first().map(|f| f.name.clone()))
-                }) else {
+                let f = p.funcs.as_ref().and_then(|fs| fs.first());
+                let Some(name) = p.val.clone().or_else(|| f.map(|f| f.name.clone())) else {
                     return Err(vec![p_loc(cfg, p)]);
                 };
-                extract.fallback = Some(map_outbound(&name, &defined, &mut extract));
+                let mapped = map_outbound(&name, &defined, &mut extract);
+                let mapped = match f {
+                    None => mapped,
+                    Some(f) => match apply_outbound_params(mapped, &f.params) {
+                        Ok(m) => m,
+                        Err(reason) => {
+                            let msg = format!("fallback: {reason}");
+                            return Err(vec![match &p.loc {
+                                Some(l) => err_at(cfg, l, msg),
+                                None => diag(None, 0, msg),
+                            }]);
+                        }
+                    },
+                };
+                extract.fallback = Some(mapped);
             }
             _ => {}
         }
@@ -2346,6 +2451,93 @@ routing {
             .outbound_map
             .iter()
             .any(|(k, v)| k == "mystery_group" && v == "proxy"));
+    }
+
+    #[test]
+    fn extract_routing_preserves_outbound_params() {
+        // 能力缺口 #1（同批）：--config 路径必须保留规则 outbound 的函数式参数；
+        // 不认识的参数整条规则进 deferred（不静默丢）。
+        let secs = parse(
+            r#"global {}
+routing {
+    l4proto(tcp) && dport(443) -> direct(mark: 0x800, must)
+    dport(9091) -> must_alt(mark: 0x42)
+    dport(9092) -> direct(bogus_param)
+    fallback: direct(must)
+}
+group { alt { filter: name(x) } }"#,
+        )
+        .unwrap();
+        let cfg = Config {
+            entry: PathBuf::from("t.dae"),
+            files: vec![PathBuf::from("t.dae")],
+            sections: secs,
+        };
+        let ex = extract_routing(&cfg).unwrap();
+        assert_eq!(ex.supported.len(), 2, "{:#?}", ex.supported);
+        assert_eq!(
+            ex.supported[0],
+            "l4proto(tcp) && dport(443) -> direct(mark: 0x800, must)"
+        );
+        // must_ 前缀糖 + 函数式参数合并（序：糖产生的 must 在前？不——按合并顺序去重）
+        assert_eq!(ex.supported[1], "dport(9091) -> alt(must, mark: 0x42)");
+        assert_eq!(ex.deferred.len(), 1, "{:#?}", ex.deferred);
+        assert!(
+            ex.deferred[0].reason.contains("bogus_param"),
+            "{:#?}",
+            ex.deferred
+        );
+        assert_eq!(ex.fallback.as_deref(), Some("direct(must)"));
+    }
+
+    #[test]
+    fn extract_routing_must_sugar() {
+        // 能力缺口 #1：must_<名称> ≡ <名称>(must)（dae patchMustOutbound）；
+        // must_rules 保留；未定义组仍保持 K3 兼容回退 proxy 但 must 语义不丢。
+        let secs = parse(
+            r#"global {}
+routing {
+    dport(8080) -> must_proxy
+    dport(8081) -> must_direct
+    dport(8082) -> must_mystery
+    dport(8083) -> must_rules
+    dport(8084) -> must_alt
+    dport(8085) -> alt(must)
+    fallback: must_proxy
+}
+group { alt { filter: name(x) } }"#,
+        )
+        .unwrap();
+        let cfg = Config {
+            entry: PathBuf::from("t.dae"),
+            files: vec![PathBuf::from("t.dae")],
+            sections: secs,
+        };
+        let ex = extract_routing(&cfg).unwrap();
+        assert_eq!(ex.supported.len(), 6, "{:#?}", ex.supported);
+        assert_eq!(ex.supported[0], "dport(8080) -> proxy(must)");
+        assert_eq!(ex.supported[1], "dport(8081) -> direct(must)");
+        // 未定义组：仍回退 proxy，但保留 (must)（不再静默丢掉 must）
+        assert_eq!(ex.supported[2], "dport(8082) -> proxy(must)");
+        // dae 保留字：must_rules 原样透传（不展开成 rules(must)）
+        assert_eq!(ex.supported[3], "dport(8083) -> must_rules");
+        assert_eq!(ex.supported[4], "dport(8084) -> alt(must)");
+        // 函数式写法与 must_ 前缀等价（不重复追加）
+        assert_eq!(ex.supported[5], "dport(8085) -> alt(must)");
+        assert_eq!(ex.fallback.as_deref(), Some("proxy(must)"));
+        assert!(ex
+            .outbound_map
+            .iter()
+            .any(|(k, v)| k == "must_proxy" && v == "proxy(must)"));
+        assert!(ex
+            .outbound_map
+            .iter()
+            .any(|(k, v)| k == "must_mystery" && v == "proxy(must)"));
+        assert!(ex
+            .outbound_map
+            .iter()
+            .any(|(k, v)| k == "must_alt" && v == "alt(must)"));
+        assert!(!ex.outbound_map.iter().any(|(k, _)| k == "must_rules"));
     }
 
     #[test]

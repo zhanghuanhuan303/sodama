@@ -35,8 +35,9 @@ use std::net::Ipv4Addr;
 
 use crate::geodata::{self, Geodata};
 
-/// 与 `ebpf-rs/src/common.rs` 的 `SODAMA_MAX_MATCH_SET_LEN` 保持一致。
-pub const MAX_MATCH_SET_LEN: u32 = 64;
+/// 与 `ebpf-rs/src/common.rs` 的 `SODAMA_MAX_MATCH_SET_LEN` 保持一致
+/// （= dae `Makefile:14` 的 `MAX_MATCH_SET_LEN ?= 1024`；超限拒启动，不静默裁剪）。
+pub const MAX_MATCH_SET_LEN: u32 = 1024;
 
 /// 与 `ebpf-rs/src/maps.rs` 的内层 LPM 模板一致（map-in-map 的 template 匹配要求）。
 /// P17a：对齐 dae `tproxy.c:75` 的 `max_entries=2,048,000`（`geoip:cn` ≈15k、
@@ -1031,6 +1032,11 @@ fn compile_rule(
         if let Some((key, domains)) = &p.domain {
             // domain 位图的位下标 = match_set 在数组中的位置（对照 dae addDomain：
             // Value 不写下标，位下标就是 appendRule 的位置）。
+            // 2026-10-16：把 word_idx/bit 预计算进 value[0..2]——数据面不再从循环下标
+            // 推导（bpf_loop 回调的 u32 参数在 verifier 里无法携带上界，会让
+            // `bitmap[(index>>5)]` 报越界可能，见 route.rs 注释）。
+            value[0] = (index / 32) as u8;
+            value[1] = (index % 32) as u8;
             // 对照 dae ahocorasick_slimtrie.go:137-143：regex 在编译期编译，
             // 编译错误使整条规则编译失败（硬失败，不静默降级）。
             domain_sets.push(DomainSetSpec::build(index, key, domains)?);
@@ -1122,7 +1128,14 @@ pub fn parse_and_compile_full(
             all.sets.push(s);
         }
         for mut spec in compiled.domain_sets {
-            spec.match_set_index += base;
+            let local = spec.match_set_index;
+            let abs = base + local;
+            // 位图 word/bit 也要按全局下标重定位（数据面直接读 value[0..2]）——
+            // 与上面 LPM 集合的 value[0..4] 重定位同款；compile_rule 里写的是
+            // 规则内本地下标，跨规则拼接后必须改写，否则位下标错位（单测抳到）。
+            all.sets[abs as usize].value[0] = (abs / 32) as u8;
+            all.sets[abs as usize].value[1] = (abs % 32) as u8;
+            spec.match_set_index = abs;
             all.domain_sets.push(spec);
         }
         for (_local, abs) in reloc {
@@ -1634,7 +1647,11 @@ mod tests {
         assert_eq!(c.sets[0].outbound, OUTBOUND_LOGICAL_OR);
         assert_eq!(c.sets[1].outbound, OUTBOUND_LOGICAL_AND);
         assert_eq!(c.sets[2].outbound, OUTBOUND_PROXY);
-        assert!(c.sets[0].value.iter().all(|b| *b == 0));
+        // 位下标编码：value[0..2] = (index/32, index%32)——数据面不再从循环下标推导
+        // （bpf_loop 回调参数无法携带 verifier 上界；配合 route.rs 预计算方案）
+        assert_eq!(c.sets[0].value[0], 0);
+        assert_eq!(c.sets[0].value[1], 0);
+        assert_eq!(c.sets[0].value[2..], [0u8; 14]);
         assert_eq!(c.domain_sets.len(), 2);
         assert_eq!(c.domain_sets[0].match_set_index, 0);
         assert_eq!(c.domain_sets[0].key, "suffix");
@@ -1646,6 +1663,22 @@ mod tests {
         // 位下标随全局重定位
         let c3 = parse_and_compile("dport(80) -> direct\ndomain(full: 'x.test') -> proxy").unwrap();
         assert_eq!(c3.domain_sets[0].match_set_index, 1);
+        assert_eq!(c3.sets[1].value[0], 0);
+        assert_eq!(c3.sets[1].value[1], 1);
+        // 跨 word 边界：index=33 → word=1 / bit=1
+        let mut text = String::new();
+        for i in 0..33 {
+            text.push_str(&format!("dport({}) -> direct\n", 20000 + i));
+        }
+        text.push_str("domain(full: 'w.test') -> proxy");
+        let c5 = parse_and_compile(&text).unwrap();
+        let ms5 = c5
+            .sets
+            .iter()
+            .find(|s| s.type_ == MATCH_DOMAIN_SET)
+            .unwrap();
+        assert_eq!(ms5.value[0], 1);
+        assert_eq!(ms5.value[1], 1);
         // regex 在编译期编译，可编译成域位图（对照 dae regexp.Compile）
         let c4 =
             parse_and_compile("domain(regex: '^api[0-9]+\\\\.regex\\\\.test$') -> proxy").unwrap();

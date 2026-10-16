@@ -61,6 +61,7 @@ mod h3client;
 mod hpack;
 mod huffman_table;
 mod hysteria2;
+mod ifwatch;
 mod juicity;
 mod outbound;
 mod quicsniff;
@@ -1380,6 +1381,10 @@ struct Args {
     no_lan: bool,
     /// WAN 侧接口（egress 分流 + ingress 状态刷新）
     wan: Vec<String>,
+    /// 能力缺口 #3：CLI 是否显式给出过 --lan/--wan（决定 config `lan_interface`/`wan_interface`
+    /// 是否回填；默认值 landae/wan 不算显式给出）。
+    lan_given: bool,
+    wan_given: bool,
     /// 单臂模式：同一接口同时挂 LAN/WAN 合用程序（sodama_wan_lan_ingress + sodama_lan_wan_egress）
     dual: Vec<String>,
     dae0: String,
@@ -1692,6 +1697,8 @@ fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
         lan: Vec::new(),
         no_lan: false,
         wan: Vec::new(),
+        lan_given: false,
+        wan_given: false,
         dual: Vec::new(),
         dae0: "dae0".into(),
         dae0peer: "dae0peer".into(),
@@ -1797,6 +1804,9 @@ fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
             other => return Err(format!("unknown option: {other}").into()),
         }
     }
+    // 能力缺口 #3：记录 CLI 是否显式给出接口（config 回填的优先级依据；后面的默认值不算）。
+    args.lan_given = !args.lan.is_empty();
+    args.wan_given = !args.wan.is_empty();
     if args.lan.is_empty() && !args.no_lan && args.dual.is_empty() {
         args.lan.push("landae".into());
     }
@@ -2101,8 +2111,8 @@ fn tc_prog_name(base: &str, l3: bool) -> String {
     }
 }
 
-/// 把 L3 接口的 ifindex 登记进 `l3_ifindex_map`（回程路径 `sodama0_ingress` 据此剥链路头）。
-fn register_l3_ifindex(ebpf: &mut Ebpf, ifname: &str) -> Result<(), Box<dyn std::error::Error>> {
+/// 把 L3 接口的 ifindex 登记进 `l3_ifindex_map`（回程路径 `sodama0_ingress` 据此跳过 MAC 改写）。
+fn register_l3_ifindex(ebpf: &mut Ebpf, ifname: &str) -> Result<u32, Box<dyn std::error::Error>> {
     let idx = if_nametoindex(ifname)?;
     let map = ebpf
         .map_mut("l3_ifindex_map")
@@ -2110,7 +2120,81 @@ fn register_l3_ifindex(ebpf: &mut Ebpf, ifname: &str) -> Result<(), Box<dyn std:
     let mut hm: HashMap<_, u32, u8> = HashMap::try_from(map)?;
     hm.insert(idx, 1u8, 0)?;
     log(&format!("link-hdr: {ifname} 登记为 L3（ifindex={idx}）"));
+    Ok(idx)
+}
+
+/// 接口消失时按记下的 ifindex 清理 `l3_ifindex_map`。
+/// 必须清：设备删除后 ifindex 会被复用，留旧条目会把新设备错认成 L3（回程不作 MAC 改写）。
+fn unregister_l3_ifindex(ebpf: &mut Ebpf, idx: u32) -> Result<(), Box<dyn std::error::Error>> {
+    let map = ebpf
+        .map_mut("l3_ifindex_map")
+        .ok_or("map l3_ifindex_map not found")?;
+    let mut hm: HashMap<_, u32, u8> = HashMap::try_from(map)?;
+    hm.remove(&idx)?;
     Ok(())
+}
+
+/// 能力缺口 #3：挂一个接口上某角色要求的全部钩子（L2/L3 按接口类型自动选变体；
+/// L3 接口登记 `l3_ifindex_map`）。启动挂载与热插拔 watcher 共用；
+/// 返回 `Some(ifindex)` 表示该接口按 L3 登记（供消失时清理）。
+fn attach_role(
+    ebpf: &mut Ebpf,
+    iface: &str,
+    role: ifwatch::Role,
+    link_hdr: LinkHdrMode,
+) -> Result<Option<u32>, Box<dyn std::error::Error>> {
+    let l3 = link_hdr_len(iface, link_hdr) == 0;
+    let l3_idx = if l3 {
+        Some(register_l3_ifindex(ebpf, iface)?)
+    } else {
+        None
+    };
+    match role {
+        ifwatch::Role::Lan => attach(
+            ebpf,
+            &tc_prog_name("sodama_lan_ingress", l3),
+            iface,
+            TcAttachType::Ingress,
+        )?,
+        ifwatch::Role::Wan => {
+            attach(
+                ebpf,
+                &tc_prog_name("sodama_wan_egress", l3),
+                iface,
+                TcAttachType::Egress,
+            )?;
+            attach(
+                ebpf,
+                &tc_prog_name("sodama_wan_ingress", l3),
+                iface,
+                TcAttachType::Ingress,
+            )?;
+        }
+        ifwatch::Role::Dual => {
+            attach(
+                ebpf,
+                &tc_prog_name("sodama_wan_lan_ingress", l3),
+                iface,
+                TcAttachType::Ingress,
+            )?;
+            attach(
+                ebpf,
+                &tc_prog_name("sodama_lan_wan_egress", l3),
+                iface,
+                TcAttachType::Egress,
+            )?;
+        }
+    }
+    Ok(l3_idx)
+}
+
+/// 能力缺口 #3：config `lan_interface`/`wan_interface` 的逗号/空白分隔解析。
+fn split_iface_list(s: &str) -> Vec<String> {
+    s.split([',', ' ', '\t'])
+        .map(|x| x.trim())
+        .filter(|x| !x.is_empty())
+        .map(|x| x.to_string())
+        .collect()
 }
 
 fn attach(
@@ -2420,8 +2504,16 @@ fn serve(listener: TcpListener) {
 
 fn handle_tproxy_conn(mut stream: TcpStream) {
     // P3b-1：TCP DNS（落到 tproxy 的 53 端口）交给 host ns 的 DNS 处理线程。
+    // 能力缺口 #1：但 `must` 的 DNS 流**不被劫持**（dae `routing.md`：must_groupname
+    // 不劫持/处理 DNS）——按普通代理连接继续往下走（relay / 回显夹具）。
     if let Ok(dst) = stream.local_addr() {
-        if dst.port() == 53 {
+        let must = stream
+            .peer_addr()
+            .ok()
+            .and_then(|p| lookup_conn_state(p, dst, 6))
+            .map(|st| st.must)
+            .unwrap_or(0);
+        if dst.port() == 53 && must == 0 {
             match TCP_DNS_TX.get() {
                 Some(tx) => match tx.send(stream) {
                     Ok(()) => return, // 连接所有权已移交
@@ -2997,6 +3089,12 @@ fn sodama_tuple_of_proto(remote: SocketAddr, local: SocketAddr, l4proto: u8) -> 
 
 /// P19：按连接 5 元组从 conn_state_map 回读数据面选中的 outbound（raw lookup）。
 fn lookup_conn_outbound(remote: SocketAddr, local: SocketAddr, l4proto: u8) -> Option<u8> {
+    lookup_conn_state(remote, local, l4proto).map(|st| st.outbound)
+}
+
+/// 能力缺口 #1：回读整条 conn_state（含 must）——DNS 交付侧据此区分
+/// 「劫持到控制面」与「must：按普通代理流转发」。
+fn lookup_conn_state(remote: SocketAddr, local: SocketAddr, l4proto: u8) -> Option<SodaConnState> {
     let fd = CONN_STATE_MAP_FD.load(Ordering::Relaxed);
     if fd < 0 {
         return None;
@@ -3018,7 +3116,7 @@ fn lookup_conn_outbound(remote: SocketAddr, local: SocketAddr, l4proto: u8) -> O
     if bpf_map_lookup_raw(fd, keyb, valb).is_err() {
         return None;
     }
-    Some(st.outbound)
+    Some(st)
 }
 
 /// P19：为一条连接选组——数据面选中的用户组优先；查不到/非用户组返回 None（调用方回退默认组）。
@@ -4627,6 +4725,10 @@ fn make_group_runtime(
 /// P34：订阅 URL 规整——`~/` 展开；config 里的裸路径（无 scheme）优先按配置目录解析，
 /// 便于把 `config.dae` 与订阅正文文件（如 `sub1.url`）放同一目录；URL/绝对路径语义不变。
 fn resolve_sub_url(cfg_dir: Option<&Path>, url: &str) -> String {
+    // 能力缺口 #2：先归一化 dae 风格 `http(s)-file://`——缓存键（子 seen/负缓存/节点缓存）
+    // 与去重都以归一化文本为准，避免同一源两种写法各自一份缓存。
+    let normalized = subscribe::normalize_url(url);
+    let url: &str = &normalized;
     let expanded = match url.strip_prefix("~/") {
         Some(rest) => match std::env::var("HOME") {
             Ok(h) => format!("{h}/{rest}"),
@@ -5609,6 +5711,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .collect();
         }
     }
+    // 能力缺口 #3：接口清单也可来自 config（CLI 显式给出优先；逗号分隔，支持 glob 与
+    // `wan_interface: auto`）。回填后主流程与 CLI 路径完全同构（含热插拔 watcher）。
+    if !args.lan_given && !args.no_lan && args.dual.is_empty() {
+        if let Some(v) = cfg_boot_val("lan_interface") {
+            let list = split_iface_list(&v);
+            if !list.is_empty() {
+                log(&format!("lan_interface（config）: {}", list.join(", ")));
+                args.lan = list;
+            }
+        }
+    }
+    if !args.wan_given && args.dual.is_empty() {
+        if let Some(v) = cfg_boot_val("wan_interface") {
+            let list = split_iface_list(&v);
+            if !list.is_empty() {
+                log(&format!("wan_interface（config）: {}", list.join(", ")));
+                args.wan = list;
+            }
+        }
+    }
     if let Some(path) = &args.log_file {
         if open_log_file(path) {
             let _ = LOG_PATH.set(path.clone());
@@ -5875,53 +5997,54 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ---------- 1) host netns：LAN ingress / WAN egress+ingress / dae0 ingress ----------
     let dae0_ifindex = if_nametoindex(&args.dae0)?;
-    for iface in &args.lan {
-        let l3 = link_hdr_len(iface, args.link_hdr) == 0;
-        if l3 {
-            register_l3_ifindex(&mut ebpf, iface)?;
-        }
-        attach(
-            &mut ebpf,
-            &tc_prog_name("sodama_lan_ingress", l3),
-            iface,
-            TcAttachType::Ingress,
-        )?;
+    // 能力缺口 #3：接口懒绑定/热插拔（对照 dae `interface_manager.go`）。
+    // 启动先展开现有接口（模式支持 glob；wan 支持 `auto` = 默认路由接口），
+    // 不存在的（含显式点名）不报错——登记 watcher，出现后主循环自动补挂。
+    let (wan_patterns, auto_notes) = ifwatch::expand_auto(&args.wan);
+    for n in &auto_notes {
+        log(&format!("iface: wan auto {n}"));
     }
-    for iface in &args.wan {
-        let l3 = link_hdr_len(iface, args.link_hdr) == 0;
-        if l3 {
-            register_l3_ifindex(&mut ebpf, iface)?;
-        }
-        attach(
-            &mut ebpf,
-            &tc_prog_name("sodama_wan_egress", l3),
-            iface,
-            TcAttachType::Egress,
-        )?;
-        attach(
-            &mut ebpf,
-            &tc_prog_name("sodama_wan_ingress", l3),
-            iface,
-            TcAttachType::Ingress,
-        )?;
+    let mut specs: Vec<ifwatch::Spec> = Vec::new();
+    for p in &args.lan {
+        specs.push(ifwatch::Spec {
+            role: ifwatch::Role::Lan,
+            pattern: p.clone(),
+        });
     }
-    for iface in &args.dual {
-        let l3 = link_hdr_len(iface, args.link_hdr) == 0;
-        if l3 {
-            register_l3_ifindex(&mut ebpf, iface)?;
+    for p in &wan_patterns {
+        specs.push(ifwatch::Spec {
+            role: ifwatch::Role::Wan,
+            pattern: p.clone(),
+        });
+    }
+    for p in &args.dual {
+        specs.push(ifwatch::Spec {
+            role: ifwatch::Role::Dual,
+            pattern: p.clone(),
+        });
+    }
+    let existing = ifwatch::list_interfaces();
+    for s in &specs {
+        if !existing
+            .iter()
+            .any(|n| ifwatch::pattern_matches(&s.pattern, n))
+        {
+            log(&format!(
+                "iface: {} 模式 \"{}\" 当前无匹配接口（懒绑定：出现后自动挂载）",
+                s.role.tag(),
+                s.pattern
+            ));
         }
-        attach(
-            &mut ebpf,
-            &tc_prog_name("sodama_wan_lan_ingress", l3),
-            iface,
-            TcAttachType::Ingress,
-        )?;
-        attach(
-            &mut ebpf,
-            &tc_prog_name("sodama_lan_wan_egress", l3),
-            iface,
-            TcAttachType::Egress,
-        )?;
+    }
+    let mut ifwatch = ifwatch::IfWatch::new(specs);
+    // 已按 L3 登记的接口：iface 名 → ifindex（消失时按此清理 `l3_ifindex_map`）。
+    let mut l3_mounts: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+    for (iface, roles) in ifwatch.initial() {
+        for role in roles {
+            if let Some(idx) = attach_role(&mut ebpf, &iface, role, args.link_hdr)? {
+                l3_mounts.insert(iface.clone(), idx);
+            }
+        }
     }
     attach(
         &mut ebpf,
@@ -6176,6 +6299,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut ticks: u64 = 0;
     let tick = Duration::from_millis(50);
     let janitor_ticks = (JANITOR_INTERVAL.as_millis() / tick.as_millis()).max(1) as u64;
+    // 能力缺口 #3：热插拔扫描间隔（1s）。扫描成本 = 读 /sys/class/net 目录名 + 模式匹配。
+    let ifwatch_ticks = (Duration::from_secs(1).as_millis() / tick.as_millis()).max(1) as u64;
     loop {
         if SHUTDOWN.load(Ordering::SeqCst) {
             graceful_shutdown();
@@ -6220,6 +6345,44 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // O8：每 30s 回收分配器空闲页（churn 后 RSS 回落；避免高频 trim 抖动）。
             if (ticks / janitor_ticks) % 6 == 0 {
                 trim_allocator();
+            }
+        }
+        // 能力缺口 #3：接口热插拔（新增补挂 / 消失清理；对照 dae interface_manager）
+        if ticks % ifwatch_ticks == 0 {
+            let (added, removed) = ifwatch.poll();
+            for (iface, roles) in added {
+                for role in roles {
+                    match attach_role(&mut ebpf, &iface, role, args.link_hdr) {
+                        Ok(idx) => {
+                            if let Some(idx) = idx {
+                                l3_mounts.insert(iface.clone(), idx);
+                            }
+                            log(&format!(
+                                "hotplug: 接口 {iface} 出现 → 已挂 {} 钩子",
+                                role.tag()
+                            ));
+                        }
+                        Err(e) => log(&format!(
+                            "hotplug: 接口 {iface} 挂 {} 钩子失败: {e}",
+                            role.tag()
+                        )),
+                    }
+                }
+            }
+            for iface in removed {
+                if let Some(idx) = l3_mounts.remove(&iface) {
+                    if let Err(e) = unregister_l3_ifindex(&mut ebpf, idx) {
+                        log(&format!(
+                            "hotplug: 接口 {iface} 的 l3_ifindex_map 清理失败: {e}"
+                        ));
+                    }
+                }
+                if let Ok(mut hooks) = HOOKS.lock() {
+                    hooks.retain(|h| !h.ends_with(&format!("@{iface}")));
+                }
+                log(&format!(
+                    "hotplug: 接口 {iface} 消失 → 已记账（TCX 钩子随 netdev 注销由内核回收）"
+                ));
             }
         }
     }
@@ -7108,6 +7271,15 @@ fn dns_loop(listener: OwnedFd, tx: std::sync::mpsc::Sender<status::MainMsg>) {
             };
             if orig_dst.port() != 53 {
                 // P4b：普通 UDP 代理流量 → NAT 会话表
+                nat_entries.push((data, client, orig_dst));
+                continue;
+            }
+            // 能力缺口 #1：must 的 DNS 流不劫持——按普通 UDP 代理流走 NAT 会话表
+            // （组选择复用 conn_state 回读；数据面只对 must 的 UDP-53 流存 conn_state）。
+            let must = lookup_conn_state(client, orig_dst, 17)
+                .map(|st| st.must)
+                .unwrap_or(0);
+            if must != 0 {
                 nat_entries.push((data, client, orig_dst));
                 continue;
             }

@@ -25,9 +25,24 @@ pub struct ParsedNode {
 const MAX_BODY: usize = 8 * 1024 * 1024;
 const MAX_REDIRECTS: usize = 3;
 
-/// P34：订阅 URL 文件——文件内容只有一行 http(s) URL 时，按该 URL 抓取（一层间接）。
-/// 空文件/多行/非 http(s) 一律当作普通订阅正文（节点列表）。
-fn url_file_target(body: &[u8]) -> Option<&str> {
+/// 能力缺口 #2：dae 的 `http-file://` / `https-file://` scheme（`dae/common/subscription/
+/// subscription.go:171-179`）——去掉 `-file` 后按普通 http(s) 拉取。持久化/回退语义在
+/// sodama 里对所有 http(s) 源统一生效（成功落盘 `sub-cache/<tag>.bin`、失败回退，
+/// 见 `fetch_one_sub`），是 dae `-file` 语义的超集；但**不识别该 scheme 时**旧版会把
+/// `https-file://…` 当本地文件路径去读（ENOENT），dae 风格配置直接失效。
+pub fn normalize_url(url: &str) -> String {
+    if let Some(rest) = url.strip_prefix("https-file://") {
+        format!("https://{rest}")
+    } else if let Some(rest) = url.strip_prefix("http-file://") {
+        format!("http://{rest}")
+    } else {
+        url.to_string()
+    }
+}
+
+/// P34：订阅 URL 文件——文件内容只有一行 http(s)（含 `-file://` 变体）URL 时，按该
+/// URL 抓取（一层间接）。空文件/多行/非 http(s) 一律当作普通订阅正文（节点列表）。
+fn url_file_target(body: &[u8]) -> Option<String> {
     if body.is_empty() || body.len() > 4096 {
         return None;
     }
@@ -35,6 +50,7 @@ fn url_file_target(body: &[u8]) -> Option<&str> {
     if t.is_empty() || t.contains('\n') || t.contains('\r') {
         return None;
     }
+    let t = normalize_url(t);
     if t.starts_with("http://") || t.starts_with("https://") {
         Some(t)
     } else {
@@ -42,9 +58,11 @@ fn url_file_target(body: &[u8]) -> Option<&str> {
     }
 }
 
-/// 拉取订阅正文：支持 `file://`、裸路径、`http://`、`https://`。
+/// 拉取订阅正文：支持 `file://`、裸路径、`http://`、`https://`（含 dae 风格的
+/// `http-file://`/`https-file://`，见 `normalize_url`）。
 pub fn fetch(url: &str, timeout: Duration) -> io::Result<Vec<u8>> {
-    let mut cur = url.to_string();
+    let url = normalize_url(url);
+    let mut cur = url.clone();
     for _ in 0..=MAX_REDIRECTS {
         match fetch_once(&cur, timeout, false)? {
             Fetch::Body(b) => return Ok(b),
@@ -61,7 +79,8 @@ pub fn fetch(url: &str, timeout: Duration) -> io::Result<Vec<u8>> {
 /// 本函数仅在上游全部失败且无缓存可用时作为最后手段，接受不完整正文——
 /// 解出的部分节点仍会经健康探测自我验证。调用方必须记警告日志。
 pub fn fetch_lenient(url: &str, timeout: Duration) -> io::Result<Vec<u8>> {
-    let mut cur = url.to_string();
+    let url = normalize_url(url);
+    let mut cur = url.clone();
     for _ in 0..=MAX_REDIRECTS {
         match fetch_once(&cur, timeout, true)? {
             Fetch::Body(b) => return Ok(b),
@@ -81,7 +100,7 @@ fn fetch_once(url: &str, timeout: Duration, lenient: bool) -> io::Result<Fetch> 
     if let Some(path) = url.strip_prefix("file://") {
         let body = std::fs::read(path)?;
         if let Some(target) = url_file_target(&body) {
-            return fetch(target, timeout).map(Fetch::Body);
+            return fetch(&target, timeout).map(Fetch::Body);
         }
         return Ok(Fetch::Body(body));
     }
@@ -90,7 +109,7 @@ fn fetch_once(url: &str, timeout: Duration, lenient: bool) -> io::Result<Fetch> 
         // （便于把 token 单独放 ~/.config/sodama/subN.url，config 只写文件名）。
         let body = std::fs::read(url)?;
         if let Some(target) = url_file_target(&body) {
-            return fetch(target, timeout).map(Fetch::Body);
+            return fetch(&target, timeout).map(Fetch::Body);
         }
         return Ok(Fetch::Body(body));
     }
@@ -798,15 +817,37 @@ mod tests {
         // P34：subN.url 这类「URL 文件」——只有一行 http(s) URL 才当间接；其余当普通正文
         assert_eq!(
             url_file_target(b"https://example.com/sub?token=x\n"),
-            Some("https://example.com/sub?token=x")
+            Some("https://example.com/sub?token=x".to_string())
         );
         assert_eq!(
             url_file_target(b"http://1.2.3.4:8080/a"),
-            Some("http://1.2.3.4:8080/a")
+            Some("http://1.2.3.4:8080/a".to_string())
+        );
+        // 能力缺口 #2：dae 风格的 `-file://` 变体也当间接，并归一化为普通 http(s)
+        assert_eq!(
+            url_file_target(b"https-file://example.com/sub?token=x\n"),
+            Some("https://example.com/sub?token=x".to_string())
         );
         assert_eq!(url_file_target(b"https://a\nhttps://b\n"), None);
         assert_eq!(url_file_target(b"ss://a@1.1.1.1:1#n"), None);
         assert_eq!(url_file_target(b""), None);
+    }
+
+    #[test]
+    fn normalize_url_maps_dae_file_schemes() {
+        // 能力缺口 #2：`http-file://`/`https-file://` ≡ 去掉 `-file`（dae patch 同义）
+        assert_eq!(
+            normalize_url("https-file://sub.example.com/x?token=t"),
+            "https://sub.example.com/x?token=t"
+        );
+        assert_eq!(
+            normalize_url("http-file://127.0.0.1:9/sub"),
+            "http://127.0.0.1:9/sub"
+        );
+        // 其余形态原样（含 file://、裸路径、普通 http(s)）
+        assert_eq!(normalize_url("file:///tmp/a"), "file:///tmp/a");
+        assert_eq!(normalize_url("/tmp/a"), "/tmp/a");
+        assert_eq!(normalize_url("https://a/b"), "https://a/b");
     }
 
     #[test]

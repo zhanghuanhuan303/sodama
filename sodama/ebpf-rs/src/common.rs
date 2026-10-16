@@ -8,7 +8,10 @@ pub const SODAMA_PACKET_HOST: u32 = 0;
 pub const SODAMA_PACKET_OTHERHOST: u32 = 3;
 pub const AF_INET: u32 = 2;
 
-pub const SODAMA_MAX_MATCH_SET_LEN: u32 = 64;
+/// 可编译 match_set 上限（= dae `Makefile:14` 的 `MAX_MATCH_SET_LEN ?= 1024`；
+/// `routing_map`/`lpm_array_map`/`domain_routing_map` 位图容量均由此推导）。
+/// 数据面扫描为有界循环（`while i < rules_len`，`rules_len` 由本常量经 map 元数据限界）。
+pub const SODAMA_MAX_MATCH_SET_LEN: u32 = 1024;
 pub const SODAMA_EPOCH_SLOT_NUM: u32 = 2;
 pub const SODAMA_EPOCH_SLOT_RESULT_SHIFT: u64 = 41;
 pub const SODAMA_RESULT_MARK_SHIFT: u64 = 8;
@@ -304,7 +307,8 @@ pub const SODAMA_XDP_MAP_SIZE: u32 = 8;
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct SodaDomainRouting {
-    pub bitmap: [u32; 2],
+    /// 位图字数 = MAX_MATCH_SET_LEN/32（1024 → 32；= dae `tproxy.c:380`）。
+    pub bitmap: [u32; (SODAMA_MAX_MATCH_SET_LEN / 32) as usize],
 }
 
 #[repr(C)]

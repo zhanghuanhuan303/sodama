@@ -1,0 +1,15 @@
+# 能力缺口 #1 实验配置模板（test-must 会把它复制到 /tmp 后运行中改写：
+# `must_proxy` → `proxy`，用 DNS 计数器做 must 语义的 A/B 断言）。
+#
+# must 语义（dae `docs/zh/configuration/routing.md`）：`(must)` = 必须走该出站且
+# **不劫持/处理 DNS**——普通 `proxy` 会把 53 端口流量劫持到控制面 DNS，`must_proxy`
+# 不会（走代理出站）。本配置无 dialer 会话里，未劫持的 UDP 53 包不产生 DNS 计数。
+global {
+    tproxy_port: 12345
+}
+
+routing {
+    l4proto(udp) && dport(53) -> must_proxy
+
+    fallback: direct
+}

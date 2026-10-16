@@ -1,10 +1,13 @@
-//! 规则 VM（有界循环扫描 + LPM array-of-maps + 双 epoch 槽），与 C `sodama_route*` 等价。
+//! 规则 VM（`bpf_loop` 扫描 + LPM array-of-maps + 双 epoch 槽），与 C `sodama_route*` 等价。
 //!
-//! 用有界循环（`rules_len <= 64` 已先验证明）而非 `bpf_loop`：aya-obj 对回调函数
-//! 指针的 relocation 不产生内核要求的 `BPF_PSEUDO_FUNC` 形式（实测 verifier 报
-//! `callback function not static`），内核 >= 5.3 对特权程序支持 bounded loop，语义相同。
+//! 扫描用内核 `bpf_loop` helper（>= 5.17，矩阵门槛同款）：verifier 成本与迭代数无关，
+//! 因此 match_set 上界可与 dae 默认值对齐（1024）。回调经 aya-obj 的 `BPF_PSEUDO_FUNC`
+//! relocation（aya-obj 0.3.0 已支持：`relocation.rs` 对非调用的文本引用设置
+//! `BPF_PSEUDO_FUNC`）——早期（P8）曾报 `callback function not static`，那是旧版 aya-obj
+//! 把函数指针发射成 `BPF_PSEUDO_CALL` 的缺口；现在不再需要「有界循环替代」。
 
 use aya_ebpf::btf_maps::lpm_trie::Key;
+use aya_ebpf_bindings::helpers::bpf_loop;
 
 use crate::common::*;
 use crate::maps::*;
@@ -21,7 +24,7 @@ unsafe fn route_loop_cb(ctx: *mut SodaRouteCtx, index: u32) -> i32 {
         return 1;
     };
     if ((*ctx).state & (SODAMA_STATE_BAD_RULE | SODAMA_STATE_GOOD_SUBRULE)) == 0
-        && route_eval_match(ctx, ms, index) != 0
+        && route_eval_match(ctx, ms) != 0
     {
         return 1;
     }
@@ -42,12 +45,20 @@ unsafe fn route_match_lpm(ctx: *mut SodaRouteCtx, ms: &SodaMatchSet, key: &SodaL
     0
 }
 
-unsafe fn route_match_domain_set(ctx: *mut SodaRouteCtx, index: u32) -> i32 {
-    if index >= SODAMA_MAX_MATCH_SET_LEN {
+unsafe fn route_match_domain_set(ctx: *mut SodaRouteCtx, ms: &SodaMatchSet) -> i32 {
+    // word_idx/bit 由 loader 预计算写进 `value[0..2]`（对照 dae addDomain 的位下标）。
+    // 不从循环下标推导：`bpf_loop` 回调的 u32 参数会被 LLVM 二次物化（校验得到的
+    // 上界不随下游使用），verifier 会把 `bitmap[(index>>5)]` 报为越界可能（实测）。
+    // 从 map 读出的 u8 经下面的检查即可获得 verifier 可证的上界（与 LPM 分支同款）。
+    let word_idx = ms.u.value[0] as u32;
+    let bit = (ms.u.value[1] as u32) & 31;
+    // 注意：不要写「word_idx >= 32 || bit >= 32」两个同形检查——LLVM 会合并成一个
+    // (word_idx|bit) >= 32，verifier 无法从合并条件回推 word_idx ≤ 31（实测：
+    // bitmap 越界报错）。bit 用 & 31（loader 恒写 <32，掩码在可达路径上是恒等）。
+    if word_idx >= SODAMA_MAX_MATCH_SET_LEN / 32 {
         (*ctx).result = EFAULT;
         return 1;
     }
-    let word_idx = index >> 5;
     if (*ctx).domain_word_cached == 0 || (*ctx).domain_word_idx != word_idx {
         let d = (*ctx).lpm_daddr.data;
         let daddr = SodaRoutingEpochIp {
@@ -67,15 +78,15 @@ unsafe fn route_match_domain_set(ctx: *mut SodaRouteCtx, index: u32) -> i32 {
         (*ctx).domain_word_bits = bits;
         (*ctx).domain_word_cached = 1;
     }
-    if ((*ctx).domain_word_bits >> (index % 32)) & 1 != 0 {
+    if ((*ctx).domain_word_bits >> bit) & 1 != 0 {
         (*ctx).state |= SODAMA_STATE_GOOD_SUBRULE;
     }
     0
 }
 
-unsafe fn route_eval_match(ctx: *mut SodaRouteCtx, ms: &SodaMatchSet, index: u32) -> i32 {
+unsafe fn route_eval_match(ctx: *mut SodaRouteCtx, ms: &SodaMatchSet) -> i32 {
     match ms.type_ {
-        SODAMA_MATCH_DOMAIN_SET => route_match_domain_set(ctx, index),
+        SODAMA_MATCH_DOMAIN_SET => route_match_domain_set(ctx, ms),
         SODAMA_MATCH_IP_SET => route_match_lpm(ctx, ms, &(*ctx).lpm_daddr),
         SODAMA_MATCH_SOURCE_IP_SET => route_match_lpm(ctx, ms, &(*ctx).lpm_saddr),
         SODAMA_MATCH_MAC => route_match_lpm(ctx, ms, &(*ctx).lpm_mac),
@@ -234,15 +245,36 @@ pub unsafe fn sodama_route(pkt: &SodaParseResult, is_wan: u8, pname: &[u8; 16]) 
         return EPERM;
     }
 
-    let mut i = 0u32;
-    while i < rules_len {
-        if route_loop_cb(ctx, i) != 0 {
-            break;
-        }
-        i += 1;
+    // bpf_loop（helper 181；内核 >= 5.17）：verifier 成本与迭代数无关——旧的有界循环
+    // 在 64 → 512/1024 时撞 1M processed insn 墙（实测 ≈4600 insn/迭代 ⇒ 上限 ≈217）。
+    // 回调返回 0 = 继续、1 = 停止（命中规则）——与 dae bpf_loop 用法一致。
+    // ctx 必须传栈指针或 NULL（内核 ARG_PTR_TO_STACK_OR_NULL）——传 NULL，回调自行
+    // 从 `route_ctx_scratch_map`（per-CPU，TC 上下文禁抢占，同 CPU 一致性成立）取回。
+    let rc = unsafe {
+        bpf_loop(
+            rules_len,
+            route_bpf_loop_cb as *const () as *mut core::ffi::c_void,
+            core::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc < 0 {
+        return EFAULT;
     }
     if (*ctx).result >= 0 {
         return (*ctx).result;
     }
     EPERM
+}
+
+/// `bpf_loop` 回调适配层（内核 ABI：`extern "C" fn(u32 index, *mut c_void ctx) -> i64`；
+/// 返回 0 = 继续、1 = 停止）。经 aya-obj 的 `BPF_PSEUDO_FUNC` relocation 链接。
+/// ctx 参数传 NULL（内核只允许栈指针/NULL）：上下文从 per-CPU scratch map 取回。
+/// index 的边界检查在 `route_loop_cb` 内（那里不依赖回调参数做数组下标——domain 位图
+/// 的 word/bit 已由 loader 预计算进 match_set，见 `route_match_domain_set`）。
+extern "C" fn route_bpf_loop_cb(index: u32, _ctx: *mut core::ffi::c_void) -> i64 {
+    let Some(ctx) = route_ctx_scratch_map.get_ptr_mut(0) else {
+        return 1;
+    };
+    unsafe { route_loop_cb(ctx, index) as i64 }
 }

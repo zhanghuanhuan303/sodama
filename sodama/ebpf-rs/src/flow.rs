@@ -320,7 +320,10 @@ pub unsafe fn split_flow(
             let _ = dns_sender_pname_map.insert(&key, &val, BPF_ANY as u64);
         }
 
-        if !(pkt.l4proto == IPPROTO_UDP && pkt.h_dport == 53) {
+        // 能力缺口 #1：must 的 UDP-53 流要存 conn_state——交付侧（控制面）据此区分
+        // 「劫持到本地 DNS」与「按普通代理流转发」（must 语义，dae routing.md）。
+        // 普通 DNS 不存（保持原热路径开销；端口 53 由交付侧按端口短路）。
+        if !(pkt.l4proto == IPPROTO_UDP && pkt.h_dport == 53) || must != 0 {
             conn_save(&pkt.tuples, outbound, mark, must, pkt.l4proto);
         }
     }
