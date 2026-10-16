@@ -4,7 +4,7 @@
 **如实**（不把未做写成已做）、**有验收条件**（每条给出可判定的完成标准）、
 **与 ADR/parity 互链**（决策理由见 ADR；覆盖度口径见 `parity-status.md`）。
 
-当前状态（dev@e5db7fd + A2 批次（除工程打包）19 项；ADR-0069；单测 346 + ebpf-logic 3；ATLAS v1.8；devlog §23；决策档案 HTML v2.46 / VLESS 提案 v1.9）：
+当前状态（main@bf26316 + A2 批次（除工程打包）19 项；ADR-0069；单测 346 + ebpf-logic 3；ATLAS v1.8；devlog §23；决策档案 HTML v2.46 / VLESS 提案 v1.9）：
 核心数据面复现（K0–K3）、分流主链路、DNS 子系统、出站 12 家族 + shadow-tls 插件、
 真网关可用、规则编译逐字节对拍、M1–M4 性能项（O3/O4/O5/O9）与 O6/O7/O8、
 G1 同机 + 真实节点口径均已交付。以下为余项。
