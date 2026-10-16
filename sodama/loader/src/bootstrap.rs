@@ -106,7 +106,8 @@ fn parse_addrs(resp: &[u8]) -> (Vec<Ipv4Addr>, Vec<Ipv6Addr>) {
 }
 
 /// 单服务器解析：A + AAAA，UDP 截断回退 TCP。
-fn query_server(server: SocketAddr, qname: &str) -> Result<Vec<IpAddr>, String> {
+/// A2 #6：`fallback_resolver` 复用同一查询实现（`sticky.rs` 调用）。
+pub(crate) fn query_server(server: SocketAddr, qname: &str) -> Result<Vec<IpAddr>, String> {
     let udp = crate::outbound::new_marked_udp_for(server)
         .map_err(|e| format!("bootstrap 建 UDP socket 失败: {e}"))?;
     udp.set_read_timeout(Some(QUERY_TIMEOUT)).ok();

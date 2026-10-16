@@ -86,6 +86,7 @@ mod ssr_cipher;
 mod status;
 mod sticky;
 mod subscribe;
+mod sysctl;
 mod target;
 mod tls;
 mod tls13;
@@ -1044,6 +1045,8 @@ struct SodaConfig {
     dae0_ifindex: u32,
     datapath_generation: u16,
     dae0peer_mac: [u8; 6],
+    /// A2 #6：控制面 socket 的 SO_MARK（`so_mark_from_dae`；数据面据此跳过自环）。
+    so_mark: u32,
 }
 unsafe impl aya::Pod for SodaConfig {}
 
@@ -2097,6 +2100,205 @@ fn log_debug(msg: &str) {
     log_at(4, msg);
 }
 
+/// A2 #6：读 global 布尔的统一口径（true/1/yes/on/enable 为真）。
+fn global_on(cfg: Option<&config::Config>, key: &str) -> bool {
+    cfg.and_then(|c| config::global_value(c, key))
+        .map(|v| matches!(v.trim(), "true" | "1" | "yes" | "on" | "enable"))
+        .unwrap_or(false)
+}
+
+/// A2 #6：**global 生效面**——把本批落地的旋钮接上消费点，并对仍未生效的键**显式告警**
+/// （清点口径要求：解析不生效不能静默；见 ADR-0069 的偏离/余项清单）。
+fn apply_global_effective_knobs(cfg: Option<&config::Config>, args: &Args) {
+    let g = |k: &str| cfg.and_then(|c| config::global_value(c, k));
+
+    // so_mark_from_dae：控制面自身 socket 的 SO_MARK（默认编译期 0x233）。
+    if let Some(v) = g("so_mark_from_dae") {
+        let t = v.trim();
+        let parsed = if let Some(hex) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+            u32::from_str_radix(hex, 16).ok()
+        } else {
+            t.parse::<u32>().ok()
+        };
+        match parsed {
+            Some(m) => {
+                outbound::set_so_mark(m);
+                log(&format!("so_mark_from_dae: 0x{m:x}（控制面 socket 标记）"));
+            }
+            None => log_warn(&format!(
+                "so_mark_from_dae '{t}' 非法（0x…/十进制），用默认 0x233"
+            )),
+        }
+    }
+    // mptcp / allow_insecure / udphop_interval / fallback_resolver。
+    if global_on(cfg, "mptcp") {
+        outbound::set_mptcp(true);
+        log("mptcp: 拨号 socket 启用 IPPROTO_MPTCP（不支持的内核会回落 TCP 并告警）");
+    }
+    if global_on(cfg, "allow_insecure") {
+        outbound::set_allow_insecure_default(true);
+        log("allow_insecure: 全局默认跳过 TLS 证书校验（节点参数优先）");
+    }
+    if let Some(v) = g("udphop_interval") {
+        match parse_duration_secs(&v) {
+            Some(secs) if secs >= 5 => {
+                outbound::set_udphop_default(secs);
+                log(&format!(
+                    "udphop_interval: {secs}s（hy2 节点默认端口跳跃间隔）"
+                ));
+            }
+            _ => log_warn(&format!("udphop_interval '{v}' 非法（≥5s 的时长），忽略")),
+        }
+    }
+    if let Some(v) = g("fallback_resolver") {
+        match crate::sticky::set_fallback_resolver(&v) {
+            Ok(()) => log(&format!("fallback_resolver: {v}（节点域名兜底解析）")),
+            Err(e) => log_warn(&format!("{e}（忽略）")),
+        }
+    }
+    // disable_thp：仅影响本进程（对照 dae `PR_SET_THP_DISABLE`；不改系统全局策略）。
+    if global_on(cfg, "disable_thp") {
+        let rc = unsafe { libc::prctl(libc::PR_SET_THP_DISABLE, 1u64, 0u64, 0u64, 0u64) };
+        if rc == 0 {
+            log("disable_thp: 本进程已退出 THP（PR_SET_THP_DISABLE）");
+        } else {
+            log_warn("disable_thp: prctl 失败（旧内核？），忽略");
+        }
+    }
+
+    // 未生效键的显式告警（清点要求；后续批次逐项补齐，见 ADR-0069 余项）。
+    const INERT_KEYS: &[&str] = &[
+        "tls_fragment",
+        "tls_fragment_length",
+        "tls_fragment_interval",
+        "utls_imitate",
+        "tls_implementation",
+        "pprof_port",
+        "bandwidth_max_tx",
+        "bandwidth_max_rx",
+    ];
+    let inert: Vec<String> = INERT_KEYS
+        .iter()
+        .filter(|k| g(k).is_some())
+        .map(|k| (*k).to_string())
+        .collect();
+    if !inert.is_empty() {
+        log_warn(&format!(
+            "config global 中 {} 项已解析但当前不生效：{}（见 docs/capability-gap-review.md §2 / ADR-0069）",
+            inert.len(),
+            inert.join(", ")
+        ));
+    }
+    let _ = args;
+}
+
+/// A2 #6：`auto_config_kernel_parameter`——写内核参数并登记期望值（被改回即纠正）。
+/// 对照 dae `control_plane_datapath.go:133-175` + `SetForwarding/SetSendRedirects`：
+/// - 全局：`net.ipv4.ip_forward=1`、`net.ipv6.conf.all.forwarding=1`；
+/// - 每个 LAN 接口：`conf/<if>/{ipv4,ipv6}/forwarding=1`、`ipv4/conf/<if>/send_redirects=0`；
+/// - 每个 WAN 接口：`conf/<if>.accept_ra == 1` 时改为 `2`（IPv6 自动配置仍可用）。
+fn auto_configure_kernel_parameters(args: &Args) {
+    const SYS: &str = "/proc/sys/net";
+    let mut applied = 0usize;
+    let mut failed = 0usize;
+    let mut set_watched = |path: String, val: &str| {
+        let p = std::path::Path::new(&path);
+        match sysctl::set(p, val, true) {
+            Ok(_) => applied += 1,
+            Err(e) => {
+                failed += 1;
+                log_warn(&format!("auto_config_kernel_parameter: {e}"));
+            }
+        }
+    };
+    set_watched(format!("{SYS}/ipv4/ip_forward"), "1");
+    set_watched(format!("{SYS}/ipv6/conf/all/forwarding"), "1");
+    let lan: Vec<String> = args
+        .lan
+        .iter()
+        .filter(|s| !s.contains('*'))
+        .cloned()
+        .collect();
+    for ifname in &lan {
+        set_watched(format!("{SYS}/ipv4/conf/{ifname}/forwarding"), "1");
+        set_watched(format!("{SYS}/ipv6/conf/{ifname}/forwarding"), "1");
+        set_watched(format!("{SYS}/ipv4/conf/{ifname}/send_redirects"), "0");
+    }
+    // WAN accept_ra：dae 只在当前值为 1 时改为 2（不改用户显式关闭/强制开启）。
+    let wan: Vec<String> = args
+        .wan
+        .iter()
+        .filter(|s| !s.contains('*'))
+        .cloned()
+        .collect();
+    for ifname in &wan {
+        let p = format!("{SYS}/ipv6/conf/{ifname}/accept_ra");
+        if sysctl::read_value(std::path::Path::new(&p))
+            .map(|v| v == "1")
+            .unwrap_or(false)
+        {
+            set_watched(p, "2");
+        }
+    }
+    sysctl::start_watcher();
+    log(&format!(
+        "auto_config_kernel_parameter: 写入 {applied} 项（失败 {failed}），已登记期望值（被改回即纠正）"
+    ));
+}
+
+/// A2 #6：启动等待网络（对照 dae `waitForNetworkOnline`）——判定：默认路由存在
+/// 且（若配置了 fallback_resolver/bootstrap）DNS 能应答；最长 `timeout` 秒，
+/// 每 2s 重试；超时只告警（订阅照样拉，本地节点照常用——dae 同语）。
+fn wait_for_network(timeout: Duration) {
+    fn has_default_route() -> bool {
+        std::fs::read_to_string("/proc/net/route")
+            .map(|t| {
+                t.lines()
+                    .skip(1)
+                    .any(|l| l.split_whitespace().nth(1) == Some("00000000"))
+            })
+            .unwrap_or(true)
+    }
+    fn ipv6_default_route() -> bool {
+        std::fs::read_to_string("/proc/net/ipv6_route")
+            .map(|t| t.lines().any(|l| l.split_whitespace().nth(1) == Some("00")))
+            .unwrap_or(true)
+    }
+    let start = Instant::now();
+    let mut attempts = 0u32;
+    loop {
+        attempts += 1;
+        if (has_default_route() || ipv6_default_route()) && dns_probe_ok() {
+            if attempts > 1 {
+                log(&format!(
+                    "网络已就绪（{attempts} 次探测，{:?}）",
+                    start.elapsed()
+                ));
+            }
+            return;
+        }
+        if start.elapsed() >= timeout {
+            log_warn(&format!(
+                "等待网络超时（{:?}，{attempts} 次探测）：仍继续拉订阅，本地节点可用；可设 disable_waiting_network: true 跳过",
+                start.elapsed()
+            ));
+            return;
+        }
+        std::thread::sleep(Duration::from_secs(2));
+    }
+}
+
+/// A2 #6：DNS 可达性探测（有配置的解析器就用解析器，否则一次系统解析）。
+fn dns_probe_ok() -> bool {
+    if let Some(f) = crate::sticky::fallback_resolver() {
+        return crate::bootstrap::query_server(f, "example.com").is_ok();
+    }
+    match std::net::ToSocketAddrs::to_socket_addrs(&("example.com", 80u16)) {
+        Ok(mut it) => it.next().is_some(),
+        Err(_) => false,
+    }
+}
+
 /// A2 #6：`log_level` 取值 → 内部级别（对照 dae logrus：panic/fatal/error/warn/info/debug/trace）。
 fn parse_log_level(s: &str) -> Option<u32> {
     match s.trim().to_ascii_lowercase().as_str() {
@@ -2579,7 +2781,12 @@ fn make_transparent_listener(port: u16) -> Result<TcpListener, Box<dyn std::erro
             one,
         ),
         (libc::SOL_SOCKET, libc::SO_REUSEADDR, "SO_REUSEADDR", one),
-        (libc::SOL_SOCKET, libc::SO_MARK, "SO_MARK", DAE_SOCKET_MARK),
+        (
+            libc::SOL_SOCKET,
+            libc::SO_MARK,
+            "SO_MARK",
+            outbound::SO_MARK_VALUE.load(Ordering::Relaxed) as libc::c_int,
+        ),
     ] {
         let rc = unsafe {
             libc::setsockopt(
@@ -2642,7 +2849,12 @@ fn make_transparent_listener6(port: u16) -> Result<TcpListener, Box<dyn std::err
         ),
         (libc::IPPROTO_IPV6, libc::IPV6_V6ONLY, "IPV6_V6ONLY", one),
         (libc::SOL_SOCKET, libc::SO_REUSEADDR, "SO_REUSEADDR", one),
-        (libc::SOL_SOCKET, libc::SO_MARK, "SO_MARK", DAE_SOCKET_MARK),
+        (
+            libc::SOL_SOCKET,
+            libc::SO_MARK,
+            "SO_MARK",
+            outbound::SO_MARK_VALUE.load(Ordering::Relaxed) as libc::c_int,
+        ),
     ] {
         let rc = unsafe {
             libc::setsockopt(
@@ -6882,6 +7094,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ));
         }
     }
+    // A2 #6：global 生效面（本批落地 8 项 + 未项显式告警；见 ADR-0069）。
+    apply_global_effective_knobs(cfg_boot.as_ref(), &args);
+    // A2 #6：`auto_config_kernel_parameter`（写 ip_forward/forwarding/send_redirects +
+    // `accept_ra`；sysctl 管理器登记期望值，被改回即纠正——见 `sysctl.rs`）。
+    if global_on(cfg_boot.as_ref(), "auto_config_kernel_parameter") {
+        auto_configure_kernel_parameters(&args);
+    }
+    // A2 #6：`disable_waiting_network`（默认 false = 启动先等网络就绪再拉订阅，
+    // 对照 dae `waitForNetworkOnline`；超时/跳过都只告警不阻断启动）。
+    if !global_on(cfg_boot.as_ref(), "disable_waiting_network") {
+        wait_for_network(Duration::from_secs(30));
+    }
 
     let _ = STARTED.set(Instant::now());
     TPROXY_PORT.store(args.tproxy_port as u32, Ordering::SeqCst);
@@ -7343,6 +7567,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 dae0_ifindex,
                 datapath_generation: generation,
                 dae0peer_mac,
+                so_mark: outbound::SO_MARK_VALUE.load(Ordering::Relaxed),
             },
             0,
         )?;
@@ -7764,12 +7989,12 @@ fn raw_udp_send(from: SocketAddr, to: SocketAddr, payload: &[u8]) -> std::io::Re
         transparent,
         1,
     )?;
-    // SO_MARK（与 dae 同语义：避开自己的钩子；失败不致命）。
+    // SO_MARK（与 dae 同语义：避开自己的钩子；失败不致命；值可配 `so_mark_from_dae`）。
     let _ = set_int_opt(
         fd.as_raw_fd(),
         libc::SOL_SOCKET,
         libc::SO_MARK,
-        DAE_SOCKET_MARK,
+        outbound::SO_MARK_VALUE.load(Ordering::Relaxed) as libc::c_int,
     );
     // bind 伪造源 IP（端口用 0：端口写在自构 UDP 头里；对照 dae 只绑地址）。
     let (st, len) = sockaddr_any_of(from);
@@ -11337,6 +11562,10 @@ fn status_json(ebpf: &mut Ebpf) -> serde_json::Value {
             "event_drops": stats.event_drops,
         },
         "events": events_json(&stats),
+        "sysctl": {
+            "watched": sysctl::expectations().len(),
+            "rewrites": sysctl::rewrites(),
+        },
         "trace": {
             "active": TRACE_UNTIL_NS.load(Ordering::Relaxed) > monotonic_now_ns(),
             "file": TRACE_PATH.get().map(|p| p.display().to_string()),

@@ -16,7 +16,7 @@
 //! 修正为「每次拨号」——接入点是 `outbound::marked_tcp_connect`（§resolve_for_dial）。
 
 use std::collections::HashMap;
-use std::net::{SocketAddr, ToSocketAddrs};
+use std::net::SocketAddr;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -38,6 +38,61 @@ struct State {
     /// 已解析地址 → 域名 host:port（拨号失败/重解析只能拿到地址；
     /// 条目被作废后 origin 仍保留——不然没法知道该重解析谁）。
     origin: HashMap<SocketAddr, String>,
+}
+
+/// A2 #6：`fallback_resolver`（对照 dae `global.fallback_resolver`，默认 8.8.8.8:53）——
+/// 节点域名解析的兜底 DNS（bootstrap 未配置/无结果时使用；再不行回系统解析器）。
+static FALLBACK_RESOLVER: OnceLock<SocketAddr> = OnceLock::new();
+
+/// A2 #6：配置 `fallback_resolver`（`host:port`）。
+pub fn set_fallback_resolver(v: &str) -> Result<(), String> {
+    let s: SocketAddr = v
+        .trim()
+        .parse()
+        .map_err(|e| format!("fallback_resolver 非法 {v:?}: {e}"))?;
+    let _ = FALLBACK_RESOLVER.set(s);
+    Ok(())
+}
+
+pub fn fallback_resolver() -> Option<SocketAddr> {
+    FALLBACK_RESOLVER.get().copied()
+}
+
+/// A2 #6：节点域名解析顺序——bootstrap（若配置）→ fallback_resolver（若配置）→ 系统解析器。
+/// 前两者都「尽力而为」：失败继续下一档（不把兜底错误放大成主错误）。
+fn resolve_ips(host: &str) -> Result<Vec<std::net::IpAddr>, String> {
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return Ok(vec![ip]);
+    }
+    let mut last = String::new();
+    if crate::bootstrap::enabled() {
+        match crate::bootstrap::resolve_host(host) {
+            Ok(v) if !v.is_empty() => return Ok(v),
+            Ok(_) => last = format!("bootstrap 无 {host} 的记录"),
+            Err(e) => last = e,
+        }
+    }
+    if let Some(f) = fallback_resolver() {
+        match crate::bootstrap::query_server(f, host) {
+            Ok(v) if !v.is_empty() => {
+                crate::log(&format!("fallback_resolver: {host} → {v:?}（{f}）"));
+                return Ok(v);
+            }
+            Ok(_) => last = format!("fallback_resolver {f} 无 {host} 的记录"),
+            Err(e) => last = e,
+        }
+    }
+    let addrs: Vec<std::net::IpAddr> = std::net::ToSocketAddrs::to_socket_addrs(&(host, 0))
+        .map_err(|e| {
+            if last.is_empty() {
+                format!("解析 {host} 失败: {e}")
+            } else {
+                format!("解析 {host} 失败: {e}（此前: {last}）")
+            }
+        })?
+        .map(|sa| sa.ip())
+        .collect();
+    Ok(addrs)
 }
 
 fn state() -> &'static Mutex<State> {
@@ -103,9 +158,11 @@ pub fn resolve(hostport: &str) -> Result<SocketAddr, String> {
     resolve_with(
         hostport,
         |hp| {
-            let addrs: Vec<SocketAddr> = hp
-                .to_socket_addrs()
-                .map_err(|e| format!("解析 {hp} 失败: {e}"))?
+            let (host, port) = hp.rsplit_once(':').unwrap_or((hp, "0"));
+            let port: u16 = port.parse().unwrap_or(0);
+            let addrs: Vec<SocketAddr> = resolve_ips(host)?
+                .into_iter()
+                .map(|ip| SocketAddr::new(ip, port))
                 .collect();
             Ok(addrs)
         },
@@ -126,9 +183,11 @@ pub fn resolve_for_dial(pinned: SocketAddr) -> SocketAddr {
     resolve_for_dial_with(
         pinned,
         |hp| {
-            let addrs: Vec<SocketAddr> = hp
-                .to_socket_addrs()
-                .map_err(|e| format!("解析 {hp} 失败: {e}"))?
+            let (host, port) = hp.rsplit_once(':').unwrap_or((hp, "0"));
+            let port: u16 = port.parse().unwrap_or(0);
+            let addrs: Vec<SocketAddr> = resolve_ips(host)?
+                .into_iter()
+                .map(|ip| SocketAddr::new(ip, port))
                 .collect();
             Ok(addrs)
         },

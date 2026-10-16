@@ -139,6 +139,9 @@ pub struct SodaConfig {
     /// 语义对齐在「同 4 元组纯 SYN」判定上。
     pub datapath_generation: u16,
     pub dae0peer_mac: [u8; 6],
+    /// A2 #6：控制面自身 socket 的 SO_MARK（`so_mark_from_dae`，默认
+    /// `SODAMA_DAE_SOCKET_MARK`；数据面按它跳过自环）。
+    pub so_mark: u32,
 }
 
 #[repr(C)]

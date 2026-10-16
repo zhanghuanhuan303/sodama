@@ -10,7 +10,7 @@
 |---|---|---|---|
 | `tproxy_port` | tproxy 监听端口（实际仅 CLI `--tproxy-port` 生效） | `12345` | ⚠️ 无消费点 |
 | `tproxy_port_protect` | 保护 tproxy 端口的防火墙标记（dae 与本实现两端均为空置字段） | `0x8000000` | ⚠️ 无消费点 |
-| `so_mark_from_dae` | 控制面 socket 标记（数据面硬编码 0x233） | `0x233` | ⚠️ 无消费点 |
+| `so_mark_from_dae` | 控制面自身 socket 的 SO_MARK（数据面按同值跳过自环） | `0x233` | ✅ |
 | `log_level` | 日志级别（off/error/warning/info/debug；默认 info） | `info` | ✅ |
 | `tcp_check_url` | 组健康检查目标（tcp） | `http://cp.cloudflare.com` | ✅ |
 | `tcp_check_http_method` | 探测 HTTP 方法（大写白名单；非法回退 CONNECT） | `HEAD` | ✅ |
@@ -19,27 +19,27 @@
 | `check_tolerance` | 连续失败容忍次数 | `1` | ✅ |
 | `lan_interface` | LAN 接口（逗号分隔；支持 glob/auto） | `landae（CLI 默认）` | ✅ |
 | `wan_interface` | WAN 接口（逗号分隔；auto = 默认路由接口；1s 轮询热插拔） | `wan（CLI 默认）` | ✅ |
-| `allow_insecure` | 跳过 TLS 证书验证（仅在节点参数侧生效） | `false` | ⚠️ 无消费点 |
+| `allow_insecure` | 跳过 TLS 证书验证（全局默认；节点参数优先） | `false` | ✅ |
 | `dial_mode` | 拨号模式 ip|domain|domain+|domain++ | `ip` | ✅ |
-| `disable_waiting_network` | 启动时不等待网络就绪 | `false` | ⚠️ 无消费点 |
-| `disable_thp` | 禁用透明大页（THP） | `false` | ⚠️ 无消费点 |
+| `disable_waiting_network` | 启动时不等待网络就绪（默认会等到默认路由+DNS 可达或超时 30s） | `false` | ✅ |
+| `disable_thp` | 本进程退出透明大页（PR_SET_THP_DISABLE；不改系统全局） | `false` | ✅ |
 | `enable_local_tcp_fast_redirect` | 本机 TCP 快速重定向 | `false` | ⚠️ 无消费点 |
-| `auto_config_kernel_parameter` | 自动写内核参数（sysctl） | `false` | ⚠️ 无消费点 |
+| `auto_config_kernel_parameter` | 自动写内核参数（ip_forward/forwarding/send_redirects/accept_ra；被改回即纠正） | `false` | ✅ |
 | `auto_config_firewall_rule` | 自动配防火墙规则 | `false` | ⚠️ 无消费点 |
 | `sniffing_timeout` | 嗅探等待上限 | `100ms` | ✅ |
 | `auto_sniff_punt` | 嗅探命中后按规则重选出口（等价 CLI `--sniff-punt`） | `false` | ✅ |
-| `tls_implementation` | TLS 实现选择 | — | ⚠️ 无消费点 |
-| `utls_imitate` | uTLS 指纹族 | — | ⚠️ 无消费点 |
-| `tls_fragment` | TLS 分片开关 | — | ⚠️ 无消费点 |
+| `tls_implementation` | TLS 实现选择（暂不生效：仅自实现 uTLS 形态，见 ADR-0069） | — | ⚠️ 无消费点 |
+| `utls_imitate` | uTLS 指纹族（暂不生效：固定 Chrome-120，见 ADR-0069） | — | ⚠️ 无消费点 |
+| `tls_fragment` | TLS 分片开关（暂不生效：见 ADR-0069） | — | ⚠️ 无消费点 |
 | `tls_fragment_length` | TLS 分片长度 | — | ⚠️ 无消费点 |
 | `tls_fragment_interval` | TLS 分片间隔 | — | ⚠️ 无消费点 |
-| `pprof_port` | pprof HTTP 端口 | `0` | ⚠️ 无消费点 |
-| `mptcp` | MPTCP 开关 | `false` | ⚠️ 无消费点 |
+| `pprof_port` | pprof HTTP 端口（暂不生效：Rust 侧无 Go pprof 等价，见 ADR-0069） | `0` | ⚠️ 无消费点 |
+| `mptcp` | MPTCP 开关（拨号 socket 用 IPPROTO_MPTCP；不支持的内核回落 TCP） | `false` | ✅ |
 | `bootstrap_resolver` | 启动期解析器（bootstrap） | — | ✅ |
-| `fallback_resolver` | 回退解析器 | — | ⚠️ 无消费点 |
+| `fallback_resolver` | 节点域名兜底 DNS（bootstrap 之后、系统解析器之前） | — | ✅ |
 | `bandwidth_max_tx` | 发送带宽上限（代理服务端能力） | — | ⚠️ 无消费点 |
 | `bandwidth_max_rx` | 接收带宽上限（代理服务端能力） | — | ⚠️ 无消费点 |
-| `udphop_interval` | hysteria2 端口跳跃间隔（仅在节点参数 `udphop-interval=` 侧生效） | `30s` | ⚠️ 无消费点 |
+| `udphop_interval` | hysteria2 端口跳跃间隔（全局默认；节点 `udphop-interval=` 优先） | `30s` | ✅ |
 | `bpf_conn_state_map_size` | conn_state_map 容量（启动时生效） | `262144` | ✅ |
 | `relay_idle_timeout` | relay 空闲回收秒数 | `300` | ✅ |
 | `udp_idle_timeout` | UDP NAT 会话空闲秒数（普通 NAT 类端点 TTL） | `60` | ✅ |

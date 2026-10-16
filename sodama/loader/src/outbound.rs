@@ -29,8 +29,52 @@ const SO_MARK_OPT: libc::c_int = 36;
 
 /// 打 SO_MARK。lab/生产路径以 root 运行；非 root（例如 cargo test 本机跑跨实现
 /// 单测）降级为告警而不是失败——此时没有数据面，不存在自环风险。
+/// A2 #6：`so_mark_from_dae`——控制面自身 socket 的 SO_MARK（默认 `DAE_SOCKET_MARK`）。
+/// 数据面按 config_map.so_mark 跳过自环（两侧同源：loader 写 config 时读这里）。
+pub static SO_MARK_VALUE: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(DAE_SOCKET_MARK as u32);
+
+/// A2 #6：`mptcp`——拨号 socket 用 IPPROTO_MPTCP（内核不支持时回落 TCP 并一次性告警）。
+static MPTCP_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// A2 #6：`allow_insecure`——节点未显式写 `insecure=`/`allowInsecure=` 时的全局默认。
+static ALLOW_INSECURE_DEFAULT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+/// A2 #6：`udphop_interval`——hy2 节点未写 `udphop-interval=` 时的全局默认（秒；0=用 30s）。
+static UDPHOP_DEFAULT_SECS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static MPTCP_FALLBACK_LOGGED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// A2 #6：设置 SO_MARK（`so_mark_from_dae`；接受 `0x…` 十六进制或十进制）。
+pub fn set_so_mark(v: u32) {
+    SO_MARK_VALUE.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// A2 #6：`mptcp` 开关。
+pub fn set_mptcp(on: bool) {
+    MPTCP_ENABLED.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// A2 #6：`allow_insecure` 全局默认（节点参数优先）。
+pub fn set_allow_insecure_default(on: bool) {
+    ALLOW_INSECURE_DEFAULT.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub(crate) fn allow_insecure_default() -> bool {
+    ALLOW_INSECURE_DEFAULT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// A2 #6：`udphop_interval` 全局默认（秒）。
+pub fn set_udphop_default(secs: u64) {
+    UDPHOP_DEFAULT_SECS.store(secs, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub(crate) fn udphop_default_secs() -> u64 {
+    UDPHOP_DEFAULT_SECS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 fn set_mark_fd(fd: RawFd) -> io::Result<()> {
-    let value: libc::c_int = DAE_SOCKET_MARK;
+    let value: libc::c_int =
+        SO_MARK_VALUE.load(std::sync::atomic::Ordering::Relaxed) as libc::c_int;
     let rc = unsafe {
         libc::setsockopt(
             fd,
@@ -111,13 +155,35 @@ pub fn marked_tcp_connect(addr: SocketAddr, timeout: Duration) -> io::Result<Tcp
             )
         }
     };
-    let raw = unsafe {
+    // A2 #6：`mptcp`——用 IPPROTO_MPTCP 建连（多路径 TCP）。内核对 MPTCP 的支持
+    // 取决于编译配置；socket 失败即回落普通 TCP（一次性告警，不打断拨号）。
+    let proto = if MPTCP_ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
+        libc::IPPROTO_MPTCP
+    } else {
+        0
+    };
+    let mut raw = unsafe {
         libc::socket(
             family,
             libc::SOCK_STREAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
-            0,
+            proto,
         )
     };
+    if raw < 0 && proto != 0 {
+        if !MPTCP_FALLBACK_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            crate::log_warn(&format!(
+                "mptcp: IPPROTO_MPTCP socket 失败（{}），回落普通 TCP",
+                io::Error::last_os_error()
+            ));
+        }
+        raw = unsafe {
+            libc::socket(
+                family,
+                libc::SOCK_STREAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
+                0,
+            )
+        };
+    }
     if raw < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -2195,7 +2261,7 @@ fn parse_anytls(rest: &str) -> Result<Outbound, String> {
         return Err("anytls:// 密码为空".to_string());
     }
     let mut sni: Option<String> = None;
-    let mut insecure = false;
+    let mut insecure = allow_insecure_default();
     for kv in query.split('&').filter(|s| !s.is_empty()) {
         let (k, v) = kv.split_once('=').unwrap_or((kv, ""));
         match k.to_ascii_lowercase().as_str() {
@@ -2236,7 +2302,7 @@ fn parse_naive(rest: &str, h3: bool) -> Result<Outbound, String> {
         None => (percent_decode(userinfo), String::new()),
     };
     let mut sni: Option<String> = None;
-    let mut insecure = false;
+    let mut insecure = allow_insecure_default();
     for kv in query.split('&').filter(|s| !s.is_empty()) {
         let (k, v) = kv.split_once('=').unwrap_or((kv, ""));
         match k.to_ascii_lowercase().as_str() {
@@ -2293,7 +2359,7 @@ fn parse_juicity(rest: &str) -> Result<Outbound, String> {
     let uuid = vless::parse_uuid(&uuid_s).ok_or_else(|| "juicity:// uuid 非法".to_string())?;
     let password = percent_decode(password_raw);
     let mut sni: Option<String> = None;
-    let mut insecure = false;
+    let mut insecure = allow_insecure_default();
     for kv in query.split('&').filter(|s| !s.is_empty()) {
         let (k, v) = kv.split_once('=').unwrap_or((kv, ""));
         match k.to_ascii_lowercase().as_str() {
@@ -2373,7 +2439,7 @@ fn parse_vless(rest: &str) -> Result<Outbound, String> {
         .ok_or_else(|| "vless:// 需要 uuid@host:port".to_string())?;
     let mut use_tls = false;
     let mut sni: Option<String> = None;
-    let mut insecure = false;
+    let mut insecure = allow_insecure_default();
     let mut ws = false;
     let mut ws_host: Option<String> = None;
     let mut ws_path: Option<String> = None;
@@ -2582,7 +2648,7 @@ fn parse_tuic(rest: &str) -> Result<Outbound, String> {
     let password = percent_decode(password_raw);
 
     let mut sni: Option<String> = None;
-    let mut insecure = false;
+    let mut insecure = allow_insecure_default();
     let mut alpn: Option<Vec<Vec<u8>>> = None;
     for kv in query.split('&').filter(|s| !s.is_empty()) {
         let (k, v) = kv.split_once('=').unwrap_or((kv, ""));
@@ -2666,7 +2732,7 @@ fn parse_hysteria2(rest: &str) -> Result<Outbound, String> {
     };
 
     let mut sni: Option<String> = None;
-    let mut insecure = false;
+    let mut insecure = allow_insecure_default();
     let mut max_tx: u64 = 0;
     let mut max_rx: u64 = 0;
     let mut max_tx_param: Option<String> = None;
@@ -2674,7 +2740,9 @@ fn parse_hysteria2(rest: &str) -> Result<Outbound, String> {
     let mut obfs_type: Option<String> = None;
     let mut obfs_password: Option<String> = None;
     let mut cc_override: Option<String> = None;
-    let mut hop_interval = Duration::from_secs(30);
+    // A2 #6：`udphop_interval` 全局默认生效（节点 `udphop-interval=` 优先；最小 5s 同 Go）。
+    let hop_default = udphop_default_secs();
+    let mut hop_interval = Duration::from_secs(if hop_default >= 5 { hop_default } else { 30 });
     for kv in query.split('&').filter(|s| !s.is_empty()) {
         let (k, v) = kv.split_once('=').unwrap_or((kv, ""));
         match k.to_ascii_lowercase().as_str() {
@@ -2995,7 +3063,7 @@ fn parse_shadowtls_plugin(raw: &str) -> Result<shadowtls::ShadowTlsConfig, Strin
     let mut version = 3u8;
     let mut sni: Option<String> = None;
     let mut host: Option<String> = None;
-    let mut allow_insecure = false;
+    let mut allow_insecure = allow_insecure_default();
     for f in fields {
         let f = f.trim();
         if f.is_empty() {
@@ -3036,7 +3104,7 @@ fn parse_trojan(rest: &str) -> Result<Outbound, String> {
         .split_once('@')
         .ok_or_else(|| "trojan:// 需要 password@host:port".to_string())?;
     let mut sni = None;
-    let mut insecure = false;
+    let mut insecure = allow_insecure_default();
     for kv in query.split('&').filter(|s| !s.is_empty()) {
         let (k, v) = kv.split_once('=').unwrap_or((kv, ""));
         match k.to_ascii_lowercase().as_str() {

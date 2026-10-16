@@ -23,10 +23,15 @@ use crate::flow::*;
 use crate::maps::*;
 use crate::parse::{parse_ip, parse_ip_at_reason, ParseSkip};
 
-/// 控制面自己的 socket：直接放行（防自环）。
+/// 控制面自己的 socket：直接放行（防自环）。mark 值来自 config（`so_mark_from_dae`，
+/// A2 #6；缺 config 时回落编译期默认）。
 #[inline(always)]
 fn dae_socket(ctx: &TcContext) -> bool {
-    unsafe { (*ctx.skb.skb).mark == SODAMA_DAE_SOCKET_MARK }
+    let mark = match config_map.get(0) {
+        Some(c) => c.so_mark,
+        None => SODAMA_DAE_SOCKET_MARK,
+    };
+    unsafe { (*ctx.skb.skb).mark == mark }
 }
 
 /// 带原因计数的解析：分片尾/L4 不支持分别计数后直通（对照 dae 的
