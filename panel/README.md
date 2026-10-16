@@ -21,8 +21,9 @@
 
 | 模块 | 内容 |
 |---|---|
-| **引擎运行时**（总览首屏重点） | 大号 RSS + 内存曲线 + **活跃连接同窗曲线**；**数据新鲜度**（`数据 Ns 前`，>12s 转黄告警“已停更”——一眼分清“面板/引擎卡住”与“内存本来就稳”）；内存曲线标 **Δ 与窗口区间**（`Δ +0.3 MB / 10min · 窗口 50.8–51.1 MB`）；专业参数：峰值/虚拟内存、线程、FD 使用（含上限）、CPU 占用/累计、活跃连接、重载槽位；右侧控制动作（重新加载引擎 / 挂起 / 恢复） |
+| **引擎运行时**（总览首屏重点） | 大号 RSS + 内存曲线 + **活跃连接同窗曲线**；**数据新鲜度**（`数据 Ns 前`，>12s 转黄告警“已停更”——一眼分清“面板/引擎卡住”与“内存本来就稳”）；内存曲线标 **Δ 与窗口区间**（`Δ +0.3 MB / 10min · 窗口 50.8–51.1 MB`）；专业参数：峰值/虚拟内存、线程、FD 使用（含上限）、CPU 占用/累计、活跃连接、重载槽位、**引擎构建**（`sodama --version` 的 git sha / dirty / 版本）；右侧控制动作（重新加载引擎 / 挂起 / 恢复） |
 | 运行指标·**三线表** | 表头线 + 数值行 + 注释行（无竖线）：节点组 / 活跃连接 / 累计流量 / DNS 缓存命中 / SNI 嗅探 / 文件描述符 / 规则重载 / 分组探测 |
+| **数据面卡片**（v2.0） | 与三线表同构，三组读数：**UDP NAT**（流量/会话/代理比/full-cone/负缓存+GSO 聚合：`gso_sends`/`gso_datagrams`/`gso_unsupported`）/ **卸载与零拷贝**（offloaded 累计/splice/reactor codec/pipe 池泄漏 = 创建−归还）/ **错误面**（溢出・丢弃・域发布失败・卸载记账失败合计，**正常应恒为 0，非零整格转警告色**）+ **观测**（sysctl watched/rewrites、域名确认集、trace 会话状态） |
 | 曲线 | 活跃连接 / 吞吐（↑↓） / 最优节点延迟；**内存环形缓冲**（默认 5s×1440 点 ≈ 2h）+ 卡片内 RSS 曲线 |
 | **CSV 导出** | `GET /api/v1/series.csv`——**按需生成、不落盘**；列含 `rss_kb/rss_mb/threads/cpu_pct`（内存与 CPU 可导出做趋势分析） |
 | 节点 | 列表：节点 · **协议（含传输/安全）** · **UDP 能力** · **服务器地址** · 来源 · EMA · 延迟分布 · 最近；**点击看详情**（延迟历史 + 协议/传输/安全/地址/UDP 事实）；深链 `#node=<tag>\|<name>` |
@@ -31,13 +32,14 @@
 | 订阅源 | 顺序/tag/URL（脱敏）/节点数/存活；**一键「设为主源」**（改配置 + 热重载 + 回执）→ 列表与控制已迁至**配置页**（总览不再重复展示） |
 | 规则集 | 本地/远程/缓存标记、更新于、**下次自动刷新倒计时**、**立即刷新**（reload） |
 | 控制 | 热重载 / 挂起 / 恢复（危险操作二次确认；reload 以 `reload.at_sec` 推进为真实判据）——位于运行时卡片内 |
+| **运维工具行**（v2.0） | 与引擎 A1/A2 取证面对齐：**drain**（`--drain=N` 旧代在飞会话排空预算）与 **abort**（`--abort` 中断在飞会话）直接作用于 reload/suspend；**抓取事件**（`sodama trace` 短时会话：秒数 1–30 / 全部·TCP·UDP / 只看丢弃，结果就地展开、服务端截断 1000 行）；**下载诊断包**（`sodama sysdump` 的 tar.gz：status/rules/config/maps + system + 现场 ip/nft/iptables/sysctl，用完即删） |
 | 配置编辑 | `config.dae` / `rules/*.txt` / `blocklist*` 在线编辑；**先 validate 再落盘**（退出码≠0 或 deferred>0 拒结）；深链 `#editor` |
 | 日志 | 日志尾（新→旧，自动刷新，可暂停） |
 | **配置页·订阅** | 列表（顺序/tag/URL 脱敏/节点数/存活/当前源）+ 上移/下移/删除 + **导入新订阅**：先「解析预览」（调引擎 `sub-parse` 真实拉取解析：节点数、协议分布、头信息条目、逐条节点名）确认无误再「添加并生效」 |
 | **批量导入** | 一个文本框每行一个（`tag url` 或只写 url，自动起名 sub2/sub3…），**N 个不限**；「解析全部」逐个预览，「全部导入并生效」只校验/落盘/热重载一次 |
 | **配置页·规则集** | 本地/远程规则集列表（条数、是否被 `routing` 引用）；添加远程 URL 或本地路径；删除 |
 | **配置页·分流条目** | 本地规则文件直接增删条目（去重、URL 自动归一化为域名、支持 `full:`/`suffix:`/`keyword:`/`regex:` 前缀）、过滤查看、单条删除 |
-| **配置页·内核参数** | 把引擎可设置的能力（`global`/`dns`/`group` 白名单，36 项）做成表单：分组（转发/探测/DNS/性能/日志）+ 每项默认值与一行说明；开关/枚举用下拉、时长/int/文本用输入框；**改了写回 config.dae → validate 护栏 → 热重载回执**，空值 = 恢复引擎默认；已改项用强调色标出 |
+| **配置页·内核参数** | 把引擎可设置的能力（`global`/`dns`/`group` 白名单，v2.0：**55 项**）做成表单：分组（转发/探测/订阅/DNS/性能/TLS 与抗封锁/日志）+ 每项默认值与一行说明；开关/枚举用下拉、时长/int/文本用输入框；**改了写回 config.dae → validate 护栏 → 热重载回执**，空值 = 恢复引擎默认；已改项用强调色标出 |
 | **HTTPS** | 可选（`tls = 1`）：首次启动自动生成自签证书（key 0600），HTTP/HTTPS 并存 |
 | 鉴权 | 可选 token 会话（HttpOnly Cookie）；**默认关闭**（`token` 留空 = LAN 免认证） |
 | **手机适配** | 窄屏单列：节点表收起次要列（UDP/地址/来源/延迟分布/最近，点行看详情），配置页宽表横向滑动，弹窗全屏；触摸设备行内动作常显（无 hover）、点击目标加大 |
@@ -82,7 +84,10 @@ PASS=xxx scripts/deploy.sh                   # 停服务→推送→procd 重启
 | GET | `/api/v1/config?raw=1` | 引擎配置（默认脱敏） |
 | GET | `/api/v1/files` · `/files/content` | 可编辑文件白名单 / 读 |
 | POST | `/api/v1/files/content` | 保存（validate → 落盘 → 等热重载回执） |
-| POST | `/api/v1/actions/{reload,suspend,resume}` | 控制（需 `enable_actions = 1`） |
+| POST | `/api/v1/actions/{reload,suspend,resume}` | 控制（需 `enable_actions = 1`）；载荷可选 `{drain_secs, abort}`（v2.0：对应引擎 `--drain=N`/`--abort`） |
+| GET | `/api/v1/engine/version` | **引擎构建信息**（v2.0：`sodama --version` 解析为 version/git_sha/dirty/toolchain；缓存 10 分钟） |
+| POST | `/api/v1/engine/trace` | **短时内核 trace**（v2.0：`{seconds 1..30, ipv4/ipv6, l4, port, drop_only}` → `{ok, lines, total_lines, truncated, file, message}`；阻塞 seconds 秒，服务端截断 1000 行） |
+| GET | `/api/v1/engine/sysdump` | **诊断包下载**（v2.0：生成 tar.gz 后作为附件返回，临时文件用完即删，体积上限 32 MiB） |
 | POST | `/api/v1/config/inspect` | **订阅解析预览**（只读，调引擎 `sub-parse`） |
 | GET \| POST | `/api/v1/config/params` | **内核参数**：GET 回显配置文件里显式写了的键；POST `{section,key,value}` 写回（空值 = 删键回默认），类型化校验 + 热重载回执 |
 | POST | `/api/v1/config/subs` \| `/subs/remove` \| `/subs/move` \| `/subs/bulk` | 订阅增/改/删/上移下移/**批量导入**（改 `config.dae` + validate 护栏 + 等热重载） |
@@ -105,6 +110,8 @@ PASS=xxx scripts/deploy.sh                   # 停服务→推送→procd 重启
 | CLI 子进程 | 仅在 `status_cmd`/`metrics_cmd` 被显式覆盖（如 SSH 远端引擎）时使用 |
 | 日志 | 默认 `tail` 形式时面板**直接读日志文件尾**（回看 512KB），不 fork `tail` |
 | 采样 | 默认**只在有人看面板时采样**（`sample_when_idle = 1` 可恢复常驻采样） |
+| 构建信息 | `sodama --version`（不需 root/socket），面板缓存 10 分钟 |
+| 取证（trace / sysdump） | **按需** fork 一次引擎 CLI：`trace` 阻塞 `seconds` 秒后返回（会话由守护进程在内核侧过滤）；`sysdump` 生成 tar.gz 即读即删（临时目录 = `$TMPDIR`，体积上限 32 MiB）。两者均受鉴权 + `enable_actions = 1` 门禁；`trace` 需要 panel.conf 的 `socket` 指向引擎状态面。 |
 
 这三条合起来：面板开着 → 引擎按 30s 活跃探测（数据新鲜）；**关掉面板约 15 分钟 → 引擎空闲退避到 600s**（CPU 降到零点几个百分点）。
 

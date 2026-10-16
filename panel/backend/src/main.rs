@@ -22,10 +22,11 @@ use serde_json::{json, Value};
 mod configapi;
 
 use shared::{
-    ConfigView, DnsView, DomainStatView, FileContent, FileInfo, GroupView, LoginReq, LoginResp,
-    MapsView, NodeDetail, NodePoint, NodeView, PnameView, RelayView, ReloadView, RuleSetView,
-    Sample, SaveResult, SeriesView, SniffView, SourceInfo, SourcesView, StatusView,
-    SubSourceView, WatchView,
+    ActionReq, ConfigView, DnsView, DomainStatView, EngineBuildView, FileContent, FileInfo,
+    GroupView, LoginReq, LoginResp, MapsView, NodeDetail, NodePoint, NodeView, PnameView,
+    RealDomainView, RelayView, ReloadView, RuleSetView, Sample, SaveResult, SeriesView, SniffView,
+    SourceInfo, SourcesView, StatsView, StatusView, SubSourceView, SysctlView, TraceReq,
+    TraceResult, TraceView, TrafficView, UdpNatView, WatchView,
 };
 
 // ---------------------------------------------------------------- 配置
@@ -67,6 +68,8 @@ pub(crate) struct Engine {
     latest: Mutex<Option<StatusView>>,
     /// `/proc/<pid>` CPU 差分用（上次采样时刻, 累计 CPU 秒, 上次百分数）
     proc_prev: Mutex<Option<(std::time::Instant, f64, f64)>>,
+    /// v2.0：`sodama --version` 缓存（拉取时刻, 值；10 分钟 TTL）
+    build: Mutex<Option<(u64, Option<EngineBuildView>)>>,
 }
 
 #[derive(Clone)]
@@ -249,6 +252,7 @@ fn parse_cfg() -> (GlobalCfg, Arc<Engine>) {
         nodes: NodeStore::default(),
         latest: Mutex::new(None),
         proc_prev: Mutex::new(None),
+        build: Mutex::new(None),
     });
 
     (g, engine)
@@ -257,13 +261,22 @@ fn parse_cfg() -> (GlobalCfg, Arc<Engine>) {
 // ---------------------------------------------------------------- 工具
 
 pub(crate) async fn run_cmd(cfg: &GlobalCfg, cmd: &str) -> Result<(i32, String, String), String> {
+    run_cmd_timeout(cfg, cmd, cfg.timeout).await
+}
+
+/// 指定超时版本（trace 这类「本身就带时长」的决定性命令用；不套 `timeout` 默认值）。
+pub(crate) async fn run_cmd_timeout(
+    _cfg: &GlobalCfg,
+    cmd: &str,
+    timeout: Duration,
+) -> Result<(i32, String, String), String> {
     let fut = tokio::process::Command::new("sh")
         .arg("-c")
         .arg(cmd)
         .stdin(std::process::Stdio::null())
         .output();
-    match tokio::time::timeout(cfg.timeout, fut).await {
-        Err(_) => Err(format!("命令超时（{}s）: {cmd}", cfg.timeout.as_secs())),
+    match tokio::time::timeout(timeout, fut).await {
+        Err(_) => Err(format!("命令超时（{}s）: {cmd}", timeout.as_secs())),
         Ok(Err(e)) => Err(format!("命令执行失败: {e}")),
         Ok(Ok(out)) => Ok((
             out.status.code().unwrap_or(-1),
@@ -271,6 +284,54 @@ pub(crate) async fn run_cmd(cfg: &GlobalCfg, cmd: &str) -> Result<(i32, String, 
             String::from_utf8_lossy(&out.stderr).into_owned(),
         )),
     }
+}
+
+/// 解析 `sodama --version` 的第一/二行（`0.1.0-g9f1179a769f6-dirty` + `rust release linux/x86_64`）。
+fn parse_engine_build(text: &str) -> EngineBuildView {
+    let mut v = EngineBuildView {
+        raw: text.trim_end().to_string(),
+        ..Default::default()
+    };
+    let mut lines = text.lines();
+    if let Some(first) = lines.next() {
+        v.full = first.trim().to_string();
+        let (base, sha_part) = match v.full.split_once("-g") {
+            Some((a, b)) => (a.to_string(), Some(b.to_string())),
+            None => (v.full.clone(), None),
+        };
+        v.version = base;
+        if let Some(sha) = sha_part {
+            let (sha, dirty) = match sha.split_once("-dirty") {
+                Some((s, _)) => (s.to_string(), true),
+                None => (sha, false),
+            };
+            v.git_sha = sha;
+            v.dirty = dirty;
+        }
+    }
+    if let Some(second) = lines.next() {
+        v.toolchain = second.trim().to_string();
+    }
+    v
+}
+
+/// 控制动作的可选载荷：解析失败一律回退默认（无 drain/abort）——旧客户端不传 body 也能用。
+fn action_req_of(body: &[u8]) -> ActionReq {
+    serde_json::from_slice::<ActionReq>(body).unwrap_or_default()
+}
+
+/// 把 `--drain=N` / `--abort` 拼到（可能来自 panel.conf 的）基础命令尾部。
+/// 值域经钳制且只含数字/固定 flag，无注入面。
+fn with_action_opts(base: &str, req: &ActionReq) -> String {
+    let mut cmd = base.trim().to_string();
+    if req.abort.unwrap_or(false) {
+        cmd.push_str(" --abort");
+    }
+    if let Some(d) = req.drain_secs {
+        let d = d.clamp(1, 600);
+        cmd.push_str(&format!(" --drain={d}"));
+    }
+    cmd
 }
 
 fn now_secs() -> u64 {
@@ -523,6 +584,14 @@ fn to_view(root: &Value, engine: &Engine) -> StatusView {
             splice_fallbacks: u64_of(&root["relay"]["splice_fallbacks"]),
             offload_enabled: bool_of(&root["relay"]["offload_enabled"]),
             offloaded_total: u64_of(&root["relay"]["offloaded_total"]),
+            offload_failures: u64_of(&root["relay"]["offload_failures"]),
+            splice_total: u64_of(&root["relay"]["splice_total"]),
+            reactor_codec_sessions: u64_of(&root["relay"]["reactor_codec_sessions"]),
+            splice_fd_budget: u64_of(&root["relay"]["splice_fd_budget"]),
+            pipe_created: u64_of(&root["relay"]["pipe_created"]),
+            pipe_reused: u64_of(&root["relay"]["pipe_reused"]),
+            pipe_released: u64_of(&root["relay"]["pipe_released"]),
+            pipe_discarded: u64_of(&root["relay"]["pipe_discarded"]),
         },
         domain_stats: root["domain_stats"]
             .as_array()
@@ -588,6 +657,8 @@ fn to_view(root: &Value, engine: &Engine) -> StatusView {
             domain_routing: u64_of(&root["maps"]["domain_routing"]),
             fast_sock: u64_of(&root["maps"]["fast_sock"]),
             redirect_track: u64_of(&root["maps"]["redirect_track"]),
+            routing_handoff: u64_of(&root["maps"]["routing_handoff"]),
+            connectivity_dead_groups: u64_of(&root["maps"]["connectivity_dead_groups"]),
         },
         pname: PnameView {
             driver: str_of(&root["pname"]["driver"]),
@@ -602,6 +673,83 @@ fn to_view(root: &Value, engine: &Engine) -> StatusView {
             debounce_ms: u64_of(&root["config_watch"]["debounce_ms"]),
             interval_secs: u64_of(&root["config_watch"]["interval_secs"]),
         },
+        // ---- v2.0：引擎 A1/A2 数据面与观测面新增段 ----
+        udp_nat: UdpNatView {
+            sessions_active: u64_of(&root["udp_nat"]["sessions_active"]),
+            sessions_total: u64_of(&root["udp_nat"]["sessions_total"]),
+            sessions_proxied: u64_of(&root["udp_nat"]["sessions_proxied"]),
+            direct_fallback: u64_of(&root["udp_nat"]["direct_fallback"]),
+            bytes_up: u64_of(&root["udp_nat"]["bytes_up"]),
+            bytes_down: u64_of(&root["udp_nat"]["bytes_down"]),
+            evicted: u64_of(&root["udp_nat"]["evicted"]),
+            errors: u64_of(&root["udp_nat"]["errors"]),
+            reply_sockets_evicted: u64_of(&root["udp_nat"]["reply_sockets_evicted"]),
+            cone_sessions: u64_of(&root["udp_nat"]["cone_sessions"]),
+            negcache_hits: u64_of(&root["udp_nat"]["negcache_hits"]),
+            raw_udp_fallbacks: u64_of(&root["udp_nat"]["raw_udp_fallbacks"]),
+            gso_sends: u64_of(&root["udp_nat"]["gso_sends"]),
+            gso_datagrams: u64_of(&root["udp_nat"]["gso_datagrams"]),
+            gso_unsupported: u64_of(&root["udp_nat"]["gso_unsupported"]),
+            idle_timeout_secs: u64_of(&root["udp_nat"]["idle_timeout_secs"]),
+        },
+        stats: StatsView {
+            udp_conn_overflow: u64_of(&root["stats"]["udp_conn_overflow"]),
+            tcp_conn_overflow: u64_of(&root["stats"]["tcp_conn_overflow"]),
+            redirect_overflow: u64_of(&root["stats"]["redirect_overflow"]),
+            redirect_update_failed: u64_of(&root["stats"]["redirect_update_failed"]),
+            rebind_rejected: u64_of(&root["stats"]["rebind_rejected"]),
+            syn_rebind_rejected: u64_of(&root["stats"]["syn_rebind_rejected"]),
+            stateless_tcp_passthrough: u64_of(&root["stats"]["stateless_tcp_passthrough"]),
+            frag_tail_passed: u64_of(&root["stats"]["frag_tail_passed"]),
+            parse_unsupported_l4: u64_of(&root["stats"]["parse_unsupported_l4"]),
+            unsolicited_udp_seen: u64_of(&root["stats"]["unsolicited_udp_seen"]),
+            sockmark_fallback: u64_of(&root["stats"]["sockmark_fallback"]),
+            rebind_rerouted: u64_of(&root["stats"]["rebind_rerouted"]),
+            event_drops: u64_of(&root["stats"]["event_drops"]),
+            domain_publish_retries: u64_of(&root["stats"]["domain_publish_retries"]),
+            domain_publish_dropped: u64_of(&root["stats"]["domain_publish_dropped"]),
+            offload_reclaimed_bytes: u64_of(&root["offload_sent"]["reclaimed_bytes"]),
+            offload_kernel_bytes: u64_of(&root["offload_sent"]["kernel_bytes"]),
+            offload_account_drops: u64_of(&root["offload_sent"]["account_drops"]),
+            fuse_engages: u64_of(&root["offload_fuse"]["engages"]),
+            fuse_lifts: u64_of(&root["offload_fuse"]["lifts"]),
+            fuse_failures: u64_of(&root["offload_fuse"]["failures"]),
+            fuse_threshold: u64_of(&root["offload_fuse"]["threshold"]),
+            xdp_packets: root["xdp"]["packets"].as_u64(),
+            xdp_bytes: root["xdp"]["bytes"].as_u64(),
+        },
+        trace: TraceView {
+            active: bool_of(&root["trace"]["active"]),
+            file: str_of(&root["trace"]["file"]),
+            events: u64_of(&root["trace"]["events"]),
+            write_errors: u64_of(&root["trace"]["write_errors"]),
+        },
+        sysctl: SysctlView {
+            watched: u64_of(&root["sysctl"]["watched"]),
+            rewrites: u64_of(&root["sysctl"]["rewrites"]),
+        },
+        real_domain: RealDomainView {
+            confirmed: u64_of(&root["real_domain"]["confirmed"]),
+            negative: u64_of(&root["real_domain"]["negative"]),
+            inflight: u64_of(&root["real_domain"]["inflight"]),
+            capacity: u64_of(&root["real_domain"]["capacity"]),
+            probes: u64_of(&root["real_domain"]["probes"]),
+            confirmed_total: u64_of(&root["real_domain"]["confirmed_total"]),
+            negative_total: u64_of(&root["real_domain"]["negative_total"]),
+            hits: u64_of(&root["real_domain"]["hits"]),
+        },
+        traffic: TrafficView {
+            window_sec: u64_of(&root["traffic"]["window_sec"]),
+            points: u64_of(&root["traffic"]["points"]),
+            samples_total: u64_of(&root["traffic"]["samples_total"]),
+            upload_rate: u64_of(&root["traffic"]["upload_rate"]),
+            download_rate: u64_of(&root["traffic"]["download_rate"]),
+            upload_total: u64_of(&root["traffic"]["upload_total"]),
+            download_total: u64_of(&root["traffic"]["download_total"]),
+            active_conns: u64_of(&root["traffic"]["active_conns"]),
+            udp_sessions: u64_of(&root["traffic"]["udp_sessions"]),
+        },
+        engine_build: engine.build.lock().ok().and_then(|g| g.clone()).and_then(|(_, v)| v),
         runtime: proc_runtime(u64_of(&root["pid"]) as u32, engine),
     }
 }
@@ -742,6 +890,26 @@ async fn engine_query(ctx: &Ctx, engine: &Arc<Engine>, cmd: &str) -> Result<Stri
 }
 
 async fn fetch_view(ctx: &Ctx, engine: &Arc<Engine>) -> Result<StatusView, String> {
+    // 引擎构建信息：10 分钟 TTL 的旁路缓存（`--version` 不需 root/socket，失败则不展示）。
+    let stale = match engine.build.lock() {
+        Ok(g) => g.as_ref().map(|(at, _)| now_secs().saturating_sub(*at) > 600).unwrap_or(true),
+        Err(_) => false,
+    };
+    if stale {
+        let info = match run_cmd_timeout(
+            &ctx.cfg,
+            &format!("{} --version 2>/dev/null", engine.sodama),
+            Duration::from_secs(5),
+        )
+        .await
+        {
+            Ok((0, out, _)) if !out.trim().is_empty() => Some(parse_engine_build(&out)),
+            _ => None,
+        };
+        if let Ok(mut g) = engine.build.lock() {
+            *g = Some((now_secs(), info));
+        }
+    }
     match engine_query(ctx, engine, "status").await {
         Ok(out) => match serde_json::from_str::<Value>(&out) {
             Ok(v) => {
@@ -1839,13 +2007,213 @@ async fn action(ctx: &Ctx, headers: &HeaderMap, uri: &Uri, cmd: &str) -> Respons
     }
 }
 
-async fn api_reload(State(ctx): State<Ctx>, headers: HeaderMap, uri: Uri) -> Response {
+/// v2.0：`GET /api/v1/engine/version` —— 引擎构建信息（`sodama --version`，带缓存）。
+async fn api_engine_version(State(ctx): State<Ctx>, headers: HeaderMap, uri: Uri) -> Response {
+    if let Err(r) = auth(&ctx, &headers, &uri) {
+        return r;
+    }
+    let engine = ctx.engine.clone();
+    let cached = engine.build.lock().ok().and_then(|g| g.clone());
+    let fresh = match cached {
+        Some((at, v)) if now_secs().saturating_sub(at) <= 600 => Some(v),
+        _ => None,
+    };
+    if let Some(v) = fresh {
+        return match v {
+            Some(v) => Json(v).into_response(),
+            None => err_json(StatusCode::BAD_GATEWAY, "引擎 --version 不可用"),
+        };
+    }
+    match run_cmd_timeout(
+        &ctx.cfg,
+        &format!("{} --version 2>/dev/null", engine.sodama),
+        Duration::from_secs(5),
+    )
+    .await
+    {
+        Ok((0, out, _)) if !out.trim().is_empty() => {
+            let v = parse_engine_build(&out);
+            if let Ok(mut g) = engine.build.lock() {
+                *g = Some((now_secs(), Some(v.clone())));
+            }
+            Json(v).into_response()
+        }
+        Ok((code, _o, err)) => err_json(
+            StatusCode::BAD_GATEWAY,
+            format!("引擎 --version 退出码 {code}: {}", err.trim()),
+        ),
+        Err(e) => err_json(StatusCode::BAD_GATEWAY, e),
+    }
+}
+
+/// v2.0：`POST /api/v1/engine/trace` —— 向引擎开一个短时内核 trace 会话（A2 #3）。
+/// 阻塞 seconds 秒（上限 30）后返回抓到的行（服务端截断到 1000 行）。
+async fn api_trace(
+    State(ctx): State<Ctx>,
+    headers: HeaderMap,
+    uri: Uri,
+    body: axum::body::Bytes,
+) -> Response {
+    if let Err(r) = require_actions(&ctx, &headers, &uri) {
+        return r;
+    }
+    let req: TraceReq = serde_json::from_slice(&body).unwrap_or_default();
+    let engine = ctx.engine.clone();
+    let seconds = req.seconds.unwrap_or(5).clamp(1, 30);
+    let (ipv4, ipv6) = (req.ipv4.unwrap_or(false), req.ipv6.unwrap_or(false));
+    if ipv4 && ipv6 {
+        return err_json(StatusCode::BAD_REQUEST, "ipv4 与 ipv6 不能同时指定");
+    }
+    let l4 = req.l4.as_deref().unwrap_or("").to_ascii_lowercase();
+    if !matches!(l4.as_str(), "" | "tcp" | "udp") {
+        return err_json(StatusCode::BAD_REQUEST, "l4 只能是 tcp/udp/空");
+    }
+    let mut cmd = format!("{} trace --seconds {seconds}", engine.sodama);
+    if ipv4 {
+        cmd.push_str(" --ipv4");
+    }
+    if ipv6 {
+        cmd.push_str(" --ipv6");
+    }
+    if !l4.is_empty() {
+        cmd.push_str(&format!(" --l4-proto {l4}"));
+    }
+    if let Some(p) = req.port {
+        cmd.push_str(&format!(" --port {p}"));
+    }
+    if req.drop_only.unwrap_or(false) {
+        cmd.push_str(" --drop-only");
+    }
+    if let Some(sock) = engine.socket.as_deref() {
+        cmd.push_str(&format!(" --socket {}", sock.display()));
+    }
+    // trace 自带时长：超时给 seconds + 12s（不套 panel.conf 的通用 timeout）。
+    let res = run_cmd_timeout(&ctx.cfg, &cmd, Duration::from_secs(seconds + 12)).await;
+    match res {
+        Ok((code, out, err)) => {
+            let all: Vec<String> = out.lines().map(str::to_string).collect();
+            let total = all.len() as u64;
+            let cap = 1000usize;
+            let truncated = all.len() > cap;
+            let mut lines = all;
+            if truncated {
+                lines.truncate(cap);
+            }
+            // 抓取后取一次新状态：`trace.file`/`events` 由守护进程刚更新（比上轮采样新鲜）。
+            let mut file = String::new();
+            let mut events = 0u64;
+            if let Ok(txt) = engine_query(&ctx, &engine, "status").await {
+                if let Ok(v) = serde_json::from_str::<Value>(&txt) {
+                    file = str_of(&v["trace"]["file"]);
+                    events = u64_of(&v["trace"]["events"]);
+                }
+            }
+            if file.is_empty() {
+                // 兜底：从引擎 stderr（`… 产出于 <path>`）里取。
+                if let Some(idx) = err.find("产出于 ") {
+                    file = err[idx + "产出于 ".len()..]
+                        .trim()
+                        .trim_end_matches('）')
+                        .trim()
+                        .to_string();
+                }
+            }
+            let message = if code == 0 {
+                format!("{}（会话事件 {events}）", err.trim())
+            } else {
+                format!("trace 退出码 {code}: {}", err.trim())
+            };
+            let _ = file;
+            let message = message;
+            Json(TraceResult {
+                ok: code == 0,
+                seconds,
+                lines,
+                total_lines: total,
+                truncated,
+                file,
+                message,
+            })
+            .into_response()
+        }
+        Err(e) => err_json(StatusCode::BAD_GATEWAY, e),
+    }
+}
+
+/// v2.0：`GET /api/v1/engine/sysdump` —— 生成 sysdump tar.gz 并作为附件下载（A2 #4）。
+/// 临时文件用完即删；体量上限 32 MiB（超出判异常，不返回）。
+async fn api_sysdump(State(ctx): State<Ctx>, headers: HeaderMap, uri: Uri) -> Response {
+    if let Err(r) = require_actions(&ctx, &headers, &uri) {
+        return r;
+    }
+    let engine = ctx.engine.clone();
+    let ts = now_secs();
+    let path = std::env::temp_dir().join(format!("sodama-sysdump-{}-{ts}.tar.gz", std::process::id()));
+    let cmd = format!(
+        "{} sysdump --out {}",
+        engine.sodama,
+        path.display()
+    );
+    let res = run_cmd_timeout(&ctx.cfg, &cmd, Duration::from_secs(30)).await;
+    match res {
+        Ok((code, _out, err)) => {
+            if code != 0 {
+                let _ = std::fs::remove_file(&path);
+                return err_json(
+                    StatusCode::BAD_GATEWAY,
+                    format!("sysdump 退出码 {code}: {}", err.trim()),
+                );
+            }
+            match std::fs::read(&path) {
+                Ok(bytes) => {
+                    let _ = std::fs::remove_file(&path);
+                    if bytes.len() > 32 * 1024 * 1024 {
+                        return err_json(
+                            StatusCode::BAD_GATEWAY,
+                            format!("sysdump 体积异常（{} 字节）", bytes.len()),
+                        );
+                    }
+                    let fname = format!("sodama-sysdump-{ts}.tar.gz");
+                    (
+                        [
+                            (header::CONTENT_TYPE, "application/gzip".to_string()),
+                            (
+                                header::CONTENT_DISPOSITION,
+                                format!("attachment; filename=\"{fname}\""),
+                            ),
+                        ],
+                        bytes,
+                    )
+                        .into_response()
+                }
+                Err(e) => {
+                    let _ = std::fs::remove_file(&path);
+                    err_json(
+                        StatusCode::BAD_GATEWAY,
+                        format!("读 sysdump 文件失败: {e}（引擎写盘位置不可读？）"),
+                    )
+                }
+            }
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&path);
+            err_json(StatusCode::BAD_GATEWAY, e)
+        }
+    }
+}
+
+async fn api_reload(
+    State(ctx): State<Ctx>,
+    headers: HeaderMap,
+    uri: Uri,
+    body: axum::body::Bytes,
+) -> Response {
     if let Err(r) = require_actions(&ctx, &headers, &uri) {
         return r;
     }
     let engine = ctx.engine.clone();
     let prev_at = current_reload_at(&ctx, &engine).await;
-    let cmd = engine.reload_cmd.clone();
+    let cmd = with_action_opts(&engine.reload_cmd, &action_req_of(&body));
     let (code, out, err) = match run_cmd(&ctx.cfg, &cmd).await {
         Ok(v) => v,
         Err(e) => return err_json(StatusCode::BAD_GATEWAY, e),
@@ -1868,15 +2236,18 @@ async fn api_reload(State(ctx): State<Ctx>, headers: HeaderMap, uri: Uri) -> Res
     .into_response()
 }
 
-async fn api_suspend(State(ctx): State<Ctx>, headers: HeaderMap, uri: Uri) -> Response {
-    let engine = ctx.engine.clone();
-    let cmd = engine.suspend_cmd.clone();
+async fn api_suspend(
+    State(ctx): State<Ctx>,
+    headers: HeaderMap,
+    uri: Uri,
+    body: axum::body::Bytes,
+) -> Response {
+    let cmd = with_action_opts(&ctx.engine.suspend_cmd, &action_req_of(&body));
     action(&ctx, &headers, &uri, &cmd).await
 }
 
 async fn api_resume(State(ctx): State<Ctx>, headers: HeaderMap, uri: Uri) -> Response {
-    let engine = ctx.engine.clone();
-    let cmd = engine.resume_cmd.clone();
+    let cmd = ctx.engine.resume_cmd.clone();
     action(&ctx, &headers, &uri, &cmd).await
 }
 
@@ -1981,6 +2352,10 @@ async fn main() {
         .route("/api/v1/actions/reload", post(api_reload))
         .route("/api/v1/actions/suspend", post(api_suspend))
         .route("/api/v1/actions/resume", post(api_resume))
+        // v2.0：引擎 A1/A2 运维取证面（构建信息 / 短时 trace / sysdump 下载）
+        .route("/api/v1/engine/version", get(api_engine_version))
+        .route("/api/v1/engine/trace", post(api_trace))
+        .route("/api/v1/engine/sysdump", get(api_sysdump))
         .fallback(static_or_spa)
         .with_state(ctx);
 

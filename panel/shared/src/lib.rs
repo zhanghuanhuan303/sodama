@@ -33,6 +33,21 @@ pub struct StatusView {
     pub maps: MapsView,
     pub pname: PnameView,
     pub config_watch: WatchView,
+    /// v2.0：UDP NAT 会话面（含 GSO 聚合与 full-cone/raw_udp 回退）
+    pub udp_nat: UdpNatView,
+    /// v2.0：数据面错误/丢弃计数 + 卸载记账 + XDP 计量
+    pub stats: StatsView,
+    /// v2.0：内核 trace 会话（A2 #3）
+    pub trace: TraceView,
+    /// v2.0：sysctl 期望监控（watched/rewrites）
+    pub sysctl: SysctlView,
+    /// v2.0：域名确认集（dial_mode=domain 的远端解析决策面）
+    pub real_domain: RealDomainView,
+    /// v2.0：1h 流量历史摘要（引擎侧对账口径）
+    pub traffic: TrafficView,
+    /// v2.0：引擎构建（`sodama --version`；不可得为 None）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub engine_build: Option<EngineBuildView>,
     /// P-AI：域名维度统计（「AI 流量」卡片；按流量 Top，最多 30 条）。
     pub domain_stats: Vec<DomainStatView>,
     /// 进程运行时（面板本地读 `/proc/<pid>`；引擎状态面不提供）
@@ -97,6 +112,194 @@ pub struct RelayView {
     pub splice_fallbacks: u64,
     pub offload_enabled: bool,
     pub offloaded_total: u64,
+    // ---- v2.0：数据面记账补充（引擎 `relay.*`）----
+    /// fast_sock 卸载失败次数（非零 = 卸载路径有问题，回退拷贝泵）
+    pub offload_failures: u64,
+    /// splice 零拷贝会话数（累计）
+    pub splice_total: u64,
+    /// reactor codec 会话数（累计；AEAD 协议走 reactor 时）
+    pub reactor_codec_sessions: u64,
+    /// splice 保留的 fd 预算
+    pub splice_fd_budget: u64,
+    /// 管道池：创建/复用/归还/丢弃（泄漏看 `创建-归还`）
+    pub pipe_created: u64,
+    pub pipe_reused: u64,
+    pub pipe_released: u64,
+    pub pipe_discarded: u64,
+}
+
+/// UDP NAT（引擎 `status.udp_nat`）：会话面 + full-cone/负缓存/raw_udp 回退 + **GSO 聚合**。
+///
+/// GSO 三段计数（v2.19 交付 + 2026-10-17 修复）：
+/// `gso_sends`/`gso_datagrams` = 实际聚合发送的调用数 / 用户数据包数；
+/// `gso_unsupported` = 内核/协议不支持时的逐包回退数。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UdpNatView {
+    pub sessions_active: u64,
+    pub sessions_total: u64,
+    /// 其中走了代理出口（其余为 direct 回退）
+    pub sessions_proxied: u64,
+    pub direct_fallback: u64,
+    pub bytes_up: u64,
+    pub bytes_down: u64,
+    pub evicted: u64,
+    pub errors: u64,
+    pub reply_sockets_evicted: u64,
+    /// full-cone 端点池会话数
+    pub cone_sessions: u64,
+    /// 负缓存命中（上次失败目标的快速失败）
+    pub negcache_hits: u64,
+    /// raw_udp 回退数（协议侧不能承载 UDP 时）
+    pub raw_udp_fallbacks: u64,
+    pub gso_sends: u64,
+    pub gso_datagrams: u64,
+    pub gso_unsupported: u64,
+    pub idle_timeout_secs: u64,
+}
+
+/// 数据面错误/丢弃计数（引擎 `status.stats`）+ 卸载记账（`offload_sent`/`offload_fuse`）+ XDP。
+///
+/// 口径：这些值**正常应恒为 0**（丢包/溢出/发布失败才是异常），面板以「错误面」呈现，
+/// 非零时提示；`domain_publish_*` 与 `offload_*` 为 2026-10-16/17 新增的观测面。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StatsView {
+    pub udp_conn_overflow: u64,
+    pub tcp_conn_overflow: u64,
+    pub redirect_overflow: u64,
+    pub redirect_update_failed: u64,
+    pub rebind_rejected: u64,
+    pub syn_rebind_rejected: u64,
+    pub stateless_tcp_passthrough: u64,
+    pub frag_tail_passed: u64,
+    pub parse_unsupported_l4: u64,
+    pub unsolicited_udp_seen: u64,
+    pub sockmark_fallback: u64,
+    pub rebind_rerouted: u64,
+    pub event_drops: u64,
+    /// DNS 域位图投递重试/丢弃（v2.19 投影重试堆）
+    pub domain_publish_retries: u64,
+    pub domain_publish_dropped: u64,
+    // ---- 卸载记账（offload_sent）----
+    /// 用户态已收回的卸载字节（对账用）
+    pub offload_reclaimed_bytes: u64,
+    /// 内核侧记账的卸载送达字节
+    pub offload_kernel_bytes: u64,
+    /// 记账丢包（探针键不符等）
+    pub offload_account_drops: u64,
+    // ---- 背压 fuse（offload_fuse）----
+    pub fuse_engages: u64,
+    pub fuse_lifts: u64,
+    pub fuse_failures: u64,
+    pub fuse_threshold: u64,
+    // ---- XDP 计量探针（未挂载 = None）----
+    pub xdp_packets: Option<u64>,
+    pub xdp_bytes: Option<u64>,
+}
+
+/// 内核 trace 会话（引擎 `status.trace`；A2 #3）+ 面板可发起短时抓取。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TraceView {
+    pub active: bool,
+    pub file: String,
+    pub events: u64,
+    pub write_errors: u64,
+}
+
+/// sysctl 期望监控（引擎 `status.sysctl`）：watched = 受管键数，rewrites = 被改回次数。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SysctlView {
+    pub watched: u64,
+    pub rewrites: u64,
+}
+
+/// 域名确认集（引擎 `status.real_domain`；`dial_mode=domain` 的远端解析决策面）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RealDomainView {
+    pub confirmed: u64,
+    pub negative: u64,
+    pub inflight: u64,
+    pub capacity: u64,
+    pub probes: u64,
+    pub confirmed_total: u64,
+    pub negative_total: u64,
+    pub hits: u64,
+}
+
+/// 1h 流量历史摘要（引擎 `status.traffic`；A2 #13）。
+/// 面板曲线仍用自有环形缓冲；本段用于「引擎侧累计/速率/窗口」对账与首屏回填。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TrafficView {
+    pub window_sec: u64,
+    pub points: u64,
+    pub samples_total: u64,
+    pub upload_rate: u64,
+    pub download_rate: u64,
+    pub upload_total: u64,
+    pub download_total: u64,
+    pub active_conns: u64,
+    pub udp_sessions: u64,
+}
+
+/// 引擎构建信息（`sodama --version`，A2 #1；缓存 10 分钟）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EngineBuildView {
+    /// “0.1.0-g9f1179a769f6-dirty”
+    pub full: String,
+    /// 版本号
+    pub version: String,
+    /// git 短 sha（解析不到为空）
+    pub git_sha: String,
+    /// 工作区是否 dirty
+    pub dirty: bool,
+    /// “rust release linux/x86_64”
+    pub toolchain: String,
+    /// 原始多行文本（弹窗/复制用）
+    pub raw: String,
+}
+
+/// 控制动作参数（reload/suspend/resume 共用的可选载荷）。
+/// `drain_secs` > 0 = 旧代在飞会话排空预算（A2：`--drain=N`）；`abort` = 中断在飞会话。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ActionReq {
+    pub drain_secs: Option<u64>,
+    pub abort: Option<bool>,
+}
+
+/// `POST /api/v1/engine/trace`：短时抓取参数（映射 `sodama trace`；A2 #3）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TraceReq {
+    /// 保持秒数（1..=30）
+    pub seconds: Option<u64>,
+    /// 仅 IPv4 / 仅 IPv6（互斥）
+    pub ipv4: Option<bool>,
+    pub ipv6: Option<bool>,
+    /// tcp | udp | 空
+    pub l4: Option<String>,
+    pub port: Option<u16>,
+    /// 只看被判丢弃的会话
+    pub drop_only: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TraceResult {
+    pub ok: bool,
+    pub seconds: u64,
+    /// 抓取到的行（服务端已截断到上限）
+    pub lines: Vec<String>,
+    pub total_lines: u64,
+    pub truncated: bool,
+    pub file: String,
+    pub message: String,
 }
 
 /// P0（2026-10-11）：单个订阅源最近一次拉取状态（引擎 `status.subscriptions[]`）。
@@ -348,6 +551,10 @@ pub struct MapsView {
     pub domain_routing: u64,
     pub fast_sock: u64,
     pub redirect_track: u64,
+    /// v2.0：首包路由交接表（eBPF 余项批次）
+    pub routing_handoff: u64,
+    /// v2.0：出口连通性判定为「死」的组数（>0 则这些组的新流被数据面阻断）
+    pub connectivity_dead_groups: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -606,6 +813,40 @@ pub const PARAMS: &[ParamSpec] = &[
         unit: "",
         options: &[],
     },
+    // ---- v2.0（引擎 A1/A2 生效面补齐）----
+    ParamSpec {
+        section: "global",
+        key: "so_mark_from_dae",
+        group: "转发与连接",
+        label: "控制面 SO_MARK",
+        help: "控制面自身 socket 的标记；数据面按同值跳过自环（一般不动）",
+        kind: ParamKind::Int,
+        default: "0x233",
+        unit: "",
+        options: &[],
+    },
+    ParamSpec {
+        section: "global",
+        key: "allow_insecure",
+        group: "转发与连接",
+        label: "跳过证书验证",
+        help: "全局默认；仅用于自签名/测试节点（节点参数优先）",
+        kind: ParamKind::Bool,
+        default: "false",
+        unit: "",
+        options: &[],
+    },
+    ParamSpec {
+        section: "global",
+        key: "udphop_interval",
+        group: "转发与连接",
+        label: "hysteria2 端口跳跃",
+        help: "全局默认跳跃间隔；节点 URL 里的 udphop-interval 优先",
+        kind: ParamKind::Duration,
+        default: "30s",
+        unit: "",
+        options: &[],
+    },
     // ---- 探测与选路 ----
     ParamSpec {
         section: "group",
@@ -650,6 +891,17 @@ pub const PARAMS: &[ParamSpec] = &[
         default: "http://cp.cloudflare.com",
         unit: "",
         options: &[],
+    },
+    ParamSpec {
+        section: "group",
+        key: "tcp_check_http_method",
+        group: "探测与选路",
+        label: "探测 HTTP 方法",
+        help: "探测请求的方法；部分节点/CF 对 HEAD 与 GET 可用性不同（空 = 引擎默认 HEAD）",
+        kind: ParamKind::Enum,
+        default: "",
+        unit: "",
+        options: &["", "HEAD", "GET", "CONNECT"],
     },
     ParamSpec {
         section: "group",
@@ -698,6 +950,39 @@ pub const PARAMS: &[ParamSpec] = &[
     },
     ParamSpec {
         section: "global",
+        key: "subscription_update_interval",
+        group: "订阅与规则集",
+        label: "订阅读周期刷新",
+        help: "零人工维护的节点刷新（0 = 关闭）；失败源按 sub_fail_ttl 负缓存",
+        kind: ParamKind::Duration,
+        default: "21600s",
+        unit: "",
+        options: &[],
+    },
+    ParamSpec {
+        section: "global",
+        key: "sub_fail_ttl",
+        group: "订阅与规则集",
+        label: "失败源负缓存",
+        help: "窗口内失败源不再打网（0 = 关）；与订阅顺序回退配套",
+        kind: ParamKind::Duration,
+        default: "600s",
+        unit: "",
+        options: &[],
+    },
+    ParamSpec {
+        section: "global",
+        key: "watch_config",
+        group: "订阅与规则集",
+        label: "配置热驱动",
+        help: "inotify 事件 + 兜底扫描秒数（0 = 关；改配置即自动重载）",
+        kind: ParamKind::Duration,
+        default: "0",
+        unit: "",
+        options: &[],
+    },
+    ParamSpec {
+        section: "global",
         key: "rule_set_update_interval",
         group: "订阅与规则集",
         label: "规则集刷新间隔",
@@ -713,6 +998,17 @@ pub const PARAMS: &[ParamSpec] = &[
         group: "订阅与规则集",
         label: "规则集缓存目录",
         help: "远程规则集落盘位置（重启后可直接用缓存）",
+        kind: ParamKind::Str,
+        default: "",
+        unit: "",
+        options: &[],
+    },
+    ParamSpec {
+        section: "global",
+        key: "geodata_dir",
+        group: "订阅与规则集",
+        label: "geodata 搜索目录",
+        help: "geoip.dat/geosite.dat 搜索目录（逗号分隔；含 XDG 默认）",
         kind: ParamKind::Str,
         default: "",
         unit: "",
@@ -749,6 +1045,50 @@ pub const PARAMS: &[ParamSpec] = &[
         help: "透明代理监听端口（改错会导致断网，改后确认）",
         kind: ParamKind::Int,
         default: "",
+        unit: "",
+        options: &[],
+    },
+    ParamSpec {
+        section: "global",
+        key: "lan_interface",
+        group: "性能与内核",
+        label: "LAN 接口",
+        help: "逗号分隔；支持 glob（如 br-*）与 auto；1s 轮询热插拔（改造网络前先确认）",
+        kind: ParamKind::Str,
+        default: "",
+        unit: "",
+        options: &[],
+    },
+    ParamSpec {
+        section: "global",
+        key: "wan_interface",
+        group: "性能与内核",
+        label: "WAN 接口",
+        help: "逗号分隔；auto = 跟随默认路由接口（pppoe 重拨会自动跟）",
+        kind: ParamKind::Str,
+        default: "",
+        unit: "",
+        options: &[],
+    },
+    ParamSpec {
+        section: "global",
+        key: "mptcp",
+        group: "性能与内核",
+        label: "MPTCP",
+        help: "拨号 socket 用 IPPROTO_MPTCP；内核不支持时自动回落 TCP（需两端支持）",
+        kind: ParamKind::Bool,
+        default: "false",
+        unit: "",
+        options: &[],
+    },
+    ParamSpec {
+        section: "global",
+        key: "disable_waiting_network",
+        group: "性能与内核",
+        label: "不等待网络就绪",
+        help: "默认启动会等到默认路由+DNS 可达（或 30s 超时）；开机早于网络时可保持默认",
+        kind: ParamKind::Bool,
+        default: "false",
         unit: "",
         options: &[],
     },
@@ -818,6 +1158,51 @@ pub const PARAMS: &[ParamSpec] = &[
         unit: "",
         options: &[],
     },
+    // ---- v2.0：TLS 指纹与分片（引擎 A2；仅自实现 TLS/REALITY 路径）----
+    ParamSpec {
+        section: "global",
+        key: "tls_fragment",
+        group: "TLS 与抗封锁",
+        label: "ClientHello 分片",
+        help: "把 TLS ClientHello 拆段发送（对抗按 CH 特征识别）；仅自实现 TLS/REALITY 路径生效",
+        kind: ParamKind::Bool,
+        default: "false",
+        unit: "",
+        options: &[],
+    },
+    ParamSpec {
+        section: "global",
+        key: "tls_fragment_length",
+        group: "TLS 与抗封锁",
+        label: "分片长度区间",
+        help: "形如 50-100（字节）；非法或倒置会回落默认",
+        kind: ParamKind::Str,
+        default: "",
+        unit: "字节",
+        options: &[],
+    },
+    ParamSpec {
+        section: "global",
+        key: "tls_fragment_interval",
+        group: "TLS 与抗封锁",
+        label: "分片间隔",
+        help: "分片之间的发送间隔（过大拖慢握手）",
+        kind: ParamKind::Duration,
+        default: "",
+        unit: "",
+        options: &[],
+    },
+    ParamSpec {
+        section: "global",
+        key: "utls_imitate",
+        group: "TLS 与抗封锁",
+        label: "uTLS 指纹",
+        help: "ClientHello 指纹族（当前仅 chrome 口径；rustls 出站不受影响）",
+        kind: ParamKind::Str,
+        default: "chrome",
+        unit: "",
+        options: &[],
+    },
     // ---- DNS ----
     ParamSpec {
         section: "dns",
@@ -836,6 +1221,28 @@ pub const PARAMS: &[ParamSpec] = &[
         group: "DNS",
         label: "DNS 监听",
         help: "接管 DNS 的监听地址（默认 0.0.0.0:53）",
+        kind: ParamKind::Str,
+        default: "",
+        unit: "",
+        options: &[],
+    },
+    ParamSpec {
+        section: "global",
+        key: "bootstrap_resolver",
+        group: "DNS",
+        label: "bootstrap 解析器",
+        help: "启动期解析器（DoH/DoT URL；解析上游域名时用）",
+        kind: ParamKind::Str,
+        default: "",
+        unit: "",
+        options: &[],
+    },
+    ParamSpec {
+        section: "global",
+        key: "fallback_resolver",
+        group: "DNS",
+        label: "兜底解析器",
+        help: "bootstrap 之后、系统解析器之前；节点域名解析失败时兜底",
         kind: ParamKind::Str,
         default: "",
         unit: "",
@@ -916,6 +1323,39 @@ pub const PARAMS: &[ParamSpec] = &[
         help: "留空 = 交给 procd/日志系统；SIGHUP 会 reopen（配合 logrotate）",
         kind: ParamKind::Str,
         default: "",
+        unit: "",
+        options: &[],
+    },
+    ParamSpec {
+        section: "global",
+        key: "disable_timestamp",
+        group: "日志与调试",
+        label: "日志不带时间戳",
+        help: "交给 syslog/procd 收日志时可关（省一点日志体积）",
+        kind: ParamKind::Bool,
+        default: "false",
+        unit: "",
+        options: &[],
+    },
+    ParamSpec {
+        section: "global",
+        key: "pprof_port",
+        group: "日志与调试",
+        label: "诊断端口",
+        help: "只绑 127.0.0.1；`/` 文本摘要、`/json` 结构化（0 = 关）",
+        kind: ParamKind::Int,
+        default: "0",
+        unit: "",
+        options: &[],
+    },
+    ParamSpec {
+        section: "global",
+        key: "status_socket",
+        group: "日志与调试",
+        label: "状态面 socket",
+        help: "面板/脚本读写状态的 Unix socket 路径（与面板 panel.conf 的 socket 要一致）",
+        kind: ParamKind::Str,
+        default: "/tmp/sodama-status.sock",
         unit: "",
         options: &[],
     },

@@ -3,10 +3,10 @@
 //! - `MetricsTable`：运行指标三线表（表头线 + 数据 + 注释行，无竖线）
 
 use leptos::prelude::*;
-use shared::{Sample, SeriesView, StatusView};
+use shared::{ActionResult, Sample, SeriesView, StatusView, TraceResult};
 
 use crate::charts::{Chart, CurveSerie};
-use crate::{fmt_bytes, fmt_rate, fmt_uptime, pct, ActionButton};
+use crate::{fmt_bytes, fmt_rate, fmt_uptime, pct, post_json, ActionButton};
 
 /// KB → (数值, 单位)，用于把数字与单位分开排版。
 fn split_size(kb: u64) -> (String, &'static str) {
@@ -146,6 +146,7 @@ pub fn RuntimeCard(
                     <ActionButton label="恢复" path="/api/v1/actions/resume" token=token msg=msg />
                 </span>
             </div>
+            <EngineOps token=token msg=msg />
             <div class="runtime-body">
                 <div class="rt-hero">
                     <div class="rt-hero-label">"常驻内存 RSS"</div>
@@ -265,9 +266,163 @@ pub fn RuntimeCard(
                             }
                         })
                     />
+                    <Stat
+                        label="引擎构建"
+                        value=Signal::derive(move || {
+                            status.get().and_then(|s| s.engine_build).map(|b| b.git_sha).unwrap_or_else(|| "—".into())
+                        })
+                        hint=Signal::derive(move || {
+                            status.get().and_then(|s| s.engine_build).map(|b| {
+                                let mut h = b.version;
+                                if b.dirty { h.push_str(" · dirty"); }
+                                h
+                            }).unwrap_or_else(|| "sodama --version".into())
+                        })
+                    />
                 </div>
             </div>
         </section>
+    }
+}
+
+// ---------------------------------------------------------------- v2.0：引擎运维工具
+
+/// 引擎运维工具行（A1/A2 取证面在面板上的入口）：
+/// - `--drain=N` / `--abort`：reload/suspend 的可选排空预算与中断在飞会话；
+/// - `trace`：短时内核事件抓取（秒数/协议/只看丢弃），结果就地展示；
+/// - `sysdump`：一键下载诊断包（tar.gz，含 status/config/maps + 现场 ip/nft/sysctl）。
+#[component]
+pub fn EngineOps(token: RwSignal<Option<String>>, msg: RwSignal<Option<(bool, String)>>) -> impl IntoView {
+    let drain = RwSignal::new(String::new());
+    let abort = RwSignal::new(false);
+    let busy = RwSignal::new(false);
+    let armed = RwSignal::new("");
+    let l4 = RwSignal::new(String::new());
+    let drop_only = RwSignal::new(false);
+    let secs = RwSignal::new("5".to_string());
+    let trace_res = RwSignal::new(Option::<TraceResult>::None);
+
+    let opts = move || {
+        let d: Option<u64> = drain.get().trim().parse().ok().filter(|v: &u64| *v > 0);
+        serde_json::json!({
+            "drain_secs": d,
+            "abort": abort.get(),
+        })
+    };
+    let act = move |label: &'static str, path: &'static str, body: serde_json::Value, must_arm: bool| {
+        if must_arm && armed.get() != label {
+            armed.set(label);
+            return;
+        }
+        armed.set("");
+        let tok = token.get_untracked();
+        busy.set(true);
+        msg.set(None);
+        leptos::task::spawn_local(async move {
+            let r = post_json::<_, ActionResult>(path, &body, tok.as_deref()).await;
+            busy.set(false);
+            msg.set(Some(match r {
+                Ok(v) => {
+                    let detail = format!("{}{}", v.stdout.trim(), v.stderr.trim());
+                    (v.ok, if detail.is_empty() { format!("{label} 完成") } else { format!("{label}：{detail}") })
+                }
+                Err(e) => (false, format!("{label} 失败：{e}")),
+            }));
+        });
+    };
+
+    let sysdump_href = move || match token.get() {
+        Some(t) if !t.is_empty() => format!("/api/v1/engine/sysdump?token={t}"),
+        _ => "/api/v1/engine/sysdump".to_string(),
+    };
+
+    view! {
+        <div class="ops-row">
+            <span class="ops-label">"运维"</span>
+            <label class="ops-inline" title="旧代在飞会话排空预算（秒；空 = 不排空）">
+                "drain"
+                <input class="inp inp-sm" type="number" min="0" max="600" placeholder="—"
+                    prop:value=move || drain.get()
+                    on:input=move |ev| drain.set(event_target_value(&ev)) />
+            </label>
+            <label class="ops-inline" title="中断在飞会话（不等待排空）">
+                <input type="checkbox" prop:checked=move || abort.get()
+                    on:change=move |ev| abort.set(event_target_checked(&ev)) />
+                "abort"
+            </label>
+            <button class="btn" disabled=move || busy.get()
+                on:click=move |_| act("重新加载引擎", "/api/v1/actions/reload", opts(), true)>
+                {move || if armed.get() == "重新加载引擎" { "再点一次确认" } else { "重新加载引擎" }}
+            </button>
+            <button class="btn btn-danger" disabled=move || busy.get()
+                on:click=move |_| act("挂起", "/api/v1/actions/suspend", opts(), true)>
+                {move || if armed.get() == "挂起" { "再点一次确认" } else { "挂起" }}
+            </button>
+            <button class="btn" disabled=move || busy.get()
+                on:click=move |_| act("恢复", "/api/v1/actions/resume", serde_json::json!({}), false)>
+                "恢复"
+            </button>
+        </div>
+        <div class="ops-row">
+            <span class="ops-label">"取证"</span>
+            <label class="ops-inline" title="trace 保持秒数（1–30）">
+                "trace"
+                <input class="inp inp-sm" type="number" min="1" max="30"
+                    prop:value=move || secs.get()
+                    on:input=move |ev| secs.set(event_target_value(&ev)) />
+                "s"
+            </label>
+            <select class="inp inp-sm" prop:value=move || l4.get()
+                on:change=move |ev| l4.set(event_target_value(&ev))>
+                <option value="">"全部协议"</option>
+                <option value="tcp">"仅 TCP"</option>
+                <option value="udp">"仅 UDP"</option>
+            </select>
+            <label class="ops-inline" title="只看被内核判丢/拒的会话">
+                <input type="checkbox" prop:checked=move || drop_only.get()
+                    on:change=move |ev| drop_only.set(event_target_checked(&ev)) />
+                "只看丢弃"
+            </label>
+            <button class="btn" disabled=move || busy.get() on:click=move |_| {
+                let tok = token.get_untracked();
+                let n: u64 = secs.get().trim().parse().unwrap_or(5).clamp(1, 30);
+                let body = serde_json::json!({
+                    "seconds": n,
+                    "l4": l4.get(),
+                    "drop_only": drop_only.get(),
+                });
+                busy.set(true);
+                trace_res.set(None);
+                leptos::task::spawn_local(async move {
+                    let r = post_json::<_, TraceResult>("/api/v1/engine/trace", &body, tok.as_deref()).await;
+                    busy.set(false);
+                    match r {
+                        Ok(v) => trace_res.set(Some(v)),
+                        Err(e) => msg.set(Some((false, format!("抓取事件失败：{e}")))),
+                    }
+                });
+            }>"抓取事件"</button>
+            <a class="btn btn-link" href=sysdump_href download=true
+                title="status/rules/config/maps + system + 现场（ip/nft/iptables/sysctl）打包下载">"下载诊断包"</a>
+        </div>
+        {move || trace_res.get().map(|t| {
+            let head = if t.ok {
+                format!("trace {}s：{} 行{}（文件 {}）", t.seconds, t.total_lines,
+                    if t.truncated { "，已截断展示" } else { "" }, t.file)
+            } else {
+                format!("trace {}s：失败 {}｜{}", t.seconds, t.message, t.file)
+            };
+            let body = t.lines.join("\n");
+            view! {
+                <div class="trace-out">
+                    <div class="trace-head">
+                        <span>{head}</span>
+                        <button class="btn btn-sm" on:click=move |_| trace_res.set(None)>"收起"</button>
+                    </div>
+                    <pre class="trace-pre">{body}</pre>
+                </div>
+            }
+        })}
     }
 }
 
@@ -312,6 +467,97 @@ pub fn MetricsTable(status: RwSignal<Option<StatusView>>) -> impl IntoView {
                     <td>{f(|s| format!("上限 {} · 驱逐 {}", s.relay.fds_soft_limit, s.relay.evicted))}</td>
                     <td>{f(|s| format!("slot {} · {} · deferred {}", s.active_slot, if s.reload.ok { "ok" } else { "ERR" }, s.config.routing_deferred))}</td>
                     <td>{f(|s| format!("失败 {} · failover {}", s.group.probes_fail, s.group.failovers))}</td>
+                </tr>
+            </tbody>
+        </table>
+        </div>
+    }
+}
+
+/// v2.0：数据面卡片 —— UDP NAT（含 GSO）/ 卸载与零拷贝 / 错误面 / 观测面。
+///
+/// 口径：`错误面` 那组计数**正常应恒为 0**（溢出/丢弃/记账失败才不为零）；非零时整格转
+/// 警告色，作为「数据面出了问题」的单点信号。GSO 两列对应 2026-10-17 修复后的聚合发送面：
+/// `GSO 聚合` = 实际聚合发送次数，`回退面` = 逐包回退/raw_udp 次数。
+#[component]
+pub fn DataplaneCard(status: RwSignal<Option<StatusView>>) -> impl IntoView {
+    let f = |g: fn(&StatusView) -> String| {
+        Signal::derive(move || status.get().map(|s| g(&s)).unwrap_or_else(|| "—".into()))
+    };
+    let err_total = move || {
+        status
+            .get()
+            .map(|s| {
+                let st = &s.stats;
+                st.udp_conn_overflow
+                    + st.tcp_conn_overflow
+                    + st.redirect_overflow
+                    + st.redirect_update_failed
+                    + st.domain_publish_dropped
+                    + st.event_drops
+                    + st.offload_account_drops
+                    + s.udp_nat.errors
+            })
+            .unwrap_or(0)
+    };
+    let err_total_sig = Signal::derive(err_total);
+    let err_cls = Signal::derive(move || {
+        if err_total_sig.get() > 0 {
+            "cell-warn".to_string()
+        } else {
+            String::new()
+        }
+    });
+    view! {
+        <div class="t3-wrap">
+        <table class="tbl-3line">
+            <thead>
+                <tr>
+                    <th>"UDP NAT 流量"</th>
+                    <th>"UDP 会话"</th>
+                    <th>"GSO 聚合"</th>
+                    <th>"回退面"</th>
+                    <th>"卸载 / 零拷贝"</th>
+                    <th>"错误面"</th>
+                    <th>"观测"</th>
+                </tr>
+            </thead>
+            <tbody>
+                <tr class="t3-values">
+                    <td>{f(|s| fmt_bytes(s.udp_nat.bytes_up + s.udp_nat.bytes_down))}</td>
+                    <td>{f(|s| s.udp_nat.sessions_active.to_string())}</td>
+                    <td>{f(|s| s.udp_nat.gso_sends.to_string())}</td>
+                    <td>{f(|s| s.udp_nat.raw_udp_fallbacks.to_string())}</td>
+                    <td>{f(|s| s.relay.offloaded_total.to_string())}</td>
+                    <td class=err_cls>
+                        {move || err_total_sig.get().to_string()}
+                    </td>
+                    <td>{f(|s| format!("{} / {}", s.sysctl.watched, s.sysctl.rewrites))}</td>
+                </tr>
+                <tr class="t3-notes">
+                    <td>{f(|s| format!(
+                        "累计 {} · 代理 {} · 直回 {}",
+                        s.udp_nat.sessions_total, s.udp_nat.sessions_proxied, s.udp_nat.direct_fallback
+                    ))}</td>
+                    <td>{f(|s| format!("full-cone {} · 回收 {}", s.udp_nat.cone_sessions, s.udp_nat.evicted))}</td>
+                    <td>{f(|s| format!("用户包 {} · 不支持 {}", s.udp_nat.gso_datagrams, s.udp_nat.gso_unsupported))}</td>
+                    <td>{f(|s| format!("负缓存 {} · 回程套接字回收 {}", s.udp_nat.negcache_hits, s.udp_nat.reply_sockets_evicted))}</td>
+                    <td>{f(|s| format!(
+                        "splice {} · reactor {} · pipe 泄漏 {}",
+                        s.relay.splice_total, s.relay.reactor_codec_sessions,
+                        s.relay.pipe_created.saturating_sub(s.relay.pipe_released)
+                    ))}</td>
+                    <td>{f(|s| {
+                        if s.relay.offload_failures + s.stats.fuse_failures > 0 {
+                            format!("卸载失败 {} · fuse 失败 {}", s.relay.offload_failures, s.stats.fuse_failures)
+                        } else {
+                            "正常（0 溢出/丢弃）".to_string()
+                        }
+                    })}</td>
+                    <td>{f(|s| format!(
+                        "域确认 {} · trace {}",
+                        s.real_domain.confirmed, if s.trace.active { "进行中" } else { "空闲" }
+                    ))}</td>
                 </tr>
             </tbody>
         </table>
