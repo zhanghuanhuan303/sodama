@@ -784,6 +784,8 @@ fn note_tag_hit(tag: &str) {
 static UPSTREAMS: Mutex<Option<Arc<UpstreamSet>>> = Mutex::new(None);
 /// P18c：`dns.routing` 编译结果（None = 无该段，走 legacy 单上游）。
 static DNS_ROUTER: Mutex<Option<Arc<dnsroute::DnsRouter>>> = Mutex::new(None);
+/// P38：`dns.bind` 已启动的监听描述（status 面展示；None = 未配置/启动失败）。
+static DNS_BIND: Mutex<Option<String>> = Mutex::new(None);
 
 fn upstreams() -> Option<Arc<UpstreamSet>> {
     UPSTREAMS.lock().ok().and_then(|g| g.clone())
@@ -925,6 +927,8 @@ struct DnsStats {
     refresh_spawned: AtomicU64,
     refresh_coalesced: AtomicU64,
     refresh_err: AtomicU64,
+    /// P38：`dns.bind` 明文监听收到的查询数
+    bind_queries: AtomicU64,
 }
 static DNS_STATS: DnsStats = DnsStats {
     queries: AtomicU64::new(0),
@@ -944,6 +948,7 @@ static DNS_STATS: DnsStats = DnsStats {
     refresh_spawned: AtomicU64::new(0),
     refresh_coalesced: AtomicU64::new(0),
     refresh_err: AtomicU64::new(0),
+    bind_queries: AtomicU64::new(0),
 };
 
 /// P28：最近一次 ECS 回填 scope（状态面展示，如 `10.9.10.0/16` / `0.0.0.0/0`）。
@@ -6977,6 +6982,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let dns_tx = _keep_tx.clone();
         std::thread::spawn(move || dns_loop(l6, dns_tx));
     }
+    // P38：dns.bind —— 明文 DNS 监听（对照 dae `Dns.Bind`；供 AdGuard/mosdns 指上游）。
+    // 启动生效；reload 改端点需重启（偏离见 ADR-0068）。
+    if let Some(bind) = dns_bind_from_config(cfg_boot.as_ref()) {
+        start_dns_bind(&bind, &_keep_tx);
+    }
 
     // P3b-1：TCP DNS 处理线程（host ns）。accept 在 daens，连接经通道转交到这里；
     // 上游 TCP 连接在本线程（host ns）建立，走宿主路由（不经自己的钩子）。
@@ -8026,6 +8036,215 @@ fn maybe_spawn_optimistic_refresh(
         }
         c.end_refresh(&key);
     });
+}
+
+// ---------------------------------------------------------------- P38：dns.bind 明文监听
+
+/// P38：`dns.bind` 端点（对照 dae `control.ParseEndpoint`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DnsBindEndpoint {
+    addr: SocketAddr,
+    udp: bool,
+    tcp: bool,
+}
+
+/// P38：解析 `dns.bind`——纯 `ip:port` = 仅 UDP；`udp+tcp://ip:port`（scheme 按 `+`
+/// 拆分，仅接受 udp/tcp）＝按 scheme 开监听（对照 dae `ErrBadLocalDNSBindFormat`）。
+fn parse_dns_bind(raw: &str) -> Result<DnsBindEndpoint, String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Err("dns.bind 为空".into());
+    }
+    if let Ok(addr) = raw.parse::<SocketAddr>() {
+        return Ok(DnsBindEndpoint {
+            addr,
+            udp: true,
+            tcp: false,
+        });
+    }
+    let (scheme, rest) = raw
+        .split_once("://")
+        .ok_or_else(|| format!("dns.bind 非法（{raw}）：需要 `ip:port` 或 `udp+tcp://ip:port`"))?;
+    let (mut udp, mut tcp) = (false, false);
+    for s in scheme.split('+') {
+        match s {
+            "udp" => udp = true,
+            "tcp" => tcp = true,
+            other => return Err(format!("dns.bind 不支持协议 {other:?}（仅 udp/tcp）")),
+        }
+    }
+    if !udp && !tcp {
+        return Err(format!("dns.bind 缺少协议（{raw}）"));
+    }
+    let addr = rest
+        .trim_end_matches('/')
+        .parse::<SocketAddr>()
+        .map_err(|e| format!("dns.bind 地址非法（{rest}）: {e}"))?;
+    Ok(DnsBindEndpoint { addr, udp, tcp })
+}
+
+/// P38：从配置读 `dns.bind`（无配置/无键/空值 → None）。
+fn dns_bind_from_config(cfg: Option<&config::Config>) -> Option<String> {
+    let cfg = cfg?;
+    for sec in cfg.sections.iter().filter(|s| s.name == "dns") {
+        for item in &sec.items {
+            if let config::Item::Param(p) = item {
+                if p.key.as_deref() == Some("bind") {
+                    let v = p.val.as_deref().unwrap_or("").trim();
+                    if !v.is_empty() {
+                        return Some(v.to_string());
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// P38：启动 `dns.bind` 监听（对照 dae `NewDNSListener` + `Start`）。
+/// 偏离（如实）：UDP 单线程串行处理（无 dae 的 16384 并发闸门，过载由内核丢包兑底）；
+/// reload 不重启监听（端点变更需重启进程；dae 会 `RestartDNSListener`）。
+fn start_dns_bind(raw: &str, tx: &std::sync::mpsc::Sender<status::MainMsg>) {
+    let ep = match parse_dns_bind(raw) {
+        Ok(ep) => ep,
+        Err(e) => {
+            log(&format!("dns.bind 解析失败: {e}（监听未启动）"));
+            return;
+        }
+    };
+    if let Ok(mut g) = DNS_BIND.lock() {
+        let proto = match (ep.udp, ep.tcp) {
+            (true, true) => "udp+tcp",
+            (true, false) => "udp",
+            (false, true) => "tcp",
+            (false, false) => "none",
+        };
+        *g = Some(format!("{proto}://{}", ep.addr));
+    }
+    if ep.udp {
+        let tx = tx.clone();
+        std::thread::spawn(move || dns_bind_udp_loop(ep.addr, tx));
+    }
+    if ep.tcp {
+        let tx = tx.clone();
+        std::thread::spawn(move || dns_bind_tcp_loop(ep.addr, tx));
+    }
+}
+
+/// P38：`dns.bind` UDP 监听——复用透明 DNS 的完整链路（resolve_dns：路由/上游/缓存/位图）。
+fn dns_bind_udp_loop(addr: SocketAddr, tx: std::sync::mpsc::Sender<status::MainMsg>) {
+    let sock = match std::net::UdpSocket::bind(addr) {
+        Ok(s) => s,
+        Err(e) => {
+            log(&format!("dns.bind: UDP 绑定 {addr} 失败: {e}"));
+            return;
+        }
+    };
+    log(&format!(
+        "dns.bind: UDP 监听 {addr}（明文 DNS；供 AdGuard/mosdns 等指上游；路由/上游/缓存与透明 DNS 同一链路）"
+    ));
+    let mut buf = vec![0u8; 65535];
+    loop {
+        let (n, peer) = match sock.recv_from(&mut buf) {
+            Ok(v) => v,
+            Err(e) => {
+                log(&format!("dns.bind: recv 失败: {e}"));
+                std::thread::sleep(Duration::from_millis(50));
+                continue;
+            }
+        };
+        let query = &buf[..n];
+        // QR 置位的包（应答/伪造）静默丢弃；头部不完整的丢掉（对照 dae dns_listener）。
+        if query.len() < 12 || query[2] & 0x80 != 0 {
+            continue;
+        }
+        DNS_STATS.bind_queries.fetch_add(1, Ordering::Relaxed);
+        let resolved = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            resolve_dns(query, ClientProto::Udp, Some(peer.ip()), None, Some(addr), &tx)
+        }));
+        let resp = match resolved {
+            Ok(Some(r)) => r,
+            // dae：超时/错误 → SERVFAIL；无法构造（畸形）则静默丢。
+            Ok(None) => dns::servfail(query),
+            Err(_) => {
+                DNS_STATS.upstream_errors.fetch_add(1, Ordering::Relaxed);
+                log("dns.bind: 查询处理 panic（已隔离，连续出现请查日志）");
+                dns::servfail(query)
+            }
+        };
+        if resp.is_empty() {
+            continue;
+        }
+        if let Err(e) = sock.send_to(&resp, peer) {
+            log(&format!("dns.bind: 回包 {peer} 失败: {e}"));
+        }
+    }
+}
+
+/// P38：`dns.bind` TCP 监听（DNS over TCP，RFC 1035 §4.2.2：2 字节长度前缀）。
+fn dns_bind_tcp_loop(addr: SocketAddr, tx: std::sync::mpsc::Sender<status::MainMsg>) {
+    let listener = match std::net::TcpListener::bind(addr) {
+        Ok(l) => l,
+        Err(e) => {
+            log(&format!("dns.bind: TCP 绑定 {addr} 失败: {e}"));
+            return;
+        }
+    };
+    log(&format!("dns.bind: TCP 监听 {addr}（明文 DNS over TCP）"));
+    for stream in listener.incoming() {
+        let Ok(stream) = stream else { continue };
+        let tx = tx.clone();
+        std::thread::spawn(move || dns_bind_tcp_conn(stream, addr, &tx));
+    }
+}
+
+fn dns_bind_tcp_conn(
+    mut stream: TcpStream,
+    local: SocketAddr,
+    tx: &std::sync::mpsc::Sender<status::MainMsg>,
+) {
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
+    let peer = stream.peer_addr().ok();
+    loop {
+        let mut lenb = [0u8; 2];
+        if stream.read_exact(&mut lenb).is_err() {
+            return;
+        }
+        let len = u16::from_be_bytes(lenb) as usize;
+        if len < 12 {
+            return;
+        }
+        let mut query = vec![0u8; len];
+        if stream.read_exact(&mut query).is_err() {
+            return;
+        }
+        if query[2] & 0x80 != 0 {
+            continue; // QR 置位（应答/伪造）：丢弃该查询，保持连接
+        }
+        DNS_STATS.bind_queries.fetch_add(1, Ordering::Relaxed);
+        let client = peer.map(|p| p.ip());
+        let resolved = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            resolve_dns(&query, ClientProto::Tcp, client, None, Some(local), tx)
+        }));
+        let resp = match resolved {
+            Ok(Some(r)) => r,
+            Ok(None) => dns::servfail(&query),
+            Err(_) => {
+                DNS_STATS.upstream_errors.fetch_add(1, Ordering::Relaxed);
+                dns::servfail(&query)
+            }
+        };
+        if resp.is_empty() {
+            return;
+        }
+        let n = resp.len().min(65535) as u16;
+        if stream.write_all(&n.to_be_bytes()).is_err()
+            || stream.write_all(&resp[..n as usize]).is_err()
+        {
+            return;
+        }
+    }
 }
 
 /// P3a/P3b/P4b UDP 线程（host ns）：一个透明监听同时承载
@@ -9805,6 +10024,8 @@ fn status_json(ebpf: &mut Ebpf) -> serde_json::Value {
             "ipversion_filtered": DNS_STATS.ipversion_filtered.load(Ordering::Relaxed),
             "fixed_domain_ttl": dnso.fixed_domain_ttl.len(),
             "domain_sets": DOMAIN_SETS.lock().map(|g| g.len()).unwrap_or(0),
+            "bind": DNS_BIND.lock().ok().and_then(|g| g.clone()),
+            "bind_queries": DNS_STATS.bind_queries.load(Ordering::Relaxed),
         },
         "config": cfg_summary,
     })
@@ -9990,6 +10211,7 @@ fn metrics_text(v: &serde_json::Value) -> String {
         ("sodama_dns_upstream_errors", ["dns", "upstream_errors"]),
         ("sodama_dns_tcp_queries", ["dns", "tcp_queries"]),
         ("sodama_dns_tcp_responses", ["dns", "tcp_responses"]),
+        ("sodama_dns_bind_queries", ["dns", "bind_queries"]),
         ("sodama_dns_cache_hits", ["dns", "cache_hits"]),
         ("sodama_dns_cache_misses", ["dns", "cache_misses"]),
         ("sodama_dns_cache_inserts", ["dns", "cache_inserts"]),
@@ -10223,6 +10445,27 @@ mod tests {
     use super::*;
 
     // ---- P38：CLI 小件 ----
+
+    #[test]
+    fn parse_dns_bind_endpoint() {
+        // 纯 ip:port = 仅 UDP（对照 dae ParseEndpoint）
+        let ep = parse_dns_bind("127.0.0.1:5353").unwrap();
+        assert_eq!(ep.addr, "127.0.0.1:5353".parse().unwrap());
+        assert!(ep.udp && !ep.tcp);
+        let ep = parse_dns_bind("[::1]:5353").unwrap();
+        assert!(ep.udp && !ep.tcp);
+        // URL 形式：scheme 按 + 拆
+        let ep = parse_dns_bind("udp+tcp://127.0.0.1:53").unwrap();
+        assert!(ep.udp && ep.tcp);
+        let ep = parse_dns_bind("tcp://127.0.0.1:5300").unwrap();
+        assert!(!ep.udp && ep.tcp);
+        // 非法：未知协议 / 缺协议 / 缺端口 / 空
+        assert!(parse_dns_bind("https://127.0.0.1:53").is_err());
+        assert!(parse_dns_bind("://127.0.0.1:53").is_err());
+        assert!(parse_dns_bind("udp://127.0.0.1").is_err());
+        assert!(parse_dns_bind("127.0.0.1").is_err());
+        assert!(parse_dns_bind("  ").is_err());
+    }
 
     #[test]
     fn log_line_timestamp_toggle() {

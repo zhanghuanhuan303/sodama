@@ -552,6 +552,31 @@ pub fn empty_noerror(query: &[u8]) -> Vec<u8> {
     out
 }
 
+/// P38：构造 SERVFAIL 应答（保留 question；QR=1，RCODE=2）——
+/// `dns.bind` 查询失败/超时的兑底应答（对照 dae `dns_listener` 的 SERVFAIL 行为）。
+pub fn servfail(query: &[u8]) -> Vec<u8> {
+    if query.len() < 12 {
+        return Vec::new();
+    }
+    let qdcount = read_u16(query, 4).unwrap_or(0);
+    if qdcount == 0 {
+        return Vec::new();
+    }
+    let Some(qend) = questions_end(query) else {
+        return Vec::new();
+    };
+    let mut out = Vec::with_capacity(12 + (qend - 12));
+    out.extend_from_slice(&query[..12]);
+    out[2] |= 0x80; // QR=1
+    out[2] &= !0x02; // TC=0
+    out[3] = 0x80 | 0x02 | (query[3] & 0x01); // RA=1，RCODE=SERVFAIL(2)
+    out[6..8].copy_from_slice(&0u16.to_be_bytes());
+    out[8..10].copy_from_slice(&0u16.to_be_bytes());
+    out[10..12].copy_from_slice(&0u16.to_be_bytes());
+    out.extend_from_slice(&query[12..qend]);
+    out
+}
+
 /// P18c：应答路由 reject——删掉 answer 段（对照 dae `respMsg.Answer = nil`），
 /// 保留 question 与其余段（authority/additional）及头部 flag/rcode。
 pub fn strip_answers(response: &[u8]) -> Vec<u8> {
@@ -1233,6 +1258,24 @@ mod tests {
         q.extend_from_slice(&(if do_bit { 0x8000u32 } else { 0u32 }).to_be_bytes());
         put_u16(&mut q, 0);
         q
+    }
+
+    #[test]
+    fn servfail_echoes_question_and_sets_rcode() {
+        let q = query("sf.test", 1);
+        let r = servfail(&q);
+        assert!(r.len() > 12);
+        assert_eq!(r[0..2], q[0..2]); // ID 保留
+        assert_eq!(r[2] & 0x80, 0x80); // QR=1
+        assert_eq!(r[2] & 0x01, 0x01); // RD 保留
+        assert_eq!(r[3] & 0x0f, 0x02); // RCODE=SERVFAIL
+        assert_eq!(r[6..8], [0, 0]); // ANCOUNT=0
+        assert_eq!(&r[12..], &q[12..]); // question 原样回显
+        // 畸形/无 question：返回空（调用方跳过发送）
+        assert!(servfail(&[0u8; 4]).is_empty());
+        let mut noq = q.clone();
+        noq[4..6].copy_from_slice(&0u16.to_be_bytes());
+        assert!(servfail(&noq).is_empty());
     }
 
     fn query(name: &str, qtype: u16) -> Vec<u8> {
