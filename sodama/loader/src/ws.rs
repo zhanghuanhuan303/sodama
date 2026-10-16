@@ -242,6 +242,15 @@ impl<R: Read> Read for WsReader<R> {
                 self.remaining -= got as u64;
                 return Ok(got);
             }
+            // 帧边界处的干净 EOF（0 字节残留）= 对端正常收尾，不是截断：
+            // 必须先探一次 EOF 再读帧头，否则 `read_frame_header` 的
+            // `ensure_buffered(2)` 会把「无数据可读」与「头只有一半」混为一谈
+            // （生产实测：CF worker 每会话结束时裸关 TCP，导致 78% 会话被误报
+            //  「ws: 帧被截断」——真截断信号淹没在假失败里）。
+            if self.pending_pos == self.pending.len() && !self.ensure_buffered(1)? {
+                self.eof = true;
+                return Ok(0);
+            }
             let (opcode, len, masked) = self.read_frame_header()?;
             if masked {
                 return Err(io::Error::new(
@@ -434,6 +443,33 @@ mod tests {
         assert_eq!(out, b"hello world!!");
         let pongs = r.pongs.lock().unwrap().clone();
         assert_eq!(pongs, vec![b"pi".to_vec()]);
+    }
+
+    #[test]
+    fn bare_eof_at_frame_boundary_is_clean() {
+        // 完整帧后对端裸关 TCP（无 Close 帧、无残留字节）：必须 Ok(0)，不能报“帧被截断”。
+        let mut script = Vec::new();
+        script.extend(frame(0x2, b"hello"));
+        let mut r = reader_with(script);
+        let mut buf = [0u8; 32];
+        assert_eq!(r.read(&mut buf).unwrap(), 5);
+        assert_eq!(&buf[..5], b"hello");
+        assert_eq!(r.read(&mut buf).unwrap(), 0);
+        // 再次读仍为干净 EOF（eof 位粘滞）
+        assert_eq!(r.read(&mut buf).unwrap(), 0);
+    }
+
+    #[test]
+    fn partial_header_eof_is_error() {
+        // 只剩 1 字节（帧头不完整）后 EOF：仍必须报 UnexpectedEof。
+        let mut script = Vec::new();
+        script.extend(frame(0x2, b"he"));
+        script.push(0x82); // 下一帧头只写了一半
+        let mut r = reader_with(script);
+        let mut buf = [0u8; 32];
+        assert_eq!(r.read(&mut buf).unwrap(), 2);
+        let e = r.read(&mut buf).expect_err("残字节应报错");
+        assert_eq!(e.kind(), ErrorKind::UnexpectedEof);
     }
 
     #[test]
