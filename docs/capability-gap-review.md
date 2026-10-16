@@ -1,6 +1,6 @@
 # 能力缺口清点：dae（上游 Go）↔ sodama（全 Rust）
 
-- **版本**：v1.2 · 2026-10-16（同日二更：eBPF 余项批次——§3 数据面全部余项落地，24 行判定全部「已完成」；ADR-0067 与 `phase2-devlog.md` §21。v1.1 = 本日 top 10 缺口 #1–#4 落地）
+- **版本**：v1.3 · 2026-10-16（同日三更：引用回填与**附 A 当前能力缺失清单**固化——§4 两行随 §3 转「已完成」、§2 生效面 23→26；清单口径：未做 20 + 部分 28。v1.2 = eBPF 余项批次；v1.1 = top 10 #1–#4）
 - **对照基线**：上游 clone `dae/`（`main@e3fee8f`，工作树 `2026-10-03`）+ 本仓库 `sodama/`（工作树 `2026-10-16`，能力缺口批次 #1–#4 之后）
 - **本文档定位**：**一次性、逐项、可核查的能力清点**。不是覆盖度百分比（那是 `parity-status.md` 的口径），也不是排期（那是 `backlog.md` 的口径）。
 
@@ -67,7 +67,7 @@
 | `include` 展开 + 目录相对约束 + 循环检测 | `dae/config/config_merger.go`（dfsMerge） | `config.rs:1036`（取 include）、`:1017`（`circular include is not allowed`）、`:2413`（测试) | **已完成** |
 | `rule_set` 段（标准格式规则集 + URL 自动更新/缓存） | dae 无此段 | `config.rs:1192`（段名）、`:2051-2063`（提取）、`ruleset.rs:90-160`（磁盘缓存） | **已完成**（sodama 独有） |
 | global 键**解析面**完整度 | `dae/config/config.go:19-63`（34 个 mapstructure 键） | `config.rs:1108-1164`（`GLOBAL_KEYS` **48 项** ⊇ dae 全部键 + sodama 自有键）、`:1223-1230`（未知键报错） | **已完成** |
-| global 键**生效面** | dae：`cmd/run.go:264`（log_level 生效）、`dialer.go:260-265`（utls/tls_fragment/bandwidth/udphop 生效）、`control_plane.go:574,878`（fallback_resolver/tproxy_port_protect） | **生效 23 项**（`tcp_check_url` `main.rs:4555`、`udp_check_dns` `:4576`、`check_interval` `:4565`、`check_tolerance` `:4570`、`dial_mode` `:5666/5355`、`sniffing_timeout` `:5682/5368`、`auto_sniff_punt` `:5691/5376`、`bootstrap_resolver` `:5710/4201`、`log_file` `:5591`、`status_socket` `:5594`、`geodata_dir` `:5600`、`watch_config` `:5597`、`sub_cache_ttl` `:5393`、`sub_fail_ttl` `:5400`、`relay_idle_timeout` `:5635`、`udp_idle_timeout` `:5653`、`dial_timeout` `:5647`、`max_conns` `:5641`、`subscription_failover` `:4603-4606`、`subscription_update_interval` `:5109`、`probe_idle_cap` `:4609-4611`、`rule_set_update_interval`/`rule_set_cache_dir` `:4094-4097`）。**解析但不生效 22 项**：`tproxy_port`（仅 CLI，`main.rs:5625`）、`so_mark_from_dae`（数据面/控制面硬编码 `0x233`，`main.rs:97`）、`log_level`、`tcp_check_http_method`（探测硬编码 GET，`group.rs:980`）、`lan_interface`/`wan_interface`、`allow_insecure`（仅节点参数侧生效，`outbound.rs:1942`）、`disable_waiting_network`、`disable_thp`、`auto_config_kernel_parameter`、`tls_implementation`、`utls_imitate`、`tls_fragment`、`tls_fragment_length`、`tls_fragment_interval`、`pprof_port`、`mptcp`、`fallback_resolver`、`bandwidth_max_tx`、`bandwidth_max_rx`、`udphop_interval`（仅 `udphop-interval=` 节点参数，`outbound.rs:2347-2348,2418`）、`bpf_conn_state_map_size` | **部分**：缺「解析了但静默不生效」的显式告警与上列 22 项的行为 |
+| global 键**生效面** | dae：`cmd/run.go:264`（log_level 生效）、`dialer.go:260-265`（utls/tls_fragment/bandwidth/udphop 生效）、`control_plane.go:574,878`（fallback_resolver/tproxy_port_protect） | **生效 26 项**（`tcp_check_url` `main.rs:4555`、`udp_check_dns` `:4576`、`check_interval` `:4565`、`check_tolerance` `:4570`、`dial_mode` `:5666/5355`、`sniffing_timeout` `:5682/5368`、`auto_sniff_punt` `:5691/5376`、`bootstrap_resolver` `:5710/4201`、`log_file` `:5591`、`status_socket` `:5594`、`geodata_dir` `:5600`、`watch_config` `:5597`、`sub_cache_ttl` `:5393`、`sub_fail_ttl` `:5400`、`relay_idle_timeout` `:5635`、`udp_idle_timeout` `:5653`、`dial_timeout` `:5647`、`max_conns` `:5641`、`subscription_failover` `:4603-4606`、`subscription_update_interval` `:5109`、`probe_idle_cap` `:4609-4611`、`rule_set_update_interval`/`rule_set_cache_dir` `:4094-4097`、**`lan_interface`/`wan_interface`（v1.1，ADR-0066：ifwatch 热插拔/模式匹配/config 回填）**、**`bpf_conn_state_map_size`（v1.2，ADR-0067：启动时生效）**）。**解析但不生效 19 项**：`tproxy_port`（仅 CLI，`main.rs:5625`）、`so_mark_from_dae`（数据面/控制面硬编码 `0x233`，`main.rs:97`）、`log_level`、`tcp_check_http_method`（探测硬编码 GET，`group.rs:980`）、`allow_insecure`（仅节点参数侧生效，`outbound.rs:1942`）、`disable_waiting_network`、`disable_thp`、`auto_config_kernel_parameter`、`tls_implementation`、`utls_imitate`、`tls_fragment`、`tls_fragment_length`、`tls_fragment_interval`、`pprof_port`、`mptcp`、`fallback_resolver`、`bandwidth_max_tx`、`bandwidth_max_rx`、`udphop_interval`（仅 `udphop-interval=` 节点参数，`outbound.rs:2347-2348,2418`） | **部分**：缺「解析了但静默不生效」的显式告警与上列 19 项的行为 |
 | `global.tproxy_port_protect` | dae：`config.go:21` 赋值到 `control_plane.go:878`，但 **C 数据面从未读取**（`kern/tproxy.c:215` 只有结构体字段） | sodama：`config.rs:1110` 允许该键，`ebpf-rs/src/common.rs:104` 也只有字段、无人读取 | **已完成**（两端同为空置；不是缺口） |
 | dns 段键解析（9 键） | `dae/config/config.go:137-149` | `config.rs:1166-1176`（`DNS_KEYS`）、`:1390-1430`（逐键处理） | **已完成** |
 | `dns.bind`（明文 DNS 监听地址） | `dae/control/control_plane.go:928-937`（`NewDNSListener`，供 AdGuardHome/mosdns 等外部 DNS 指上游） | 仅允许键（`config.rs:1171`），**无消费点**（`grep '"bind"' main.rs` 空） | **未做** |
@@ -128,10 +128,10 @@
 |---|---|---|---|
 | 加载器/ABI/生成绑定：`bpf_bpfeb.go`、`bpf_bpfel.go`、`bpf_stub.go`、`bpf_host_abi.go`、`bpf_utils.go`、`bpf_purge.go` | `control/bpf_utils.go:659-670`（`PARAM` 注入）、`:806`（map 句柄拷贝） | aya 装载 + 用户态 BTF 解析（`btfoff.rs`，14 项测试）+ 挂载 `main.rs:2116-2136` | **已完成**（形态不同：cilium/ebpf 生成绑定 vs aya 运行期解析） |
 | 控制面主体与 datapath 装配：`control.go`、`control_plane.go`、`control_plane_core.go`、`active_control_plane.go`、`control_plane_parse.go`、`control_plane_datapath.go`、`control_plane_core_routing.go`、`control_plane_core_bind.go`、`control_plane_core_bind_event.go` | `control_plane.go:407`（sysctl 初始化）、`:868-878`（选项装配）、`control_plane_core_bind.go:172-183`（bindLan + 自动内核参数）、`:487+`（接口 pattern 注册） | `main.rs:4080-4158`（编译写槽）、`:2116-2136`（挂载）、`:4446-4518`（组构建）；**接口懒绑定/热插拔已补（v1.1）**：`ifwatch.rs`（`path.Match` glob + 1s 轮询 + `auto`→默认路由接口；`main.rs:6039-6044/6352-6374` 挂载与补挂/清理；ADR-0066 偏离 #1：轮询替代 netlink） | **已完成**（内核级实测 `test-hotplug`；余：接管时延 ~1s 未量化） |
-| 代次/热重载/交接：`datapath_generation.go`、`fresh_datapath_state.go`、`generation_state.go`、`routing_epoch.go`、`routing_epoch_execution.go`、`routing_epoch_runtime.go`、`bpf_routing_epoch_attribution.go`、`control_plane_drain.go`、`control_plane_dialtarget.go`、`control_plane_dns.go` | `cmd/run.go:155-197`（`stagedReloadHandoff` 20+ 字段）、`run_reload.go:499`、`run_reload_worker.go:497` | `main.rs:108-110`（`EPOCH_SLOT_NUM=2`）、`:3956-3964`（切槽）、`:4189-4304`（reload 全流程）、`:6240-6258`（优雅退出） | **部分**：双 epoch 有；缺 `datapath_generation` 代次标记、fresh-datapath 交接与 drain 预算（dae 用于「换代期间新旧规则并存」的精确语义） |
+| 代次/热重载/交接：`datapath_generation.go`、`fresh_datapath_state.go`、`generation_state.go`、`routing_epoch.go`、`routing_epoch_execution.go`、`routing_epoch_runtime.go`、`bpf_routing_epoch_attribution.go`、`control_plane_drain.go`、`control_plane_dialtarget.go`、`control_plane_dns.go` | `cmd/run.go:155-197`（`stagedReloadHandoff` 20+ 字段）、`run_reload.go:499`、`run_reload_worker.go:497` | `main.rs:108-110`（`EPOCH_SLOT_NUM=2`）、`:3956-3964`（切槽）、`:4189-4304`（reload 全流程）、`:6240-6258`（优雅退出）；**`datapath_generation` 代次标记已补（v1.2，ADR-0067：启动随机/reload 递增，用于纯 SYN 重绑判定）** | **部分**：双 epoch + 代次标注有；仍缺 fresh-datapath 交接与 drain 预算（dae 用于「换代期间新旧规则并存」的精确语义） |
 | 规则匹配与分流 VM：`routing_matcher_builder.go`、`routing_matcher_userspace.go`、`domain_routing_tracker.go`、`real_domain_runtime.go`、`hash_utils.go`、`utils.go`、`addr.go` | `component/routing/matcher_builder.go`；`control/routing_matcher_userspace.go` 头注释：「用户态重放规则」 | `rules.rs`（数据面 VM 与用户态重放共用）、`main.rs:7214-7279`（域位图投影/回收）、`:3341-3357`（sniff-punt 重判） | **部分**：缺 `real_domain_runtime.go:1-16` 的「已验证真实域名」容量 8192 的 FIFO 确认集与负缓存（sodama 走 `sticky.rs` 粘滞 IP，语义相近但不等价） |
 | TCP 流转发：`tcp.go`、`tcp_flow_binding.go`、`tcp_relay_core.go`、`tcp_relay_capabilities.go`、`tcp_relay_offload.go`、`tcp_copy_engine.go`、`tcp_copy_linux.go`、`tcp_copy_gather_linux.go`、`tcp_copy_other.go`、`tcp_copy_gather_other.go`、`tcp_sniff_policy.go` | `control/tcp.go`（relay 主体）、`tcp_copy_linux.go`（splice/copy 引擎） | `main.rs:3359-3773`（`handle_relay_conn`）、`:2523-2579`（copy pump）、`:2654-2731`（splice pump）、`reactor.rs`（epoll worker 池） | **已完成**（能力等价：splice 零拷贝、半关闭、SO_MARK 均实测，M1/M4） |
-| TCP offload 生命周期：`tcp_offload_common.go`、`tcp_offload_hook.go`、`tcp_offload_links.go`、`tcp_offload_linux.go`、`tcp_offload_other.go` | `control/tcp_offload_hook.go`（fentry/kprobe 二选一）、`tcp_offload_links.go`（link 管理） | `main.rs:3070-3115`（try_offload）、`:2188-2260`（fentry/kprobe 挂载）、`:2867-2955`（看门狗）、`offload.rs` | **部分**：缺 `tcp_offload_pause` 背压 fuse 与 pause 键（同 §3） |
+| TCP offload 生命周期：`tcp_offload_common.go`、`tcp_offload_hook.go`、`tcp_offload_links.go`、`tcp_offload_linux.go`、`tcp_offload_other.go` | `control/tcp_offload_hook.go`（fentry/kprobe 二选一）、`tcp_offload_links.go`（link 管理） | `main.rs:3070-3115`（try_offload）、`:2188-2260`（fentry/kprobe 挂载）、`:2867-2955`（看门狗）、`offload.rs`；**背压 fuse 已补（v1.2，ADR-0067）** | **已完成**（余：fuse 真实触发留生产观测） |
 | UDP 会话与转发：`udp.go`、`udp_runtime.go`、`udp_flow.go`、`udp_flow_binding.go`、`udp_conn_state_tracker.go`、`udp_lifecycle.go`、`udp_profile.go` | `control/udp.go`、`udp_conn_state_tracker.go` | `main.rs:7372-7483`（`udp_nat_session`）、`:7540-7564`（janitor）、`:7297-7335`（会话读线程） | **已完成** |
 | UDP 批处理/任务池：`udp_ingress_batch.go`、`udp_ingress_task.go`、`udp_task_pool.go`、`udp_write_batch.go` | `control/udp_ingress_batch.go`（recvmmsg 批量） | `main.rs:6556-6652`（`UdpRecvBatch` recvmmsg）、`:6438-6486`（`send_batch_to_udp` sendmmsg）；O7 四方对拍 20k pps 0 丢包 | **已完成**（已实测） |
 | UDP endpoint pool / full-cone：`udp_endpoint_pool.go`、`udp_endpoint_lifecycle.go`、`udp_endpoint_reply.go`、`udp_endpoint_watcher.go` | `control/udp_endpoint_pool.go:20-27`（负缓存 `ErrEndpointFailed`）、`:29-40`（TTL/janitor） | 无 endpoint 池：每 `(client,orig_dst)` 会话一个透明回包 socket，容量 128 的 LRU 缓存（`main.rs:7339-7369`） | **未做**：缺端点复用池/负缓存/watcher（`backlog.md:70` E1 已登记） |
@@ -143,7 +143,7 @@
 | 告警节流：`alert_pacing.go` | `control/alert_pacing.go:14-22`（「持续条件合并为 N 秒一条 + 上报观察次数」） | `main.rs:4403-4442`（90% 容量固定步长告警）、`:989-995`（事件按类型限速 1/s） | **部分**：缺「持续条件 + 观察次数」抽象（只有固定步长单次告警） |
 | 钩子生命周期：`tc_hook_set.go`、`tc_hook_handoff.go` | `control/tc_hook_set.go`、`tc_hook_handoff.go`（跨代钩子交接） | `main.rs:2116-2136`（挂载，link 持有）+ `HOOKS`（`:136`）；无摘钩/交接（依赖 TCX 进程退出自动摘） | **部分**：缺显式摘钩/交接用例（TCX 冷启动语义已实测，ADR-0009） |
 | 状态清扫与 pinning：`conn_state_janitor.go`、`conn_state_pinning.go` | `conn_state_janitor.go:197-199`（含 routing_handoff 清扫，60s 级） | `main.rs:4370-4396`（conn_state）、`:4403-4442`（redirect_track）；**map pinning 已补（v1.2，见 §3）** | **已完成** |
-| 拨号/健康/连接性：`dial.go`、`connectivity.go`、`node_latency.go` | `dial.go`（拨号参数与 must 语义）、`connectivity.go:13-18`（3 域 × 2 IP 版本 × 出口）、`node_latency.go:12-19`（延迟快照 API） | `group.rs`（探测/策略/`min_moving_avg`/容忍度/UDP DNS 探测）、`main.rs:3021-3039`（按组选 dialer） | **部分**：缺数据面连通性投影（`outbound_connectivity_map`，见 §3） |
+| 拨号/健康/连接性：`dial.go`、`connectivity.go`、`node_latency.go` | `dial.go`（拨号参数与 must 语义）、`connectivity.go:13-18`（3 域 × 2 IP 版本 × 出口）、`node_latency.go:12-19`（延迟快照 API） | `group.rs`（探测/策略/`min_moving_avg`/容忍度/UDP DNS 探测）、`main.rs:3021-3039`（按组选 dialer）；**数据面连通性投影已补（v1.2，ADR-0067：`outbound_connectivity_map` + 2s 健康投影）** | **已完成** |
 | 会话管理与 abort：`session_manager.go` | `control/session_manager.go:143-151`（进程级 flow owner）、`cmd/reload.go:260`（`--abort`）、`cmd/run.go:164,795,835`（交接时 abort） | 无 | **未做**：reload/suspend 不能中止已建连接 |
 | 系统集成：`netns_utils.go`、`sysctl.go` | `control/netns_utils.go`（建 netns/移网卡/tproxy 规则）、`sysctl.go:32`（`InitSysctlManager` + fsnotify 监视回写） | 脚本侧等价：`sodama/lab/gateway.sh:299-350`（sysctl/veth/路由/路由表 2023 全套 + `restore_sysctls`）；loader 自身**不自建**（`docs/deploy.md:19-21`） | **部分**：能力在（脚本级，gateway.sh 已实测）；systemd 路径需外部自备，且无「运行中 sysctl 被改回即纠正」的监视 |
 | netkit 设备（替代 veth） | `control/netkit_linux.go:11-25`（`NetkitConfig`，含 `ScrubNone` 关 mark 擦除）、`netkit_netlink.go` | 无（`lab/gateway.sh` 用经典 veth） | **未做**（低相关：设备类型优化，非功能缺失） |
@@ -219,14 +219,15 @@
 | 1. CLI 面 | 18 | 3 | 7 | 8 |
 | 2. 配置面 | 21 | 5 | 3 | 13 |
 | 3. 数据面 | 24 | 0 | 0 | 24 |
-| 4. 控制面子系统 | 24 | 4 | 11 | 9 |
+| 4. 控制面子系统 | 24 | 4 | 9 | 11 |
 | 5. 运维/发布面 | 12 | 5 | 4 | 3 |
 | 6. 工程化/质量面 | 11 | 3 | 5 | 3 |
-| **合计** | **110** | **20** | **31** | **59** |
+| **合计** | **110** | **20** | **28** | **62** |
 
 （表内每行判定均为三档之一；判定为「不适用」的项一律只在上一小节列出，不计入本表。
 v1.1（2026-10-16 晚）：能力缺口批次 #1–#4 落地，4 行由「未做/部分」转「已完成」——§2 两行（must 糖、订阅 `-file` scheme）、§3 一行（`routing_map` 容量）、§4 一行（接口懒绑定/热插拔）。
-v1.2（2026-10-16 深夜）：**eBPF 余项批次落地，§3 数据面 24 行全部「已完成」**——4 项未做（`lan_egress`/出口存活/背压 fuse/pinning）与 6 项部分（事件 3/5/9/限速键域/容量可配/stats 键/handoff）全部补齐（ADR-0067、devlog §21）；残留项为已文档化的偏离（per-CPU 限速、运行期容量、pinning 迁移方案等，见 ADR-0067 偏离清单）。）
+v1.2（2026-10-16 深夜）：**eBPF 余项批次落地，§3 数据面 24 行全部「已完成」**——4 项未做（`lan_egress`/出口存活/背压 fuse/pinning）与 6 项部分（事件 3/5/9/限速键域/容量可配/stats 键/handoff）全部补齐（ADR-0067、devlog §21）；残留项为已文档化的偏离（per-CPU 限速、运行期容量、pinning 迁移方案等，见 ADR-0067 偏离清单）。
+v1.3（2026-10-16）：引用回填与清单固化——§4 两行随 §3 同步转「已完成」（offload 生命周期、拨号/健康/连接性），§2 global 生效面更新（生效 23 → **26**：`lan_interface`/`wan_interface`、`bpf_conn_state_map_size`；不生效 22 → 19）；新增**附 A · 当前能力缺失清单**（未做 20 + 部分 28 的过滤视图，随本表同步维护）。）
 
 读数提示：
 
@@ -246,12 +247,87 @@ v1.2（2026-10-16 深夜）：**eBPF 余项批次落地，§3 数据面 24 行�
 | 3 | ~~接口懒绑定 / 热插拔缺失（`wan_interface: auto`、glob pattern、netlink add/remove 回调，§4）~~ **✅ 已完成（本批 #3，ADR-0066；内核级实测 `test-hotplug`；实现为 1s 轮询而非 netlink）** | 网关形态下设备变动是常态（USB 网卡、容器 veth、接口改名、拨号重建）。dae 在接口出现时自动补挂（`interface_manager.go:38-50` + `control_plane_core_bind.go:487+`），sodama 只在启动时按**精确名字**挂一次；变动后该接口流量**静默不被接管**。 |
 | 4 | ~~`routing_map` 上限 64 vs 1024（§3）~~ **✅ 已完成（本批 #4，ADR-0066；`bpf_loop` 路线，内核级实测 `test-rules-cap`）** | 直接决定「大规则集能不能上线」：sodama 编译期报错拒启（不静默，但配置改不动）。参考点：`dae/example.dae:370-394` 的 routing 段只有 6 条规则，远低于上限——**推断**（未统计社区配置样本）：风险只在「规则数 > 64」的大配置上变现（如逐站点 `domain()` 白名单 + `pname` 组合），届时为硬门槛。 |
 | 5 | TLS 分片与 uTLS 指纹开关全部不生效（`tls_fragment*`/`utls_imitate`/`tls_implementation`，§2） | 直接影响「能不能过」：SNI 分片是抗阻断的常用手段，且 dae 是全局开关一次生效。sodama 有自实现 Chrome-120 指纹（REALITY 路径），但**用户无法切换/分片**，也无法对普通 TLS 出站生效。 |
-| 6 | 数据面「出口已死」判定缺失（`outbound_connectivity_map` + `wan_outbound_is_alive`，§3） | 出口全死时 sodama 仍把流量 redirect 到控制面，靠 relay 侧拨号失败兜底：每一次失败都要走完整 tproxy→relay→dial 链路，表现为**延迟上升与失败率放大**，而不是数据面直接丢弃/回退。 |
+| 6 | ~~数据面「出口已死」判定缺失（`outbound_connectivity_map` + `wan_outbound_is_alive`，§3）~~ **✅ 已完成（eBPF 余项批次，ADR-0067，devlog §21；内核级实测 `test-alive`：组标死→数据面阻断→恢复）** | 出口全死时 sodama 仍把流量 redirect 到控制面，靠 relay 侧拨号失败兑底：每一次失败都要走完整 tproxy→relay→dial 链路，表现为**延迟上升与失败率放大**，而不是数据面直接丢弃/回退。 |
 | 7 | global 生效面缺口里的「日常行为参数」：`fallback_resolver`、`allow_insecure`、`log_level`、`so_mark_from_dae`、`disable_thp`、`pprof_port`、`bandwidth_max_*`（§2） | 这些是**运维/排障日常**要用的旋钮：`log_level` 决定能否临时提详细度；`fallback_resolver` 决定节点域名解析的兜底；`allow_insecure` 是全局兜底（节点级已有）；`pprof_port` 决定能不能现场抓火焰图。逐项影响不大，但合起来是「调不动」的观感。 |
 | 8 | reload/suspend 不带 `--abort`，且无 session_manager（§1/§4） | 换节点或改配置后，**已建连接继续走旧出口**直到自然结束（长连接可能是小时级）。对「改完立刻生效」的预期是直接违背。 |
-| 9 | `conn_state_map` 容量 65536（dae 默认 262144）且**不可配**、无 pinning（§3） | 高并发网关（数万 flow）下提前触发溢出路径（有事件与计数，非静默），且重启后既有流状态全失（靠无状态放行兜底）。属于**容量安全边际**问题。 |
+| 9 | ~~`conn_state_map` 容量 65536（dae 默认 262144）且**不可配**、无 pinning（§3）~~ **✅ 已完成（eBPF 余项批次，ADR-0067：默认 262144 + `bpf_conn_state_map_size` 启动生效 + pinning/冷启动迁移；内核级实测 `test-pinning`）** | 高并发网关（数万 flow）下提前触发溢出路径（有事件与计数，非静默），且重启后既有流状态全失（靠无状态放行兑底）。属于**容量安全边际**问题。 |
 | 10 | 运维日常三件套：日志轮转三参缺失、无 pidfile、无 `--version`/`completion`（§1/§5） | 路由器上最现实的故障是**磁盘被日志吃满**（sodama 只有 SIGHUP reopen，需用户自配 logrotate）；pidfile/`--version`/补全是脚本化运维与工单取证的最低要求。 |
 
-紧随其后（第 11–15，未进 top 10）：`tcp_offload_pause` 背压 fuse、UDP endpoint pool/full-cone 与 raw UDP 回退、订阅 SIP008 + 链式代理 `chains`、`dns.bind` 明文 DNS 监听出口、发布工程（Docker/发行包/发行 CI/lint 门禁/数据面单测/fuzz——`backlog.md` A 类之所以排最高优先级是从「从可运行到可分发」的角度，而本表按**日常网关影响**排序，故后置）。
+紧随其后（第 11–15，未进 top 10）：UDP endpoint pool/full-cone 与 raw UDP 回退、订阅 SIP008 + 链式代理 `chains`、`dns.bind` 明文 DNS 监听出口、发布工程（Docker/发行包/发行 CI/lint 门禁/数据面单测/fuzz——`backlog.md` A 类之所以排最高优先级是从「从可运行到可分发」的角度，而本表按**日常网关影响**排序，故后置）；`tcp_offload_pause` 背压 fuse 已随 eBPF 余项批次落地（ADR-0067），自本条移出。
+
+> **v1.3 注**：top 10 中 #1–#4（v1.1，ADR-0066）、#6 与 #9（v1.2，ADR-0067）已落地；剩余缺口的完整过滤视图见**附 A**（未做 20 + 部分 28），它随汇总表同步维护，是“当前还缺什么”的单一入口。
 
 **排序理由摘要**：前 4 名都是「会让用户直接感知或静默出错」的项（语义错、启不来、不接管、上不了线）——**v1.1：这 4 项已全部落地并内核级实测**（ADR-0066、`phase2-devlog.md` §20）；5–9 名是「能不能过 / 过得好不好 / 出问题能不能查」的项；第 10 名是把若干小项合并的运维基线缺口。数据面形态类（netkit、GSO、scratch map）与纯工程化类（CI 矩阵、打包）按此口径全部后置。
+
+---
+
+## 附 A · 当前能力缺失清单（v1.3 快照：未做 20 + 部分 28 = 48 项）
+
+> **单一入口**：只列「未做」与「部分」（已完成/不适用见上文各表）；本清单随汇总表同步维护。
+> 判定口径与逐条证据（dae 文件:行号 ↔ sodama 现状）见对应小节；「部分」列中的一句即「缺什么」。
+
+### A1 · 未做（20 项）
+
+| # | 域 | 项 | 缺什么（一句） |
+|---|---|---|---|
+| 1 | CLI | `--disable-timestamp` | 时间戳恒开，无关闭开关 |
+| 2 | CLI | pid 文件与 `--disable-pidfile` | 无 pidfile（dae `/var/run/dae.pid`） |
+| 3 | CLI | `completion [bash\|zsh\|fish]` | 无补全子命令 |
+| 4 | 配置 | `dns.bind` 明文 DNS 监听 | 键被允许但无消费点（供 AdGuard/mosdns 指上游的监听口） |
+| 5 | 配置 | group 级 `tcp_check_http_method` | 键被允许但探测写死 `GET /generate_204` |
+| 6 | 配置 | `node` 链式代理 `chains`（`A -> B`） | 无链式解析（节点按单跳） |
+| 7 | 配置 | SIP008 订阅格式 | 无（ss 节点 JSON 列表） |
+| 8 | 配置 | `check_interval > 0` 校验 | 无对应校验（防调度器 panic） |
+| 9 | 控制面 | UDP endpoint pool / full-cone | 无端点复用池/负缓存/watcher（每会话一 socket + 128 LRU） |
+| 10 | 控制面 | 原始 UDP 回退（`raw_udp`） | 无（特定透明回包形态才需要） |
+| 11 | 控制面 | 会话管理与 abort（`session_manager`） | reload/suspend 不能中止已建连接（同 A2 #12/#13） |
+| 12 | 控制面 | netkit 设备（替代 veth） | 无（设备类型优化，低相关） |
+| 13 | 运维 | shell 补全脚本 | 无（bash/zsh/fish 工件） |
+| 14 | 运维 | 容器镜像 + compose | 无引擎镜像（panel/deploy 不含引擎） |
+| 15 | 运维 | 发行工件与发行 CI | 无 tag 发行/prerelease/nightly 流水线 |
+| 16 | 运维 | 配置文档自动生成 | 无（dae hack/ci 生成器） |
+| 17 | 运维 | 版本与 CHANGELOG | `Cargo.toml` 0.1.0，无 CHANGELOG/版本注入 |
+| 18 | 工程 | 数据面（BPF）单测 | 0 个（数据面逻辑仅由 lab 集成用例覆盖） |
+| 19 | 工程 | fuzz 目标 | 无（.dae 解析/DNS/CH 等） |
+| 20 | 工程 | 静态检查/lint 门禁 | 无 clippy/fmt 门禁（ci.yml 显式声明） |
+
+### A2 · 部分（28 项：能力在，语义/覆盖/形态不完整）
+
+| # | 域 | 项 | 缺什么（一句） |
+|---|---|---|---|
+| 1 | CLI | `--version` 输出 | 仅状态面 JSON/Cargo.toml，无 CLI 版本行 |
+| 2 | CLI | 日志轮转三参 | 缺内建大小/份数上限与压缩（需外部 logrotate） |
+| 3 | CLI | `reload --abort` | 缺（不掐已建连接） |
+| 4 | CLI | `suspend --abort` | 缺（同上） |
+| 5 | CLI | `trace` 过滤器 | 无协议/端口/IP 版本/drop-only/输出文件 |
+| 6 | CLI | `sysdump` 网络现场 | 单份 JSON，缺路由表/网卡/sysctl/nft/iptables 现场 |
+| 7 | CLI | `export outline` | 缺机器可读 schema 导出（现导用户配置实例） |
+| 8 | 配置 | global 生效面 | 26 生效 / **19 不生效**（`log_level`/`fallback_resolver`/`tls_fragment*`/`utls_imitate`/`pprof_port`/`bandwidth_max_*` 等），且无「解析不生效」显式告警 |
+| 9 | 配置 | `dns.ipversion_prefer` 语义 | 缺 50ms 偏好等待（先到 A 时仍先返回 A） |
+| 10 | 配置 | `global.udphop_interval` | 能力在节点参数位（`udphop-interval=`），global 键不读 |
+| 11 | 控制面 | 代次/热重载交接 | 双 epoch + 代次标记（v1.2）有；仍缺 fresh-datapath 交接与 drain 预算 |
+| 12 | 控制面 | `real_domain_runtime` | 缺「已验证真实域名」FIFO 确认集/负缓存（sodama 走 sticky IP） |
+| 13 | 控制面 | DNS 控制面 | 缺 `dns.bind`（同 A1 #4）；BPF 投影为同步直写（dae 为带重试任务堆） |
+| 14 | 控制面 | DNS 偏好等待 | 同 #9 |
+| 15 | 控制面 | 观测 1h 历史 | 缺 1h 流量历史/速率窗口（dae 服务 daed API） |
+| 16 | 控制面 | 告警节流 | 缺「持续条件 + 观察次数」抽象（现为固定步长单次） |
+| 17 | 控制面 | 钩子生命周期 | 无显式摘钩/交接用例（依赖 TCX 退出自动摘） |
+| 18 | 控制面 | 系统集成 | 脚本级等价已实测；无「运行中 sysctl 被改回即纠正」监视 |
+| 19 | 控制面 | UDP GSO | 缺 GSO 聚合发送（sendmmsg 批量已有） |
+| 20 | 运维 | systemd 单元 | 缺 ExecStartPre validate/StartLimit/OOMScoreAdjust/Type=notify |
+| 21 | 运维 | 安装/卸载脚本 | 缺升级与失败回滚 |
+| 22 | 运维 | 部署/使用文档 | 缺多发行版教程（面向最终用户） |
+| 23 | 运维 | 配置参考与迁移指南 | 无独立配置参考（散在 README/deploy/examples） |
+| 24 | 工程 | 单测口径 | 用户态密度可观，但与 dae（文件数 vs 用例数）不可直比 |
+| 25 | 工程 | 内核矩阵 | 有且更贴近数据面，但**不入 CI**（需 root/特权） |
+| 26 | 工程 | CI 覆盖 | 缺特权内核加载/数据面对象验证/lint/容器流水线 |
+| 27 | 工程 | 长稳/soak | 脚本与判据齐备；72h 未完成且不入 CI |
+| 28 | 工程 | 依赖/供应链审计 | 无 cargo-deny 等（security-proposal S0–S5 待采纳） |
+
+### 排序建议（“下一批做什么”）
+
+1. **A 类发布工程**（未做 #13–#17 + 部分 #20–#23）——「从可运行到可分发」的最后一段，且不受数据面演进影响；
+2. **CLI/运维日常三件套**（未做 #1–#3 + 部分 #1–#4）——工单取证与脚本化运维的最低要求；
+3. **配置面收尾**（部分 #8 的-19 项：优先 `log_level`/`fallback_resolver`/`allow_insecure` 三个日常旋钮 + 未做 #8 校验）；
+4. **工程质量**（未做 #18–#20 + 部分 #25–#28）——数据面单测/lint 门禁/fuzz/cargo-deny；
+5. 其余（endpoint pool/链式代理/SIP008/dns.bind/GSO/session abort）在真实需求触发时再做。
