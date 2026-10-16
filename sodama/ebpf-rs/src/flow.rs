@@ -89,16 +89,18 @@ unsafe fn active_slot_enc() -> u8 {
 /// （TCP 调用方据此 fail-closed，对照 dae `tproxy.c:3115-3133`）。
 /// `inline(never)`：独立子程序帧（SodaConnState 24B 不进 `split_flow` 主帧，
 /// verifier 的 combined stack 限制：实测主帧过大报 `528 > 512`）。
+///
+/// `meta` 打包（outbound | must<<8 | l4proto<<16 | slot_enc<<24）不是风格偏好：
+/// BPF-to-BPF 调用只有 5 个寄存器参数，第 6 个起走栈传参，LLVM（实测 nightly
+/// 1.101 + bpf-linker 0.11.1）会为栈参数生成未消除的 R11 伪寄存器访问
+/// （`*(u64 *)(r11-8) = …`），6.18 验证器直接 `R11 is invalid` 拒绝加载。
+/// 参数压到 5 个以内即可避开。改动本函数签名前请先重跑 lab `verify`。
 #[inline(never)]
-unsafe fn conn_save(
-    key: &SodaTuple,
-    outbound: u8,
-    mark: u32,
-    must: u8,
-    l4proto: u8,
-    slot_enc: u8,
-    generation: u16,
-) -> bool {
+unsafe fn conn_save(key: &SodaTuple, mark: u32, meta: u32, generation: u16) -> bool {
+    let outbound = (meta & 0xff) as u8;
+    let must = ((meta >> 8) & 0xff) as u8;
+    let l4proto = ((meta >> 16) & 0xff) as u8;
+    let slot_enc = ((meta >> 24) & 0xff) as u8;
     let Some(st) = conn_scratch_map.get_ptr_mut(0) else {
         return false;
     };
@@ -483,15 +485,12 @@ pub unsafe fn split_flow(
         // 普通 DNS 不存（保持原热路径开销；端口 53 由交付侧按端口短路）。
         let mut save_failed = false;
         if !(pkt.l4proto == IPPROTO_UDP && pkt.h_dport == 53) || must != 0 {
-            save_failed = !conn_save(
-                &pkt.tuples,
-                outbound,
-                mark,
-                must,
-                pkt.l4proto,
-                active_slot_enc(),
-                cfg.datapath_generation,
-            );
+            // meta 打包理由见 conn_save 注释（避开 >5 参数触发的 LLVM R11 伪寄存器）。
+            let meta = outbound as u32
+                | (must as u32) << 8
+                | (pkt.l4proto as u32) << 16
+                | (active_slot_enc() as u32) << 24;
+            save_failed = !conn_save(&pkt.tuples, mark, meta, cfg.datapath_generation);
         }
 
         // LAN ingress fail-closed（对照 dae tproxy.c:3115-3133）：TCP 且 conn_state
