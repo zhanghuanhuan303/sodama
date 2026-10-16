@@ -302,7 +302,11 @@ mod tests {
         let now = Instant::now();
         let a = resolve_with("keep.test:443", |_| Ok(addrs(&["1.1.1.1:443"])), now).unwrap();
         // 钉仍有效：即使 DNS 现在给出别的答案，也不重解析。
-        let b = resolve_for_dial_with(a, |_| Ok(addrs(&["9.9.9.9:443"])), now + Duration::from_secs(5));
+        let b = resolve_for_dial_with(
+            a,
+            |_| Ok(addrs(&["9.9.9.9:443"])),
+            now + Duration::from_secs(5),
+        );
         assert_eq!(b, a);
     }
 
@@ -313,13 +317,21 @@ mod tests {
         note_dial(a, false);
         note_dial(a, false);
         note_dial(a, false); // 作废
-        let b = resolve_for_dial_with(a, |_| Ok(addrs(&["4.4.4.4:443"])), now + Duration::from_secs(1));
+        let b = resolve_for_dial_with(
+            a,
+            |_| Ok(addrs(&["4.4.4.4:443"])),
+            now + Duration::from_secs(1),
+        );
         assert_eq!(b, "4.4.4.4:443".parse().unwrap());
         // 重解析后 note_dial 仍按域名记数：新地址连续失败也能再次作废。
         note_dial(a, false);
         note_dial(a, false);
         note_dial(a, false);
-        let c = resolve_for_dial_with(a, |_| Ok(addrs(&["5.5.5.5:443"])), now + Duration::from_secs(2));
+        let c = resolve_for_dial_with(
+            a,
+            |_| Ok(addrs(&["5.5.5.5:443"])),
+            now + Duration::from_secs(2),
+        );
         assert_eq!(c, "5.5.5.5:443".parse().unwrap());
     }
 

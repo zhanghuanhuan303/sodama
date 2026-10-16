@@ -68,6 +68,8 @@ impl SsrDialer {
     }
 
     /// 拨号：TCP + 流密码；首段写目标地址（origin proto）。
+    /// P38：当前运行路径经 outbound 的 DialedStream → `connect()`；本方法保留为完整便捷入口。
+    #[allow(dead_code)]
     pub fn connect_tcp(
         &self,
         target: &Target,

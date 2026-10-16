@@ -39,7 +39,7 @@ fn rt() -> &'static Runtime {
 }
 
 fn map_err<E: std::fmt::Display>(what: &'static str, e: E) -> io::Error {
-    io::Error::new(ErrorKind::Other, format!("juicity: {what}: {e}"))
+    io::Error::other(format!("juicity: {what}: {e}"))
 }
 
 #[derive(Debug, Clone)]

@@ -250,8 +250,8 @@ impl<R: Read> Read for WsReader<R> {
                 ));
             }
             match opcode {
-                0x0 | 0x1 | 0x2 => self.remaining = len,
-                0x8 | 0x9 | 0xA => self.pending_control = Some((opcode, len)),
+                0x0..=0x2 => self.remaining = len,
+                0x8..=0xA => self.pending_control = Some((opcode, len)),
                 other => {
                     return Err(io::Error::new(
                         ErrorKind::InvalidData,

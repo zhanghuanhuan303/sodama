@@ -46,3 +46,6 @@ blake2 = "0.10"
 ring = "0.17"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 ml-kem = "0.2"
+
+[lints]
+workspace = true

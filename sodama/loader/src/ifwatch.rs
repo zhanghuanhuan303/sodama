@@ -165,11 +165,7 @@ pub fn parse_default_v6(text: &str) -> Vec<String> {
     for line in text.lines() {
         let f: Vec<&str> = line.split_whitespace().collect();
         // dest(32 hex) dest_plen src src_plen nh metric refcnt use flags ifname
-        if f.len() >= 10
-            && f[0].len() == 32
-            && f[0].chars().all(|c| c == '0')
-            && f[1] == "00"
-        {
+        if f.len() >= 10 && f[0].len() == 32 && f[0].chars().all(|c| c == '0') && f[1] == "00" {
             out.push(f[9].to_string());
         }
     }
@@ -320,7 +316,8 @@ mod tests {
 
     #[test]
     fn default_route_parsing() {
-        let v4 = "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n\
+        let v4 =
+            "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n\
                   eth0\t00000000\t0100A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0\n\
                   wan0\t0000A8C0\t00000000\t0001\t0\t0\t0\t00FFFFFF\t0\t0\t0\n";
         assert_eq!(parse_default_v4(v4), vec!["eth0".to_string()]);

@@ -114,13 +114,8 @@ impl DirWatcher {
         struct EvBuf([u8; 8192]);
         let mut buf = EvBuf([0u8; 8192]);
         loop {
-            let n = unsafe {
-                libc::read(
-                    self.fd.as_raw_fd(),
-                    buf.0.as_mut_ptr().cast(),
-                    buf.0.len(),
-                )
-            };
+            let n =
+                unsafe { libc::read(self.fd.as_raw_fd(), buf.0.as_mut_ptr().cast(), buf.0.len()) };
             if n <= 0 {
                 break; // EAGAIN 或错误
             }
@@ -182,7 +177,7 @@ mod tests {
         std::fs::write(&target, "a=1\n").unwrap();
 
         let mut w = DirWatcher::new().unwrap();
-        w.set_targets(&targets_for(&[target.clone()]));
+        w.set_targets(&targets_for(std::slice::from_ref(&target)));
         assert_eq!(w.watched_dirs(), 1);
 
         // 覆盖写 + close → IN_CLOSE_WRITE（目录级，带目标文件名）

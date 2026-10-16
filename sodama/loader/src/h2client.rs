@@ -23,6 +23,8 @@ const PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 
 const FRAME_DATA: u8 = 0;
 const FRAME_HEADERS: u8 = 1;
+/// P38：帧类型登记表完整性（当前不发 PRIORITY；保留常量避免魔法数字）。
+#[allow(dead_code)]
 const FRAME_PRIORITY: u8 = 2;
 const FRAME_RST_STREAM: u8 = 3;
 const FRAME_SETTINGS: u8 = 4;

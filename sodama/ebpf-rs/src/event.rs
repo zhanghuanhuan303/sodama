@@ -34,7 +34,8 @@ unsafe fn rate_limited(key: u32) -> bool {
     };
     let old = *last;
     let now = bpf_ktime_get_ns();
-    if now.wrapping_sub(old) < SODAMA_EVENT_RATE_WINDOW_NS {
+    // P38：窗口判定抽到 `ebpf-logic`（host 可单测；语义：now - old < window）。
+    if ebpf_logic::rate_window_closed(now, old, SODAMA_EVENT_RATE_WINDOW_NS) {
         return true;
     }
     *last = now;

@@ -1229,9 +1229,6 @@ impl Worker {
     }
 }
 
-/// 在 worker 内消费协议响应头（VLESS）的读半：旧实现为「按会话短命线程」，
-/// I6 起由 `PreludeBuf` 状态机非阻塞驱动（每连接 0 线程）。
-
 /// 初始化 worker 池（幂等；在 relay 通道建立后调用一次）。
 pub fn init() {
     if !enabled() {
@@ -1556,11 +1553,14 @@ mod tests {
         let mut cache: Vec<[RawFd; 2]> = Vec::new();
 
         let p = new_pipe().unwrap();
-        let one = [b'x'];
+        let one = *b"x";
         let w = unsafe { libc::write(p[1], one.as_ptr() as *const libc::c_void, 1) };
         assert_eq!(w, 1, "管道写入 1 字节用于模拟残留");
         recycle_pipe(&mut cache, p, 1);
-        assert!(cache.is_empty(), "带残留字节的管道不得入缓存（跨会话串流风险）");
+        assert!(
+            cache.is_empty(),
+            "带残留字节的管道不得入缓存（跨会话串流风险）"
+        );
 
         let q = new_pipe().unwrap();
         recycle_pipe(&mut cache, q, 0);

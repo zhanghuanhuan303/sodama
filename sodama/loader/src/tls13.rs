@@ -208,7 +208,7 @@ impl AeadKey {
     }
 
     fn encrypt(&self, nonce: &[u8; 12], aad: &[u8], buf: &mut Vec<u8>) -> io::Result<()> {
-        let err = |_| io::Error::new(io::ErrorKind::Other, "tls13: 记录加密失败");
+        let err = |_| io::Error::other("tls13: 记录加密失败");
         match self {
             AeadKey::Aes128(c) => c
                 .encrypt_in_place(aes_gcm::Nonce::from_slice(nonce), aad, buf)
@@ -720,20 +720,19 @@ impl HsIo {
 
     /// 取下一个握手消息（跨记录重组）。
     fn next_handshake_msg(&mut self) -> Option<(u8, Vec<u8>)> {
-        loop {
-            if self.hs_buf.len() >= 4 {
-                let len = ((self.hs_buf[1] as usize) << 16)
-                    | ((self.hs_buf[2] as usize) << 8)
-                    | (self.hs_buf[3] as usize);
-                if self.hs_buf.len() >= 4 + len {
-                    let typ = self.hs_buf[0];
-                    let body = self.hs_buf[4..4 + len].to_vec();
-                    self.hs_buf.drain(..4 + len);
-                    return Some((typ, body));
-                }
+        // P38：原为 `loop { … return None; }`（首轮必退出；clippy::never_loop）。语义不变。
+        if self.hs_buf.len() >= 4 {
+            let len = ((self.hs_buf[1] as usize) << 16)
+                | ((self.hs_buf[2] as usize) << 8)
+                | (self.hs_buf[3] as usize);
+            if self.hs_buf.len() >= 4 + len {
+                let typ = self.hs_buf[0];
+                let body = self.hs_buf[4..4 + len].to_vec();
+                self.hs_buf.drain(..4 + len);
+                return Some((typ, body));
             }
-            return None;
         }
+        None
     }
 }
 
@@ -805,7 +804,8 @@ pub fn client_handshake<S: Read + Write>(
             }
             CT_HANDSHAKE => {
                 io_hs.hs_buf.extend_from_slice(&body);
-                while let Some((mtyp, mbody)) = io_hs.next_handshake_msg() {
+                // P38：原 `while let Some(…) { … break; }` 首轮必 break（clippy::never_loop）。
+                if let Some((mtyp, mbody)) = io_hs.next_handshake_msg() {
                     if mtyp != HS_SERVER_HELLO {
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidData,
@@ -822,7 +822,6 @@ pub fn client_handshake<S: Read + Write>(
                     )?;
                     transcript.extend_from_slice(&wrap_handshake(HS_SERVER_HELLO, &mbody));
                     got_server_hello = true;
-                    break;
                 }
             }
             other => {
@@ -1066,7 +1065,7 @@ fn parse_server_hello(
     if body.len() < 35 + sid_len + 3 {
         return Err(bad("ServerHello session_id 越界"));
     }
-    if sid_len != 32 || &body[35..35 + 32] != &client_hello[39..39 + 32] {
+    if sid_len != 32 || body[35..35 + 32] != client_hello[39..39 + 32] {
         return Err(bad("ServerHello session_id 未按 REALITY 回显"));
     }
     let cs = u16::from_be_bytes([body[35 + sid_len], body[35 + sid_len + 1]]);
@@ -1342,6 +1341,8 @@ struct Shared {
     pending: Vec<u8>,
     want_key_update: bool,
     /// 写半已更新密钥（由写线程执行）；读半只置 want_key_update。
+    /// P38：握手状态记账——写入后由读写线程消费，保留字段为调试/后续扩展用途。
+    #[allow(dead_code)]
     closed_read: bool,
 }
 
@@ -1353,6 +1354,8 @@ pub struct Tls13Reader {
     plain: Vec<u8>,
     plain_pos: usize,
     eof: bool,
+    /// P38：协商套件（建立后不再读；保留供调试/扩展，`#[allow(dead_code)]`）。
+    #[allow(dead_code)]
     suite: Suite,
 }
 
@@ -1361,6 +1364,8 @@ pub struct Tls13Reader {
 pub struct Tls13Writer {
     core: Arc<Mutex<Shared>>,
     sock: TcpStream,
+    /// P38：同 Tls13Reader::suite（保留字段，建立后不再读）。
+    #[allow(dead_code)]
     suite: Suite,
     /// M3：Vision 上行 DIRECT——置位后裸写 TCP（不再封外层 TLS 记录）。
     raw: Arc<AtomicBool>,
@@ -1371,11 +1376,15 @@ pub struct Tls13Writer {
 
 impl Tls13Reader {
     /// P15：短连接/超时场景设置底层 socket 读超时。
+    /// P38：当前调用方未使用（`#[allow(dead_code)]`，保留为对称 API）。
+    #[allow(dead_code)]
     pub fn set_read_timeout(&self, d: Option<Duration>) -> io::Result<()> {
         self.sock.set_read_timeout(d)
     }
 
     /// Vision 层用：切到裸 TCP 读（幂等）。
+    /// P38：当前调用方未使用（Vision 路径切读在协议层完成）；保留为对称 API。
+    #[allow(dead_code)]
     pub fn set_raw_read(&self) {
         self.raw.store(true, Ordering::SeqCst);
     }
@@ -1475,15 +1484,13 @@ impl Read for Tls13Reader {
                         let mut c = self.core.lock().map_err(poisoned)?;
                         c.read.open(&hdr, &body).map(|(_, p)| p)
                     };
-                    match plain {
-                        Ok(p) => {
-                            if p.first() == Some(&1) {
-                                // warning: close_notify → EOF
-                                return Ok(0);
-                            }
-                            return Err(alert_error(&p));
+                    {
+                        let p = plain?;
+                        if p.first() == Some(&1) {
+                            // warning: close_notify → EOF
+                            return Ok(0);
                         }
-                        Err(e) => return Err(e),
+                        return Err(alert_error(&p));
                     }
                 }
                 CT_APPLICATION_DATA => {
@@ -1624,7 +1631,7 @@ impl Tls13Writer {
 }
 
 fn poisoned<T>(_: std::sync::PoisonError<T>) -> io::Error {
-    io::Error::new(io::ErrorKind::Other, "tls13: 锁中毒")
+    io::Error::other("tls13: 锁中毒")
 }
 
 /// 用 TcpStream 跑握手并拆出读写半。返回（读半, 写半, 裸读开关, 裸写开关）。
@@ -1748,7 +1755,6 @@ mod tests {
         assert_eq!(p, b"two");
     }
 
-    #[test]
     #[test]
     fn hs_io_take_record_partial() {
         // 回归：分片到达时 take_record 必须返回 None（调用方需继续读，不得 panic）。

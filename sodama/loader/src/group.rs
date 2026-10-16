@@ -669,7 +669,7 @@ impl GroupRuntime {
         let tol = self.check_tolerance;
         let mut last_err: Option<std::io::Error> = None;
         let mut tried = 0usize;
-        for &i in order.iter().take(3.max(1)) {
+        for &i in order.iter().take(3) {
             self.stats.dials.fetch_add(1, Ordering::Relaxed);
             match inner.members[i].outbound.dial_tcp(target, timeout) {
                 Ok(d) => {

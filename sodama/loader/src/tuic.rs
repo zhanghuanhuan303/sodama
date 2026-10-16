@@ -80,7 +80,7 @@ impl std::fmt::Debug for TuicDialer {
 }
 
 fn map_err<E: std::fmt::Display>(what: &'static str, e: E) -> io::Error {
-    io::Error::new(ErrorKind::Other, format!("tuic: {what}: {e}"))
+    io::Error::other(format!("tuic: {what}: {e}"))
 }
 
 impl TuicDialer {
@@ -171,7 +171,7 @@ impl TuicDialer {
                             crate::log("tuic: 0-RTT 早数据已发送（认证+首流）");
                             // 等服务端接受早数据；超时也继续用该连接（后续流不受影响）
                             let _ = tokio::time::timeout(Duration::from_secs(3), accepted).await;
-                            return Ok(conn);
+                            Ok(conn)
                         }
                         Err(e) => {
                             crate::log(&format!("tuic: 0-RTT 认证失败（{e}），回退 1-RTT"));
@@ -184,7 +184,7 @@ impl TuicDialer {
                                 .map_err(|_| map_err("握手超时", "8s"))?
                                 .map_err(|e| map_err("握手", e))?;
                             Self::auth(&conn, cfg).await?;
-                            return Ok(conn);
+                            Ok(conn)
                         }
                     }
                 }

@@ -38,7 +38,7 @@ jobs:
 
       - name: Install Rust (stable + pinned nightly with rust-src)
         run: |
-          rustup toolchain install stable --profile minimal
+          rustup toolchain install stable --profile minimal --component rustfmt --component clippy
           rustup toolchain install "${NIGHTLY}" --profile minimal --component rust-src
           rustup default stable
           rustc --version
@@ -103,10 +103,20 @@ jobs:
         working-directory: sodama
         run: cargo build --release --locked
 
-      # 只跑单测；`--ignored` 的 e2e 用例需要真实节点/root，不在此触发。
-      - name: Unit tests (release)
-        working-directory: sodama/loader
-        run: cargo test --release --locked
+      # P38（A1 #20）：lint 门禁（fmt + clippy -D warnings）。
+      # 放行清单见 sodama/Cargo.toml `[workspace.lints.clippy]`（逐条附理由）。
+      - name: Format check
+        working-directory: sodama
+        run: cargo fmt --check
 
-      # 刻意不加 `cargo fmt --check`：仓库当前并非 rustfmt-clean（例如
-      # loader/src/huffman_table.rs），加进来会立刻失败。
+      - name: Clippy (deny warnings)
+        working-directory: sodama
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      # 只跑单测；`--ignored` 的 e2e 用例需要真实节点/root，不在此触发。
+      # P38：--workspace 覆盖 ebpf-logic（数据面纯逻辑的 host 单测，A1 #18）。
+      - name: Unit tests (release)
+        working-directory: sodama
+        run: cargo test --release --locked --workspace
+
+

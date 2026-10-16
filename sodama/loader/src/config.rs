@@ -887,11 +887,8 @@ fn expand_glob(entry_dir: &Path, pattern: &str) -> Result<Vec<PathBuf>, String> 
     } else {
         PathBuf::from(&comps[0])
     };
-    let rest = if comps[0] == "/" {
-        &comps[1..]
-    } else {
-        &comps[1..]
-    };
+    // 已是绝对路径：保留原样；相对路径：保留首段后的剩余部分（P36 缓存键）。
+    let rest = &comps[1..];
 
     fn walk(dir: &Path, rest: &[String], out: &mut Vec<PathBuf>) -> Result<(), String> {
         if rest.is_empty() {
@@ -1105,7 +1102,7 @@ pub fn load(entry: &Path) -> Result<Config, Vec<Diag>> {
 
 // ---------------------------------------------------------------- schema 校验
 
-const GLOBAL_KEYS: &[&str] = &[
+pub const GLOBAL_KEYS: &[&str] = &[
     "tproxy_port",
     "tproxy_port_protect",
     "so_mark_from_dae",
@@ -1165,7 +1162,7 @@ const GLOBAL_KEYS: &[&str] = &[
     "disable_timestamp",
 ];
 
-const DNS_KEYS: &[&str] = &[
+pub const DNS_KEYS: &[&str] = &[
     "ipversion_prefer",
     "fixed_domain_ttl",
     "upstream",
@@ -1177,7 +1174,7 @@ const DNS_KEYS: &[&str] = &[
     "max_cache_size",
 ];
 
-const GROUP_KEYS: &[&str] = &[
+pub const GROUP_KEYS: &[&str] = &[
     "filter",
     "policy",
     "tcp_check_url",
@@ -1846,7 +1843,9 @@ fn append_must(mapped: &str) -> String {
 
 fn record_outbound_map(extract: &mut RoutingExtract, from: &str, to: &str) {
     if !extract.outbound_map.iter().any(|(k, _)| k == from) {
-        extract.outbound_map.push((from.to_string(), to.to_string()));
+        extract
+            .outbound_map
+            .push((from.to_string(), to.to_string()));
     }
 }
 
@@ -2331,6 +2330,114 @@ pub fn groups(cfg: &Config) -> Vec<GroupSpec> {
         }
     }
     out
+}
+
+// ---------------------------------------------------------------- P38：配置参考登记
+
+/// P38：配置键登记项（`sodama config-doc` 与 `docs/config-reference.md` 的唯一事实来源）。
+/// `consumed=false` 表示「解析通过但当前无消费点」——口径与 `docs/capability-gap-review.md` §2
+/// 的实测清单一致（不把解析写成生效）。
+pub struct KeyDoc {
+    pub section: &'static str,
+    pub key: &'static str,
+    pub desc: &'static str,
+    pub default: &'static str,
+    pub consumed: bool,
+}
+
+/// P38：全部键的登记表（新增键必须同步此处；lint 事实来源）。
+pub fn key_docs() -> Vec<KeyDoc> {
+    let g = |key, desc, default, consumed| KeyDoc {
+        section: "global",
+        key,
+        desc,
+        default,
+        consumed,
+    };
+    let d = |key, desc, default, consumed| KeyDoc {
+        section: "dns",
+        key,
+        desc,
+        default,
+        consumed,
+    };
+    let gr = |key, desc, default, consumed| KeyDoc {
+        section: "group",
+        key,
+        desc,
+        default,
+        consumed,
+    };
+    vec![
+        // ---- global ----
+        g("tproxy_port", "tproxy 监听端口（实际仅 CLI `--tproxy-port` 生效）", "12345", false),
+        g("tproxy_port_protect", "保护 tproxy 端口的防火墙标记（dae 与本实现两端均为空置字段）", "0x8000000", false),
+        g("so_mark_from_dae", "控制面 socket 标记（数据面硬编码 0x233）", "0x233", false),
+        g("log_level", "日志级别", "info", false),
+        g("tcp_check_url", "组健康检查目标（tcp）", "http://cp.cloudflare.com", true),
+        g("tcp_check_http_method", "探测 HTTP 方法（大写白名单；非法回退 CONNECT）", "HEAD", true),
+        g("udp_check_dns", "组健康检查目标（udp DNS）", "dns.google:53, 8.8.8.8:53", true),
+        g("check_interval", "健康探测周期（必须为正）", "30s", true),
+        g("check_tolerance", "连续失败容忍次数", "1", true),
+        g("lan_interface", "LAN 接口（逗号分隔；支持 glob/auto）", "landae（CLI 默认）", true),
+        g("wan_interface", "WAN 接口（逗号分隔；auto = 默认路由接口；1s 轮询热插拔）", "wan（CLI 默认）", true),
+        g("allow_insecure", "跳过 TLS 证书验证（仅在节点参数侧生效）", "false", false),
+        g("dial_mode", "拨号模式 ip|domain|domain+|domain++", "ip", true),
+        g("disable_waiting_network", "启动时不等待网络就绪", "false", false),
+        g("disable_thp", "禁用透明大页（THP）", "false", false),
+        g("enable_local_tcp_fast_redirect", "本机 TCP 快速重定向", "false", false),
+        g("auto_config_kernel_parameter", "自动写内核参数（sysctl）", "false", false),
+        g("auto_config_firewall_rule", "自动配防火墙规则", "false", false),
+        g("sniffing_timeout", "嗅探等待上限", "100ms", true),
+        g("auto_sniff_punt", "嗅探命中后按规则重选出口（等价 CLI `--sniff-punt`）", "false", true),
+        g("tls_implementation", "TLS 实现选择", "", false),
+        g("utls_imitate", "uTLS 指纹族", "", false),
+        g("tls_fragment", "TLS 分片开关", "", false),
+        g("tls_fragment_length", "TLS 分片长度", "", false),
+        g("tls_fragment_interval", "TLS 分片间隔", "", false),
+        g("pprof_port", "pprof HTTP 端口", "0", false),
+        g("mptcp", "MPTCP 开关", "false", false),
+        g("bootstrap_resolver", "启动期解析器（bootstrap）", "", true),
+        g("fallback_resolver", "回退解析器", "", false),
+        g("bandwidth_max_tx", "发送带宽上限（代理服务端能力）", "", false),
+        g("bandwidth_max_rx", "接收带宽上限（代理服务端能力）", "", false),
+        g("udphop_interval", "hysteria2 端口跳跃间隔（仅在节点参数 `udphop-interval=` 侧生效）", "30s", false),
+        g("bpf_conn_state_map_size", "conn_state_map 容量（启动时生效）", "262144", true),
+        g("relay_idle_timeout", "relay 空闲回收秒数", "300", true),
+        g("udp_idle_timeout", "UDP NAT 会话空闲秒数（普通 NAT 类端点 TTL）", "60", true),
+        g("dial_timeout", "拨号超时秒数", "5", true),
+        g("max_conns", "relay 并发上限（0=不限）", "0", true),
+        g("subscription_failover", "订阅按声明顺序回退（pacman 风格）", "true", true),
+        g("subscription_update_interval", "订阅读周期刷新秒数（0=关）", "21600", true),
+        g("watch_config", "配置热驱动（inotify 事件 + 兜底扫描秒数；0=关）", "0", true),
+        g("sub_cache_ttl", "订阅节点缓存 TTL 秒数", "1800", true),
+        g("sub_fail_ttl", "失败源负缓存秒数（0=关）", "600", true),
+        g("log_file", "日志文件路径（SIGHUP reopen）", "stdout", true),
+        g("status_socket", "状态面 Unix socket 路径", "/tmp/sodama-status.sock", true),
+        g("geodata_dir", "geoip.dat/geosite.dat 搜索目录（逗号分隔）", "", true),
+        g("rule_set_update_interval", "rule_set 刷新间隔秒数（0=每次 reload 刷新）", "0", true),
+        g("rule_set_cache_dir", "rule_set 磁盘缓存目录", "$XDG_CACHE_HOME/sodama/rule-set", true),
+        g("probe_idle_cap", "健康探测空闲退避上限秒数（0=不退避）", "600", true),
+        g("disable_timestamp", "日志时间戳开关（P38 扩展键，dae 无）", "false", true),
+        // ---- dns ----
+        d("ipversion_prefer", "IPv4/IPv6 偏好（4/6；缺 50ms 偏好等待）", "0", true),
+        d("fixed_domain_ttl", "固定域名 TTL 表（`域名: 秒数` 子段）", "", true),
+        d("upstream", "DNS 上游 tag → URL 映射（udp/tcp/tcp+udp/tls/https）", "8.8.8.8:53", true),
+        d("routing", "DNS 请求/应答路由（geosite/reject/asis/tag 等）", "", true),
+        d("bind", "明文 DNS 监听（`ip:port` = 仅 UDP；`udp+tcp://ip:port`；供 AdGuard/mosdns 指上游；缺省 = 不开监听）", "缺省不开", true),
+        d("optimistic_cache", "乐观缓存（RFC 8767 stale）开关", "true", true),
+        d("optimistic_cache_ttl", "乐观缓存 TTL 秒数", "60", true),
+        d("optimistic_stale_reply_ttl", "过期应答可回窗口秒数", "30", true),
+        d("max_cache_size", "DNS 缓存容量", "4096", true),
+        // ---- group ----
+        gr("filter", "成员过滤表达式（可多行，OR 组合）", "", true),
+        gr("policy", "选节点策略（min/min_moving_avg/min_avg10/random/fixed(n)）", "min", true),
+        gr("tcp_check_url", "组级健康检查目标（覆盖 global）", "", true),
+        gr("tcp_check_http_method", "组级探测 HTTP 方法（覆盖 global；不校验）", "", true),
+        gr("udp_check_dns", "组级 UDP 检查目标（覆盖 global）", "", true),
+        gr("check_interval", "组级探测周期（0=继承 global；不得为负）", "继承", true),
+        gr("check_tolerance", "组级失败容忍（覆盖 global）", "继承", true),
+    ]
 }
 
 // ---------------------------------------------------------------- 测试

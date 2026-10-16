@@ -182,10 +182,6 @@ pub fn marked_tcp_connect(addr: SocketAddr, timeout: Duration) -> io::Result<Tcp
     Ok(stream)
 }
 
-/// 设置/清除 socket 的 `SO_RCVTIMEO` + `SO_SNDTIMEO`。
-/// `None` = 清除（timeval 全 0 意为“永不超时”）。
-/// SO_*TIMEO 是 socket 级选项，对该 socket 的所有 `dup` 副本生效，
-/// 因此在一个 fd 上设/清即可惠及 `from_remote`/`to_remote`/`socket`。
 // ---- 拨号墙钟看门狗 ----------------------------------------------------------
 //
 // 起因（2026-10-10 生产事故）：`marked_tcp_connect` 的 `timeout` 只覆盖
@@ -201,7 +197,7 @@ pub fn marked_tcp_connect(addr: SocketAddr, timeout: Duration) -> io::Result<Tcp
 
 thread_local! {
     static CUR_DIAL_WATCH: std::cell::RefCell<Option<Arc<AtomicBool>>> =
-        std::cell::RefCell::new(None);
+        const { std::cell::RefCell::new(None) };
 }
 
 /// 给 `fd` 起墙钟看门狗；返回取消标志（由 `disarm_dial_watchdog` 置位）。
@@ -269,6 +265,10 @@ impl Drop for DialWatchdogGuard {
     }
 }
 
+/// 设置/清除 socket 的 `SO_RCVTIMEO` + `SO_SNDTIMEO`。
+/// `None` = 清除（timeval 全 0 意为“永不超时”）。
+/// SO_*TIMEO 是 socket 级选项，对该 socket 的所有 `dup` 副本生效，
+/// 因此在一个 fd 上设/清即可惠及 `from_remote`/`to_remote`/`socket`。
 pub(crate) fn set_sock_timeouts(fd: std::os::fd::RawFd, t: Option<Duration>) -> io::Result<()> {
     let tv = match t {
         Some(d) => libc::timeval {
@@ -1072,7 +1072,9 @@ pub enum Outbound {
     Group(std::sync::Arc<GroupRuntime>),
     /// P38：链式代理（`A -> B`，左侧为出口、右侧为第一跳；对照 dae `register.go`）。
     /// 仅 TCP 型协议可作链节点（QUIC 型无静态 TCP 服务端地址，无法被上一跳承载）。
-    Chain { hops: Vec<std::sync::Arc<Outbound>> },
+    Chain {
+        hops: Vec<std::sync::Arc<Outbound>>,
+    },
 }
 
 impl Outbound {
@@ -1126,11 +1128,7 @@ impl Outbound {
             } => format!("naive+quic://{server}"),
             Self::Naive { server, .. } => format!("naive+https://{server}"),
             Self::Group(g) => format!("group:{}（{} 节点）", g.name, g.member_count()),
-            Self::Chain { hops } => hops
-                .iter()
-                .map(|h| h.name())
-                .collect::<Vec<_>>()
-                .join("->"),
+            Self::Chain { hops } => hops.iter().map(|h| h.name()).collect::<Vec<_>>().join("->"),
         }
     }
 
@@ -1229,11 +1227,7 @@ impl Outbound {
             Self::Socks5 { .. } => ("socks5", "tcp", "—"),
             Self::Http { .. } => ("http", "tcp", "—"),
             Self::Shadowsocks { shadowtls, .. } => (
-                if shadowtls.is_some() {
-                    "shadowsocks"
-                } else {
-                    "shadowsocks"
-                },
+                "shadowsocks",
                 "tcp",
                 if shadowtls.is_some() {
                     "shadowtls"
@@ -3095,7 +3089,10 @@ mod tests {
             matches!(r, Ok(0) | Err(_)),
             "看门狗应让读返回 0/错误，实际 {r:?}"
         );
-        assert!(dt < Duration::from_secs(2), "应在 deadline 附近返回，实际 {dt:?}");
+        assert!(
+            dt < Duration::from_secs(2),
+            "应在 deadline 附近返回，实际 {dt:?}"
+        );
         disarm_dial_watchdog();
     }
 
@@ -3132,7 +3129,7 @@ mod tests {
             )
         };
         assert_eq!(rc, 0, "getsockopt(SO_RCVTIMEO) 应成功");
-        tv.tv_sec as i64 * 1_000_000 + tv.tv_usec as i64
+        tv.tv_sec * 1_000_000 + tv.tv_usec
     }
 
     /// 近似比较：内核会把 `SO_*TIMEO` 向上取整到时钟粒度（实测 1_500_000 µs
@@ -3201,13 +3198,17 @@ mod tests {
         assert!(!o.supports_udp());
         assert!(o.server_addr().is_none());
         // 桥接拷贝（服务端地址替换）对每段可用
-        assert!(hops[0].with_server_addr("127.0.0.1:9".parse().unwrap()).is_some());
+        assert!(hops[0]
+            .with_server_addr("127.0.0.1:9".parse().unwrap())
+            .is_some());
         // 名字段（# 之后）的 `->` 不参与拆分
         let o = parse("ss://chacha20-ietf-poly1305:pw@1.1.1.1:1#a -> b").unwrap();
         assert!(matches!(o, Outbound::Shadowsocks { .. }), "{o:?}");
         // 三段链
         let o = parse("socks5://1.1.1.1:1 -> http://2.2.2.2:2 -> socks5://3.3.3.3:3").unwrap();
-        let Outbound::Chain { hops } = &o else { panic!() };
+        let Outbound::Chain { hops } = &o else {
+            panic!()
+        };
         assert_eq!(hops.len(), 3);
         assert_eq!(hops[2].protocol(), "socks5");
     }
@@ -3219,7 +3220,9 @@ mod tests {
         assert!(parse("-> socks5://1.1.1.1:1").is_err());
         // direct / 组 / QUIC 型均无 TCP 服务端地址，不能作链节点
         assert!(parse("direct -> socks5://1.1.1.1:1").is_err());
-        assert!(parse("hysteria2://pw@1.1.1.1:443 -> socks5://1.1.1.1:1").unwrap_err().contains("无 TCP 服务端地址"));
+        assert!(parse("hysteria2://pw@1.1.1.1:443 -> socks5://1.1.1.1:1")
+            .unwrap_err()
+            .contains("无 TCP 服务端地址"));
         // 段内链接本身非法 → 报第几段
         let e = parse("bogus://x -> socks5://1.1.1.1:1").unwrap_err();
         assert!(e.contains("第 1 段"), "{e}");

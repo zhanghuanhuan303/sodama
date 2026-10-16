@@ -137,7 +137,8 @@ fn load_one_inner(
 ) -> Result<RuleSet, String> {
     let remote = src.starts_with("http://") || src.starts_with("https://");
     let mut from_cache = false;
-    let mut updated = None;
+    // P38：延迟初始化（每条路径在使用前赋值；初值 None 从未被读—— clippy::unused_assignments）。
+    let updated;
     let mut local_path: Option<PathBuf> = None;
     let body: Vec<u8>;
     if remote {

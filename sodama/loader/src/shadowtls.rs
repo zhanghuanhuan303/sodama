@@ -216,7 +216,6 @@ fn connect_v2(
     };
     let hs = tls13::client_handshake(&mut io, &ch, &kx, policy_of(cfg))?;
     let sum8 = io.mac.clone().finalize().into_bytes()[..8].to_vec();
-    drop(io);
     Ok((
         ShadowTlsReader::framed(sock, hs.pending, ReadMode::V2 { keys: hs.read }),
         ShadowTlsWriter {
@@ -634,6 +633,8 @@ impl Write for ShadowTlsWriter {
 }
 
 impl ShadowTlsWriter {
+    /// P38：当前无调用方（保留为对称 API：与 ShadowTlsReader/其他写半接口对齐）。
+    #[allow(dead_code)]
     pub fn shutdown_write(&self) -> io::Result<()> {
         self.sock.shutdown(std::net::Shutdown::Write)
     }
@@ -694,7 +695,7 @@ mod tests {
 
     #[test]
     fn v2_first_write_prefixes_hmac() {
-        let (mut client, mut server) = pair();
+        let (client, mut server) = pair();
         let mut h = hmac_sha1(b"testpass").unwrap();
         h.update(b"fake-server-flight");
         let sum8 = h.clone().finalize().into_bytes()[..8].to_vec();
@@ -725,7 +726,7 @@ mod tests {
 
     #[test]
     fn v3_write_chain_verifiable_by_server_state() {
-        let (mut client, mut server) = pair();
+        let (client, mut server) = pair();
         let sr = [0x5au8; 32];
         let mut cw = hmac_sha1(b"testpass").unwrap();
         cw.update(&sr);
@@ -776,7 +777,7 @@ mod tests {
         let read_key = Sha256::digest([pw.as_bytes(), sr.as_slice()].concat()).to_vec();
         let mut relay = hmac_sha1(pw.as_bytes()).unwrap();
         relay.update(&sr);
-        let mut send_app = |server: &mut TcpStream, relay: &mut HmacSha1, plain: &[u8]| {
+        let send_app = |server: &mut TcpStream, relay: &mut HmacSha1, plain: &[u8]| {
             let wire: Vec<u8> = plain
                 .iter()
                 .enumerate()

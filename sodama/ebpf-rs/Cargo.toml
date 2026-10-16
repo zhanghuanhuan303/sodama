@@ -12,6 +12,8 @@ repository = "https://github.com/zhanghuanhuan303/dae-rust"
 [dependencies]
 aya-ebpf = "0.2.1"
 aya-ebpf-bindings = "0.2.0"
+# P38：数据面纯逻辑（host 可单测；no_std）。
+ebpf-logic = { path = "../ebpf-logic" }
 
 [[bin]]
 name = "sodama-ebpf"

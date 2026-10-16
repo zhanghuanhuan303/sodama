@@ -447,7 +447,11 @@ pub fn record_source_status(mut st: SourceStatus) {
     let is_net = st.source == "net";
     if let Some(prev) = m.iter().find(|x| x.tag == st.tag).cloned() {
         // 连续失败计数：失败叠加（success/disk 回退均视为“拿到数据”，归零）。
-        st.fails = if st.ok { 0 } else { prev.fails.saturating_add(1) };
+        st.fails = if st.ok {
+            0
+        } else {
+            prev.fails.saturating_add(1)
+        };
         if is_net {
             st.fetches_total = prev.fetches_total.saturating_add(1);
             st.fetch_fail_total = prev.fetch_fail_total + u64::from(!st.ok);
@@ -530,9 +534,11 @@ pub fn source_status_json() -> serde_json::Value {
 /// 限流冷却：收到 429 后短期不再打网络（回退内存/磁盘缓存），避免火上浇油。
 const COOLDOWN_429_SECS: u64 = 15 * 60;
 
-fn cooldown_map() -> &'static std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>> {
-    static C: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>> =
-        std::sync::OnceLock::new();
+fn cooldown_map() -> &'static std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>
+{
+    static C: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
+    > = std::sync::OnceLock::new();
     C.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
@@ -603,7 +609,8 @@ pub fn sub_seen(url: &str) -> bool {
 }
 
 /// 最近一次打网失败时刻（B2 负缓存）。
-fn fetch_fail_map() -> &'static std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>> {
+fn fetch_fail_map(
+) -> &'static std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>> {
     static F: std::sync::OnceLock<
         std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
     > = std::sync::OnceLock::new();
@@ -713,8 +720,8 @@ pub fn parse_sip008(text: &str) -> Option<Vec<(String, String)>> {
             .and_then(|x| x.as_str())
             .unwrap_or("")
             .to_string();
-        let userinfo = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .encode(format!("{method}:{password}"));
+        let userinfo =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(format!("{method}:{password}"));
         let mut link = format!("ss://{userinfo}@{server}:{port}");
         if let Some(plugin) = s
             .get("plugin")
@@ -888,7 +895,9 @@ mod tests {
         record_source_status(mk_status(tag, true, "disk", 11)); // 磁盘兜底：不计打网
         record_source_status(mk_status(tag, true, "net", 12)); // 打网成功 #2
         record_source_status(mk_status(tag, true, "memory", 13)); // 内存命中：不计
-        let m = source_status_map().lock().unwrap_or_else(|p| p.into_inner());
+        let m = source_status_map()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         let s = m.iter().find(|s| s.tag == tag).expect("状态应存在");
         assert_eq!(s.fetches_total, 2);
         assert_eq!(s.fetch_fail_total, 1);
@@ -1003,7 +1012,9 @@ mod tests {
     fn http_response_429_retry_after_passthrough() {
         // P1：429 限流带 Retry-After——错误信息透传，供冷却逻辑识别。
         let resp = b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 120\r\n\r\n";
-        let e = parse_http_response(resp, false, false).unwrap_err().to_string();
+        let e = parse_http_response(resp, false, false)
+            .unwrap_err()
+            .to_string();
         assert!(e.contains("429") && e.contains("120"), "{e}");
     }
 

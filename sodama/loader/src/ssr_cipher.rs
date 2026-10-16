@@ -312,6 +312,8 @@ impl SsrCipher {
         self.info.iv_len
     }
 
+    /// P38：诊断/测试用访问器（当前无调用方，保留以便断言初始化状态）。
+    #[allow(dead_code)]
     pub fn encrypt_inited(&self) -> bool {
         self.enc.is_some()
     }
@@ -357,6 +359,8 @@ impl SsrCipher {
         }
     }
 
+    /// P38：诊断/测试用访问器（当前无调用方）。
+    #[allow(dead_code)]
     pub fn key(&self) -> &[u8] {
         &self.key
     }

@@ -184,10 +184,12 @@ impl<W: Write> Write for VlessWriter<W> {
     }
 }
 
-/// 写请求头并拆出两半（TCP 模式）。
+/// 写请求头并拆出两半（TCP 模式；无 flow 的对称入口）。
+/// P38：保留为对称 API（`connect_split_flow` 的薄包装；当前调用方均显式传 flow）。
+#[allow(dead_code)]
 pub fn connect_split<R, W>(
     read: R,
-    mut write: W,
+    write: W,
     uuid: &[u8; 16],
     target: &Target,
 ) -> io::Result<(VlessReader<R>, VlessWriter<W>)>

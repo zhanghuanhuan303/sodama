@@ -73,7 +73,7 @@ impl RealityConfig {
             }
             hex.push(b as char);
         }
-        if hex.len() % 2 != 0 {
+        if !hex.len().is_multiple_of(2) {
             // dae 直接 hex.Decode：奇数长度会报错——保持一致。
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -170,7 +170,7 @@ pub fn connect(
         let hk = Hkdf::<Sha256>::new(Some(&random[..20]), ecdh.as_bytes());
         let mut okm = [0u8; 32];
         hk.expand(b"REALITY", &mut okm)
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "reality: HKDF 失败"))?;
+            .map_err(|_| io::Error::other("reality: HKDF 失败"))?;
         okm
     };
 
@@ -189,19 +189,16 @@ pub fn connect(
     let mut sealed = sid_plain[..16].to_vec();
     {
         let cipher = Aes256Gcm::new_from_slice(&auth_key)
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "reality: AES-GCM 初始化失败"))?;
+            .map_err(|_| io::Error::other("reality: AES-GCM 初始化失败"))?;
         let nonce = aes_gcm::Nonce::from_slice(&random[20..32]);
         // AD = session_id 置零的完整 ClientHello（当前 hello 字节）；
         // 明文仅前 16B（[ver][unix][sid]，后 16B 本就是 GCM tag 位置）。
         cipher
             .encrypt_in_place(nonce, &hello, &mut sealed)
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "reality: session_id 密封失败"))?;
+            .map_err(|_| io::Error::other("reality: session_id 密封失败"))?;
     }
     if sealed.len() != 32 {
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
-            "reality: session_id 密封长度异常",
-        ));
+        return Err(io::Error::other("reality: session_id 密封长度异常"));
     }
     hello[39..71].copy_from_slice(&sealed);
 
@@ -209,7 +206,7 @@ pub fn connect(
     let mut cert_hook = |leaf: &[u8]| -> io::Result<Option<Vec<u8>>> {
         let (pubkey, signature) = parse_ed25519_cert(leaf)?;
         let mut mac = <Hmac<Sha512> as Mac>::new_from_slice(&auth_key)
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "reality: HMAC 初始化失败"))?;
+            .map_err(|_| io::Error::other("reality: HMAC 初始化失败"))?;
         mac.update(&pubkey);
         let expect = mac.finalize().into_bytes();
         if signature.len() != expect.len() || !ct_eq(&signature, &expect) {
@@ -309,7 +306,7 @@ fn parse_ed25519_cert(der: &[u8]) -> io::Result<([u8; 32], Vec<u8>)> {
         return Err(bad("SPKI 算法域非 SEQUENCE"));
     }
     // ed25519 OID: 06 03 2B 65 70
-    if alg.len() < 5 || alg[0] != 0x06 || alg[1] != 0x03 || &alg[2..5] != &[0x2b, 0x65, 0x70] {
+    if alg.len() < 5 || alg[0] != 0x06 || alg[1] != 0x03 || alg[2..5] != [0x2b, 0x65, 0x70] {
         return Err(bad("公钥非 Ed25519"));
     }
     let (t_bits, bits) = der_tlv(&spki, &mut r)?;

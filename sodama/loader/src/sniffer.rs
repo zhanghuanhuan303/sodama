@@ -274,7 +274,7 @@ fn parse_tls(buf: &[u8]) -> Sniff {
         return Sniff::No;
     }
     let rec_len = u16::from_be_bytes([buf[3], buf[4]]) as usize;
-    if rec_len < 4 || rec_len > 16384 + 2048 {
+    if !(4..=16384 + 2048).contains(&rec_len) {
         return Sniff::No;
     }
     if buf.len() < 5 + rec_len {

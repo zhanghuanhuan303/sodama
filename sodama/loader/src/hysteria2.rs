@@ -87,7 +87,7 @@ impl std::fmt::Debug for Hy2Dialer {
 }
 
 fn map_err<E: std::fmt::Display>(what: &'static str, e: E) -> io::Error {
-    io::Error::new(ErrorKind::Other, format!("hy2: {what}: {e}"))
+    io::Error::other(format!("hy2: {what}: {e}"))
 }
 
 fn random_pad(rng: &mut impl Rng, min: usize, max: usize) -> Vec<u8> {
@@ -279,9 +279,7 @@ impl Hy2Dialer {
                         .map_err(|e| map_err("响应读", e))?;
                     match ty {
                         FRAME_HEADERS => {
-                            return Ok::<Vec<(String, String)>, io::Error>(
-                                qpack_decode(&payload).map_err(|e| map_err("QPACK 解码", e))?,
-                            )
+                            return qpack_decode(&payload).map_err(|e| map_err("QPACK 解码", e))
                         }
                         FRAME_DATA => continue,
                         _ => continue,
@@ -370,29 +368,26 @@ impl Hy2Dialer {
                 Err(_) => Err(map_err("请求帧写超时", "")),
             }
         })?;
-        // 响应帧：status + msg + padding
-        let resp = rt.block_on(async {
-            async {
-                let mut status = [0u8; 1];
-                recv.read_exact(&mut status)
-                    .await
-                    .map_err(|e| map_err("响应 status", e))?;
-                let msg_len = read_varint_async(&mut recv).await?;
-                let mut msg = vec![0u8; msg_len as usize];
-                recv.read_exact(&mut msg)
-                    .await
-                    .map_err(|e| map_err("响应 msg", e))?;
-                let pad_len = read_varint_async(&mut recv).await?;
-                let mut pad = vec![0u8; pad_len as usize];
-                recv.read_exact(&mut pad)
-                    .await
-                    .map_err(|e| map_err("响应 padding", e))?;
-                Ok::<(u8, String), io::Error>((
-                    status[0],
-                    String::from_utf8_lossy(&msg).into_owned(),
-                ))
-            }
-        });
+        // 响应帧：status + msg + padding。
+        // P38：去掉外层的 `async {{ async {{…}} }}`（clippy::async_yields_async 报错）——
+        // 旧写法只是把内层 future 包了一层“壳”，语义不变（真正的轮询在下面的 timeout）。
+        let resp = async {
+            let mut status = [0u8; 1];
+            recv.read_exact(&mut status)
+                .await
+                .map_err(|e| map_err("响应 status", e))?;
+            let msg_len = read_varint_async(&mut recv).await?;
+            let mut msg = vec![0u8; msg_len as usize];
+            recv.read_exact(&mut msg)
+                .await
+                .map_err(|e| map_err("响应 msg", e))?;
+            let pad_len = read_varint_async(&mut recv).await?;
+            let mut pad = vec![0u8; pad_len as usize];
+            recv.read_exact(&mut pad)
+                .await
+                .map_err(|e| map_err("响应 padding", e))?;
+            Ok::<(u8, String), io::Error>((status[0], String::from_utf8_lossy(&msg).into_owned()))
+        };
         let (status, msg) = rt.block_on(async {
             match tokio::time::timeout(timeout, resp).await {
                 Ok(r) => r,

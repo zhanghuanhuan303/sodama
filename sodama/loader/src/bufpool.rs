@@ -107,6 +107,8 @@ impl Drop for PoolBuf {
 }
 
 /// 测试/诊断：当前池内缓冲数（small, large）与保留字节数。
+/// P38：当前无调用方（lab 用 perf/mem 采样 RSS）；保留为池内省 API。
+#[allow(dead_code)]
 pub fn pool_len() -> (usize, usize) {
     match pool().lock() {
         Ok(p) => (p.small.len(), p.large.len()),
@@ -115,6 +117,7 @@ pub fn pool_len() -> (usize, usize) {
 }
 
 /// 测试/诊断：池内保留字节数。
+#[allow(dead_code)]
 pub fn pool_bytes() -> usize {
     match pool().lock() {
         Ok(p) => p.bytes,

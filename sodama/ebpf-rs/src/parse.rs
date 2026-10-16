@@ -66,15 +66,13 @@ pub fn parse_ip_at_reason(ctx: &TcContext, link_h_len: u32) -> Result<SodaParseR
 #[inline(always)]
 pub fn parse_v4_at(ctx: &TcContext, link_h_len: u32) -> Result<SodaParseResult, ParseSkip> {
     let iph: IpHdr = ctx.load(link_h_len as usize).map_err(|_| ParseSkip::Other)?;
-    if (iph.vihl >> 4) != 4 {
+    // P38：头合法性判定抽到 `ebpf-logic`（host 可单测；`#[inline(always)]` 内联等价）。
+    if !ebpf_logic::v4_ihl_valid(iph.vihl) {
         return Err(ParseSkip::Other);
     }
     let ihl = ((iph.vihl & 0x0f) as u32) * 4;
-    if ihl < 20 {
-        return Err(ParseSkip::Other);
-    }
     // 分片：非首片（offset != 0）没有完整 L4 头，交内核原路径（对照 dae tproxy.c:1131）。
-    if (u16::from_be(iph.frag_off) & 0x1fff) != 0 {
+    if ebpf_logic::v4_frag_tail(iph.frag_off) {
         return Err(ParseSkip::FragTail);
     }
 
@@ -148,7 +146,7 @@ fn load_l4(ctx: &TcContext, off: u32, proto: u8, out: &mut SodaParseResult) -> R
             /* 位段按 LE u16：首字节高半字节是 doff，flags 在高字节：fin=bit8, syn=bit9,
              * rst=bit10, psh=bit11, ack=bit12（C 的位段等价写法）。 */
             let flags = (th.doff_flags >> 8) as u8;
-            out.new_flow = ((flags & 0x02) != 0 && (flags & 0x10) == 0) as u8;
+            out.new_flow = ebpf_logic::tcp_flags_new_flow(flags) as u8;
             Ok(())
         }
         IPPROTO_UDP => {

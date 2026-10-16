@@ -1,8 +1,25 @@
 [workspace]
 resolver = "2"
-members = ["loader"]
+members = ["loader", "ebpf-logic"]
 # 数据面 Rust 迁移（P8）：BPF 目标需要 nightly + build-std，不随主 workspace 构建。
 exclude = ["ebpf-rs"]
+
+# P38（A1 #20）：lint 门禁——CI 以 `cargo clippy --workspace --all-targets -- -D warnings`
+# 与 `cargo fmt --check` 运行（见 .github/workflows/ci.yml）。下列 lint 为**有意**放行
+# （逐条附理由），其余必须清零；每条放行都是一次显式取舍，不是“统一关掉 clippy”。
+[workspace.lints.clippy]
+# 出站枚举（Outbound 等）刻意保持值型：热路径 match 不引入间接跳转/分配；
+# 状态面签名与协议握手参数（h3client 8 参）同理，拆 alias/结构体会掩盖调用点语义。
+large_enum_variant = "allow"
+type_complexity = "allow"
+too_many_arguments = "allow"
+# h3client 单线程 runtime 下持锁跨 await 为既有形态（已在现场注释记账）。
+await_holding_lock = "allow"
+# 中文文档的列表续行缩进风格与英文规则不符（7 处；排版另一套约定）。
+doc_lazy_continuation = "allow"
+doc_overindented_list_items = "allow"
+# recvmmsg/poll 的索引循环与裸指针/SAFETY 注释一一对应，改写为迭代器反而降可读性。
+needless_range_loop = "allow"
 
 [profile.release]
 lto = true

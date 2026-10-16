@@ -37,7 +37,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use aya::maps::lpm_trie::Key;
-use aya::maps::{Array, ArrayOfMaps, HashMap, LpmTrie, MapData, PerCpuHashMap, RingBuf, SockHash, SockMap};
+use aya::maps::{
+    Array, ArrayOfMaps, HashMap, LpmTrie, MapData, PerCpuHashMap, RingBuf, SockHash, SockMap,
+};
 use aya::programs::tc::{self, TcAttachType};
 use aya::programs::{CgroupAttachMode, CgroupSock, CgroupSockAddr, SchedClassifier, SkSkb};
 use aya::programs::{CgroupSockAddrAttachType, CgroupSockAttachType};
@@ -54,6 +56,8 @@ mod config;
 mod dns;
 mod dnsroute;
 mod dnsup;
+#[cfg(test)]
+mod fuzz_smoke;
 mod geodata;
 mod group;
 mod h2client;
@@ -718,7 +722,10 @@ fn fnv_step(h: &mut u64, b: u8) {
 /// 轻量会话 hash（FNV-1a；避免 SipHash 每包开销）。
 fn udp_nat_shard(key: &UdpFlowKey) -> &'static UdpNatShard {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for ip in [key.client.ip(), key.dst.map(|d| d.ip()).unwrap_or(key.client.ip())] {
+    for ip in [
+        key.client.ip(),
+        key.dst.map(|d| d.ip()).unwrap_or(key.client.ip()),
+    ] {
         match ip {
             std::net::IpAddr::V4(v4) => {
                 for b in v4.octets() {
@@ -1074,7 +1081,11 @@ fn bump_datapath_generation(ebpf: &mut Ebpf) {
 
 fn current_datapath_generation() -> u16 {
     let v = DATAPATH_GENERATION.load(Ordering::SeqCst);
-    if v == 0 { 1 } else { v }
+    if v == 0 {
+        1
+    } else {
+        v
+    }
 }
 
 /// conn_state_map 的 pin 路径（对照 dae `LIBBPF_PIN_BY_NAME` + `/sys/fs/bpf/dae`；
@@ -1101,10 +1112,8 @@ fn migrate_pinned_conn_state(ebpf: &mut Ebpf, capacity: u32) {
                     aya::maps::Map::HashMap(old_data),
                 ) {
                     // 容量上限防御：旧表可能来自更大的配置。
-                    for item in old.iter().take(capacity as usize) {
-                        if let Ok(kv) = item {
-                            entries.push(kv);
-                        }
+                    for kv in old.iter().take(capacity as usize).flatten() {
+                        entries.push(kv);
                     }
                 }
                 if let Some(map) = ebpf.map_mut("conn_state_map") {
@@ -1136,10 +1145,14 @@ fn migrate_pinned_conn_state(ebpf: &mut Ebpf, capacity: u32) {
                 }
             }
         }
-        Err(e) => log(&format!("conn_state pin: 目录不可用（{e}），重启后状态不保留")),
+        Err(e) => log(&format!(
+            "conn_state pin: 目录不可用（{e}），重启后状态不保留"
+        )),
     }
     if migrated > 0 || dropped > 0 {
-        log(&format!("conn_state pin: 迁移 {migrated} 条（容量外丢弃 {dropped}）"));
+        log(&format!(
+            "conn_state pin: 迁移 {migrated} 条（容量外丢弃 {dropped}）"
+        ));
     }
 }
 
@@ -1347,7 +1360,11 @@ fn format_event_addr(a: &[u8; 16]) -> String {
 fn log_soda_event(ev: &SodaEvent) {
     let slot = event_type_slot(ev.type_);
     let (last, suppressed, window_ns) = match slot {
-        Some(i) => (&EVENT_LAST_LOG_NS[i], &EVENT_SUPPRESSED[i], 1_000_000_000u64),
+        Some(i) => (
+            &EVENT_LAST_LOG_NS[i],
+            &EVENT_SUPPRESSED[i],
+            1_000_000_000u64,
+        ),
         // 未知类型：限速更严（1 条/10s），避免损坏数据/ABI 漂移洪泛。
         None => (
             &EVENT_UNKNOWN_LAST_LOG_NS,
@@ -1860,7 +1877,11 @@ fn epoch_to_civil(secs: i64) -> (i64, u32, u32, i64, i64, i64) {
 
 fn log(msg: &str) {
     // P38：`--disable-timestamp` 关闭时间戳前缀（对照 dae `--disable-timestamp`）。
-    let line = log_line(LOG_TS_OFF.load(std::sync::atomic::Ordering::Relaxed), &now_hms(), msg);
+    let line = log_line(
+        LOG_TS_OFF.load(std::sync::atomic::Ordering::Relaxed),
+        &now_hms(),
+        msg,
+    );
     let mut done = false;
     if let Ok(mut g) = LOG_SINK.lock() {
         if let Some(f) = g.as_mut() {
@@ -1988,6 +2009,7 @@ fn usage() -> ! {
            sodama trace [--seconds N]           P6：过滤 sodama 的 ftrace 输出（需 root）\n\
            sodama completion [bash|zsh|fish]   P38：输出 shell 补全脚本（对照 dae completion；\n\
                                  预生成副本在 install/shell-completion/）\n\
+           sodama config-doc [--format md|json] [--out <file>] P38：输出配置参考（docs/config-reference.md 由此生成）\n\
          \n\
          运行中收到 SIGHUP 会重读 --rules/--config 并热重载（非活跃槽 → 切换 active），
          同时清除 suspend 状态并 reopen --log-file（对照 dae reload）；SIGUSR2 = suspend。
@@ -2099,7 +2121,9 @@ fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
                     "auto" => LinkHdrMode::Auto,
                     "l2" => LinkHdrMode::L2,
                     "l3" => LinkHdrMode::L3,
-                    other => return Err(format!("--link-hdr 取值非法: {other}（auto|l2|l3）").into()),
+                    other => {
+                        return Err(format!("--link-hdr 取值非法: {other}（auto|l2|l3）").into())
+                    }
                 };
             }
             "--xdp" => args.xdp.push(next()?),
@@ -2534,9 +2558,10 @@ fn attach(
         .try_into()?;
     program.load()?;
     let _ = tc::qdisc_add_clsact(ifname);
-    let link = program.attach(ifname, attach_type)?;
-    // link 持有 TCX/BPF link 的 fd，drop 即摘除钩子；实验进程全程保活。
-    std::mem::forget(link);
+    // P38（A1 #20）：attach 返回的是 `SchedClassifierLinkId`（弱句柄——drop 不摘钩，
+    // 旧写的 `mem::forget` 是无操作）；真正的 link 由 program 内部 links 表持有，
+    // 随 Ebpf/program（进程全程）存活，钩子随进程退出由内核回收。
+    let _link = program.attach(ifname, attach_type)?;
     log(&format!("attached {name} to {ifname} ({attach_type:?})"));
     if let Ok(mut hooks) = HOOKS.lock() {
         hooks.push(format!("{name}@{ifname}"));
@@ -2553,7 +2578,9 @@ fn write_trace_params(ebpf: &mut Ebpf) -> Option<btfoff::SkBuffOffsets> {
     let off = match btfoff::sk_buff_offsets() {
         Ok(o) => o,
         Err(e) => {
-            log(&format!("offload 记账: BTF 解析失败（{e}），跳过 skb_send_sock 探针"));
+            log(&format!(
+                "offload 记账: BTF 解析失败（{e}），跳过 skb_send_sock 探针"
+            ));
             return None;
         }
     };
@@ -2622,9 +2649,8 @@ fn attach_offload_accounting(ebpf: &mut Ebpf) {
             .ok_or("program skb_send_sock_account not found")?
             .try_into()?;
         p.load("skb_send_sock", &btf)?;
-        let link = p.attach()?;
-        // 与本进程同生命周期：drop 即摘钩（与 TC 钩子同一策略）。
-        std::mem::forget(link);
+        // P38：LinkId 弱句柄（drop 不摘钩）；钩子生命周期随 program/Ebpf。
+        let _link = p.attach()?;
         Ok(())
     })();
     match fe_ret {
@@ -2651,8 +2677,8 @@ fn attach_offload_kprobe(ebpf: &mut Ebpf) {
             .ok_or("program skb_send_sock_account_kprobe not found")?
             .try_into()?;
         p.load()?;
-        let link = p.attach("skb_send_sock", 0)?;
-        std::mem::forget(link);
+        // P38：同 fentry 分支：LinkId drop 不摘钩。
+        let _link = p.attach("skb_send_sock", 0)?;
         Ok(())
     })();
     match r {
@@ -2681,8 +2707,8 @@ fn attach_xdp_probes(ebpf: &mut Ebpf, ifaces: &[String]) -> Result<(), Box<dyn s
     for iface in ifaces {
         // Default：内核自选模式（驱动支持则 native，否则 generic）。
         match prog.attach(iface, XdpMode::Default) {
-            Ok(link) => {
-                std::mem::forget(link);
+            Ok(_link) => {
+                // P38：LinkId drop 不摘钩（真正的 link 由 program 持有，进程全程保活）。
                 log(&format!(
                     "attached sodama_xdp_observe to {iface} (xdp, 仅计量)"
                 ));
@@ -2690,7 +2716,9 @@ fn attach_xdp_probes(ebpf: &mut Ebpf, ifaces: &[String]) -> Result<(), Box<dyn s
                     hooks.push(format!("sodama_xdp_observe@{iface}"));
                 }
             }
-            Err(e) => log(&format!("xdp: 挂载到 {iface} 失败（{e}），跳过（不影响转发）")),
+            Err(e) => log(&format!(
+                "xdp: 挂载到 {iface} 失败（{e}），跳过（不影响转发）"
+            )),
         }
     }
     Ok(())
@@ -3226,18 +3254,6 @@ fn pump_or_splice_down(
     pump(from_remote, Box::new(client), last_ns, sink, false, stop);
 }
 
-/// P7/M4 stage 2：全局 offload 看门狗（单线程，每 offload 连接 0 线程）。
-///
-/// 取代原先「每连接一个 monitor 线程 + 两个驻留泵线程」的模型：注册后直接返回，
-/// 不再驻留用户态泵；由本线程统一 poll(RDHUP) 判定半关闭并在超时后强制回收，
-/// 并负责 fast_sock 键注销与 `relay_finish`。
-/// 实测规则（C 基准 + 逐级实验，不变）：
-///   - 内核重定向会自行处理 FIN，但不会把 EOF 传给对端用户态；
-///   - FIN 重定向尝试会在源 socket 上留下 POLLERR——这不是错误，**绝不能**
-///     在传输中 force-close（会把在途重定向数据全部切断）；
-///   - 用户态主动向对端传播 FIN 也会截断排队中的数据；
-/// 因此：只在两侧都 RDHUP 时干净退出；只有一侧 RDHUP 超过 10s
-/// （对照 dae relayHalfCloseTimeout）才强制关闭，保证连接最终可回收。
 // ---------------- offload 背压 fuse（对照 dae `fuseStep` / `tcp_offload_pause`） ----------------
 
 /// 背压阈值（dae：64 MiB；`SODAMA_FUSE_MAX_BACKLOG` 可调，测试用）。
@@ -3282,7 +3298,9 @@ fn offload_sent_read(key: &SodaTuple) -> u64 {
         return 0;
     };
     let Ok(m) = m.lock() else { return 0 };
-    m.get(key, 0).map(|v| v.iter().copied().sum::<u64>()).unwrap_or(0)
+    m.get(key, 0)
+        .map(|v| v.iter().copied().sum::<u64>())
+        .unwrap_or(0)
 }
 
 /// 读一侧 socket 的累计接收字节（TCP_INFO.tcpi_bytes_received）。
@@ -3421,7 +3439,10 @@ fn fuse_decision(
             if drained {
                 return (FuseDecision::Lift, backlog);
             }
-            if since_drain_start.map(|d| d > FUSE_DRAIN_WAIT).unwrap_or(false) {
+            if since_drain_start
+                .map(|d| d > FUSE_DRAIN_WAIT)
+                .unwrap_or(false)
+            {
                 return (FuseDecision::LiftTimeout, backlog);
             }
             return (FuseDecision::None, backlog);
@@ -3447,13 +3468,18 @@ fn offload_fuse_step(e: &mut OffloadWatchEntry) {
     };
     // 首轮采样 baseline（注册后尽快形成干净基线，对照 dae `newTCPRelayOffloadSession`）。
     if e.fuse_rx_base.is_none() {
-        if let (Some(l), Some(r)) = (tcp_conn_rx_bytes(e.client_fd), tcp_conn_rx_bytes(e.upstream_fd)) {
+        if let (Some(l), Some(r)) = (
+            tcp_conn_rx_bytes(e.client_fd),
+            tcp_conn_rx_bytes(e.upstream_fd),
+        ) {
             e.fuse_rx_base = Some((l, r));
         }
         return;
     }
-    let (Some(lr), Some(rr)) = (tcp_conn_rx_bytes(e.client_fd), tcp_conn_rx_bytes(e.upstream_fd))
-    else {
+    let (Some(lr), Some(rr)) = (
+        tcp_conn_rx_bytes(e.client_fd),
+        tcp_conn_rx_bytes(e.upstream_fd),
+    ) else {
         return;
     };
     let (lb, rb) = e.fuse_rx_base.unwrap();
@@ -3553,7 +3579,10 @@ fn offload_fuse_step(e: &mut OffloadWatchEntry) {
                 let _ = offload_pause_set(k_up, false);
                 let _ = offload_pause_set(k_cl, false);
                 RELAY_STATS.fuse_failures.fetch_add(1, Ordering::Relaxed);
-                log(&format!("offload fuse: #{id} pause 键写入失败，已回滚", id = e.id));
+                log(&format!(
+                    "offload fuse: #{id} pause 键写入失败，已回滚",
+                    id = e.id
+                ));
             }
         }
     }
@@ -3636,6 +3665,18 @@ fn offload_watch_cleanup(id: u64, keys: &Option<(SodaTuple, SodaTuple)>) {
     relay_finish(id);
 }
 
+/// P7/M4 stage 2：全局 offload 看门狗（单线程，每 offload 连接 0 线程）。
+///
+/// 取代原先「每连接一个 monitor 线程 + 两个驻留泵线程」的模型：注册后直接返回，
+/// 不再驻留用户态泵；由本线程统一 poll(RDHUP) 判定半关闭并在超时后强制回收，
+/// 并负责 fast_sock 键注销与 `relay_finish`。
+/// 实测规则（C 基准 + 逐级实验，不变）：
+///   - 内核重定向会自行处理 FIN，但不会把 EOF 传给对端用户态；
+///   - FIN 重定向尝试会在源 socket 上留下 POLLERR——这不是错误，**绝不能**
+///     在传输中 force-close（会把在途重定向数据全部切断）；
+///   - 用户态主动向对端传播 FIN 也会截断排队中的数据；
+/// 因此：只在两侧都 RDHUP 时干净退出；只有一侧 RDHUP 超过 10s
+/// （对照 dae relayHalfCloseTimeout）才强制关闭，保证连接最终可回收。
 fn offload_watch_loop() {
     const HALF_CLOSE_TIMEOUT: Duration = Duration::from_secs(10);
     fn poll_revents(fd: RawFd) -> i16 {
@@ -3905,14 +3946,12 @@ fn try_offload(client: &TcpStream, upstream: &TcpStream) -> Option<(SodaTuple, S
     else {
         return None;
     };
-    let Some(map) = RELAY_OFFLOAD.get() else {
-        return None;
-    };
+    let map = RELAY_OFFLOAD.get()?;
     let Ok(mut m) = map.lock() else {
         return None;
     };
-    let r1 = m.insert(&key_for_upstream, upstream.as_raw_fd(), 0);
-    let r2 = m.insert(&key_for_client, client.as_raw_fd(), 0);
+    let r1 = m.insert(key_for_upstream, upstream.as_raw_fd(), 0);
+    let r2 = m.insert(key_for_client, client.as_raw_fd(), 0);
     if r1.is_ok() && r2.is_ok() {
         // P8：Rust verdict 用 guard 镜像做预检，先写 fast_sock 再写 guard
         // （反过来的窗口里 guard 命中但 fast_sock 未命中会导致 redirect 丢包）。
@@ -3982,7 +4021,9 @@ fn offload_sent_reclaim(key: &SodaTuple) -> u64 {
         Err(e) => {
             static LOGGED: AtomicBool = AtomicBool::new(false);
             if !LOGGED.swap(true, Ordering::Relaxed) {
-                log(&format!("offload_sent: 记账键回收失败（{e}），后续同类只静默忽略"));
+                log(&format!(
+                    "offload_sent: 记账键回收失败（{e}），后续同类只静默忽略"
+                ));
             }
         }
     }
@@ -4778,7 +4819,7 @@ fn write_rules(
                 rules::BPF_F_NO_PREALLOC,
             )?;
             for (plen, data) in prefixes {
-                trie.insert(&Key::new(*plen, *data), &1u32, 0)?;
+                trie.insert(&Key::new(*plen, *data), 1u32, 0)?;
             }
             outer.set(base + *idx, &trie, 0)?;
         }
@@ -4870,9 +4911,7 @@ fn build_upstream_set_core(
         .or(first_ok)
         .or_else(|| dnsup::Upstream::new("8.8.8.8:53").ok())
         .ok_or("没有任何可用的 DNS 上游（含内置回退）")?;
-    if cli.is_some() {
-        by_tag.insert("default".to_string(), legacy.clone());
-    } else if by_tag.is_empty() {
+    if cli.is_some() || by_tag.is_empty() {
         by_tag.insert("default".to_string(), legacy.clone());
     }
     Ok(Arc::new(UpstreamSet {
@@ -5105,7 +5144,11 @@ fn do_reload(args: &Args, ebpf: &mut Ebpf, startup: bool, fast: bool) -> ReloadO
                 // 手动 reload / SIGHUP 仍为 Full（强制拉取）。
                 request_sub_refresh(
                     args,
-                    if fast { SubFetchMode::Fast } else { SubFetchMode::Full },
+                    if fast {
+                        SubFetchMode::Fast
+                    } else {
+                        SubFetchMode::Full
+                    },
                 );
             }
             log(&format!("热重载完成（{n} 条 match_set）"));
@@ -5191,8 +5234,6 @@ pub fn traffic_active(within: u64) -> bool {
     t > 0 && unix_now_sec().saturating_sub(t) < within
 }
 
-/// 解析 `--dialer`：G1 支持 direct / socks5:// / ss:// / trojan://（见 outbound）。
-
 fn monotonic_now_ns() -> u64 {
     let mut ts = libc::timespec {
         tv_sec: 0,
@@ -5213,16 +5254,14 @@ fn sweep_conn_state(ebpf: &mut Ebpf) -> Result<usize, Box<dyn std::error::Error>
     let mut conn_state: HashMap<_, SodaTuple, SodaConnState> = HashMap::try_from(map)?;
     let now = monotonic_now_ns();
     let mut dead: Vec<SodaTuple> = Vec::new();
-    for item in conn_state.iter() {
-        if let Ok((k, v)) = item {
-            let timeout = if v.l4proto == 6 {
-                TCP_TIMEOUT_NS
-            } else {
-                UDP_TIMEOUT_NS
-            };
-            if v.last_seen_ns <= now && now - v.last_seen_ns > timeout {
-                dead.push(k);
-            }
+    for (k, v) in conn_state.iter().flatten() {
+        let timeout = if v.l4proto == 6 {
+            TCP_TIMEOUT_NS
+        } else {
+            UDP_TIMEOUT_NS
+        };
+        if v.last_seen_ns <= now && now - v.last_seen_ns > timeout {
+            dead.push(k);
         }
     }
     let n = dead.len();
@@ -5252,12 +5291,10 @@ fn sweep_redirect_track(ebpf: &mut Ebpf) -> Result<(usize, usize), Box<dyn std::
     let now = monotonic_now_ns();
     let mut dead: Vec<SodaTuple> = Vec::new();
     let mut total: usize = 0;
-    for item in track.iter() {
-        if let Ok((k, v)) = item {
-            total += 1;
-            if v.last_seen_ns <= now && now - v.last_seen_ns > REDIRECT_TIMEOUT_NS {
-                dead.push(k);
-            }
+    for (k, v) in track.iter().flatten() {
+        total += 1;
+        if v.last_seen_ns <= now && now - v.last_seen_ns > REDIRECT_TIMEOUT_NS {
+            dead.push(k);
         }
     }
     let n = dead.len();
@@ -5704,50 +5741,52 @@ fn fetch_one_sub(
                 .and_then(|b| subscribe::decode_body(&b).map(|t| (b, t)))
             {
                 Ok((body, text)) => {
-                let (mut ns, errs) = subscribe::parse_subscription(&text, tag);
-                for e in errs.iter().take(3) {
-                    log(&format!("订阅 {tag}: {e}"));
-                }
-                if errs.len() > 3 {
-                    log(&format!("订阅 {tag}: 另有 {} 行不支持", errs.len() - 3));
-                }
-                if ns.is_empty() {
-                    last_err = Some("解析结果为空".into());
-                } else {
-                    // 节点数骤降告警（截断被 CL 校验兜住后的第二道可见性；仅告警不拒绝）。
-                    if let Some(prev) = cache_peek_count(url) {
-                        if prev >= 8 && ns.len() * 2 < prev {
-                            log(&format!(
+                    let (mut ns, errs) = subscribe::parse_subscription(&text, tag);
+                    for e in errs.iter().take(3) {
+                        log(&format!("订阅 {tag}: {e}"));
+                    }
+                    if errs.len() > 3 {
+                        log(&format!("订阅 {tag}: 另有 {} 行不支持", errs.len() - 3));
+                    }
+                    if ns.is_empty() {
+                        last_err = Some("解析结果为空".into());
+                    } else {
+                        // 节点数骤降告警（截断被 CL 校验兜住后的第二道可见性；仅告警不拒绝）。
+                        if let Some(prev) = cache_peek_count(url) {
+                            if prev >= 8 && ns.len() * 2 < prev {
+                                log(&format!(
                                 "订阅 {tag}: 警告：节点数骤降 {prev} -> {}（疑似截断/套餐变更，请留意）",
                                 ns.len()
                             ));
+                            }
                         }
-                    }
-                    for n in &mut ns {
-                        n.rank = rank;
-                    }
-                    log(&format!(
-                        "订阅 {tag}: 拉取成功，{} 个节点（来源顺序 #{rank}）",
-                        ns.len()
-                    ));
-                    cache_put_sub(url, &ns);
-                    // P37（B1）：登记「曾成功拉取」——下次配置热重载（Fast）走磁盘缓存不打网。
-                    subscribe::mark_sub_seen(url);
-                    subscribe::clear_fetch_fail(url);
-                    if let Some(dir) = cfg_dir {
-                        if let Err(e) = subscribe::disk_store(dir, tag, &body) {
-                            log(&format!("订阅 {tag}: 磁盘缓存写入失败: {e}"));
+                        for n in &mut ns {
+                            n.rank = rank;
                         }
+                        log(&format!(
+                            "订阅 {tag}: 拉取成功，{} 个节点（来源顺序 #{rank}）",
+                            ns.len()
+                        ));
+                        cache_put_sub(url, &ns);
+                        // P37（B1）：登记「曾成功拉取」——下次配置热重载（Fast）走磁盘缓存不打网。
+                        subscribe::mark_sub_seen(url);
+                        subscribe::clear_fetch_fail(url);
+                        if let Some(dir) = cfg_dir {
+                            if let Err(e) = subscribe::disk_store(dir, tag, &body) {
+                                log(&format!("订阅 {tag}: 磁盘缓存写入失败: {e}"));
+                            }
+                        }
+                        mk_status(true, None, ns.len(), "net");
+                        return ns;
                     }
-                    mk_status(true, None, ns.len(), "net");
-                    return ns;
                 }
-            }
                 Err(e) => {
                     let es = e.to_string();
                     subscribe::note_fetch_error(url, &es);
                     if attempt < 3 {
-                        log(&format!("订阅 {tag}: 第 {attempt} 次拉取失败（{es}），重试…"));
+                        log(&format!(
+                            "订阅 {tag}: 第 {attempt} 次拉取失败（{es}），重试…"
+                        ));
                         std::thread::sleep(Duration::from_millis(600 * attempt as u64));
                     }
                     last_err = Some(es);
@@ -5806,7 +5845,11 @@ struct SourceFetch {
 /// P34：来源顺序 = 内联 node(0) → CLI --subscribe(1..) → config subscription(声明顺序)；
 /// 顺序回退（pacman 风格，`subscription_failover` 默认开）：前面来源有活节点就用它。
 /// P37（B1/B2/B3）：`mode` 决定缓存优先/负缓存/定向重拉（见 `SubFetchMode`）。
-fn fetch_sources(cfg: Option<&config::Config>, args: &Args, mode: &SubFetchMode) -> Vec<SourceFetch> {
+fn fetch_sources(
+    cfg: Option<&config::Config>,
+    args: &Args,
+    mode: &SubFetchMode,
+) -> Vec<SourceFetch> {
     let node_specs = cfg.map(config::inline_nodes).unwrap_or_default();
     let sub_specs = cfg.map(config::subscriptions).unwrap_or_default();
     let timeout = Duration::from_secs(15);
@@ -5873,7 +5916,11 @@ fn fetch_sources(cfg: Option<&config::Config>, args: &Args, mode: &SubFetchMode)
 }
 
 /// 兼容旧调用方：扁平化全部来源的节点（启动期组构建）。
-fn fetch_nodes(cfg: Option<&config::Config>, args: &Args, mode: &SubFetchMode) -> Vec<subscribe::ParsedNode> {
+fn fetch_nodes(
+    cfg: Option<&config::Config>,
+    args: &Args,
+    mode: &SubFetchMode,
+) -> Vec<subscribe::ParsedNode> {
     fetch_sources(cfg, args, mode)
         .into_iter()
         .flat_map(|s| s.nodes)
@@ -6112,7 +6159,9 @@ fn reload_group_members(args: &Args, mode: &SubFetchMode) {
             old.stop();
         }
         if stopped > 0 {
-            log(&format!("组集合变更：已停止 {stopped} 个旧世代健康探测线程"));
+            log(&format!(
+                "组集合变更：已停止 {stopped} 个旧世代健康探测线程"
+            ));
         }
         let mut groups = Vec::with_capacity(specs.len());
         let mut by_name = std::collections::HashMap::new();
@@ -6431,6 +6480,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 | "sysdump"
                 | "trace"
                 | "completion"
+                | "config-doc"
         )
     {
         return run_subcommand(&argv);
@@ -6704,10 +6754,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .filter(|n| (1024..=4_194_304).contains(n))
         .unwrap_or(262_144);
     let mut loader = aya::EbpfLoader::new();
-    loader.set_max_entries("conn_state_map", conn_state_size);
-    let mut ebpf = loader
-        .load(&data)
-        .map_err(|e| format!("Ebpf::load: {e}"))?;
+    loader.map_max_entries("conn_state_map", conn_state_size);
+    let mut ebpf = loader.load(&data).map_err(|e| format!("Ebpf::load: {e}"))?;
     migrate_pinned_conn_state(&mut ebpf, conn_state_size);
 
     // P18c+：把 dns_sender_pname_map 的 fd dup 一份给 DNS 线程
@@ -6738,10 +6786,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .name("ebpf-events".into())
                     .spawn(move || ebpf_event_loop(rb))
                 {
-                    log(&format!("event_ringbuf: 消费线程创建失败（{e}），事件通道不可用"));
+                    log(&format!(
+                        "event_ringbuf: 消费线程创建失败（{e}），事件通道不可用"
+                    ));
                 }
             }
-            Err(e) => log(&format!("event_ringbuf: RingBuf 打开失败（{e}），事件通道不可用")),
+            Err(e) => log(&format!(
+                "event_ringbuf: RingBuf 打开失败（{e}），事件通道不可用"
+            )),
         }
     } else {
         log("event_ringbuf: 对象不含该 map，事件通道不可用");
@@ -7144,7 +7196,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             do_reload(&args, &mut ebpf, false, false);
         }
         ticks += 1;
-        if ticks % janitor_ticks == 0 {
+        if ticks.is_multiple_of(janitor_ticks) {
             match sweep_conn_state(&mut ebpf) {
                 Ok(0) => {}
                 Ok(n) => log(&format!("conn_state janitor: 清理 {n} 条过期状态")),
@@ -7156,12 +7208,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Err(e) => log(&format!("redirect_track janitor 失败: {e}")),
             }
             // O8：每 30s 回收分配器空闲页（churn 后 RSS 回落；避免高频 trim 抖动）。
-            if (ticks / janitor_ticks) % 6 == 0 {
+            if (ticks / janitor_ticks).is_multiple_of(6) {
                 trim_allocator();
             }
         }
         // 能力缺口 #3：接口热插拔（新增补挂 / 消失清理；对照 dae interface_manager）
-        if ticks % ifwatch_ticks == 0 {
+        if ticks.is_multiple_of(ifwatch_ticks) {
             let (added, removed) = ifwatch.poll();
             for (iface, roles) in added {
                 for role in roles {
@@ -7367,13 +7419,31 @@ fn raw_udp_send(from: SocketAddr, to: SocketAddr, payload: &[u8]) -> std::io::Re
         return Err(std::io::Error::last_os_error());
     }
     let fd = unsafe { OwnedFd::from_raw_fd(raw) };
-    set_int_opt(fd.as_raw_fd(), if v6 { libc::IPPROTO_IPV6 } else { libc::IPPROTO_IP }, transparent, 1)?;
+    set_int_opt(
+        fd.as_raw_fd(),
+        if v6 {
+            libc::IPPROTO_IPV6
+        } else {
+            libc::IPPROTO_IP
+        },
+        transparent,
+        1,
+    )?;
     // SO_MARK（与 dae 同语义：避开自己的钩子；失败不致命）。
-    let _ = set_int_opt(fd.as_raw_fd(), libc::SOL_SOCKET, libc::SO_MARK, DAE_SOCKET_MARK);
+    let _ = set_int_opt(
+        fd.as_raw_fd(),
+        libc::SOL_SOCKET,
+        libc::SO_MARK,
+        DAE_SOCKET_MARK,
+    );
     // bind 伪造源 IP（端口用 0：端口写在自构 UDP 头里；对照 dae 只绑地址）。
     let (st, len) = sockaddr_any_of(from);
     if unsafe {
-        libc::bind(fd.as_raw_fd(), &st as *const _ as *const libc::sockaddr, len)
+        libc::bind(
+            fd.as_raw_fd(),
+            &st as *const _ as *const libc::sockaddr,
+            len,
+        )
     } != 0
     {
         return Err(std::io::Error::last_os_error());
@@ -7437,7 +7507,11 @@ pub(crate) fn udp_checksum(src: std::net::IpAddr, dst: std::net::IpAddr, udp_pac
         sum = (sum & 0xffff) + (sum >> 16);
     }
     let r = !(sum as u16);
-    if r == 0 { 0xffff } else { r }
+    if r == 0 {
+        0xffff
+    } else {
+        r
+    }
 }
 
 /// UDP 透明 socket（P22 起支持 v4/v6）。
@@ -7659,6 +7733,9 @@ struct UdpRecvBatch {
     slots: Vec<Vec<u8>>,
     names: Vec<libc::sockaddr_storage>,
     ctrls: Vec<CtlBuf>,
+    /// P38：持有所有权——`msgs[i].msg_hdr.msg_iov` 指向该 Vec 的元素，
+    /// 释放会让指针悬垂（字段本意“不读但必须活”）。
+    #[allow(dead_code)]
     iovecs: Vec<libc::iovec>,
     msgs: Vec<libc::mmsghdr>,
     max: usize,
@@ -8027,7 +8104,7 @@ fn resolve_dns(
                 }
                 depth += 1;
                 DNS_STATS.relookups.fetch_add(1, Ordering::Relaxed);
-                let Some(set) = upstreams() else { return None };
+                let set = upstreams()?;
                 let Some(next) = set.get(&t) else {
                     DNS_STATS.upstream_errors.fetch_add(1, Ordering::Relaxed);
                     log(&format!("dns 应答路由出口 {t:?} 不在 dns.upstream"));
@@ -8300,7 +8377,14 @@ fn dns_bind_udp_loop(addr: SocketAddr, tx: std::sync::mpsc::Sender<status::MainM
         }
         DNS_STATS.bind_queries.fetch_add(1, Ordering::Relaxed);
         let resolved = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            resolve_dns(query, ClientProto::Udp, Some(peer.ip()), None, Some(addr), &tx)
+            resolve_dns(
+                query,
+                ClientProto::Udp,
+                Some(peer.ip()),
+                None,
+                Some(addr),
+                &tx,
+            )
         }));
         let resp = match resolved {
             Ok(Some(r)) => r,
@@ -8548,7 +8632,7 @@ fn publish_domain_bits(
                 val.bitmap[i] |= b;
             }
         }
-        dm.insert(&key, &val, 0)?;
+        dm.insert(key, val, 0)?;
     }
     Ok(())
 }
@@ -8618,7 +8702,10 @@ fn udp_session_reader(sess: Arc<UdpSession>) {
             break;
         }
         let got = if sess.full_cone {
-            match sess.relay.recv_batch_src(&mut slots, UDP_RECV_BATCH, &mut srcs) {
+            match sess
+                .relay
+                .recv_batch_src(&mut slots, UDP_RECV_BATCH, &mut srcs)
+            {
                 Ok(n) => n,
                 Err(e) if udp_read_retryable(&e) => continue,
                 Err(e) => {
@@ -8681,8 +8768,9 @@ fn udp_read_retryable(e: &std::io::Error) -> bool {
 const REPLY_SOCKET_CAP: usize = 128;
 
 /// P38：透明回包 socket 全局缓存（DNS 与 UDP NAT 共用；多线程读者共用一把短锁）。
-static REPLY_SOCKETS: std::sync::LazyLock<Mutex<std::collections::HashMap<SocketAddr, Arc<OwnedFd>>>> =
-    std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+static REPLY_SOCKETS: std::sync::LazyLock<
+    Mutex<std::collections::HashMap<SocketAddr, Arc<OwnedFd>>>,
+> = std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
 
 /// 取（或创建）绑定 addr 的透明回包 socket；保留原始错误（raw_udp 回退判定要用 errno）。
 fn reply_socket_global(addr: SocketAddr) -> std::io::Result<Arc<OwnedFd>> {
@@ -8713,13 +8801,17 @@ fn reply_send(from: SocketAddr, to: SocketAddr, datas: &[&[u8]]) -> std::io::Res
         Ok(fd) => match send_batch_to_udp(fd.as_raw_fd(), to, datas) {
             Ok(()) => Ok(()),
             Err(e) if raw_udp_eligible(&e, from, to) => {
-                UDP_NAT_STATS.raw_udp_fallbacks.fetch_add(1, Ordering::Relaxed);
+                UDP_NAT_STATS
+                    .raw_udp_fallbacks
+                    .fetch_add(1, Ordering::Relaxed);
                 raw_udp_send_all(from, to, datas)
             }
             Err(e) => Err(e),
         },
         Err(e) if raw_udp_eligible(&e, from, to) => {
-            UDP_NAT_STATS.raw_udp_fallbacks.fetch_add(1, Ordering::Relaxed);
+            UDP_NAT_STATS
+                .raw_udp_fallbacks
+                .fetch_add(1, Ordering::Relaxed);
             raw_udp_send_all(from, to, datas)
         }
         Err(e) => {
@@ -8788,12 +8880,19 @@ fn udp_neg_cache_put(key: UdpFlowKey) {
 }
 
 fn udp_sess_lookup(key: &UdpFlowKey) -> Option<Arc<UdpSession>> {
-    udp_nat_shard(key).lock().ok().and_then(|t| t.get(key).cloned())
+    udp_nat_shard(key)
+        .lock()
+        .ok()
+        .and_then(|t| t.get(key).cloned())
 }
 
 /// P38：取（或创建）一条 UDP 端点：普通明文 UDP → Full-Cone（key.client，任意目标复用）；
 /// QUIC Initial / 代理型协议 → dest-affine（key.dst）。创建路径含 QUIC 嗅探与拨号（不持锁）。
-fn udp_nat_session(client: SocketAddr, orig_dst: SocketAddr, probe: &[u8]) -> Option<Arc<UdpSession>> {
+fn udp_nat_session(
+    client: SocketAddr,
+    orig_dst: SocketAddr,
+    probe: &[u8],
+) -> Option<Arc<UdpSession>> {
     // P20：QUIC Initial 识别 + SNI 嗅探（解 Initial 加密；失败仅计识别数）。
     // 识别命中 → dest-affine（对照 dae：QUIC 需目的亲和）。
     let quic = is_quic_initial(probe);
@@ -8933,7 +9032,11 @@ fn udp_nat_session(client: SocketAddr, orig_dst: SocketAddr, probe: &[u8]) -> Op
 }
 
 /// P38：单包上行（full-cone 端点按包目标；affine 会话用固定目标）。
-fn udp_sess_send_one(sess: &UdpSession, orig_dst: SocketAddr, data: &[u8]) -> std::io::Result<usize> {
+fn udp_sess_send_one(
+    sess: &UdpSession,
+    orig_dst: SocketAddr,
+    data: &[u8],
+) -> std::io::Result<usize> {
     if sess.full_cone {
         sess.relay.send_payload_to(orig_dst, data)
     } else {
@@ -9448,6 +9551,7 @@ fn run_subcommand(argv: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             Ok(())
         }
         "dns-bench" => run_dns_bench(argv),
+        "config-doc" => run_config_doc(argv),
         "completion" => run_completion(argv),
         _ => unreachable!(),
     }
@@ -9613,6 +9717,88 @@ fn completion_script(shell: &str) -> Option<String> {
         }
         _ => None,
     }
+}
+
+/// P38：`sodama config-doc [--format md|json] [--out <file>]`：输出配置参考
+///（对照 dae `hack/ci` 的配置文档生成器；`docs/config-reference.md` 由此生成）。
+fn run_config_doc(argv: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let mut format = "md".to_string();
+    let mut out_path: Option<String> = None;
+    let mut it = argv.iter().skip(2);
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--format" => format = it.next().ok_or("--format 需要值")?.clone(),
+            "--out" => out_path = Some(it.next().ok_or("--out 需要值")?.clone()),
+            other => return Err(format!("未知参数 {other}").into()),
+        }
+    }
+    let text = match format.as_str() {
+        "md" => config_doc_markdown(),
+        "json" => {
+            let list: Vec<serde_json::Value> = config::key_docs()
+                .iter()
+                .map(|k| {
+                    json!({
+                        "section": k.section,
+                        "key": k.key,
+                        "desc": k.desc,
+                        "default": k.default,
+                        "consumed": k.consumed,
+                    })
+                })
+                .collect();
+            serde_json::to_string_pretty(&list)? + "\n"
+        }
+        other => return Err(format!("--format 取值非法: {other}（md|json）").into()),
+    };
+    match out_path {
+        Some(p) => {
+            std::fs::write(&p, &text)?;
+            eprintln!("config-doc -> {p}");
+        }
+        None => print!("{text}"),
+    }
+    Ok(())
+}
+
+/// P38：配置参考的 markdown 渲染（分组 + 生效面标记；生成物与单测锁定同步）。
+fn config_doc_markdown() -> String {
+    let mut out = String::new();
+    out.push_str("# sodama 配置参考（自动生成，不要手工编辑）\n\n");
+    out.push_str("由 `sodama config-doc` 从 `loader/src/config.rs` 的 `key_docs()` 生成；");
+    out.push_str("修改请改登记表并重新生成（`cargo test` 的 drift 用例会锁定同步）。\n\n");
+    out.push_str("「生效」列：✅ = 键有消费点；⚠️ = 解析通过但当前无消费点——");
+    out.push_str("不把解析写成生效（口径见 `docs/capability-gap-review.md` §2）。\n\n");
+    for section in ["global", "dns", "group"] {
+        out.push_str(&format!("## {section}\n\n"));
+        out.push_str("| 键 | 说明 | 默认 | 生效 |\n|---|---|---|---|\n");
+        for k in config::key_docs().iter().filter(|k| k.section == section) {
+            out.push_str(&format!(
+                "| `{}` | {} | {} | {} |\n",
+                k.key,
+                k.desc,
+                if k.default.is_empty() {
+                    "—".to_string()
+                } else {
+                    format!("`{}`", k.default)
+                },
+                if k.consumed {
+                    "✅"
+                } else {
+                    "⚠️ 无消费点"
+                },
+            ));
+        }
+        out.push('\n');
+    }
+    out.push_str("## 其它段\n\n");
+    out.push_str(
+        "`include` / `routing` / `subscription` / `node` / `rule_set` / `dns.fixed_domain_ttl` ",
+    );
+    out.push_str(
+        "见 `docs/deploy.md`、`sodama/lab/gateway.dae` 示例与 `docs/capability-gap-review.md`。\n",
+    );
+    out
 }
 
 /// P38：`sodama completion [bash|zsh|fish]`（对照 dae completion 子命令）。
@@ -9894,7 +10080,16 @@ fn print_status_human(raw: &str) -> Result<(), Box<dyn std::error::Error>> {
             println!("  {key}: {x}");
         }
     }
-    for key in ["rules", "maps", "stats", "hooks", "config", "events", "offload_sent", "xdp"] {
+    for key in [
+        "rules",
+        "maps",
+        "stats",
+        "hooks",
+        "config",
+        "events",
+        "offload_sent",
+        "xdp",
+    ] {
         if let Some(x) = v.get(key) {
             println!("  {key}: {x}");
         }
@@ -10171,7 +10366,8 @@ fn status_json(ebpf: &mut Ebpf) -> serde_json::Value {
     let conn_state = count_map::<SodaTuple, SodaConnState>(ebpf, "conn_state_map");
     let redirect_track = count_map::<SodaTuple, SodaRedirectEntry>(ebpf, "redirect_track");
     let domain_routing = count_map::<SodaEpochIp, SodaDomainRouting>(ebpf, "domain_routing_map");
-    let routing_handoff = count_map::<SodaTuple, SodaRoutingHandoffEntry>(ebpf, "routing_handoff_map");
+    let routing_handoff =
+        count_map::<SodaTuple, SodaRoutingHandoffEntry>(ebpf, "routing_handoff_map");
     // P17b：cookie→pname 条目数 + 规则 VM 的 pname 命中计数
     let cookie_pid = count_map::<u64, SodaPidPname>(ebpf, "cookie_pid_map");
     let pname_hits = read_pname_hits(ebpf);
@@ -10615,7 +10811,10 @@ fn metrics_text(v: &serde_json::Value) -> String {
     for (name, path) in [
         ("sodama_udp_nat_cone_sessions", ["udp_nat", "cone_sessions"]),
         ("sodama_udp_nat_negcache_hits", ["udp_nat", "negcache_hits"]),
-        ("sodama_udp_nat_raw_udp_fallbacks", ["udp_nat", "raw_udp_fallbacks"]),
+        (
+            "sodama_udp_nat_raw_udp_fallbacks",
+            ["udp_nat", "raw_udp_fallbacks"],
+        ),
     ] {
         emit(&mut s, "counter", name, get(v, &path));
     }
@@ -10923,7 +11122,44 @@ mod tests {
             log_line(false, "2026-10-16 12:00:00", "hello"),
             "[sodama] 2026-10-16 12:00:00 hello"
         );
-        assert_eq!(log_line(true, "2026-10-16 12:00:00", "hello"), "[sodama] hello");
+        assert_eq!(
+            log_line(true, "2026-10-16 12:00:00", "hello"),
+            "[sodama] hello"
+        );
+    }
+
+    #[test]
+    fn config_doc_registry_covers_all_keys() {
+        // 登记表必须覆盖三个键白名单的全部键（新增键忘了同步会在这里红）。
+        let docs = config::key_docs();
+        for (section, keys) in [
+            ("global", config::GLOBAL_KEYS),
+            ("dns", config::DNS_KEYS),
+            ("group", config::GROUP_KEYS),
+        ] {
+            for k in keys {
+                assert!(
+                    docs.iter().any(|d| d.section == section && d.key == *k),
+                    "{section}.{k} 缺少 config-doc 登记"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn config_reference_artifact_in_sync() {
+        // docs/config-reference.md 必须与生成器一致（防止文档 drift）。
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/config-reference.md");
+        if !path.exists() {
+            return; // 裁剪源码树（打包后）跳过
+        }
+        let want = config_doc_markdown();
+        let got = std::fs::read_to_string(&path).unwrap_or_default();
+        assert_eq!(
+            got, want,
+            "docs/config-reference.md 与 `sodama config-doc` 不一致（重新生成即可）"
+        );
     }
 
     #[test]
@@ -10950,8 +11186,8 @@ mod tests {
     fn completion_artifacts_in_sync() {
         // 预生成副本（install/shell-completion/）必须与生成器一致——防止 drift。
         // 裁剪源码树（如打包后）无该目录时跳过。
-        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../install/shell-completion");
+        let base =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../install/shell-completion");
         if !base.exists() {
             return;
         }

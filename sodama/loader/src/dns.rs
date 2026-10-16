@@ -52,7 +52,7 @@ fn read_name(buf: &[u8], start: usize) -> Option<(String, usize)> {
             break;
         }
         if len & 0xc0 == 0xc0 {
-            let ptr = (((len & 0x3f) as usize) << 8) | *buf.get(off + 1)? as usize;
+            let ptr = ((len & 0x3f) << 8) | *buf.get(off + 1)? as usize;
             if next.is_none() {
                 next = Some(off + 2);
             }
@@ -465,7 +465,7 @@ pub fn truncate_prefix(ip: IpAddr, prefix: u8) -> IpAddr {
 pub fn ecs_scope_ladder(ip: IpAddr, prefix: u8) -> Vec<(IpAddr, u8)> {
     let host = if ip.is_ipv4() { 32 } else { 128 };
     let mut out: Vec<(IpAddr, u8)> = Vec::new();
-    let mut push = |out: &mut Vec<(IpAddr, u8)>, p: u8| {
+    let push = |out: &mut Vec<(IpAddr, u8)>, p: u8| {
         let p = p.min(host);
         let t = truncate_prefix(ip, p);
         if !out.iter().any(|(a, b)| *a == t && *b == p) {
@@ -834,9 +834,7 @@ impl DnsCache {
         query: &[u8],
         now: Instant,
     ) -> Option<(Vec<u8>, bool)> {
-        let Some(e) = self.map.get(key) else {
-            return None;
-        };
+        let e = self.map.get(key)?;
         let elapsed = now.saturating_duration_since(e.stored).as_secs() as u32;
         if elapsed >= e.ttl {
             // P23：optimistic cache——过期但在窗口内则继续供应（TTL 压到
@@ -933,21 +931,20 @@ impl DnsCache {
             do_bit: edns.do_bit,
             scope: scope.to_string(),
         };
-        if self.map.contains_key(&key) {
-            self.map.insert(key, entry);
-            self.inserts += 1;
-            return true;
-        }
-        self.sweep_expired(now);
-        if self.map.len() >= DNS_CACHE_MAX_ENTRIES {
-            if let Some(k) = self
-                .map
-                .iter()
-                .min_by_key(|(_, e)| e.stored)
-                .map(|(k, _)| k.clone())
-            {
-                self.map.remove(&k);
-                self.evictions += 1;
+        // P38：替换语义（含存在时仅计数）用 entry 一次性完成（clippy::map_entry）。
+        let replace_existing = self.map.contains_key(&key);
+        if !replace_existing {
+            self.sweep_expired(now);
+            if self.map.len() >= DNS_CACHE_MAX_ENTRIES {
+                if let Some(k) = self
+                    .map
+                    .iter()
+                    .min_by_key(|(_, e)| e.stored)
+                    .map(|(k, _)| k.clone())
+                {
+                    self.map.remove(&k);
+                    self.evictions += 1;
+                }
             }
         }
         self.map.insert(key, entry);
@@ -1271,7 +1268,7 @@ mod tests {
         assert_eq!(r[3] & 0x0f, 0x02); // RCODE=SERVFAIL
         assert_eq!(r[6..8], [0, 0]); // ANCOUNT=0
         assert_eq!(&r[12..], &q[12..]); // question 原样回显
-        // 畸形/无 question：返回空（调用方跳过发送）
+                                        // 畸形/无 question：返回空（调用方跳过发送）
         assert!(servfail(&[0u8; 4]).is_empty());
         let mut noq = q.clone();
         noq[4..6].copy_from_slice(&0u16.to_be_bytes());
@@ -1633,7 +1630,7 @@ mod tests {
         let parsed = parse_rrs(&out).unwrap();
         let opt = parsed.iter().find(|r| r.rtype == RR_OPT).unwrap();
         assert_eq!(opt.rdlen, 11);
-        assert_eq!(opt.rdata_off + opt.rdlen as usize, out.len());
+        assert_eq!(opt.rdata_off + opt.rdlen, out.len());
         // v6 → /56，地址截断到 7 字节
         let (ip6, plen6) = ecs_auto_prefix("2001:db8:1:2:3:4:5:6".parse().unwrap());
         assert_eq!(plen6, 56);

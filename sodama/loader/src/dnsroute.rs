@@ -502,7 +502,7 @@ fn parse_cidr_plain(v: &str) -> Result<Cidr, String> {
 
 fn rule_params(rule: &Rule) -> Result<(), String> {
     for f in &rule.and_functions {
-        if f.params.iter().any(|p| p.annotation.iter().count() > 0) {
+        if !f.params.iter().all(|p| p.annotation.is_empty()) {
             return Err(format!("{} 不支持 [annotation]", f.name));
         }
     }
@@ -800,7 +800,7 @@ fn compile_request(
                 }
             }
             Item::Param(p) if p.key.as_deref() == Some("fallback") => {
-                if p.annotation.iter().count() > 0 {
+                if !p.annotation.is_empty() {
                     return Err("fallback 不支持 [annotation]".into());
                 }
                 let (_, name) = param_text(p)?;

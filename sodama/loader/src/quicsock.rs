@@ -591,17 +591,13 @@ mod tests {
             segment_size: None,
             src_ip: None,
         };
-        // 测试专用：WouldBlock 时用 noop waker 轮询 io poller（真实环境由 quinn 驱动）
-        struct NoopWaker;
-        impl std::task::Wake for NoopWaker {
-            fn wake(self: Arc<Self>) {}
-        }
+        // 测试专用：WouldBlock 时用 noop waker 轮询 io poller（真实环境由 quinn 驱动）。
+        // P38：改用标准库 `Waker::noop()`（替代手写的 NoopWaker）。
         let send = |t: &Transmit| loop {
             match hop.try_send(t) {
                 Ok(()) => return,
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    let waker = std::task::Waker::from(Arc::new(NoopWaker));
-                    let mut cx = std::task::Context::from_waker(&waker);
+                    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
                     let mut poller = hop.clone().create_io_poller();
                     while poller.as_mut().poll_writable(&mut cx).is_pending() {
                         std::thread::sleep(Duration::from_millis(1));
@@ -633,8 +629,7 @@ mod tests {
         // 新 socket = 新的本地端口
         assert_ne!(src_first.port(), src_second.port(), "跳后应换本地端口");
         // 回程：接收端把回包发给第二个 socket 的本地端口，验证 poll_recv 能取到
-        let waker = std::task::Waker::from(Arc::new(NoopWaker));
-        let mut cx = std::task::Context::from_waker(&waker);
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
         let mut buf = [0u8; 64];
         let mut iov = [std::io::IoSliceMut::new(&mut buf)];
         let mut meta = [RecvMeta::default()];
