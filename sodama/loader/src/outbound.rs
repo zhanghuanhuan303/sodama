@@ -657,6 +657,26 @@ fn recvmmsg_udp(
     out: &mut Vec<crate::bufpool::PoolBuf>,
     max: usize,
 ) -> io::Result<usize> {
+    recvmmsg_udp_inner(fd, out, max, None)
+}
+
+/// P38：同 `recvmmsg_udp`，额外回填每包来源地址（full-cone 端点回包选源用）。
+pub fn recvmmsg_udp_with_src(
+    fd: RawFd,
+    out: &mut Vec<crate::bufpool::PoolBuf>,
+    max: usize,
+    srcs: &mut Vec<SocketAddr>,
+) -> io::Result<usize> {
+    srcs.clear();
+    recvmmsg_udp_inner(fd, out, max, Some(srcs))
+}
+
+fn recvmmsg_udp_inner(
+    fd: RawFd,
+    out: &mut Vec<crate::bufpool::PoolBuf>,
+    max: usize,
+    mut srcs: Option<&mut Vec<SocketAddr>>,
+) -> io::Result<usize> {
     let cap = max.min(UDP_BATCH_MAX);
     if out.is_empty() {
         out.push(crate::bufpool::PoolBuf::zeroed(UDP_SLOT));
@@ -708,6 +728,11 @@ fn recvmmsg_udp(
         for i in 0..got {
             let len = msgs[i].msg_len as usize;
             out[i].truncate(len.min(UDP_SLOT));
+            if let Some(srcs) = srcs.as_deref_mut() {
+                if let Some(a) = crate::sockaddr_to_std(&names[i]) {
+                    srcs.push(a);
+                }
+            }
         }
         // 本批收满 → 下一批扩容一档（队列持续深时逐步升到 max）。
         if got == n && n < cap {
@@ -900,6 +925,44 @@ impl UdpRelay {
                 Ok(1)
             }
         }
+    }
+
+    /// P38：带来源地址的批量下行（full-cone 端点回包需要按每包的来源选回包源地址）。
+    /// Plain 走 recvmmsg 捕获 `msg_name`；其余类型兑底为 `recv_batch` + 固定 `target`。
+    pub fn recv_batch_src(
+        &self,
+        out: &mut Vec<crate::bufpool::PoolBuf>,
+        max: usize,
+        srcs: &mut Vec<SocketAddr>,
+    ) -> io::Result<usize> {
+        match &self.kind {
+            UdpKind::Plain(socket) => recvmmsg_udp_with_src(socket.as_raw_fd(), out, max, srcs),
+            // P38：ss 的内层源地址在解密后的帧头里（当前未做 per-包目标解析）；
+            // 其余类型为「会话即目标」型，来源就是 target。
+            _ => {
+                let got = self.recv_batch(out, max)?;
+                srcs.clear();
+                srcs.resize(got, self.target);
+                Ok(got)
+            }
+        }
+    }
+
+    /// P38：按**每包目标**发送（仅直连型；full-cone 端点用）。
+    /// 代理型协议的目标编码在协议帧内（ss 可扩展、流式不可）——当前不支返。
+    pub fn send_payload_to(&self, target: SocketAddr, data: &[u8]) -> io::Result<usize> {
+        match &self.kind {
+            UdpKind::Plain(socket) => socket.send_to(data, target),
+            _ => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "该出口类型不支持每包目标（full-cone 仅直连型）",
+            )),
+        }
+    }
+
+    /// P38：是否直连型（full-cone 端点判定用）。
+    pub fn is_plain(&self) -> bool {
+        matches!(self.kind, UdpKind::Plain(_))
     }
 }
 

@@ -2433,9 +2433,37 @@ test_udp_idle() {
   out="$(ip netns exec "$CLIENT_NS" timeout 10 python3 "$HERE/udp_probe.py" 2.2.2.2 9998 1 2>&1 || true)"
   echo "$out"
   echo "$out" | grep -q "^summary=1/1" || { echo "FAIL: UDP 首发未成功"; exit 1; }
-  sleep 8  # 超过 --udp-idle-timeout=2s，janitor（5s 周期）回收
+  sleep 8  # 超过 --udp-idle-timeout=2s，janitor（1s 周期）回收
   "$LOADER" status --socket "$STATUS_SOCK" --json | python3 -c 'import json,sys;v=json.load(sys.stdin);u=v["udp_nat"];assert u["sessions_active"]==0,u;assert u["evicted"]>=1,u;print("udp nat janitor: evicted=%d active=%d" % (u["evicted"],u["sessions_active"]))'
   echo "PASS: UDP NAT janitor 回收空闲会话"
+}
+
+test_udp_cone() {
+  require_root
+  echo "== 测试 UDP full-cone（同一客户端 src 向双目标 → 复用 1 个出口端点）=="
+  local out before after
+  "$LOADER" status --socket "$STATUS_SOCK" --json >/tmp/sodama-cone-before.json
+  out="$(ip netns exec "$CLIENT_NS" timeout 10 python3 "$HERE/udp_cone_probe.py" 2.2.2.2 9998 9997 2 2>&1 || true)"
+  echo "$out"
+  echo "$out" | grep -q "^summary=4/4" || { echo "FAIL: 双目标 UDP 未全部回显"; exit 1; }
+  echo "$out" | grep -q "from=2.2.2.2:9998" || { echo "FAIL: 缺 9998 的回包源"; exit 1; }
+  echo "$out" | grep -q "from=2.2.2.2:9997" || { echo "FAIL: 缺 9997 的回包源"; exit 1; }
+  sleep 0.3
+  "$LOADER" status --socket "$STATUS_SOCK" --json >/tmp/sodama-cone-after.json
+  before=/tmp/sodama-cone-before.json
+  after=/tmp/sodama-cone-after.json
+  python3 - "$before" "$after" <<'PY'
+import json, sys
+b = json.load(open(sys.argv[1]))["udp_nat"]
+a = json.load(open(sys.argv[2]))["udp_nat"]
+# full-cone：4 报文（双目标）只新建 1 个端点；旧行为（每目标一会话）会是 +2
+assert a["sessions_total"] == b["sessions_total"] + 1, (b, a)
+assert a["cone_sessions"] == b["cone_sessions"] + 1, (b, a)
+assert a["sessions_active"] == b["sessions_active"] + 1, (b, a)
+assert a["errors"] == b["errors"], (b, a)
+print("udp full-cone: +1 endpoint（cone=%d active=%d）" % (a["cone_sessions"], a["sessions_active"]))
+PY
+  echo "PASS: UDP full-cone（双目标 4 报文复用 1 端点、回包源各异）"
 }
 
 # P16：IPv6 全链（tproxy v6 → relay → ss v6 目标；v6 direct 内核转发对照）。
@@ -4607,6 +4635,7 @@ test-dns-udp) test_dns_udp ;;  # 显式 udp:// 上游（仅 UDP）
   test-pinning) test_pinning ;;
   offload-up) USE_RULES="$HERE/rules.dae" USE_DIALER=direct USE_OFFLOAD=1 USE_RELAY_IDLE=600 up ;;
   udp-up) USE_RULES="$HERE/rules.udp.dae" USE_UDP_IDLE=2 up ;;
+  cone-up) USE_RULES="$HERE/rules.udp.dae" USE_UDP_IDLE=10 up ;;  # P38：full-cone 用例（TTL 放宽到 10s）
   ss-up) USE_RULES="$HERE/rules.dae" USE_SS=1 USE_SS_METHOD=chacha20-ietf-poly1305 USE_SS_PASSWORD=testpass \
     USE_DIALER="ss://chacha20-ietf-poly1305:testpass@127.0.0.1:$SS_PORT" USE_OFFLOAD=1 USE_RELAY_IDLE=600 up ;;
   ss2022-up) ss2022_up ;;  # P18e：SS2022（shadowsocks-rust ssserver 参考对端）
@@ -4693,6 +4722,7 @@ test-dns-udp) test_dns_udp ;;  # 显式 udp:// 上游（仅 UDP）
     USE_SS_B=1 USE_DIAL_MODE=domain+ USE_SNIFF_TIMEOUT=500 USE_SNIFF_PUNT=1 USE_RELAY_IDLE=600 up ;;  # P21
   test-sniff-punt) test_sniff_punt ;;  # P21：嗅探重判（direct/block/组重选）
   test-udp-idle) test_udp_idle ;;
+  test-udp-cone) test_udp_cone ;;  # P38：full-cone（单客户端 src 多目标复用 1 个出口端点）
   test-relay-offload) test_relay_offload ;;
   test-offload-lifecycle) test_offload_lifecycle ;;
   test-ss) test_ss ;;
