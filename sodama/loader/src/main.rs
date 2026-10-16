@@ -662,6 +662,8 @@ struct UdpSession {
     reply: Arc<OwnedFd>,
     last_ns: AtomicU64,
     alive: AtomicBool,
+    /// P38：创建时的数据面代次（`reload --abort` 只关闭旧代会话）。
+    generation: u16,
 }
 
 static UDP_NAT: std::sync::LazyLock<Vec<UdpNatShard>> = std::sync::LazyLock::new(|| {
@@ -727,6 +729,10 @@ struct RelayHandle {
     upstream: Option<TcpStream>,
     /// P-AI：本连接归属域名（收尾归入域名统计；IP 直连为 None）。
     domain: Option<Box<str>>,
+    /// P38：创建时的数据面代次（`reload --abort` 只关闭旧代会话）。
+    generation: u16,
+    /// P38：(client, orig_dst) 五元组（abort 时清对应 conn_state）。
+    conn_key: Option<(SocketAddr, SocketAddr)>,
     /// P-AI：本连接字节明细（泵双写：全局统计 + 本字段）。
     bytes_up: AtomicU64,
     bytes_down: AtomicU64,
@@ -1943,8 +1949,10 @@ fn usage() -> ! {
            sodama export-config <config.dae>  合并后的配置导出为 JSON\n\
            sodama extract-routing <config.dae> 输出可编译规则（deferred 到 stderr）\n\
            sodama status [--socket <path>] [--json]  查询状态面\n\
-           sodama reload [--socket <path>]      P6：热重载（等价 kill -HUP，同步等结果）\n\
-           sodama suspend|resume [--socket <path>] P6：no-load 挂起 / 恢复（对照 dae suspend）\n\
+           sodama reload [--socket <path>] [--abort] P6/P38：热重载（等价 kill -HUP，同步等结果；\n\
+                                 --abort = 关闭旧代已建连接，对照 dae reload --abort）
+           sodama suspend|resume [--socket <path>] [--abort] P6/P38：no-load 挂起 / 恢复\n\
+                                 （suspend --abort = 同时关闭全部已建连接）\n\
            sodama metrics [--socket <path>]     P6：Prometheus 文本格式统计导出\n\
            sodama sub-parse <url|path> [--tag <t>] [--json] [--limit <n>] [--timeout <s>] 只读：拉取订阅解析预览\n\
            sodama sysdump [--socket <path>] [--out <file>] P6：状态+规则+系统网络信息归档\n\
@@ -4396,6 +4404,8 @@ fn handle_relay_conn(mut client: TcpStream) {
         client: client_clone,
         upstream: upstream_clone,
         domain: handled_domain,
+        generation: current_datapath_generation(),
+        conn_key: client.peer_addr().ok().map(|p| (p, orig)),
         bytes_up: AtomicU64::new(0),
         bytes_down: AtomicU64::new(0),
     });
@@ -8644,6 +8654,7 @@ fn udp_nat_session(
         reply,
         last_ns: AtomicU64::new(monotonic_now_ns()),
         alive: AtomicBool::new(true),
+        generation: current_datapath_generation(),
     });
     // 插入可能与其他线程竞争（当前只有 dns_loop 调用，但保持防御性）：
     // 已有则用已有的，新建的会话随 drop 关闭。
@@ -8741,6 +8752,99 @@ fn udp_nat_janitor_loop() {
             udp_nat_retire(&s);
         }
     }
+}
+
+// ---------------------------------------------------------------- P38：会话 abort
+
+/// P38：abort 范围（对照 dae `AbortConnections` / `AbortGeneration` 的两种语义）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AbortScope {
+    /// `reload --abort`：只关「旧代」会话（代次 != 当前；对照 dae `AbortGeneration`）。
+    OldGeneration,
+    /// `suspend --abort`：关全部已建会话（dae suspend 的空配置换代等价于此）。
+    All,
+}
+
+/// P38：单会话是否在 abort 范围内（纯函数，便于单测）。
+fn abort_should_kill(scope: AbortScope, session_gen: u16, current_gen: u16) -> bool {
+    match scope {
+        AbortScope::All => true,
+        AbortScope::OldGeneration => session_gen != current_gen,
+    }
+}
+
+/// P38：关闭范围内的已建会话（TCP relay / reactor / UDP NAT）并清理对应 conn_state
+/// （对照 dae `SessionManager.AbortGeneration`：先 TCP 后 UDP、逐流关 socket、再 scrub）。
+/// 返回 (关闭会话数, 清理 conn_state 条数)。
+fn abort_sessions(ebpf: &mut Ebpf, scope: AbortScope) -> (usize, usize) {
+    let cur = current_datapath_generation();
+    // 1) 快照（持锁只收集，不执行关闭）
+    let mut tcp: Vec<(u64, Arc<RelayHandle>)> = Vec::new();
+    if let Ok(g) = RELAY_CONNS.lock() {
+        for (id, h) in g.iter() {
+            if abort_should_kill(scope, h.generation, cur) {
+                tcp.push((*id, h.clone()));
+            }
+        }
+    }
+    let mut udp: Vec<Arc<UdpSession>> = Vec::new();
+    for shard in UDP_NAT.iter() {
+        if let Ok(t) = shard.lock() {
+            for s in t.values() {
+                if abort_should_kill(scope, s.generation, cur) {
+                    udp.push(s.clone());
+                }
+            }
+        }
+    }
+    // 2) 执行关闭：先 TCP 后 UDP（对照 dae 的顺序）
+    let mut killed = 0usize;
+    let mut scrubbed = 0usize;
+    for (id, h) in &tcp {
+        if h.reactor_managed {
+            reactor::kill(*id);
+        }
+        if let Some(c) = &h.client {
+            let _ = c.shutdown(std::net::Shutdown::Both);
+        }
+        if let Some(u) = &h.upstream {
+            let _ = u.shutdown(std::net::Shutdown::Both);
+        }
+        h.stop.store(true, Ordering::Relaxed);
+        if let Some((client, orig)) = h.conn_key {
+            if remove_conn_state(ebpf, client, orig, 6) {
+                scrubbed += 1;
+            }
+        }
+        killed += 1;
+    }
+    for s in &udp {
+        udp_nat_retire(s);
+        if remove_conn_state(ebpf, s.client, s.relay.target(), 17) {
+            scrubbed += 1;
+        }
+        killed += 1;
+    }
+    (killed, scrubbed)
+}
+
+/// P38：删除单条 conn_state（abort 用；best-effort，找不到/无 map 返回 false）。
+fn remove_conn_state(
+    ebpf: &mut Ebpf,
+    client: SocketAddr,
+    orig_dst: SocketAddr,
+    l4proto: u8,
+) -> bool {
+    let Some(key) = sodama_tuple_of_proto(client, orig_dst, l4proto) else {
+        return false;
+    };
+    let Some(map) = ebpf.map_mut("conn_state_map") else {
+        return false;
+    };
+    let Ok(mut conn_state) = HashMap::<_, SodaTuple, SodaConnState>::try_from(map) else {
+        return false;
+    };
+    conn_state.remove(&key).is_ok()
 }
 
 // ---------------------------------------------------------------- K3：子命令
@@ -8866,8 +8970,12 @@ fn run_subcommand(argv: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             Ok(())
         }
         "reload" | "suspend" | "resume" => {
-            let (sock, _) = parse_socket_args(argv, 2)?;
-            let resp = status::client(Path::new(&sock), argv[1].as_str())?;
+            // P38：`--abort`（对照 dae `reload/suspend --abort`）——随命令发给守护进程。
+            let abort = argv.iter().any(|a| a == "--abort");
+            let filtered: Vec<String> = argv.iter().filter(|a| *a != "--abort").cloned().collect();
+            let (sock, _) = parse_socket_args(&filtered, 2)?;
+            let cmd = abort_cmd(&argv[1], abort);
+            let resp = status::client(Path::new(&sock), &cmd)?;
             println!("{resp}");
             let bad = serde_json::from_str::<serde_json::Value>(&resp)
                 .ok()
@@ -9427,6 +9535,15 @@ fn bench_one(
         }
     });
     (all, errs, ancount_last, ttl_last)
+}
+
+/// P38：控制命令拼装（`reload --abort` 等；拆出便于单测）。
+fn abort_cmd(base: &str, abort: bool) -> String {
+    if abort {
+        format!("{base} --abort")
+    } else {
+        base.to_string()
+    }
 }
 
 /// P6：解析 `--socket <path>` / `--out <path>`（子命令公用）。
@@ -10329,24 +10446,47 @@ fn metrics_text(v: &serde_json::Value) -> String {
 fn handle_status_query(cmd: &str, ebpf: &mut Ebpf, args: &Args) -> String {
     match cmd {
         "status" => status_json(ebpf).to_string(),
-        "reload" | "reload-fast" => {
+        "reload" | "reload-fast" | "reload --abort" => {
             // P35：reload-fast（watch 触发的自动 reload）订阅节点走缓存；
             // 手动 reload/SIGHUP 始终强制重拉（P18e 语义）。
-            let out = do_reload(args, ebpf, false, cmd == "reload-fast");
+            // P38：`reload --abort` 在切代后关闭旧代已建连接（对照 dae abort）。
+            let abort = cmd.ends_with("--abort");
+            let out = do_reload(args, ebpf, false, cmd.starts_with("reload-fast"));
+            let (killed, scrubbed) = if abort {
+                let (k, s) = abort_sessions(ebpf, AbortScope::OldGeneration);
+                log(&format!(
+                    "reload --abort：关闭旧代会话 {k} 条（conn_state 清理 {s} 条）"
+                ));
+                (k, s)
+            } else {
+                (0, 0)
+            };
             json!({
                 "ok": out.ok,
                 "match_sets": out.match_sets,
                 "slot": out.slot,
                 "error": out.error,
                 "at_sec": out.at_sec,
+                "aborted": killed,
+                "conn_state_scrubbed": scrubbed,
             })
             .to_string()
         }
-        "suspend" => match set_suspend(ebpf, true) {
+        "suspend" | "suspend --abort" => match set_suspend(ebpf, true) {
             Ok(()) => {
                 SUSPENDED.store(true, Ordering::SeqCst);
+                let (killed, scrubbed) = if cmd.ends_with("--abort") {
+                    let (k, s) = abort_sessions(ebpf, AbortScope::All);
+                    log(&format!(
+                        "suspend --abort：关闭已建会话 {k} 条（conn_state 清理 {s} 条）"
+                    ));
+                    (k, s)
+                } else {
+                    (0, 0)
+                };
                 log("已挂起（no-load，全部流量 fail-open）；reload 恢复");
-                json!({"ok": true, "suspended": true}).to_string()
+                json!({"ok": true, "suspended": true, "aborted": killed, "conn_state_scrubbed": scrubbed})
+                    .to_string()
             }
             Err(e) => json!({"ok": false, "error": e.to_string()}).to_string(),
         },
@@ -10445,6 +10585,17 @@ mod tests {
     use super::*;
 
     // ---- P38：CLI 小件 ----
+
+    #[test]
+    fn abort_scope_and_cmd() {
+        // suspend --abort：全部会话；reload --abort：只关旧代
+        assert!(abort_should_kill(AbortScope::All, 7, 7));
+        assert!(!abort_should_kill(AbortScope::OldGeneration, 7, 7));
+        assert!(abort_should_kill(AbortScope::OldGeneration, 6, 7));
+        assert_eq!(abort_cmd("reload", false), "reload");
+        assert_eq!(abort_cmd("reload", true), "reload --abort");
+        assert_eq!(abort_cmd("suspend", true), "suspend --abort");
+    }
 
     #[test]
     fn parse_dns_bind_endpoint() {
