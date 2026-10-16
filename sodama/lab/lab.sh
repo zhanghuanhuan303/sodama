@@ -35,10 +35,11 @@
 #                                #   skb_send_sock 记账探针（fentry 优先、kprobe 回退）
 #   sudo lab/lab.sh test-relay-offload    # 内核拼接证据 + 记账计数（probe_calls/kernel_bytes）
 #   sudo lab/lab.sh test-l3-attach        # 对标批：L3 接口（ipip，arphrd=768）自动选 _l3 变体并挂载
-#   sudo lab/lab.sh test-l3               # 对标批：L3 端到端（经 ipip 隧道的代理路径；VM 内未过，见 devlog §19）
+#   sudo lab/lab.sh test-l3               # 对标批：L3 端到端（经 ipip 隧道的代理路径，verify 门禁）
 #   sudo lab/lab.sh test-xdp              # 对标批 C4：XDP 计量探针（恒 XDP_PASS）计数随流量推进
 #   USE_XDP_IFACE=  # 显式置空可关闭 up() 默认的 --xdp landae 计量探针
 #   NO_L3=1         # 不建 L3 段（跳过 ipip 隧道）
+#   SKIP_NET_OFFLOAD=1  # 跳过 up() 对 l3u/landae3/dae0 等设备的关 offload（A/B 对照用）
 #   sudo lab/lab.sh udp-up       # P4b：UDP NAT 会话（rules.udp.dae）
 #   sudo lab/lab.sh test-udp-relay    # UDP 真实转发 + 会话复用
 #   sudo lab/lab.sh test-udp-idle     # UDP 会话 janitor 回收
@@ -152,6 +153,18 @@ forward_disallow() {
   command -v iptables >/dev/null 2>&1 || return 0
   iptables -D FORWARD -i "$1" -o "$2" -j ACCEPT 2>/dev/null || true
   iptables -D FORWARD -i "$2" -o "$1" -j ACCEPT 2>/dev/null || true
+}
+
+# 关闭网卡 offload（免 ethtool，见 net_offload.py；输出即回读证据，失败不致命）。
+# SKIP_NET_OFFLOAD=1 时整体跳过——供「抖动/故障是否与关 offload 有关」的 A/B 对照。
+disable_offload() {
+  [ -z "${SKIP_NET_OFFLOAD:-}" ] || return 0
+  python3 "$HERE/net_offload.py" "$@" || true
+}
+netns_disable_offload() {
+  [ -z "${SKIP_NET_OFFLOAD:-}" ] || return 0
+  local ns="$1"; shift
+  ip netns exec "$ns" python3 "$HERE/net_offload.py" "$@" || true
 }
 
 # K3：只读状态面 / 过渡一跳
@@ -479,6 +492,7 @@ cleanup() {
   ip netns del "$DAE_NS" 2>/dev/null || true
   ip link del landae 2>/dev/null || true
   ip link del landae3 2>/dev/null || true
+  ip link del l3u 2>/dev/null || true
   ip link del wan 2>/dev/null || true
   ip link del dae0 2>/dev/null || true
   ip link del single 2>/dev/null || true
@@ -526,15 +540,34 @@ up() {
     # 先显式 modprobe：`ip tunnel add` 靠内核 rtnl-link 自动加载，而在 initramfs/chroot
     # 环境下 usermodehelper 看不到 chroot 里的模块树，自动加载会失败（VM 实测）。
     modprobe ipip 2>/dev/null || true
-    if ! ip tunnel add landae3 mode ipip local 10.0.0.1 remote 10.0.0.2; then
+    # 给 L3 段一条**专用 underlay veth**（10.30.0.0/24）：
+    #   1) 关 offload 只影响这条链路，不动标准用例的 lanclient/landae 吞吐基线；
+    #   2) 隧道外层流量有独立路径，排障时无歧义。
+    # 不建 underlay 时（旧形态）外层走 10.0.0.0/24，但隧道的 return 腿会踩
+    # 「veth+隧道 内层校验和 PARTIAL」问题（见 net_offload.py 头部注释）。
+    ip link add l3u type veth peer name l3uc
+    ip link set l3uc netns "$CLIENT_NS"
+    ip addr add 10.30.0.1/24 dev l3u
+    ip link set l3u up
+    ip -n "$CLIENT_NS" link set l3uc up
+    ip -n "$CLIENT_NS" addr add 10.30.0.2/24 dev l3uc
+    if ! ip tunnel add landae3 mode ipip local 10.30.0.1 remote 10.30.0.2; then
       echo "!! ipip 隧道创建失败（内核无 ipip 模块？）——L3 用例将 SKIP"
     fi
     if ip link show landae3 >/dev/null 2>&1; then
       ip link set landae3 up
       ip addr add 10.20.0.1/24 dev landae3
-      ip -n "$CLIENT_NS" tunnel add l3cli mode ipip local 10.0.0.2 remote 10.0.0.1
+      # MTU：ipip 封装开销 20(外层 IP)+14(以太) = 34 → 内层 1466，使内层 MSS=1426，
+      # 外层封包 ≤1500。不降 MTU 时大流会在封装处超 MTU（实测：512KB 流被 RST）。
+      ip link set landae3 mtu 1466
+      ip -n "$CLIENT_NS" tunnel add l3cli mode ipip local 10.30.0.2 remote 10.30.0.1
       ip -n "$CLIENT_NS" link set l3cli up
       ip -n "$CLIENT_NS" addr add 10.20.0.2/24 dev l3cli
+      ip -n "$CLIENT_NS" link set l3cli mtu 1466
+      # 关掉 L3 链路两端的 offload：不关时内层校验和恒错 → 对端静默丢包
+      # （工具免 ethtool 依赖，见 lab/net_offload.py；输出即回读证据，失败不致命）。
+      disable_offload l3u landae3
+      netns_disable_offload "$CLIENT_NS" l3uc l3cli
       L3_IFACE=landae3
     fi
   fi
@@ -604,8 +637,18 @@ up() {
     sysctl -qw net.ipv6.conf.all.forwarding=1
   fi
   # 对照 dae control/netns_utils.go:863-867：accept_local 防止内核按
-  # “martian source” 丢掉源地址是本机地址的包
+  # "martian source" 丢掉源地址是本机地址的包
   ip netns exec "$DAE_NS" sysctl -qw net.ipv4.conf.dae0peer.accept_local=1
+  # 关掉控制面对（dae0/dae0peer）的 offload：L3 回程会经这对 veth 进控制面再回来，
+  # 不关时内层校验和以 PARTIAL 一路带到隧道封装，对端静默丢包（同 net_offload.py 注释）。
+  disable_offload dae0
+  netns_disable_offload "$DAE_NS" dae0peer
+  # MTU 1466（=1500-34）：控制面回程要能塞进 L3 隧道的封装里（否则大流超 MTU）。
+  # 只在建了 L3 段时降——标准拓扑保持 1500，不影响既有性能基线。
+  if [ -n "$L3_IFACE" ]; then
+    ip link set dae0 mtu 1466 2>/dev/null || true
+    ip -n "$DAE_NS" link set dae0peer mtu 1466 2>/dev/null || true
+  fi
   # 对照 dae control/kern/tproxy.c:2904 的注释：被 mark 的报文必须本地投递
   ip -n "$DAE_NS" rule add fwmark 0x8000000/0x8000000 table 2023
   ip -n "$DAE_NS" route add local default dev lo table 2023
@@ -3179,9 +3222,10 @@ test_l3() {
   out="$(ip netns exec "$CLIENT_NS" timeout 8 python3 "$HERE/client_probe.py" "$PROXY_DST" 8080 2>&1 || true)"
   echo "$out"
   echo "$out" | grep -q "orig_dst=$PROXY_DST:8080" || rc=1
-  out="$(ip netns exec "$CLIENT_NS" timeout 30 python3 "$HERE/stream_probe.py" "$PROXY_DST" 8080 512 2>&1 || true)"
+  # 512KB 回显：无 dialer 会话的 tproxy 连接由 loader 回显夹具接管（每次回显带一行
+  # banner），用 banner 容忍的探针校验字节完整性；只验字节一致，不依赖协议语义。
+  out="$(ip netns exec "$CLIENT_NS" timeout 40 python3 "$HERE/tproxy_stream_probe.py" "$PROXY_DST" 8080 512 2>&1 || true)"
   echo "$out"
-  # 512KB 回显：代理路径下仍是 tproxy echo（逐行回显），只验证字节完整性
   echo "$out" | grep -q "^stream-ok bytes=524288" || rc=1
   ip -n "$CLIENT_NS" route del "$PROXY_DST/32" dev l3cli 2>/dev/null || true
   [ "$rc" = 0 ] || { echo "FAIL: L3 链路分流未打通（补头/剥头/解析链）"; exit 1; }
@@ -3982,11 +4026,17 @@ verify() {
   if (test_status) >/dev/null 2>&1; then echo "status    : PASS"; else echo "status    : FAIL"; t_fails=$((t_fails + 1)); fi
   if (test_fault_reload) >/dev/null 2>&1; then echo "fault/reload: PASS"; else echo "fault/reload: FAIL"; t_fails=$((t_fails + 1)); fi
   # 对标批：L3 变体（ipip 隧道）与 XDP 计量探针。两者在拓扑/内核不满足时 SKIP（不算失败）。
-  # 对标批：L3 变体的选择/挂载（稳定可判定）入 verify 门禁；端到端（test-l3）不入。
+  # 对标批：L3 变体的选择/挂载与端到端都入 verify 门禁（端到端依赖夹具逐块回显，
+  # 见 loader handle_tproxy_conn 与 tproxy_stream_probe.py）。
   if (test_l3_attach) >/dev/null 2>&1; then
     if [ -e /tmp/sodama-l3-skip ]; then echo "l3-attach : SKIP（无 L3 接口）"; else echo "l3-attach : PASS"; fi
   else
     echo "l3-attach : FAIL"; t_fails=$((t_fails + 1))
+  fi
+  if (test_l3) >/dev/null 2>&1; then
+    if [ -e /tmp/sodama-l3-skip ]; then echo "l3        : SKIP（无 L3 接口）"; else echo "l3        : PASS"; fi
+  else
+    echo "l3        : FAIL"; t_fails=$((t_fails + 1))
   fi
   if (test_xdp) >/dev/null 2>&1; then
     if [ -e /tmp/sodama-xdp-skip ]; then echo "xdp       : SKIP（未挂载）"; else echo "xdp       : PASS"; fi

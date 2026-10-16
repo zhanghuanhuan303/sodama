@@ -1,14 +1,14 @@
-# K2 内核矩阵：执行汇总（最近复跑 2026-10-04，P9+）
+# K2 内核矩阵：执行汇总（最近复跑 2026-10-16，ADR-0065 收口）
 
 同一份 sodama（**唯一 Rust/aya-ebpf 数据面对象 + Rust 加载器**，C 对象已移除，见 ADR-0025）
-在不同内核上跑同一套 `lab.sh verify`（**9 个用例**：proxy / direct / block / host / reload /
-rebind / status / fault-reload / fault-kill）。
+在不同内核上跑同一套 `lab.sh verify`（**12 个用例**：proxy / direct / block / host / reload /
+rebind / status / fault-reload / l3-attach / l3 / xdp / fault-kill）。
 
 | 内核 | 获取方式 | 结果 | 证据 |
 |---|---|---|---|
-| 6.18.54-2-lts（宿主） | `lab/matrix.sh run`（privileged 容器 + chroot） | **9/9 PASS** | [`out/host-kernel-6.18.54-2-lts.log`](./out/host-kernel-6.18.54-2-lts.log) |
-| 7.2.8-arch1-2 | `lab/matrix.sh vm`（QEMU + virtio-9p root + 自制 initramfs） | **9/9 PASS** | [`out/vm-kernel-7.2.8-arch1-2.log`](./out/vm-kernel-7.2.8-arch1-2.log) |
-| 7.2.8-arch1-2（数据面对标批次，2026-10-16） | 同上 | **11/11 PASS**（原 9 项 + `l3-attach` + `xdp`）；`offload=`/`l3_e2e=` 为信息项（QEMU 环境既有抖动 / lab 拓扑未补完，见 `docs/phase2-devlog.md` §19） | [`out/vm-kernel-7.2.8-arch1-2.log`](./out/vm-kernel-7.2.8-arch1-2.log)（`MATRIX-RESULT … verify=PASS`） |
+| 6.18.54-2-lts（宿主） | `lab/matrix.sh run`（privileged 容器 + chroot） | **9/9 PASS**（旧轮次，未含对标批新项） | [`out/host-kernel-6.18.54-2-lts.log`](./out/host-kernel-6.18.54-2-lts.log) |
+| 7.2.8-arch1-2 | `lab/matrix.sh vm`（QEMU + virtio-9p root + 自制 initramfs） | **9/9 PASS**（旧轮次） | [`out/vm-kernel-7.2.8-arch1-2.log`](./out/vm-kernel-7.2.8-arch1-2.log) |
+| 7.2.8-arch1-2（数据面对标批次，2026-10-16） | 同上 | **12/12 PASS**（原 9 项 + `l3-attach` + `l3` + `xdp`）；仅 `offload=` 为信息项（QEMU 环境既有抖动，随宿主状态大幅波动且基线同环境同样失败，见 `docs/phase2-devlog.md` §19） | [`out/vm-kernel-7.2.8-arch1-2.log`](./out/vm-kernel-7.2.8-arch1-2.log)（`MATRIX-RESULT … verify=PASS`） |
 
 两台内核都满足 `bpf_loop`（≥5.17）与 TCX（≥6.6）；VM 里 TCX 钩子同样是
 `single/lan/wan → tcx/*`，进程退出后自动摘除（`fault/kill` 用例验证）。
@@ -19,9 +19,9 @@ K2 时代的旧结果（8 用例、C 数据面）已被上表取代。
 | 用例 | 内容 | 门禁？ |
 |---|---|---|
 | `l3-attach` | L3 接口（ipip，arphrd=768）被自动判定并挂上 `sodama_lan_ingress_l3` | ✅ 入门禁 |
+| `l3` | `test-l3`：经 ipip 隧道的 L3 端到端代理（小连接分流 + 512KB 逐字节回显） | ✅ 入门禁（删 ipip/无法建隧道时 SKIP） |
 | `xdp` | `--xdp landae` 探针挂载 + 计数器随流量推进（恒 `XDP_PASS`） | ✅ 入门禁 |
-| `test-l3`（`l3_e2e=`） | 经 ipip 隧道的 L3 端到端代理（补头/剥头闭环） | ❌ 信息项：lab 回程腿未通（对照实验同样失败） |
-| `offload=`（`test-relay-offload` + `test-offload-lifecycle`） | offload 路径 + 字节记账（`probe_calls`/`kernel_bytes`/`reclaimed_bytes`） | ❌ 信息项：QEMU 首连抖动（基线复现） |
+| `offload=`（`test-relay-offload` + `test-offload-lifecycle`） | offload 路径 + 字节记账（`probe_calls`/`kernel_bytes`/`reclaimed_bytes`） | ❌ 信息项：QEMU 环境既有抖动（2026-10-16 重启后四组对照含基线 5092723 均 9/9 失败，环境主导；待查注册交接竞态） |
 
 > 注：宿主矩阵以 root 运行会在 `out/` 留下 root 属主目录；复跑 VM 前需先把 `out/`
 > 改回调用者属主（`chown`），否则 initramfs 写入报 Permission denied。
@@ -56,5 +56,6 @@ lab/matrix.sh vm
   并替换 `/init`：insmod 后把宿主根以 9p 挂到 `/newroot`，chroot 进 `lab/vm-init.sh`。
 - 发行版 busybox 没编 `mount`/`insmod` applet，`/init` 用的是镜像自带的
   util-linux `mount` 与 kmod `insmod`；任何失败都会强制关机，不会停在 shell。
-- `vm-init.sh` 在 VM 内跑 `matrix.sh check && lab.sh up && lab.sh verify &&
-  lab.sh down`，结果写到 `out/vm-kernel-<ver>.log`（经 9p 以宿主用户身份落盘）。
+- `vm-init.sh` 在 VM 内跑 `matrix.sh check && lab.sh up && lab.sh verify && lab.sh down`，
+  随后是 offload 信息项阶段（`offload-up` 重试三轮 + `test-relay-offload`/`test-offload-lifecycle`），
+  结果写到 `out/vm-kernel-<ver>.log`（经 9p 以宿主用户身份落盘）。

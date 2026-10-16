@@ -2465,8 +2465,12 @@ fn handle_tproxy_conn(mut stream: TcpStream) {
         .map(|a| a.to_string())
         .unwrap_or_else(|e| format!("<{e}>"));
     log(&format!("TPROXY ACCEPT orig_dst={orig_dst} peer={peer}"));
+    // 回显夹具（无 dialer 的 up/ops-up 会话）：每读到一块数据就回一行 banner + 原样数据，
+    // 直到对端关闭。**不要限制读次数**：早期版本限 8 次读（≈32KB），之后 shutdown(Both)
+    // 使残余数据触发 RST——现象酷似“大流被中间设备 reset”，曾把 lab 排障引向 MTU/隧道
+    // 方向（见 devlog §19）。夹具只用于 lab；生产会话必有 dialer，不会走到这里。
     let mut buf = [0u8; 4096];
-    for _ in 0..8 {
+    loop {
         match stream.read(&mut buf) {
             Ok(0) | Err(_) => break,
             Ok(n) => {

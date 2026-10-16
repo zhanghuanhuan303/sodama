@@ -31,9 +31,9 @@ fi
 "$BASE/lab/lab.sh" down || true
 
 # 对标批（ADR-0065）：offload 字节记账需要 `--offload` 会话（up 的基线不带 dialer）。
-# 注意：QEMU 环境里 offload 内核路径有**既有抖动**（首连超时；基线构建同样复现，
-# 且记账探针关掉也复现，见 devlog §19），所以这里重试三轮，并把记账三件套
-# （probe_calls / parse_fail / guard_miss）无论成败都打出来作证据。
+# 注意：QEMU 环境里 offload 内核路径有**既有抖动**（问候超时/首连降级；基线 5092723 同环境
+# 四组对照 9/9 失败，随宿主状态大幅波动，见 devlog §19），故此项为信息项：重试三轮，
+# 并把记账三件套（probe_calls / parse_fail / guard_miss）无论成败都打出来作证据。
 offload=FAIL
 for attempt in 1 2 3; do
   if USE_OFFLOAD=1 "$BASE/lab/lab.sh" offload-up \
@@ -50,12 +50,8 @@ for attempt in 1 2 3; do
 done
 "$BASE/lab/lab.sh" down || true
 
-# 对标批（ADR-0065）：L3 端到端（经 ipip 隧道；不入 verify 门禁，仅信息项）。
-l3_e2e=SKIP
-if "$BASE/lab/lab.sh" up >/dev/null 2>&1; then
-  if "$BASE/lab/lab.sh" test-l3 >/dev/null 2>&1; then l3_e2e=PASS; else l3_e2e=FAIL; fi
-fi
-"$BASE/lab/lab.sh" down || true
-echo "MATRIX-RESULT kernel=$(uname -r) verify=$result offload=$offload l3_e2e=$l3_e2e"
+# 对标批（ADR-0065）：L3 端到端（经 ipip 隧道）已并入 verify() 门禁（l3 用例），
+# 此处不再单列。
+echo "MATRIX-RESULT kernel=$(uname -r) verify=$result offload=$offload"
 sync
 exec /tmp/busybox poweroff -f

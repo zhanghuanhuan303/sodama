@@ -7,10 +7,14 @@
 
 use core::ffi::c_void;
 
-use aya_ebpf::{bpf_printk, macros::classifier, programs::TcContext};
+use aya_ebpf::{
+    bpf_printk,
+    macros::classifier,
+    programs::TcContext,
+};
 use aya_ebpf_bindings::{
-    bindings::{BPF_F_INGRESS, bpf_adj_room_mode::BPF_ADJ_ROOM_MAC},
-    helpers::{bpf_sk_assign, bpf_sk_release, bpf_skb_adjust_room},
+    bindings::BPF_F_INGRESS,
+    helpers::{bpf_sk_assign, bpf_sk_release},
 };
 
 use crate::common::*;
@@ -203,23 +207,20 @@ pub fn sodama0peer_ingress(ctx: TcContext) -> i32 {
 
 /* ---------------- dae0 ingress：回程交付（L2/L3 按 ifindex 判定） ---------------- */
 
-/// L3 回程：把回程包上「去控制面时补出的」14B 以太头剥掉，再把包 redirect 回原接口。
+/// L3 回程：把回程包 redirect 回原接口；**不手工剥链路头**。
 ///
-/// 这是对 dae 的一处**有意偏离**（见 ADR-0065「偏离清单」）：dae 的 `tproxy_dae0_ingress`
-/// 对任何回程都按以太处理（写 MAC + redirect），当原接口是 tun/ppp（无链路头）时，
-/// 回到该接口的报文会多带 14B。sodama 用 loader 写入的 `l3_ifindex_map` 标记 L3 接口，
-/// 命中则用 `bpf_skb_adjust_room(-14, BPF_ADJ_ROOM_MAC)` 剥头。剥头失败时退化为
-/// 直接放行（`TC_ACT_OK`），交给协议栈判定——不静默丢包。
+/// 实测结论（VM/7.2.8，抓包 + 十六进制取证）：从 TC ingress 把包 redirect 到
+/// **L3 设备**（ipip/tun）时，内核自己会在送出前去掉 L2 头——若我们再用
+/// `bpf_skb_adjust_room(-14, BPF_ADJ_ROOM_MAC)` 手工剥一次，会多剥 14 字节，
+/// 外层载荷变成「内层 IP 头第 14 字节起」（实测外层 IP total_length=66，
+/// 载荷 `01 01 0a 14 00 02 1f 90 b0 a8 …`），对端解封后 IP 版本字节不对 → 静默丢包。
+///
+/// 这还是对 dae 的一处**有意偏离**（见 ADR-0065「偏离清单」）：dae 的
+/// `tproxy_dae0_ingress` 对任何回程都按以太处理（写 MAC + redirect），L3 目标接口
+/// 会把以太头带进隧道。sodama 靠 loader 写入的 `l3_ifindex_map` 识别 L3 目标：
+/// 跳过 MAC 改写（没有 L2 绑定可写），直接 redirect——L2 头的去除由 redirect 完成。
 #[inline(always)]
-unsafe fn dae0_ingress_l3_reply(ctx: &TcContext, ifindex: u32, from_wan: u8) -> i32 {
-    let skb = ctx.skb.skb;
-    let rc = bpf_skb_adjust_room(skb, -(ETH_HLEN as i32), BPF_ADJ_ROOM_MAC as u32, 0);
-    if crate::flow::debug_log() {
-        bpf_printk!(c"sodama: L3 reply pop adjust_room=%d ifindex=%u\n", rc as i32, ifindex);
-    }
-    if rc != 0 {
-        return tc_ok();
-    }
+unsafe fn dae0_ingress_l3_reply(ifindex: u32, from_wan: u8) -> i32 {
     let flags: u64 = if from_wan != 0 {
         BPF_F_INGRESS as u64
     } else {
@@ -227,7 +228,7 @@ unsafe fn dae0_ingress_l3_reply(ctx: &TcContext, ifindex: u32, from_wan: u8) -> 
     };
     if crate::flow::debug_log() {
         bpf_printk!(
-            c"sodama: dae0_ingress L3 reply -> pop 14B, ifindex=%u ingress=%u\n",
+            c"sodama: L3 reply redirect ifindex=%u ingress=%u\n",
             ifindex,
             (flags != 0) as u32
         );
@@ -289,7 +290,7 @@ pub fn sodama0_ingress(ctx: TcContext) -> i32 {
     let _ = unsafe { skb_change_type(&ctx, ty) };
 
     if l3_target {
-        return unsafe { dae0_ingress_l3_reply(&ctx, ifindex, from_wan) };
+        return unsafe { dae0_ingress_l3_reply(ifindex, from_wan) };
     }
 
     if ctx.store(6usize, &entry_dmac, 0).is_err() {
