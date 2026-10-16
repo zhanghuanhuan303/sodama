@@ -1,0 +1,498 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>性能与资源边界报告 v4.0 · 本机全量强度轮（2026-10-16）</title>
+<style>
+:root{
+  --ink:#1a1d21; --muted:#5a6570; --rule:#d9dee4; --rule-soft:#e8ecf0;
+  --navy:#1f4e79; --navy-soft:#eef3f8; --warm:#a0522d; --warm-soft:#f8f1ec;
+  --green:#2e7d4f; --bg:#ffffff; --code:#f4f6f8;
+}
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{margin:0;background:var(--bg);color:var(--ink);
+  font:15px/1.75 "Segoe UI",system-ui,-apple-system,"Noto Sans SC","PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;
+  font-variant-numeric:tabular-nums}
+.wrap{max-width:980px;margin:0 auto;padding:48px 40px 96px}
+header.doc{border-bottom:2px solid var(--ink);padding-bottom:22px;margin-bottom:34px}
+.kicker{font-size:12px;letter-spacing:.18em;text-transform:uppercase;color:var(--muted);margin-bottom:10px}
+h1{font-size:27px;line-height:1.35;margin:0 0 10px;font-weight:700;letter-spacing:.01em}
+.subtitle{color:var(--muted);font-size:14.5px;margin:0 0 16px}
+.meta{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:6px 28px;font-size:13px;color:var(--muted)}
+.meta b{color:var(--ink);font-weight:600}
+h2{font-size:19px;margin:44px 0 14px;padding-bottom:6px;border-bottom:1px solid var(--rule);font-weight:700}
+h3{font-size:15.5px;margin:28px 0 10px;font-weight:700}
+h4{font-size:14px;margin:20px 0 8px;font-weight:700}
+p{margin:10px 0}
+ul,ol{margin:10px 0 10px 4px;padding-left:22px}
+li{margin:4px 0}
+small,.small{font-size:12.5px;color:var(--muted)}
+code,kbd{background:var(--code);border:1px solid var(--rule-soft);border-radius:3px;padding:1px 5px;font:12.5px/1.5 ui-monospace,SFMono-Regular,Consolas,monospace}
+pre{background:var(--code);border:1px solid var(--rule-soft);border-radius:4px;padding:12px 14px;overflow:auto;font:12.5px/1.65 ui-monospace,SFMono-Regular,Consolas,monospace}
+table{width:100%;border-collapse:collapse;margin:14px 0;font-size:13.5px}
+th,td{border-bottom:1px solid var(--rule-soft);padding:7px 10px;text-align:left;vertical-align:top}
+thead th{border-bottom:1.5px solid var(--ink);font-weight:600;font-size:12.5px;letter-spacing:.02em}
+td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
+tbody tr:hover{background:#fafbfc}
+.callout{border-left:3px solid var(--navy);background:var(--navy-soft);padding:12px 16px;margin:16px 0;border-radius:0 4px 4px 0}
+.callout.warn{border-color:var(--warm);background:var(--warm-soft)}
+.callout p:first-child{margin-top:0}.callout p:last-child{margin-bottom:0}
+figure{margin:22px 0;border:1px solid var(--rule-soft);border-radius:4px;padding:14px 14px 8px}
+figure svg{display:block;width:100%;height:auto}
+figcaption{font-size:12.5px;color:var(--muted);margin-top:8px;line-height:1.6}
+.tag{display:inline-block;font-size:11.5px;border-radius:3px;padding:1px 7px;letter-spacing:.03em}
+.tag.ok{background:#e9f3ec;color:#1d5c34;border:1px solid #c4ddcd}
+.tag.bad{background:#fbeaea;color:#8a2b2b;border:1px solid #e6c3c3}
+.tag.new{background:var(--navy-soft);color:var(--navy);border:1px solid #c9dcee}
+.badge{display:inline-block;border:1px solid var(--ink);border-radius:3px;padding:1px 8px;font-size:11.5px;letter-spacing:.08em;margin-left:8px;vertical-align:2px}
+footer.doc{margin-top:56px;padding-top:18px;border-top:1px solid var(--rule);font-size:12.5px;color:var(--muted)}
+@media print{.wrap{max-width:none;padding:0 6mm}h2{break-after:avoid}figure,table{break-inside:avoid}a{color:inherit;text-decoration:none}}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header class="doc">
+  <div class="kicker">SODAMA BENCHMARK · LOCAL FULL-INTENSITY ROUND</div>
+  <h1>性能与资源边界报告 v4.0 · 本机全量强度轮</h1>
+  <p class="subtitle">补全后 eBPF 数据面（A2 批次收口）+ 2 项修复 · 网络切换（不经软路由）后本机复测 · 与 dae v2.1.1 等四方同台</p>
+  <div class="meta">
+    <div><b>日期</b> 2026-10-16～17</div>
+    <div><b>机器</b> Arch · 6.18.54-2-lts · i9-9900KF 8C16T · 31 GB（同 atlas 基准机）</div>
+    <div><b>构建</b> main@e5db7fd + <code>flow.rs</code> conn_save 参数打包修复（见 §8.1）</div>
+    <div><b>对照</b> dae v2.1.1 · sing-box 1.14.2 · v2ray 5.52.0 · mihomo 1.19.32</div>
+    <div><b>口径</b> 全部 <code>SKIP_NET_OFFLOAD=1</code>（理由见 §8.2）；netns 本机对拍</div>
+    <div><b>数据源</b> <code>docs/reviews/2026-10-16-local-full-bench/</code></div>
+  </div>
+</header>
+
+<h2 id="s1">§1 摘要</h2>
+<p>本轮按 atlas §9.1 的标准命令全集在本机重跑（吞吐四方、并发扩展、内存五方、四层模型 100→5 万、UDP 五方、codec 压、60 分钟长稳），并因"补全后内核"暴露的三个问题做了两组增量实验（验证器修复、两个回归的提交级二分）。<b>核心结论</b>：</p>
+<table>
+<thead><tr><th>维度</th><th>结论（本轮实测）</th><th>对 atlas v1.8 / v3.0</th></tr></thead>
+<tbody>
+<tr><td>吞吐 · VLESS 明文</td><td>sodama <b>16 589 Mbps</b>（p50 44 µs / CPU 70 ms / 384 MB 双工口径）</td><td>与 M1 后 16 926 同级；较 dae 本轮 13 048 高 <b>+27%</b></td></tr>
+<tr><td>吞吐 · direct</td><td>25 463 Mbps（夹具 ≈24.5 G 天花板；64×1 MB 口径 <b>38.7 G</b>）</td><td>同级；64 流口径再提（35.2 → 38.7）</td></tr>
+<tr><td>吞吐 · VLESS+TLS</td><td>12 089 Mbps / CPU 420 ms（rustls）</td><td>≥ 历史 11 670（M2 kTLS 实验 12 318）</td></tr>
+<tr><td>吞吐 · ss（chacha20）</td><td>6 228 Mbps 中位（双峰 5.8–9.0 G）<span class="tag bad">回归</span></td><td>M1 时代 9 840 稳定；二分定位到 <code>b030f90</code>（§8.3）</td></tr>
+<tr><td>用户态内存</td><td>hold 2 000 连接 <b>32.1 MB</b>；5 万连接 <b>55.6 MB</b> / 31 线程 / 100 008 socket fd（2/连接）</td><td>边际增量仍趋零；基线较 atlas 期上移（11.9→29 MB 量级，§5）</td></tr>
+<tr><td>系统总内存 @5 万</td><td>净增 <b>≈2.0 GB</b>（40.9 KB/连接）vs dae <b>≈8.2 GB</b>（172.7 KB/连接）</td><td>结论方向一致；dae 用户态 6.6 GB 为大头</td></tr>
+<tr><td>UDP（20k pps）</td><td>sodama 代理路径<b>失效</b>（上行 100% 转发、回程全灭）<span class="tag bad">回归</span></td><td>二分定位到 <code>e5db7fd</code> 的 UDP GSO（§8.4）；A2 前构建零丢包</td></tr>
+<tr><td>长稳 60 min</td><td>RSS +17.6% <span class="tag bad">FAIL</span>（单次 4.5 MB 阶梯，非持续泄漏形态）；Slab +0.26% / SUnrec +0.88% / fd 无增长 / 零失败；RTT p50 中位 44 µs</td><td>atlas 60min 轮 +3.1% PASS —— <b>本轮 RSS 未过 ±5% 线（项目首次）</b>，见 §6</td></tr>
+<tr><td>宿主加载性</td><td>补全批次 <code>e87ea69</code> 起 eBPF 对象被 6.18 验证器拒载（R11）；<b>已修复</b>，<code>verify 12/12</code> 全绿</td><td>新增发现（atlas 内核级验收在 QEMU 7.2.8，宿主未覆盖）</td></tr>
+</tbody>
+</table>
+<div class="callout warn">
+  <p><b>三条口径修正（直接影响读数，务必先读）</b>：① 新 lab 在 <code>up()</code> 里关闭 dae0/dae0peer（控制面对）offload，会把<b>标准代理路径</b>吞吐砍半（8.5→17.3 Gbps），本轮全部改用 <code>SKIP_NET_OFFLOAD=1</code>（§8.2）；② <code>e87ea69</code> 引入的 7 参数 BPF 调用在宿主 6.18 上被验证器拒载（R11），修复前<b>整机不可运行</b>（§8.1）；③ dae 首轮出现"启动未就绪 → 被假公网兜底放行"的高分假象（24.6 G/CPU 0），复跑后为正常的 12.3–13.2 G（§2.3）。</p>
+</div>
+
+<h2 id="s2">§2 方法学</h2>
+<h3>2.1 环境与口径</h3>
+<ul>
+<li>全部测试在 netns 拓扑（client ns — 网关 — WAN ns）内完成，与公网路径无关；机器已切换到不经软路由的网络（wlan0 直连），对 netns 数字无影响。真实公网口径（real.sh，atlas §4.5）需节点 URL，本轮未采集。</li>
+<li>夹具：<code>lab/bench_io</code>（48 MB × 4 流全双工；lat 500 次）、<code>conn_scale</code>（hold/churn）、<code>echo_server</code>（万级连接）。direct 口径受夹具 ≈24.5 Gbps 上限约束（64×1 MB 口径可达 38.7 G）。</li>
+<li>ss 上游为 <code>ssserver</code> 1.25.0（shadowsocks-rust）；Python 上游有 GIL ≈2.4 Gbps 上限，仅作功能对照。</li>
+<li>CPU 列 = 被测进程 utime+stime 增量（realfile <code>/proc/pid/stat</code>，10 ms 粒度）；RSS/线程为负载期值。</li>
+<li>CPU governor 固定 <code>performance</code>（空闲 800 MHz 会导致短促负载的采样偏低；默认 powersave 下首轮偏低 10–20%）。</li>
+</ul>
+<h3>2.2 与 atlas 的差异（为什么数字不会逐字相同）</h3>
+<ul>
+<li>atlas 表 2 的 sodama 行（threads=11）实测于 M1–M2 时代构建；本轮为 A2 收口构建（threads=31，M4 reactor 线程模型），线程/内存基线与若干路径性能已不同。</li>
+<li>atlas 图 4（五方 RSS @2 000）的柱标签与正文折算值存在对不上的迹象（图内 sing-box=298.1 MB 与正文"sing-box ≈47 KB/连接"矛盾）；本轮实测口径为 dae≈153 KB、mihomo≈88 KB、v2ray≈73 KB、sing-box≈43 KB、sodama≈16 KB，与 atlas 正文一致（§5.1）。</li>
+</ul>
+<h3>2.3 流程坑（本轮踩到）</h3>
+<p><b>dae 就绪等待</b>：<code>run.sh</code> 启动后固定 <code>sleep 2.5</code> 即开测。首轮 <code>all</code> 中 dae 尚在加载（RSS 41 MB、无 relay 日志），流量被"假公网兜底路由"无实现直通 → 读出 24.6 G / CPU 0 的假象。复跑（验证 RSS 已增、relay 日志出现）后为 12.3–13.2 G / CPU 380–420 ms。判定方法：vless 行与 direct 行数字近似（≈夹具上限）或 CPU≈0 即为假象，须复测。</p>
+
+<h2 id="s3">§3 吞吐四方对拍（5 轮中位；VLESS 5 轮 / ss 5 轮 / TLS 3 轮）</h2>
+<figure>
+<svg viewBox="0 0 880 320" role="img" aria-label="四方吞吐分组柱状图（direct / VLESS / ss / VLESS-TLS）">
+  <line x1="70" y1="250" x2="862" y2="250" stroke="#c9c2ae"/>
+  <line x1="70" y1="211.5" x2="862" y2="211.5" stroke="#eee8d8"/>
+  <line x1="70" y1="173.1" x2="862" y2="173.1" stroke="#eee8d8"/>
+  <line x1="70" y1="134.6" x2="862" y2="134.6" stroke="#eee8d8"/>
+  <line x1="70" y1="96.2" x2="862" y2="96.2" stroke="#eee8d8"/>
+  <line x1="70" y1="57.7" x2="862" y2="57.7" stroke="#eee8d8"/>
+  <text x="56" y="254" text-anchor="end" font-size="10.5" fill="#6f6a5c">0</text>
+  <text x="56" y="215.5" text-anchor="end" font-size="10.5" fill="#6f6a5c">5</text>
+  <text x="56" y="177.1" text-anchor="end" font-size="10.5" fill="#6f6a5c">10</text>
+  <text x="56" y="138.6" text-anchor="end" font-size="10.5" fill="#6f6a5c">15</text>
+  <text x="56" y="100.2" text-anchor="end" font-size="10.5" fill="#6f6a5c">20</text>
+  <text x="56" y="61.7" text-anchor="end" font-size="10.5" fill="#6f6a5c">25</text>
+  <text x="12" y="26" font-size="10.5" fill="#6f6a5c">Gbps</text>
+  <rect x="70" y="6" width="10" height="10" fill="#1f4e79"/><text x="86" y="16" font-size="11" fill="#3d3a33">direct</text>
+  <rect x="150" y="6" width="10" height="10" fill="#a0522d"/><text x="166" y="16" font-size="11" fill="#3d3a33">VLESS 明文</text>
+  <rect x="255" y="6" width="10" height="10" fill="#2e7d4f"/><text x="271" y="16" font-size="11" fill="#3d3a33">ss（chacha20）</text>
+  <rect x="375" y="6" width="10" height="10" fill="#8a6d3b"/><text x="391" y="16" font-size="11" fill="#3d3a33">VLESS+TLS（rustls）</text>
+  <!-- sodama -->
+  <rect x="90" y="54.1" width="34" height="195.9" fill="#1f4e79"/><text x="107" y="50" text-anchor="middle" font-size="9" fill="#3d3a33">25 463</text>
+  <rect x="132" y="122.4" width="34" height="127.6" fill="#a0522d"/><text x="149" y="118.4" text-anchor="middle" font-size="9" fill="#3d3a33">16 589</text>
+  <rect x="174" y="202.1" width="34" height="47.9" fill="#2e7d4f"/><text x="191" y="198.1" text-anchor="middle" font-size="9" fill="#3d3a33">6 228</text>
+  <rect x="216" y="157.0" width="34" height="93.0" fill="#8a6d3b"/><text x="233" y="153" text-anchor="middle" font-size="9" fill="#3d3a33">12 088</text>
+  <text x="170" y="268" text-anchor="middle" font-size="11.5" fill="#3d3a33">sodama</text>
+  <!-- dae -->
+  <rect x="292" y="58.0" width="34" height="192.0" fill="#1f4e79"/><text x="309" y="54" text-anchor="middle" font-size="9" fill="#3d3a33">24 956</text>
+  <rect x="334" y="149.6" width="34" height="100.4" fill="#a0522d"/><text x="351" y="145.6" text-anchor="middle" font-size="9" fill="#3d3a33">13 048</text>
+  <rect x="376" y="178.3" width="34" height="71.7" fill="#2e7d4f"/><text x="393" y="174.3" text-anchor="middle" font-size="9" fill="#3d3a33">9 326</text>
+  <rect x="418" y="161.6" width="34" height="88.4" fill="#8a6d3b"/><text x="435" y="157.6" text-anchor="middle" font-size="9" fill="#3d3a33">11 486</text>
+  <text x="372" y="268" text-anchor="middle" font-size="11.5" fill="#3d3a33">dae v2.1.1</text>
+  <!-- singbox -->
+  <rect x="494" y="76.0" width="34" height="174.0" fill="#1f4e79"/><text x="511" y="72" text-anchor="middle" font-size="9" fill="#3d3a33">22 613</text>
+  <rect x="536" y="125.8" width="34" height="124.2" fill="#a0522d"/><text x="553" y="121.8" text-anchor="middle" font-size="9" fill="#3d3a33">16 142</text>
+  <rect x="578" y="170.8" width="34" height="79.2" fill="#2e7d4f"/><text x="595" y="166.8" text-anchor="middle" font-size="9" fill="#3d3a33">10 292</text>
+  <rect x="620" y="156.3" width="34" height="93.7" fill="#8a6d3b"/><text x="637" y="152.3" text-anchor="middle" font-size="9" fill="#3d3a33">12 176</text>
+  <text x="574" y="268" text-anchor="middle" font-size="11.5" fill="#3d3a33">sing-box 1.14.2</text>
+  <!-- v2ray -->
+  <rect x="696" y="142.0" width="34" height="108.0" fill="#1f4e79"/><text x="713" y="138" text-anchor="middle" font-size="9" fill="#3d3a33">14 035</text>
+  <rect x="738" y="167.6" width="34" height="82.4" fill="#a0522d"/><text x="755" y="163.6" text-anchor="middle" font-size="9" fill="#3d3a33">10 714</text>
+  <rect x="780" y="202.4" width="34" height="47.6" fill="#2e7d4f"/><text x="797" y="198.4" text-anchor="middle" font-size="9" fill="#3d3a33">6 192</text>
+  <rect x="822" y="189.9" width="34" height="60.1" fill="#8a6d3b"/><text x="839" y="185.9" text-anchor="middle" font-size="9" fill="#3d3a33">7 812</text>
+  <text x="776" y="268" text-anchor="middle" font-size="11.5" fill="#3d3a33">v2ray 5.52.0</text>
+  <text x="70" y="300" font-size="10.5" fill="#6f6a5c">口径：direct 受夹具 ≈24.5 Gbps 上限约束（下界）；ss 的 sodama 行为回归值（§8.3），dae/sing-box/v2ray 与 atlas 吻合（±3%）。</text>
+</svg>
+<figcaption><b>图 1 · 四方吞吐（Mbps，5/5/3 轮中位）。</b>VLESS 明文 sodama 领先（+27% vs dae）；direct 全部贴夹具上限（实现差异被掩蔽，看 CPU 才有意义）；ss 是 sodama 当前最大短板且已二分定位为回归；TLS 路径四方接近，v2ray 明显落后。</figcaption>
+</figure>
+
+<h3>3.1 VLESS 明文（主口径）</h3>
+<table>
+<thead><tr><th>实现</th><th class="num">direct</th><th class="num">direct p50</th><th class="num">VLESS</th><th class="num">VLESS p50</th><th class="num">VLESS CPU/384MB</th><th class="num">RSS</th><th class="num">线程</th></tr></thead>
+<tbody>
+<tr><td>sodama</td><td class="num">25 463</td><td class="num">15 µs</td><td class="num"><b>16 589</b></td><td class="num">44 µs</td><td class="num"><b>70 ms</b></td><td class="num"><b>29.9 MB</b></td><td class="num">31</td></tr>
+<tr><td>dae v2.1.1</td><td class="num">24 956</td><td class="num">15 µs</td><td class="num">13 048</td><td class="num">42 µs</td><td class="num">400 ms</td><td class="num">50.3 MB</td><td class="num">21</td></tr>
+<tr><td>sing-box 1.14.2</td><td class="num">22 613</td><td class="num">25 µs</td><td class="num">16 142</td><td class="num">41 µs</td><td class="num">80 ms</td><td class="num">62.0 MB</td><td class="num">20</td></tr>
+<tr><td>v2ray 5.52.0</td><td class="num">14 035</td><td class="num">35 µs</td><td class="num">10 714</td><td class="num">52 µs</td><td class="num">730 ms</td><td class="num">70.2 MB</td><td class="num">26</td></tr>
+</tbody>
+</table>
+<p>sodama 逐轮：17 115 / 16 589 / 15 101 / 17 106 / 16 455 Mbps。与 dae 的 CPU 差 <b>5.7×</b>（70 vs 400 ms）——VLESS 明文走 splice 零拷贝，用户态只搬头；dae 同为内核转发族但未对明文流做同类零拷贝治理。</p>
+
+<h3>3.2 ss（chacha20-ietf-poly1305）</h3>
+<table>
+<thead><tr><th>实现</th><th class="num">direct</th><th class="num">ss</th><th class="num">ss p50</th><th class="num">ss CPU/384MB</th><th class="num">RSS</th><th class="num">线程</th></tr></thead>
+<tbody>
+<tr><td>sodama</td><td class="num">25 269</td><td class="num">6 228 <span class="tag bad">回归</span></td><td class="num">46 µs</td><td class="num">520 ms</td><td class="num">38.6 MB</td><td class="num">31</td></tr>
+<tr><td>dae v2.1.1</td><td class="num">24 532</td><td class="num">9 326</td><td class="num">39 µs</td><td class="num">450 ms</td><td class="num">52.0 MB</td><td class="num">20</td></tr>
+<tr><td>sing-box 1.14.2</td><td class="num">22 617</td><td class="num"><b>10 292</b></td><td class="num">46 µs</td><td class="num">480 ms</td><td class="num">66.0 MB</td><td class="num">20</td></tr>
+<tr><td>v2ray 5.52.0</td><td class="num">13 187</td><td class="num">6 192</td><td class="num">52 µs</td><td class="num">690 ms</td><td class="num">72.5 MB</td><td class="num">25</td></tr>
+</tbody>
+</table>
+<p>sodama 逐轮双峰：5 797 / 6 096 / <b>9 031</b> / 6 229 / <b>8 864</b> Mbps——同构建内既有"M1 水平"快轮也有 6 G 慢轮。dae/sing-box/v2ray 三家与 atlas 值 ±3% 内（9 357 / 10 615 / 6 289），环境无漂移。回归二分见 §8.3。</p>
+
+<h3>3.3 VLESS+TLS（rustls，3 轮）</h3>
+<table>
+<thead><tr><th>实现</th><th class="num">direct</th><th class="num">VLESS+TLS</th><th class="num">p50</th><th class="num">CPU/384MB</th><th class="num">RSS</th><th class="num">线程</th></tr></thead>
+<tbody>
+<tr><td>sodama</td><td class="num">24 733</td><td class="num">12 089</td><td class="num">50 µs</td><td class="num">420 ms</td><td class="num">36.9 MB</td><td class="num">31</td></tr>
+<tr><td>dae v2.1.1</td><td class="num">25 328</td><td class="num">11 486</td><td class="num">49 µs</td><td class="num">430 ms</td><td class="num">56.0 MB</td><td class="num">21</td></tr>
+<tr><td>sing-box 1.14.2</td><td class="num">22 599</td><td class="num"><b>12 176</b></td><td class="num">51 µs</td><td class="num">450 ms</td><td class="num">68.2 MB</td><td class="num">18</td></tr>
+<tr><td>v2ray 5.52.0</td><td class="num">13 659</td><td class="num">7 812</td><td class="num">50 µs</td><td class="num">840 ms</td><td class="num">74.7 MB</td><td class="num">26</td></tr>
+</tbody>
+</table>
+
+<h2 id="s4">§4 并发扩展（1/2/4/8 流 ×64 MB + 64 流 ×1 MB）</h2>
+<figure>
+<svg viewBox="0 0 880 240" role="img" aria-label="并发流扩展折线图">
+  <line x1="70" y1="200" x2="862" y2="200" stroke="#c9c2ae"/>
+  <line x1="70" y1="157.5" x2="862" y2="157.5" stroke="#eee8d8"/>
+  <line x1="70" y1="115" x2="862" y2="115" stroke="#eee8d8"/>
+  <line x1="70" y1="72.5" x2="862" y2="72.5" stroke="#eee8d8"/>
+  <line x1="70" y1="30" x2="862" y2="30" stroke="#eee8d8"/>
+  <text x="56" y="204" text-anchor="end" font-size="10.5" fill="#6f6a5c">0</text>
+  <text x="56" y="161.5" text-anchor="end" font-size="10.5" fill="#6f6a5c">10</text>
+  <text x="56" y="119" text-anchor="end" font-size="10.5" fill="#6f6a5c">20</text>
+  <text x="56" y="76.5" text-anchor="end" font-size="10.5" fill="#6f6a5c">30</text>
+  <text x="56" y="34" text-anchor="end" font-size="10.5" fill="#6f6a5c">40</text>
+  <text x="12" y="26" font-size="10.5" fill="#6f6a5c">Gbps</text>
+  <rect x="70" y="6" width="10" height="10" fill="#1f4e79"/><text x="86" y="16" font-size="11" fill="#3d3a33">direct</text>
+  <rect x="150" y="6" width="10" height="10" fill="#a0522d"/><text x="166" y="16" font-size="11" fill="#3d3a33">VLESS</text>
+  <rect x="230" y="6" width="10" height="10" fill="#2e7d4f"/><text x="246" y="16" font-size="11" fill="#3d3a33">relay（无加密用户态泵）</text>
+  <polyline points="100,162.3 260,128.6 420,90.4 580,106.3 740,35.5" fill="none" stroke="#1f4e79" stroke-width="2"/>
+  <polyline points="100,163.3 260,133.7 420,128.1 580,135.6 740,135.5" fill="none" stroke="#a0522d" stroke-width="2"/>
+  <polyline points="100,162.9 260,132.4 420,113.6 580,114.7 740,142.2" fill="none" stroke="#2e7d4f" stroke-width="2"/>
+  <circle cx="100" cy="162.3" r="2.8" fill="#1f4e79"/><text x="100" y="154" text-anchor="middle" font-size="9" fill="#3d3a33">8 860</text>
+  <circle cx="260" cy="128.6" r="2.8" fill="#1f4e79"/><text x="260" y="120.3" text-anchor="middle" font-size="9" fill="#3d3a33">16 808</text>
+  <circle cx="420" cy="90.4" r="2.8" fill="#1f4e79"/><text x="420" y="82.1" text-anchor="middle" font-size="9" fill="#3d3a33">25 799</text>
+  <circle cx="580" cy="106.3" r="2.8" fill="#1f4e79"/><text x="580" y="98" text-anchor="middle" font-size="9" fill="#3d3a33">22 038</text>
+  <circle cx="740" cy="35.5" r="2.8" fill="#1f4e79"/><text x="740" y="27.2" text-anchor="middle" font-size="9" fill="#3d3a33">38 701</text>
+  <circle cx="100" cy="163.3" r="2.8" fill="#a0522d"/><text x="100" y="176" text-anchor="middle" font-size="9" fill="#3d3a33">8 627</text>
+  <circle cx="260" cy="133.7" r="2.8" fill="#a0522d"/><text x="260" y="146.4" text-anchor="middle" font-size="9" fill="#3d3a33">15 596</text>
+  <circle cx="420" cy="128.1" r="2.8" fill="#a0522d"/><text x="420" y="140.8" text-anchor="middle" font-size="9" fill="#3d3a33">16 912</text>
+  <circle cx="580" cy="135.6" r="2.8" fill="#a0522d"/><text x="580" y="148.3" text-anchor="middle" font-size="9" fill="#3d3a33">15 159</text>
+  <circle cx="740" cy="135.5" r="2.8" fill="#a0522d"/><text x="740" y="148.2" text-anchor="middle" font-size="9" fill="#3d3a33">15 172</text>
+  <circle cx="100" cy="162.9" r="2.8" fill="#2e7d4f"/><text x="100" y="188.5" text-anchor="middle" font-size="9" fill="#3d3a33">8 729</text>
+  <circle cx="260" cy="132.4" r="2.8" fill="#2e7d4f"/><text x="260" y="158.9" text-anchor="middle" font-size="9" fill="#3d3a33">15 900</text>
+  <circle cx="420" cy="113.6" r="2.8" fill="#2e7d4f"/><text x="420" y="126.3" text-anchor="middle" font-size="9" fill="#3d3a33">20 333</text>
+  <circle cx="580" cy="114.7" r="2.8" fill="#2e7d4f"/><text x="580" y="127.4" text-anchor="middle" font-size="9" fill="#3d3a33">20 067</text>
+  <circle cx="740" cy="142.2" r="2.8" fill="#2e7d4f"/><text x="740" y="154.9" text-anchor="middle" font-size="9" fill="#3d3a33">13 593</text>
+  <text x="100" y="218" text-anchor="middle" font-size="10.5" fill="#6f6a5c">1</text>
+  <text x="260" y="218" text-anchor="middle" font-size="10.5" fill="#6f6a5c">2</text>
+  <text x="420" y="218" text-anchor="middle" font-size="10.5" fill="#6f6a5c">4</text>
+  <text x="580" y="218" text-anchor="middle" font-size="10.5" fill="#6f6a5c">8</text>
+  <text x="740" y="218" text-anchor="middle" font-size="10.5" fill="#6f6a5c">64×1MB</text>
+  <text x="70" y="236" font-size="10.5" fill="#6f6a5c">口径：1–8 流 ×64 MB；64 流为 1 MB/流小流口径。除 64 流点外均为单轮（中位口径同 atlas §4.1 并发扩展）。</text>
+</svg>
+<figcaption><b>图 2 · 并发扩展。</b>direct 64×1 MB 达 <b>38.7 Gbps</b>（atlas 35.2）；VLESS 4 流起平台化 ≈15–17 G，8 流不再上涨（用户态单点效率），但也不回退；relay（无加密用户态泵）4–8 流 ≈20 G。</figcaption>
+</figure>
+<table>
+<thead><tr><th>路径</th><th class="num">1 流</th><th class="num">2 流</th><th class="num">4 流</th><th class="num">8 流</th><th class="num">64×1MB</th></tr></thead>
+<tbody>
+<tr><td>direct（Mbps / p50 / CPU ms）</td><td class="num">8 860 / 15 / 0</td><td class="num">16 808 / 19 / 0</td><td class="num">25 799 / 15 / 0</td><td class="num">22 038 / 15 / 0</td><td class="num">38 701 / 15 / 0</td></tr>
+<tr><td>VLESS</td><td class="num">8 627 / 46 / 20</td><td class="num">15 596 / 38 / 20</td><td class="num">16 912 / 38 / 90</td><td class="num">15 159 / 38 / 150</td><td class="num">15 172 / 50 / 60</td></tr>
+<tr><td>relay</td><td class="num">8 729 / 24 / 10</td><td class="num">15 900 / 24 / 30</td><td class="num">20 333 / 24 / 80</td><td class="num">20 067 / 25 / 140</td><td class="num">13 593 / 24 / 50</td></tr>
+</tbody>
+</table>
+<p class="small">对照 atlas：vless 8×64 MB 历史 16 177（本轮 15 159，−6%）；relay 8 流历史 21 580 / 4 流 23 147（本轮 20 067 / 20 333，−7~12%）；direct 64×1 MB 历史 35 200（本轮 38 701，+10%）。VLESS/relay 的小幅回落与 §8.3 的 reactor 调度路径同源，幅度在噪声边缘，不作单独结论。</p>
+<p class="small">另外：codec 压（vless-tls 4/8/64 流 ×15 轮 = 45 轮）：<b>ALL OK</b>（reactor 日志补泵触发 22 598 次为信息项，无失败/无卡死）。</p>
+
+<h2 id="s5">§5 内存</h2>
+<h3>5.1 五方五阶段（hold 2 000 连接，峰值口径）</h3>
+<table>
+<thead><tr><th>实现</th><th class="num">idle</th><th class="num">吞吐期</th><th class="num">hold 2000</th><th class="num">churn 峰值</th><th class="num">静置 30s</th><th class="num">每连接边际（hold−idle）</th></tr></thead>
+<tbody>
+<tr><td>sodama</td><td class="num">29.3 MB</td><td class="num">29.6 MB</td><td class="num"><b>32.1 MB</b></td><td class="num">32.9 MB</td><td class="num"><b>32.3 MB</b></td><td class="num"><b>≈1.4 KB</b></td></tr>
+<tr><td>sing-box 1.14.2</td><td class="num">57.9 MB</td><td class="num">60.8 MB</td><td class="num">84.3 MB</td><td class="num">92.3 MB</td><td class="num">73.3 MB</td><td class="num">≈13.2 KB</td></tr>
+<tr><td>v2ray 5.52.0</td><td class="num">45.3 MB</td><td class="num">68.1 MB</td><td class="num">143.3 MB</td><td class="num">484.8 MB</td><td class="num">314.4 MB</td><td class="num">≈49 KB</td></tr>
+<tr><td>mihomo 1.19.32</td><td class="num">47.6 MB</td><td class="num">49.0 MB</td><td class="num">171.0 MB</td><td class="num">229.3 MB</td><td class="num">69.9 MB</td><td class="num">≈62 KB</td></tr>
+<tr><td>dae v2.1.1</td><td class="num">49.7 MB</td><td class="num">50.1 MB</td><td class="num">302.4 MB</td><td class="num">343.1 MB</td><td class="num">81.8 MB</td><td class="num">≈126 KB</td></tr>
+</tbody>
+</table>
+<p class="small">sodama churn 峰值线程 130（2000 连接风暴），静置后回落 31 线程 / 359 fd（完全回收）；dae 静置后 81.8 MB 不回落至基线（Go GC 保留）；v2ray 静置 314 MB（分配器滞留）。折算每连接值与 atlas 正文（sodama≈15、sing-box≈47、v2ray≈72、mihomo≈88、dae≈153 KB）的排序一致。</p>
+
+<h3>5.2 四层模型扫描（100 → 50 000 连接，active 口径）</h3>
+<figure>
+<svg viewBox="0 0 880 240" role="img" aria-label="四方用户态 RSS 随连接数变化（线性轴）">
+  <line x1="70" y1="200" x2="862" y2="200" stroke="#c9c2ae"/>
+  <line x1="70" y1="154.3" x2="862" y2="154.3" stroke="#eee8d8"/>
+  <line x1="70" y1="108.6" x2="862" y2="108.6" stroke="#eee8d8"/>
+  <line x1="70" y1="62.9" x2="862" y2="62.9" stroke="#eee8d8"/>
+  <text x="56" y="204" text-anchor="end" font-size="10.5" fill="#6f6a5c">0</text>
+  <text x="56" y="158.3" text-anchor="end" font-size="10.5" fill="#6f6a5c">2 000</text>
+  <text x="56" y="112.6" text-anchor="end" font-size="10.5" fill="#6f6a5c">4 000</text>
+  <text x="56" y="66.9" text-anchor="end" font-size="10.5" fill="#6f6a5c">6 000</text>
+  <text x="12" y="26" font-size="10.5" fill="#6f6a5c">MB（线性）</text>
+  <rect x="70" y="6" width="10" height="10" fill="#1f4e79"/><text x="86" y="16" font-size="11" fill="#3d3a33">sodama</text>
+  <rect x="150" y="6" width="10" height="10" fill="#a0522d"/><text x="166" y="16" font-size="11" fill="#3d3a33">dae</text>
+  <rect x="215" y="6" width="10" height="10" fill="#2e7d4f"/><text x="231" y="16" font-size="11" fill="#3d3a33">sing-box</text>
+  <polyline points="120,199.3 275,199.3 430,199.2 585,199.0 740,198.7" fill="none" stroke="#1f4e79" stroke-width="2.5"/>
+  <polyline points="120,198.7 275,196.0 430,184.1 585,139.3 740,48.0" fill="none" stroke="#a0522d" stroke-width="2.5"/>
+  <polyline points="120,198.6 275,198.2 430,196.8 585,192.0 740,183.5" fill="none" stroke="#2e7d4f" stroke-width="2.5"/>
+  <circle cx="120" cy="199.3" r="2.8" fill="#1f4e79"/><circle cx="275" cy="199.3" r="2.8" fill="#1f4e79"/><circle cx="430" cy="199.2" r="2.8" fill="#1f4e79"/><circle cx="585" cy="199.0" r="2.8" fill="#1f4e79"/><circle cx="740" cy="198.7" r="2.8" fill="#1f4e79"/>
+  <text x="472" y="192" text-anchor="middle" font-size="10" fill="#1f4e79">sodama 全程 29→56 MB（贴轴，5 万点 55.6 MB）</text>
+  <circle cx="120" cy="198.7" r="2.8" fill="#a0522d"/><text x="120" y="192.7" text-anchor="middle" font-size="9" fill="#3d3a33">57</text>
+  <circle cx="275" cy="196.0" r="2.8" fill="#a0522d"/><text x="275" y="190" text-anchor="middle" font-size="9" fill="#3d3a33">177</text>
+  <circle cx="430" cy="184.1" r="2.8" fill="#a0522d"/><text x="430" y="178.1" text-anchor="middle" font-size="9" fill="#3d3a33">696</text>
+  <circle cx="585" cy="139.3" r="2.8" fill="#a0522d"/><text x="585" y="133.3" text-anchor="middle" font-size="9" fill="#3d3a33">2 654</text>
+  <circle cx="740" cy="48.0" r="2.8" fill="#a0522d"/><text x="740" y="42" text-anchor="middle" font-size="9" fill="#3d3a33">6 649</text>
+  <circle cx="120" cy="198.6" r="2.8" fill="#2e7d4f"/><text x="120" y="210.7" text-anchor="middle" font-size="9" fill="#3d3a33">62</text>
+  <circle cx="275" cy="198.2" r="2.8" fill="#2e7d4f"/><text x="275" y="210.2" text-anchor="middle" font-size="9" fill="#3d3a33">79</text>
+  <circle cx="430" cy="196.8" r="2.8" fill="#2e7d4f"/><text x="430" y="210.8" text-anchor="middle" font-size="9" fill="#3d3a33">139</text>
+  <circle cx="585" cy="192.0" r="2.8" fill="#2e7d4f"/><text x="585" y="210" text-anchor="middle" font-size="9" fill="#3d3a33">349</text>
+  <circle cx="740" cy="183.5" r="2.8" fill="#2e7d4f"/><text x="740" y="210" text-anchor="middle" font-size="9" fill="#3d3a33">720</text>
+  <text x="120" y="232" text-anchor="middle" font-size="10.5" fill="#6f6a5c">100</text>
+  <text x="275" y="232" text-anchor="middle" font-size="10.5" fill="#6f6a5c">1k</text>
+  <text x="430" y="232" text-anchor="middle" font-size="10.5" fill="#6f6a5c">5k</text>
+  <text x="585" y="232" text-anchor="middle" font-size="10.5" fill="#6f6a5c">20k</text>
+  <text x="740" y="232" text-anchor="middle" font-size="10.5" fill="#6f6a5c">50k</text>
+</svg>
+<figcaption><b>图 3 · 用户态 RSS vs 连接数（线性轴，MB）。</b>dae 近似线性直冲 6.6 GB（126 KB/连接）；sing-box 720 MB；sodama 贴轴平走（29→56 MB，5 万连接）。<b>但用户态只是第一层</b>——内核侧与系统总量见表 6/表 7。</figcaption>
+</figure>
+<table>
+<caption>表 6 · 用户态（active 口径）</caption>
+<thead><tr><th>N</th><th class="num">sodama RSS</th><th class="num">sodama 线程</th><th class="num">dae RSS</th><th class="num">dae 线程</th><th class="num">sing-box RSS</th><th class="num">sing-box 线程</th></tr></thead>
+<tbody>
+<tr><td>100</td><td class="num">29.4 MB</td><td class="num">31</td><td class="num">57.0 MB</td><td class="num">23</td><td class="num">61.8 MB</td><td class="num">13</td></tr>
+<tr><td>1 000</td><td class="num">29.3 MB</td><td class="num">31</td><td class="num">176.7 MB</td><td class="num">23</td><td class="num">79.4 MB</td><td class="num">22</td></tr>
+<tr><td>5 000</td><td class="num">32.8 MB</td><td class="num">31</td><td class="num">695.5 MB</td><td class="num">24</td><td class="num">138.8 MB</td><td class="num">23</td></tr>
+<tr><td>20 000</td><td class="num">45.6 MB</td><td class="num">31</td><td class="num">2 654.0 MB</td><td class="num">25</td><td class="num">348.5 MB</td><td class="num">24</td></tr>
+<tr><td>50 000</td><td class="num"><b>55.6 MB</b></td><td class="num"><b>31</b></td><td class="num">6 649.3 MB</td><td class="num">25</td><td class="num">720.4 MB</td><td class="num">24</td></tr>
+</tbody>
+</table>
+<table>
+<caption>表 7 · 内核侧与系统总量（active；对照=同拓扑无实现；净增=impl−对照）</caption>
+<thead><tr><th>指标 @N</th><th class="num">对照</th><th class="num">sodama</th><th class="num">dae</th><th class="num">sing-box</th><th>每连接折算（净增/50k）</th></tr></thead>
+<tbody>
+<tr><td>Slab 总量 @50k</td><td class="num">1 138 MB</td><td class="num">3 082 MB</td><td class="num">2 922 MB</td><td class="num">4 805 MB</td><td>sodama ≈38.8 KB · dae ≈35.6 KB · sing-box ≈73.4 KB</td></tr>
+<tr><td>↓ 其中 SUnreclaim @50k</td><td class="num">551 MB</td><td class="num">2 064 MB</td><td class="num">2 017 MB</td><td class="num">3 652 MB</td><td class="num">—</td></tr>
+<tr><td>↓ 其中 sock_inode_cache @50k</td><td class="num">80.7 MB</td><td class="num">239.3 MB</td><td class="num">239.2 MB</td><td class="num">239.3 MB</td><td>四方一致（≈3.2 KB/连接）</td></tr>
+<tr><td>↓ 其中 TCP 相关 slab @50k</td><td class="num">238.5 MB</td><td class="num">714.4 MB</td><td class="num">714.5 MB</td><td class="num">714.4 MB</td><td>四方一致（≈9.5 KB/连接）</td></tr>
+<tr><td>fd 总数 / socket fd @50k</td><td class="num">0 / 0</td><td class="num">101 639 / 100 008</td><td class="num">100 094 / 100 008</td><td class="num">300 008 / 100 003</td><td>sodama 2.0/连接（空闲态同）；sing-box 6.0/连接</td></tr>
+<tr><td>系统总净增 @50k（Slab 净增 + RSS）</td><td class="num">—</td><td class="num"><b>≈2.00 GB</b></td><td class="num">≈8.24 GB</td><td class="num">≈4.28 GB</td><td>sodama ≈40.9 KB · dae ≈172.7 KB · sing-box ≈89.9 KB</td></tr>
+<tr><td>释放后恢复（50k → 静止）</td><td class="num">—</td><td class="num">Slab 3 082→1 092 MB，fd 359</td><td class="num">Slab 2 922→—（进程实时）</td><td class="num">—</td><td>sodama 完整回收（SUnrec 2 064→425 MB）</td></tr>
+</tbody>
+</table>
+<p class="small">口径：对照行为同拓扑、同夹具、无实现（50 000 条 hold 连接仍被内核直通到假公网），用于扣除夹具与系统噪声；sock_inode_cache 与 TCP slab 四方一致的增量来自"每连接 2 个 socket（客户端侧+回显侧）"的固有成本，非实现开销。sodama 全程零失败（各点 setup ok=N fail=0）；50k 建立时间 ≈2 分钟级（SETUP_MAX=1500×0.2s 未触顶）。</p>
+
+<h2 id="s6">§6 长稳（60 分钟）</h2>
+<p>负载：常驻 200 长连接 + 每 5s churn（0.1s 连接风暴）+ 每 60s 8MB×2 流全双工校验 + 每 15s RTT 采样（20 次）。采样 15s/点，共 234 点。</p>
+<table>
+<thead><tr><th>指标</th><th class="num">基线（t≥120s 首点）</th><th class="num">终值（静置 15s）</th><th class="num">漂移</th><th>判据（±5%）</th></tr></thead>
+<tbody>
+<tr><td>RSS</td><td class="num">30 496 kB</td><td class="num">35 852 kB</td><td class="num">+17.56%</td><td><span class="tag bad">FAIL</span></td></tr>
+<tr><td>Slab</td><td class="num">790 336 kB</td><td class="num">792 412 kB</td><td class="num">+0.26%</td><td><span class="tag ok">PASS</span></td></tr>
+<tr><td>SUnreclaim</td><td class="num">287 324 kB</td><td class="num">289 840 kB</td><td class="num">+0.88%</td><td><span class="tag ok">PASS</span></td></tr>
+<tr><td>fd</td><td class="num">759</td><td class="num">359</td><td class="num">−52.7%（释放）</td><td><span class="tag ok">PASS（无增长）</span></td></tr>
+<tr><td>fail（churn/周期负载失败计数）</td><td class="num">0</td><td class="num">0</td><td class="num">—</td><td><span class="tag ok">PASS</span></td></tr>
+<tr><td>RTT（全程）</td><td class="num" colspan="2">p50 35–92 µs（中位 44）；p99 265–917 µs（中位 523）</td><td class="num">—</td><td>与 atlas 60min 轮（34–93 / 229–904 µs）同带</td></tr>
+</tbody>
+</table>
+<p><b>bounded-memory 总判据：FAIL（RSS 单项）</b>——首次长稳未过 ±5% 线。</p>
+<p><b>形态与定位</b>：RSS 不是持续爬升：t=0–45 min 基本平直（28.2→31.2 MB；其中 hold 阶段每连接 ≈15 KB），<b>t≈2 710→3 003 s 出现单次 +4.5 MB 阶梯</b>（31 240→35 780 kB），之后 ~10 分钟直至终值（含静置 15 s）完全平直（+0.2%）。Slab / SUnreclaim / fd / bpf map 全程平直，零失败。判定为「一次性分配（用户态 arena / 转发缓冲扩展）」形态而非持续泄漏，但按既定判据如实记 FAIL。候选待查：splice 转发读块的一次性扩容、分配器 arena 抖动；建议 2–3 h 复测观察是否再阶梯，并配 smaps/arena 采样定位。</p>
+<p><b>口径备注</b>：常驻 200 连接在 t≈295 s 被 <code>relay janitor</code> 按空闲超时回收（日志 200 条「回收空闲连接」，holder 进程本身仍存活）。此后负载实际为 churn + 周期负载 + 采样。该回收是设计行为，但意味着 atlas 口径「200 条长连接贯穿全程」在本轮未严格成立——建议 soak 夹具给 hold 连接加心跳或显式设置 <code>relay_idle_timeout</code>，使长稳同时压住“空闲长连接”维度。</p>
+
+<h2 id="s7">§7 UDP 五方（40 000×256 B @20 000 pps）</h2>
+<table>
+<thead><tr><th>实现</th><th class="num">proxy Mbps/pps</th><th class="num">丢包</th><th class="num">proxy CPU/40k 包</th><th class="num">direct 行 CPU</th><th>判定</th></tr></thead>
+<tbody>
+<tr><td>sodama（当前构建）</td><td class="num">1.2 / 500</td><td class="num"><b>39 999 / 40 000</b></td><td class="num">1 130 ms</td><td class="num">0</td><td><span class="tag bad">回程全灭（回归）</span></td></tr>
+<tr><td>dae v2.1.1</td><td class="num">41.0 / 20 000</td><td class="num">0</td><td class="num">2 170 ms</td><td class="num">0</td><td><span class="tag ok">零丢包</span></td></tr>
+<tr><td>sing-box 1.14.2</td><td class="num">41.0 / 20 000</td><td class="num">0</td><td class="num">1 610 ms</td><td class="num">1 110 ms</td><td><span class="tag ok">零丢包</span></td></tr>
+<tr><td>v2ray 5.52.0</td><td class="num">41.0 / 20 000</td><td class="num">0</td><td class="num">1 820 ms</td><td class="num">1 340 ms</td><td><span class="tag ok">零丢包</span></td></tr>
+<tr><td>mihomo 1.19.32</td><td class="num">41.0 / 20 000</td><td class="num">0</td><td class="num">2 460 ms</td><td class="num">1 270 ms</td><td><span class="tag ok">零丢包</span></td></tr>
+</tbody>
+</table>
+<p>pps=20 000 时 256 B 包的线速为 41 Mbps，该口径的分辨力在丢包与 CPU，不在带宽。sodama 上行 100% 转发（<code>udp_nat.sessions_proxied</code> 计数吻合），<b>回程全灭</b>；速率阶梯：2 000/5 000 pps 零丢包 → 10 000 pps 起失败（recv=1/0）。A2 前构建（08d14e6）与 A2-4（26a0411）探针均零丢包，首个失败提交为 <code>e5db7fd</code>（UDP GSO 批次）——详见 §8.4。修复目标参考：atlas 期同口径 580 ms/40k 包（当前构建无法复测）。</p>
+
+<h2 id="s8">§8 回归与修复专题</h2>
+
+<h3>8.1 eBPF 对象被宿主验证器拒载（已修复）</h3>
+<p><b>现象</b>：按当前 main 构建的 eBPF 对象在本机 6.18.54 上加载即失败：<code>1360: (7b) *(u64 *)(r11 -8) = r6 — R11 is invalid</code>（flow.rs:486，<code>conn_save</code> 调用点）。此前内核级验收走 QEMU 7.2.8 矩阵，未覆盖宿主内核加载。</p>
+<p><b>根因</b>：<code>e87ea69</code>（eBPF 余项批次）把 <code>conn_save</code> 扩到 7 个参数。BPF-to-BPF 调用只有 5 个寄存器参数，第 6 个起走栈传参；本工具链（nightly 1.101 + bpf-linker 0.11.1）为栈参数生成 R11 伪寄存器访问且未消除（对象内共 4 处，仅此一调用），6.18 验证器直接拒载。</p>
+<p><b>修复</b>：参数打包为 4 个——<code>conn_save(key, mark, meta, generation)</code>，其中 <code>meta = outbound | must&lt;&lt;8 | l4proto&lt;&lt;16 | slot_enc&lt;&lt;24</code>；<code>#[inline(never)]</code> 独立子程序帧保留（combined stack 约束不变）。修复后对象 R11 = 0，<code>lab.sh verify</code> 宿主全绿：<b>12/12</b>（proxy / direct / block / host-wan / reload / rebind / status / fault-reload / l3-attach / l3 / xdp / fault-kill）。</p>
+<p class="small">该修复尚未提交（工作区改动 <code>sodama/ebpf-rs/src/flow.rs</code>），建议随本轮报告一并入库。修复不改变数据面语义（值等价搬运），对性能影响在噪声内（vless 16 589 与历史同级）。</p>
+
+<h3>8.2 实验室 offload 口径（新 lab 使标准路径吞吐减半）</h3>
+<p><b>现象</b>：默认 lab 拓扑下 sodama VLESS 只有 8.3–9.2 Gbps（CPU 140–190 ms），对照历史 16.9 G。perf 剖面：<code>csum_partial</code> 13.9% / <code>memcpy_orig</code> 11.5% / <code>memset_orig</code> 6.8% / <code>skb_segment</code> 1.6%（均为"软件校验和+软件分段"特征）。</p>
+<p><b>定位</b>：<code>47c603a</code>（今日 L3 收口批次）引入 <code>lab/net_offload.py</code>，<code>up()</code> 中无条件对 <b>dae0/dae0peer（控制面对，代理流量的用户态交接通道）</b>关闭 offload——本意是修 L3 隧道内层校验（ipip 场景），但代理路径的数据面恰经这对 netkit 进出用户态，GSO/校验和卸载被一并关闭。</p>
+<p><b>A/B 实证</b>：同一构建、同一命令，加 <code>SKIP_NET_OFFLOAD=1</code>（lab 内置开关）后 sodama VLESS = <b>17 237 / 17 315 Mbps</b>（+103%）。M1 时代 lab 无任何 offload 动作（已核对 4739410 的 lab.sh），故历史数字均为默认 offload 口径。</p>
+<p><b>处置</b>：本轮全部压测统一 <code>SKIP_NET_OFFLOAD=1</code>（与该 L3 修正不冲突：L3 用例不参与本口径）；建议后续把 dae0/dae0peer 的 offload 关闭动作收进 L3 用例内部（用例前关、后恢复），或在 lab 文档中把"性能轮必须 SKIP_NET_OFFLOAD=1"写成硬口径。</p>
+
+<h3>8.3 ss 吞吐回归（提交级二分：<code>b030f90</code>）</h3>
+<p><b>现象</b>：ss（chacha20）中位 6 228 Mbps 且双峰（5.8–9.0 G），M1 时代 9 840 稳定；dae/sing-box/v2ray 三家均与 atlas 吻合，排除环境。同构建 vless（splice 路径）不受影响。</p>
+<figure>
+<svg viewBox="0 0 880 210" role="img" aria-label="ss 回归二分：各提交 6 轮吞吐">
+  <line x1="70" y1="160" x2="862" y2="160" stroke="#c9c2ae"/>
+  <text x="56" y="164" text-anchor="end" font-size="10" fill="#6f6a5c">4 G</text>
+  <line x1="70" y1="121" x2="862" y2="121" stroke="#eee8d8"/>
+  <text x="56" y="125" text-anchor="end" font-size="10" fill="#6f6a5c">7 G</text>
+  <line x1="70" y1="82" x2="862" y2="82" stroke="#eee8d8"/>
+  <text x="56" y="86" text-anchor="end" font-size="10" fill="#6f6a5c">10 G</text>
+  <g stroke="#c9c2ae" stroke-width="1">
+    <line x1="122" y1="160" x2="122" y2="20"/><line x1="240" y1="160" x2="240" y2="20"/>
+    <line x1="358" y1="160" x2="358" y2="20"/><line x1="476" y1="160" x2="476" y2="20"/>
+    <line x1="594" y1="160" x2="594" y2="20"/><line x1="712" y1="160" x2="712" y2="20"/>
+    <line x1="830" y1="160" x2="830" y2="20"/>
+  </g>
+  <!-- M1: 9338-10292 (10 pts) -->
+  <g fill="#2e7d4f">
+    <circle cx="108" cy="36" r="3"/><circle cx="118" cy="42" r="3"/><circle cx="128" cy="56" r="3"/><circle cx="138" cy="33" r="3"/><circle cx="148" cy="45" r="3"/><circle cx="158" cy="38" r="3"/><circle cx="168" cy="41" r="3"/><circle cx="178" cy="29" r="3"/><circle cx="188" cy="36" r="3"/><circle cx="198" cy="42" r="3"/>
+  </g>
+  <!-- 33d884c: 9514..10214 -->
+  <g fill="#2e7d4f">
+    <circle cx="226" cy="40" r="3"/><circle cx="236" cy="37" r="3"/><circle cx="246" cy="33" r="3"/><circle cx="256" cy="30" r="3"/><circle cx="266" cy="26" r="3"/><circle cx="276" cy="24" r="3"/>
+  </g>
+  <!-- 693f826: 9383..10168 -->
+  <g fill="#2e7d4f">
+    <circle cx="344" cy="43" r="3"/><circle cx="354" cy="42" r="3"/><circle cx="364" cy="32" r="3"/><circle cx="374" cy="31" r="3"/><circle cx="384" cy="30" r="3"/><circle cx="394" cy="24" r="3"/>
+  </g>
+  <!-- b030f90: 4117 4253 6159 8979 9773 9919 -->
+  <g fill="#a0522d">
+    <circle cx="462" cy="160" r="3"/><circle cx="472" cy="158" r="3"/><circle cx="482" cy="113" r="3"/><circle cx="492" cy="54" r="3"/><circle cx="502" cy="38" r="3"/><circle cx="512" cy="34" r="3"/>
+  </g>
+  <!-- b920fe5: 4289 5808 5873 5911 6133 9471 -->
+  <g fill="#a0522d">
+    <circle cx="580" cy="158" r="3"/><circle cx="590" cy="112" r="3"/><circle cx="600" cy="111" r="3"/><circle cx="610" cy="110" r="3"/><circle cx="620" cy="107" r="3"/><circle cx="630" cy="46" r="3"/>
+  </g>
+  <!-- d4ac773: 5692 5699 5700 5928 6031 9644 -->
+  <g fill="#a0522d">
+    <circle cx="698" cy="114" r="3"/><circle cx="708" cy="113" r="3"/><circle cx="718" cy="113" r="3"/><circle cx="728" cy="109" r="3"/><circle cx="738" cy="107" r="3"/><circle cx="748" cy="42" r="3"/>
+  </g>
+  <!-- HEAD: 5797 6096 9031 6229 8864 -->
+  <g fill="#a0522d">
+    <circle cx="816" cy="112" r="3"/><circle cx="826" cy="103" r="3"/><circle cx="836" cy="52" r="3"/><circle cx="846" cy="100" r="3"/><circle cx="856" cy="56" r="3"/>
+  </g>
+  <text x="153" y="182" text-anchor="middle" font-size="10.5" fill="#3d3a33">M1 4739410</text>
+  <text x="251" y="182" text-anchor="middle" font-size="10.5" fill="#3d3a33">#6 33d884c</text>
+  <text x="369" y="182" text-anchor="middle" font-size="10.5" fill="#3d3a33">#7 693f826</text>
+  <text x="487" y="182" text-anchor="middle" font-size="10.5" fill="#3d3a33">#8 b030f90</text>
+  <text x="605" y="182" text-anchor="middle" font-size="10.5" fill="#3d3a33">#24 b920fe5</text>
+  <text x="723" y="182" text-anchor="middle" font-size="10.5" fill="#3d3a33">#48 d4ac773</text>
+  <text x="836" y="182" text-anchor="middle" font-size="10.5" fill="#3d3a33">HEAD</text>
+  <text x="70" y="204" font-size="10.5" fill="#6f6a5c">每列 = 该提交 6 轮实测分布（绿=干净，橙=劣化）；M1 为 10 轮。y 轴 4→10 Gbps。</text>
+</svg>
+<figcaption><b>图 4 · ss 回归二分（48 MB×4 流，ssserver 上游，每提交 6 轮）。</b>#7 之前全部 9.3–10.3 G 稳定；<code>b030f90</code>（M4-stag2：ss/ssr/anytls codec 会话迁上 reactor）起出现 4.1–4.3 G 慢轮；其后提交慢轮占比升高，直至 HEAD 中位 ≈5.8–6.2 G。</figcaption>
+</figure>
+<table>
+<thead><tr><th>提交</th><th>内容</th><th class="num">6 轮分布（Mbps）</th><th class="num">中位</th><th>判定</th></tr></thead>
+<tbody>
+<tr><td>4739410（M1，10 轮）</td><td>splice 零拷贝数据面（atlas 16.9 G 同源）</td><td class="num">9 338–10 292</td><td class="num">9 840</td><td><span class="tag ok">干净</span></td></tr>
+<tr><td>33d884c (#6)</td><td>reactor codec 会话（VLESS-TLS/Trojan）</td><td class="num">9 514 / 9 585 / 9 765 / 9 940 / 10 088 / 10 214</td><td class="num">9 852</td><td><span class="tag ok">干净</span></td></tr>
+<tr><td>693f826 (#7)</td><td>codec 覆盖 VLESS 全组合 + vmess</td><td class="num">9 383 / 9 464 / 9 822 / 9 870 / 9 892 / 10 168</td><td class="num">9 846</td><td><span class="tag ok">干净</span></td></tr>
+<tr><td><b>b030f90 (#8)</b></td><td><b>codec 覆盖 ss/ssr/anytls；offload 看门狗单线程化</b></td><td class="num">4 117 / 4 253 / 6 159 / 8 979 / 9 773 / 9 919</td><td class="num">7 569</td><td><span class="tag bad">首个劣化</span></td></tr>
+<tr><td>b920fe5 (#24)</td><td>P35 inotify 热驱动等</td><td class="num">4 289 / 5 808 / 5 873 / 5 911 / 6 133 / 9 471</td><td class="num">5 892</td><td><span class="tag bad">劣化</span></td></tr>
+<tr><td>d4ac773 (#48)</td><td>（含"组绕 reactor"修复）</td><td class="num">5 692 / 5 699 / 5 700 / 5 928 / 6 031 / 9 644</td><td class="num">5 814</td><td><span class="tag bad">劣化</span></td></tr>
+<tr><td>HEAD（e5db7fd）</td><td>A2 收口</td><td class="num">5 797 / 6 096 / 9 031 / 6 229 / 8 864</td><td class="num">6 228</td><td><span class="tag bad">劣化</span></td></tr>
+</tbody>
+</table>
+<p><b>解读与修复方向</b>：ss 是"全 AEAD 每字节"的 codec，迁入 reactor 后每连接的双向加密在单一 worker 上串行交错；旧线程泵路径（每连接独立泵线程，可跨核并行）+ 每字节拷贝的调度更有利。表现为：快轮可达 9 G（说明算力足够）但慢轮增多（调度/流水线化不足），且 CPU 总量反而不高（520 ms vs 历史 590 ms vs wall 更长的"stall"形态）。建议：① 复核 reactor codec 的 rx/tx 交错策略（同会话两方向分派到不同 worker 或显式流水线）；② 或为"每字节重加密类 codec"保留线程泵回退路径；③ 在 lab 增加 ss 吞吐门禁（本轮数据已可作基线）。</p>
+
+<h3>8.4 UDP 回程全灭回归（提交级二分：<code>e5db7fd</code>）</h3>
+<p><b>现象</b>：ss UDP 代理路径在 ≥10 000 pps 时回程全灭（上行 100% 转发、客户端 recv≈0）；≤5 000 pps 正常。</p>
+<table>
+<thead><tr><th>探针</th><th>内容</th><th class="num">20k pps ×2 轮结果</th><th>判定</th></tr></thead>
+<tbody>
+<tr><td>08d14e6</td><td>A2 前最后代码提交</td><td class="num">recv=4000 / 4000（零丢包）</td><td><span class="tag ok">通过</span></td></tr>
+<tr><td>26a0411</td><td>A2 批次 4</td><td class="num">recv=4000 / 4000（零丢包）</td><td><span class="tag ok">通过</span></td></tr>
+<tr><td><b>e5db7fd</b></td><td><b>A2 批次 5（UDP GSO 引入）</b></td><td class="num">recv=1 / 0（全灭）</td><td><span class="tag bad">失败</span></td></tr>
+</tbody>
+</table>
+<p><b>机制（代码级证据）</b>：<code>loader/src/main.rs</code> 的 <code>udp_gso_enable()</code>（8723 行）用 <code>setsockopt(SOL_UDP, UDP_SEGMENT, 1)</code> 做"能力探测"并留下副作用——<b>该回复 socket 的 gso_size=1</b>；随后 <code>send_gso_udp()</code> 在 <code>hdr.msg_controllen</code> 仍为 0 时调用 <code>CMSG_FIRSTHDR(&hdr)</code>（glibc 要求 <code>msg_controllen ≥ sizeof(cmsghdr)</code>）→ 恒返回 NULL → 提前 <code>Ok(false)</code>，<b>GSO 发送从未真正发生</b>、回落 sendmmsg。于是：首次"同目的等长 ≥2 报"批次触发 enable（污染 socket），此后该 socket 上<b>一切回复发送</b>都被内核按 gso_size=1 处理/拒绝 → 回程全灭。</p>
+<p><b>关键实证</b>：① 20k pps 失败后，同一会话下 2k pps 重试<i>也</i>全灭（新进程新会话则 2k pps 正常）——污染持久于 socket；② <code>udp_nat.sessions_proxied</code> 计数表明上行全量转发；③ 状态面 <code>gso_sends</code> 不增长（发送未发生）。</p>
+<p><b>修复方向</b>：① 在 <code>CMSG_FIRSTHDR</code> 前先设 <code>msg_controllen</code>（或直接手写 cmsghdr，不依赖 CMSG_FIRSTHDR）；② 探测不得留下 gso_size=1 副作用（例如探测后用 <code>UDP_SEGMENT=0</code> 复位，或仅通过首次真实 GSO sendmsg 的 EINVAL 反馈回落）；③ 增加 UDP 高 pps（≥10k）的门禁用例——本轮数据表明既有 verify/cap 用例未覆盖该速率窗。</p>
+
+<h2 id="s9">§9 复现命令</h2>
+<pre><code># 构建（含本轮 R11 修复）
+cd sodama && cargo build --release && lab/build-ebpf-rs.sh
+
+# 口径（本轮全部命令均带）：保持历史标准（offload 默认开）
+export SKIP_NET_OFFLOAD=1
+
+# 吞吐四方（VLESS 5 轮 / ss 5 轮 ssserver 上游 / TLS 3 轮）
+sudo ROUNDS=5 PROXY_PROTO=vless lab/perf/run.sh all
+sudo ROUNDS=5 PROXY_PROTO=ss SS_UPSTREAM=ssserver lab/perf/run.sh all
+sudo ROUNDS=3 PROXY_PROTO=vless-tls lab/perf/run.sh all
+
+# 并发扩展
+sudo PROXY_PROTO=vless lab/perf/run.sh prepare && sudo OUT=/tmp/scaling.tsv lab/perf/scaling.sh all
+
+# 内存五方 + 四层扫描（含 5 万点）
+sudo lab/perf/mem.sh all
+sudo lab/perf/mem-system.sh prepare
+PTS="100 500 1000 2000 5000 10000 20000 50000"
+sudo POINTS="$PTS" HOLD_SECS=6 SETUP_MAX=1500 RESULTS=/tmp/mem-control.tsv  lab/perf/mem-system.sh run-control
+sudo POINTS="$PTS" HOLD_SECS=6 SETUP_MAX=1500 RESULTS=/tmp/mem-sodama.tsv   lab/perf/mem-system.sh run
+sudo IMPL=dae     POINTS="$PTS" HOLD_SECS=6 SETUP_MAX=1500 RESULTS=/tmp/mem-dae.tsv     lab/perf/mem-system.sh run
+sudo IMPL=singbox POINTS="$PTS" HOLD_SECS=6 SETUP_MAX=1500 RESULTS=/tmp/mem-singbox.tsv lab/perf/mem-system.sh run
+
+# UDP 五方 / codec 压 / 长稳
+sudo UDP_COUNT=40000 UDP_SIZE=256 UDP_PPS=20000 ROUNDS=3 lab/perf/udp.sh prepare && sudo ... lab/perf/udp.sh all
+sudo PROXY_PROTO=vless-tls lab/perf/run.sh prepare && sudo lab/perf/codec-stress.sh 15
+sudo lab/perf/soak-curve.sh run 3600
+
+# 回归二分（工作树）：checkout 提交 → 构建 → 同一 ss/UDP 探针（详见数据目录）
+# 注意 dae 对照二进制：官方 v2.1.1 预编译置于 /tmp/perf/usr/bin/dae</code></pre>
+
+<h2 id="s10">§10 数据源与后续建议</h2>
+<ul>
+<li>原始数据：<code>docs/reviews/2026-10-16-local-full-bench/</code>（16 个 TSV + README）。</li>
+<li>建议后续动作（按优先级）：① UDP GSO 修复 + 高 pps 门禁（阻塞性功能缺陷）；② ss reactor codec 调度修复（对照 M1 线程泵路径回归验证）；③ 长稳 RSS 阶梯复测（§6，2–3 h + smaps）；④ R11 修复入库；⑤ lab offload 口径固化（§8.2）；⑥ run.sh 增加实现就绪判定（§2.3）；⑦ 真实公网口径轮（real.sh）待节点 URL 后补测。</li>
+<li>本轮未覆盖：真实公网节点（需 URL）、72 h 长稳（60 min 已完成，见 §6）、OpenWrt 生产机复测（真机 CPU/内存口径见 atlas §4.7，不因本轮而变）。</li>
+</ul>
+
+<footer class="doc">
+  <p>性能与资源边界报告 v4.0 · 2026-10-16 本机全量强度轮 · 数据目录 <code>docs/reviews/2026-10-16-local-full-bench/</code> · 图集口径见 <code>docs/sodama-atlas.html</code> §4 与 <code>docs/benchmark-report.html</code> v3.0。</p>
+  <p>所有数字均为本轮实测；未复现项与不确定项已显式标注（如 v2ray direct 行为、ss 慢轮的调度解释为待证假说）。</p>
+</footer>
+
+</div>
+</body>
+</html>

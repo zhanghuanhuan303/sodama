@@ -1,0 +1,6 @@
+RSS          base=    30496 final=    35852 drift=+17.56% (≤5%) FAIL
+Slab         base=   790336 final=   792412 drift= +0.26% (≤5%) PASS
+SUnreclaim   base=   287324 final=   289840 drift= +0.88% (≤5%) PASS
+fd           base=      759 final=      359 drift=-52.70% (无增长) PASS
+fail 记录：无
+bounded-memory 判据：FAIL
