@@ -65,7 +65,7 @@ PASS=xxx scripts/deploy.sh                   # 停服务→推送→procd 重启
 
 密码一律通过 `PASS` 环境变量传入（脚本不内置默认密码）；`HOST` 可覆盖目标。
 
-产物：二进制 ~2.6 MB（含 TLS）、静态资源 ~940 KB、常驻 **~3 MB RSS / 3 线程**（实测，OpenWrt 软路由）；无浏览器访问时不采样、不 fork。
+产物（v2.0 实测）：二进制 **2.8 MB**（含 TLS）、静态资源 **~1.2 MB**（wasm 1.17 MB + JS/CSS，未压缩传输——同机/局域网口径）、常驻 **~3 MB RSS / 3 线程**（OpenWrt 软路由）；无浏览器访问时不采样、不 fork。
 
 ## API
 
