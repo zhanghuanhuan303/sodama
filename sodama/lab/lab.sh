@@ -39,7 +39,7 @@
 #   sudo lab/lab.sh test-xdp              # 对标批 C4：XDP 计量探针（恒 XDP_PASS）计数随流量推进
 #   USE_XDP_IFACE=  # 显式置空可关闭 up() 默认的 --xdp landae 计量探针
 #   NO_L3=1         # 不建 L3 段（跳过 ipip 隧道）
-#   SKIP_NET_OFFLOAD=1  # 跳过 up() 对 l3u/landae3/dae0 等设备的关 offload（A/B 对照用）
+#   SKIP_NET_OFFLOAD=1  # 跳过 L3/控制面的关 offload 治理（A/B 对照用）
 #   USE_LAN_ARG / USE_WAN_ARG  # 覆盖 up() 传给 loader 的 --lan/--wan（接口 pattern / 热插拔用）
 #   sudo lab/lab.sh must-up       # 能力缺口 #1：must_<组名> 前缀糖（config 路径）
 #   sudo lab/lab.sh test-must     #   must_proxy → proxy(must)：DNS 不劫持（A/B 计数器断言）
@@ -684,10 +684,10 @@ up() {
   # 对照 dae control/netns_utils.go:863-867：accept_local 防止内核按
   # "martian source" 丢掉源地址是本机地址的包
   ip netns exec "$DAE_NS" sysctl -qw net.ipv4.conf.dae0peer.accept_local=1
-  # 关掉控制面对（dae0/dae0peer）的 offload：L3 回程会经这对 veth 进控制面再回来，
-  # 不关时内层校验和以 PARTIAL 一路带到隧道封装，对端静默丢包（同 net_offload.py 注释）。
-  disable_offload dae0
-  netns_disable_offload "$DAE_NS" dae0peer
+  # 控制面对（dae0/dae0peer）的 offload 治理（关→用→恢复）已移入 test_l3：
+  # 仅 L3 数据用例需要（内层校验和 PARTIAL 进 ipip 封装会对端静默丢包）；
+  # 在此处无条件关会把**标准代理路径**的吞吐砍半（2026-10-17 实测 17.3→8.5 Gbps，
+  # 代理数据面恰经这对 netkit 进出用户态）——性能口径必须保持 offload 默认开。
   # MTU 1466（=1500-34）：控制面回程要能塞进 L3 隧道的封装里（否则大流超 MTU）。
   # 只在建了 L3 段时降——标准拓扑保持 1500，不影响既有性能基线。
   if [ -n "$L3_IFACE" ]; then
@@ -3371,6 +3371,16 @@ test_l3() {
   [ -n "$L3_IFACE" ] || L3_IFACE=landae3
   [ -e "/sys/class/net/$L3_IFACE" ] || { echo "SKIP: 无 L3 接口（$L3_IFACE 不存在，ipip 隧道未建）"; touch /tmp/sodama-l3-skip; return 0; }
   echo "== 测试 L3 端到端（ipip 隧道 $L3_IFACE）=="
+  # C1 校验和治理（自 up() 移入）：仅本用例关 dae0/dae0peer offload（内层校验和
+  # PARTIAL 进 ipip 封装会对端静默丢包）；用例结束恢复——标准压测路径不再受影响
+  # （性能口径：offload 默认开；SKIP_NET_OFFLOAD=1 可整体跳过本治理）。
+  restore_offloads() {
+    [ -z "${SKIP_NET_OFFLOAD:-}" ] || return 0
+    python3 "$HERE/net_offload.py" --on dae0 >/dev/null 2>&1 || true
+    ip netns exec "$DAE_NS" python3 "$HERE/net_offload.py" --on dae0peer >/dev/null 2>&1 || true
+  }
+  disable_offload dae0
+  netns_disable_offload "$DAE_NS" dae0peer
   # 接口类型自证：ipip 应为 arphrd=768（ARPHRD_TUNNEL）。数值只作证据打印，
   # 真正的断言是「loader 把它归为 L3 并挂上了 _l3 变体」（下一段）。
   local ty
@@ -3391,6 +3401,7 @@ test_l3() {
   echo "$out"
   echo "$out" | grep -q "^stream-ok bytes=524288" || rc=1
   ip -n "$CLIENT_NS" route del "$PROXY_DST/32" dev l3cli 2>/dev/null || true
+  restore_offloads
   [ "$rc" = 0 ] || { echo "FAIL: L3 链路分流未打通（补头/剥头/解析链）"; exit 1; }
   echo "PASS: L3 变体分流（经 ipip 隧道的 512KB 回显一致，补头+剥头闭环）"
 }

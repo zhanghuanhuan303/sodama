@@ -56,17 +56,27 @@ FEATURES = [
 
 
 def main() -> int:
-    if len(sys.argv) < 2:
-        print(__doc__)
+    """用法：net_offload.py [--on] <dev>…
+
+    默认关闭五类 offload（校验和/TSO/GSO/GRO）；`--on` 恢复开启
+    （用于 L3 用例的“治完即还”，避免污染同一拓扑上的后续压测）。
+    """
+    args = sys.argv[1:]
+    enable = False
+    if args and args[0] in ("--on", "--enable", "on"):
+        enable = True
+        args = args[1:]
+    if not args:
+        print(main.__doc__)
         return 2
     failed = 0
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
-        for dev in sys.argv[1:]:
+        for dev in args:
             states = []
             for name, gcmd, scmd in FEATURES:
                 try:
-                    _ioctl_value(sock, dev, scmd, 0)
+                    _ioctl_value(sock, dev, scmd, 1 if enable else 0)
                 except OSError as e:
                     failed += 1
                     states.append(f"{name}=set失败({e.strerror})")
