@@ -1,6 +1,6 @@
 # 对标进度：dae（Go）↔ sodama（全 Rust）
 
-- **版本**：v2.19 · 2026-10-16（A2 批次（除工程打包）19 项：`--version`（git sha/profile 注入）、`export outline` schema、`trace` 过滤器（内核侧位图过滤 + `SODAMA_EVENT_TRACE`）、`sysdump --out *.tar.gz` 现场归档、日志轮转三参 + `log_level`、global 生效面 27 → 36（`so_mark_from_dae`/`mptcp`/`allow_insecure`/`udphop_interval`/`fallback_resolver`/`disable_thp`/等待网络/sysctl 纠正 + `tls_fragment*`/`utls_imitate`/`pprof_port`/`bandwidth_max_*`）、`dns.ipversion_prefer` 50ms 偏好等待、DNS 投影重试堆、1h 流量历史、告警节流、`sd_notify` + systemd 单元强化、`reload/suspend --drain=N` 排空预算、`real_domain_runtime`、UDP GSO、钩子生命周期用例 + lab 基建修复——ADR-0069、devlog §23。v2.18 = A1 批次（ADR-0068））
+- **版本**：v2.20 · 2026-10-17（修复轮：ws 帧边界干净 EOF 假失败修复（生产 78% 会话误报日志根因）+ musl 交叉构建 GSO cmsg 可移植修复；单测 351 = 348 + ebpf-logic 3；面板 v2.0 上线生产、新引擎 72h 轮进行中；ATLAS v2.0（重写版）。覆盖度数字与证据锚点继承 v2.19。v2.19 = 2026-10-16（A2 批次（除工程打包）19 项：`--version`（git sha/profile 注入）、`export outline` schema、`trace` 过滤器（内核侧位图过滤 + `SODAMA_EVENT_TRACE`）、`sysdump --out *.tar.gz` 现场归档、日志轮转三参 + `log_level`、global 生效面 27 → 36（`so_mark_from_dae`/`mptcp`/`allow_insecure`/`udphop_interval`/`fallback_resolver`/`disable_thp`/等待网络/sysctl 纠正 + `tls_fragment*`/`utls_imitate`/`pprof_port`/`bandwidth_max_*`）、`dns.ipversion_prefer` 50ms 偏好等待、DNS 投影重试堆、1h 流量历史、告警节流、`sd_notify` + systemd 单元强化、`reload/suspend --drain=N` 排空预算、`real_domain_runtime`、UDP GSO、钩子生命周期用例 + lab 基建修复——ADR-0069、devlog §23。v2.18 = A1 批次（ADR-0068））
 - **口径**：「覆盖度」= 该域**功能点覆盖**的粗估（我方可用 ÷ dae 等价能力），
   **不是代码行数、不是性能等价**；数字是判断值，逐行给出证据出处。
   按口径分两档汇总：主链路（日常代理网关）与 dae 全功能面。
