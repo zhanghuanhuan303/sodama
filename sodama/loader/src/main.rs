@@ -146,6 +146,8 @@ static TCP_RELAY_TX: OnceLock<std::sync::mpsc::Sender<TcpStream>> = OnceLock::ne
 static GROUP_SET: OnceLock<std::sync::RwLock<GroupSet>> = OnceLock::new();
 /// P19：conn_state_map 的 fd（dup；relay/UDP 线程按 5 元组回读该连接选中的组）。
 static CONN_STATE_MAP_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+/// routing_handoff_map 的 dup fd（首包路由兜底读取用；模式同上）。
+static HANDOFF_MAP_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
 
 /// P19：组集合与默认组（`--group` 指定 > proxy > 第一个）。
 #[derive(Default)]
@@ -292,6 +294,10 @@ struct RelayStats {
     /// 对标批：offload 会话在内核路径真实推送的字节（`skb_send_sock` fentry/kprobe
     /// 记账，per-CPU 分桶；用户态在键摘除时汇总 `offload_sent` 得到）。
     offload_sent_bytes: AtomicU64,
+    /// 背压 fuse（对照 dae `fuseStep`/`tcp_offload_pause`）：engage / lift / 失败计数。
+    fuse_engages: AtomicU64,
+    fuse_lifts: AtomicU64,
+    fuse_failures: AtomicU64,
 }
 static RELAY_STATS: RelayStats = RelayStats {
     conns_total: AtomicU64::new(0),
@@ -312,6 +318,9 @@ static RELAY_STATS: RelayStats = RelayStats {
     limit_rejected: AtomicU64::new(0),
     reactor_codec_sessions: AtomicU64::new(0),
     offload_sent_bytes: AtomicU64::new(0),
+    fuse_engages: AtomicU64::new(0),
+    fuse_lifts: AtomicU64::new(0),
+    fuse_failures: AtomicU64::new(0),
 };
 
 // ---- P-AI：按域名统计（面板「AI 流量」卡片的数据源） ------------------------
@@ -540,6 +549,81 @@ static RELAY_OFFLOAD_GUARD: OnceLock<Mutex<HashMap<MapData, SodaTuple, u8>>> = O
 /// 的 `tcp_offload_sent`（记账在 `tproxy.c:4324-4393`；其 per-key 背压 fuse 未实现，
 /// 本表只做归因计量）。
 static OFFLOAD_SENT: OnceLock<Mutex<PerCpuHashMap<MapData, SodaTuple, u64>>> = OnceLock::new();
+
+/// offload 背压 fuse 的 pause 表（键在 = verdict 改回 SK_PASS，数据交用户态泵）。
+/// 对照 dae `tcp_offload_pause`（`control/tcp_offload_linux.go` 的 fuseStep）。
+/// 数据面是 LRU_HASH；用户态用 `HashMap` 承载（aya 的 `TryFrom` 支持 LruHashMap 变体）。
+static OFFLOAD_PAUSE: OnceLock<Mutex<HashMap<MapData, SodaTuple, u8>>> = OnceLock::new();
+
+/// 出口连通性投影句柄（Array；每 2s 由 `connectivity_loop` 从组健康刷新）。
+/// 对照 dae `outbound_connectivity_map` + `resumeOutboundConnectivityUpdates`。
+static OUTBOUND_CONNECTIVITY: OnceLock<Mutex<Array<MapData, u32>>> = OnceLock::new();
+/// 上次投影的 dead 组数（status 用；0 = 全部存活）。
+static CONNECTIVITY_DEAD_GROUPS: AtomicU64 = AtomicU64::new(0);
+
+/// 出口连通性投影（对照 dae `control/connectivity.go:135-186`）：
+/// 仅 `dial_mode=ip` 且策略非 random/fixed 时把真实健康写入数据面；否则恒写 1
+/// （保留用户态选择/回退）。键域：outbound*6 + domain*2 + ipver（3 domain × 2 版本）。
+fn publish_outbound_connectivity() {
+    let Some(gs_lock) = GROUP_SET.get() else {
+        return;
+    };
+    let Some(map_lock) = OUTBOUND_CONNECTIVITY.get() else {
+        return;
+    };
+    let mode = DIAL_MODE.load(Ordering::Relaxed);
+    let gs = match gs_lock.read() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    let Ok(mut map) = map_lock.lock() else {
+        return;
+    };
+    let mut dead = 0u64;
+    for (i, g) in gs.groups.iter().enumerate() {
+        let outbound = (rules::GROUP_INDEX_BASE as usize + i) as u8;
+        if outbound >= rules::OUTBOUND_MUST_RULES {
+            break;
+        }
+        let policy = g.policy();
+        // 空组（无节点，dialer 兑底直连）不投影真实健康：sodama 特有形态，
+        // 投影 0 会把兑底流量全部阻断（dae 的组总有成员，无此形态）。
+        let publish_health = mode == 0
+            && g.member_count() > 0
+            && !matches!(
+                &*policy,
+                group::Policy::Random | group::Policy::Fixed(_) | group::Policy::FixedName(_)
+            );
+        let alive: u32 = if publish_health {
+            if g.snapshot().iter().any(|n| n.alive) {
+                1
+            } else {
+                0
+            }
+        } else {
+            1
+        };
+        if alive == 0 {
+            dead += 1;
+        }
+        for domain in 0..3u32 {
+            for ipv in 0..2u32 {
+                let key = (outbound as u32) * 6 + domain * 2 + ipv;
+                let _ = map.set(key, alive, 0);
+            }
+        }
+    }
+    CONNECTIVITY_DEAD_GROUPS.store(dead, Ordering::Relaxed);
+}
+
+/// 投影循环（2s tick；幂等写，开销 = 组数 × 6 次 map set）。
+/// 首次启动晚于组构建：循环内部容忍 GROUP_SET/句柄未就绪（early return）。
+fn connectivity_loop() {
+    loop {
+        std::thread::sleep(Duration::from_secs(2));
+        publish_outbound_connectivity();
+    }
+}
 
 // ---- P4b：UDP NAT ----
 
@@ -884,10 +968,138 @@ extern "C" fn on_sigusr2(_sig: libc::c_int) {
 struct SodaConfig {
     tproxy_port: u32,
     dae0_ifindex: u32,
+    datapath_generation: u16,
     dae0peer_mac: [u8; 6],
-    pad: [u8; 2],
 }
 unsafe impl aya::Pod for SodaConfig {}
+
+/// 数据面代次（u16，非 0）：启动时由时间种子随机、每次 reload 递增。
+/// 数据面把写时的代次+epoch 槽记进 conn_state；纯 SYN 按「同代拒改 / 异代重路由」
+/// 分流（对照 dae `nextDatapathGeneration`，`control/datapath_generation.go:20-27`；
+/// sodama 的冷启动代次必与上一次不同——跨重启保留的 pinned 条目因此不会误判同代）。
+static DATAPATH_GENERATION: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
+
+fn init_datapath_generation() -> u16 {
+    let cur = DATAPATH_GENERATION.load(Ordering::SeqCst);
+    if cur != 0 {
+        return cur;
+    }
+    let seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| (d.subsec_nanos() ^ d.as_secs() as u32) as u16)
+        .unwrap_or(1)
+        | 1;
+    DATAPATH_GENERATION.store(seed, Ordering::SeqCst);
+    seed
+}
+
+fn next_datapath_generation() -> u16 {
+    loop {
+        let cur = DATAPATH_GENERATION.load(Ordering::SeqCst);
+        let mut next = cur.wrapping_add(1);
+        if next == 0 {
+            next = 1;
+        }
+        if DATAPATH_GENERATION
+            .compare_exchange(cur, next, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            return next;
+        }
+    }
+}
+
+/// reload 时递增代次并回写 config_map（生效于数据面纯 SYN 重绑判定）。
+/// 对照 dae：每次换代重建 datapath 时写新 `PARAM.datapath_generation`。
+fn bump_datapath_generation(ebpf: &mut Ebpf) {
+    let gen = next_datapath_generation();
+    let Some(map) = ebpf.map_mut("config_map") else {
+        return;
+    };
+    let Ok(mut arr) = Array::<_, SodaConfig>::try_from(map) else {
+        return;
+    };
+    if let Ok(cur) = arr.get(&0, 0) {
+        let next = SodaConfig {
+            datapath_generation: gen,
+            ..cur
+        };
+        if arr.set(0, next, 0).is_ok() {
+            log(&format!("datapath generation -> {gen}"));
+        }
+    }
+}
+
+fn current_datapath_generation() -> u16 {
+    let v = DATAPATH_GENERATION.load(Ordering::SeqCst);
+    if v == 0 { 1 } else { v }
+}
+
+/// conn_state_map 的 pin 路径（对照 dae `LIBBPF_PIN_BY_NAME` + `/sys/fs/bpf/dae`；
+/// sodama 用 `/sys/fs/bpf/sodama/conn_state_map`）。
+const CONN_STATE_PIN_DIR: &str = "/sys/fs/bpf/sodama";
+fn conn_state_pin_path() -> std::path::PathBuf {
+    std::path::Path::new(CONN_STATE_PIN_DIR).join("conn_state_map")
+}
+
+/// 把 pinned 旧 conn_state_map 的条目迁移进新表，然后 pin 新表。
+/// 对照 dae：`LIBBPF_PIN_BY_NAME`（跨重启保留）+「Loader may override pinning on
+/// cold start」；sodama 用一次性搬迁替代 libbpf 的 pinned map 复用——旧条目的
+/// `datapath_generation` 与新进程不同，纯 SYN 会按「异代重路由」处理（语义正确）。
+/// 尽力而为：/sys/fs/bpf 不可写、旧表不兼容等都只告警不阻断启动。
+fn migrate_pinned_conn_state(ebpf: &mut Ebpf, capacity: u32) {
+    let path = conn_state_pin_path();
+    let mut migrated: u64 = 0;
+    let mut dropped: u64 = 0;
+    if path.exists() {
+        match aya::maps::MapData::from_pin(&path) {
+            Ok(old_data) => {
+                let mut entries: Vec<(SodaTuple, SodaConnState)> = Vec::new();
+                if let Ok(old) = HashMap::<MapData, SodaTuple, SodaConnState>::try_from(
+                    aya::maps::Map::HashMap(old_data),
+                ) {
+                    // 容量上限防御：旧表可能来自更大的配置。
+                    for item in old.iter().take(capacity as usize) {
+                        if let Ok(kv) = item {
+                            entries.push(kv);
+                        }
+                    }
+                }
+                if let Some(map) = ebpf.map_mut("conn_state_map") {
+                    if let Ok(mut new_map) = HashMap::<_, SodaTuple, SodaConnState>::try_from(map) {
+                        for (k, v) in &entries {
+                            match new_map.insert(k, v, 0) {
+                                Ok(()) => migrated += 1,
+                                Err(_) => dropped += 1,
+                            }
+                        }
+                    }
+                }
+            }
+            Err(e) => log(&format!("conn_state pin: 读旧表失败（{e}），跳过迁移")),
+        }
+        // 旧 pin 必须先摘掉（pin 新表会 EEXIST）。
+        if let Err(e) = std::fs::remove_file(&path) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                log(&format!("conn_state pin: 摘除旧 pin 失败（{e}）"));
+            }
+        }
+    }
+    // pin 新表（失败降级：无 pinning = 重启后状态不保留，靠无状态放行兜底）。
+    match std::fs::create_dir_all(CONN_STATE_PIN_DIR) {
+        Ok(()) => {
+            if let Some(aya::maps::Map::HashMap(md)) = ebpf.map("conn_state_map") {
+                if let Err(e) = md.pin(&path) {
+                    log(&format!("conn_state pin: 失败（{e}），重启后状态不保留"));
+                }
+            }
+        }
+        Err(e) => log(&format!("conn_state pin: 目录不可用（{e}），重启后状态不保留")),
+    }
+    if migrated > 0 || dropped > 0 {
+        log(&format!("conn_state pin: 迁移 {migrated} 条（容量外丢弃 {dropped}）"));
+    }
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -913,9 +1125,27 @@ struct SodaConnState {
     has_routing: u8,
     l4proto: u8,
     is_wan_ingress_direction: u8,
-    pad: [u8; 3],
+    routing_epoch_slot: u8,
+    pad: [u8; 2],
+    datapath_generation: u16,
 }
 unsafe impl aya::Pod for SodaConnState {}
+
+/// 首包路由结果交接（兜底；与 ebpf-rs/src/common.rs 的 `SodaRoutingHandoffEntry` 同位）。
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+struct SodaRoutingHandoffEntry {
+    last_seen_ns: u64,
+    result: u64,
+    datapath_generation: u16,
+    dscp: u8,
+    pad: u8,
+    mac: [u8; 6],
+}
+unsafe impl aya::Pod for SodaRoutingHandoffEntry {}
+
+/// handoff 条目陈旧阈值（sodama 侧；见 ebpf-rs/common.rs `SODAMA_HANDOFF_TTL_NS`）。
+const SODAMA_HANDOFF_TTL_NS: u64 = 30_000_000_000;
 
 /// 与 ebpf-rs/src/common.rs 的 `SodaTraceParam` 同位（16 字节）。
 /// 字段= `struct sk_buff` 的字节偏移（用户态 BTF 解出后写入；a/k/a «CO-RE 替代»）。
@@ -952,8 +1182,11 @@ unsafe impl aya::Pod for SodaEvent {}
 const EV_BLOCKED: u32 = 0;
 const EV_UDP_CONN_OVERFLOW: u32 = 1;
 const EV_TCP_CONN_OVERFLOW: u32 = 2;
+const EV_BLOCKED_ALIVE: u32 = 3;
 const EV_REDIRECT_REBIND_REJECTED: u32 = 4;
+const EV_SYN_REBIND_REJECTED: u32 = 5;
 const EV_REDIRECT_UPDATE_FAILED: u32 = 8;
+const EV_SYN_REBIND_REROUTED: u32 = 9;
 
 /// 事件类型名（日志/status 用；未实现的编号保留为 unknown）。
 fn event_type_name(t: u32) -> &'static str {
@@ -961,8 +1194,11 @@ fn event_type_name(t: u32) -> &'static str {
         EV_BLOCKED => "blocked",
         EV_UDP_CONN_OVERFLOW => "udp_conn_overflow",
         EV_TCP_CONN_OVERFLOW => "tcp_conn_overflow",
+        EV_BLOCKED_ALIVE => "blocked_alive",
         EV_REDIRECT_REBIND_REJECTED => "redirect_rebind_rejected",
+        EV_SYN_REBIND_REJECTED => "syn_rebind_rejected",
         EV_REDIRECT_UPDATE_FAILED => "redirect_update_failed",
+        EV_SYN_REBIND_REROUTED => "syn_rebind_rerouted",
         _ => "unknown",
     }
 }
@@ -971,14 +1207,20 @@ fn event_type_name(t: u32) -> &'static str {
 /// 经 `event_type_slot` 归一）；未知类型与长度异常的记录单独归入 unknown——对照
 /// dae `control/event_ringbuf.go` 的 default 分支：ABI 漂移不得被静默丢弃。
 static EVENTS_TOTAL: AtomicU64 = AtomicU64::new(0);
-static EVENT_COUNTS: [AtomicU64; 5] = [
+static EVENT_COUNTS: [AtomicU64; 8] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
 ];
-static EVENT_SUPPRESSED: [AtomicU64; 5] = [
+static EVENT_SUPPRESSED: [AtomicU64; 8] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
@@ -987,7 +1229,10 @@ static EVENT_SUPPRESSED: [AtomicU64; 5] = [
 ];
 /// 每类型最近一条日志的 monotonic ns：用户态限速 1 条/秒/类型（未知类型更严），
 /// 其余只计数——内核侧已限速，这里兜底 ABI 漂移/损坏数据打爆日志的可能。
-static EVENT_LAST_LOG_NS: [AtomicU64; 5] = [
+static EVENT_LAST_LOG_NS: [AtomicU64; 8] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
@@ -998,14 +1243,17 @@ static EVENT_UNKNOWN_TOTAL: AtomicU64 = AtomicU64::new(0);
 static EVENT_UNKNOWN_SUPPRESSED: AtomicU64 = AtomicU64::new(0);
 static EVENT_UNKNOWN_LAST_LOG_NS: AtomicU64 = AtomicU64::new(0);
 
-/// 已知事件类型 → 槽位（`EV_*` 是位标志，值不连续，不能直接当下标）。
+/// 已知事件类型 → 槽位（与 `events_json` 的列表顺序一致）。
 fn event_type_slot(t: u32) -> Option<usize> {
     match t {
         EV_BLOCKED => Some(0),
         EV_UDP_CONN_OVERFLOW => Some(1),
         EV_TCP_CONN_OVERFLOW => Some(2),
-        EV_REDIRECT_REBIND_REJECTED => Some(3),
-        EV_REDIRECT_UPDATE_FAILED => Some(4),
+        EV_BLOCKED_ALIVE => Some(3),
+        EV_REDIRECT_REBIND_REJECTED => Some(4),
+        EV_SYN_REBIND_REJECTED => Some(5),
+        EV_REDIRECT_UPDATE_FAILED => Some(6),
+        EV_SYN_REBIND_REROUTED => Some(7),
         _ => None,
     }
 }
@@ -2150,12 +2398,23 @@ fn attach_role(
         None
     };
     match role {
-        ifwatch::Role::Lan => attach(
-            ebpf,
-            &tc_prog_name("sodama_lan_ingress", l3),
-            iface,
-            TcAttachType::Ingress,
-        )?,
+        ifwatch::Role::Lan => {
+            attach(
+                ebpf,
+                &tc_prog_name("sodama_lan_ingress", l3),
+                iface,
+                TcAttachType::Ingress,
+            )?;
+            // LAN egress 角色（对照 dae `setupLanInterface` 同时挂 lan_ingress + lan_egress，
+            // `control_plane_core_bind.go:259-280`）：反向 conntrack 刷新——容器/独立
+            // netns 出口场景下的回程状态保活（tproxy.c:2771-2855）。
+            attach(
+                ebpf,
+                &tc_prog_name("sodama_lan_egress", l3),
+                iface,
+                TcAttachType::Egress,
+            )?;
+        }
         ifwatch::Role::Wan => {
             attach(
                 ebpf,
@@ -2913,6 +3172,341 @@ fn pump_or_splice_down(
 ///   - 用户态主动向对端传播 FIN 也会截断排队中的数据；
 /// 因此：只在两侧都 RDHUP 时干净退出；只有一侧 RDHUP 超过 10s
 /// （对照 dae relayHalfCloseTimeout）才强制关闭，保证连接最终可回收。
+// ---------------- offload 背压 fuse（对照 dae `fuseStep` / `tcp_offload_pause`） ----------------
+
+/// 背压阈值（dae：64 MiB；`SODAMA_FUSE_MAX_BACKLOG` 可调，测试用）。
+fn fuse_max_backlog() -> u64 {
+    std::env::var("SODAMA_FUSE_MAX_BACKLOG")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(64 << 20)
+}
+/// 恢复阈值（dae：1 MiB）。
+const FUSE_RESUME_BYTES: u64 = 1 << 20;
+/// drain 上限（dae：10s）：stop 后泵尽力排空，超时强强 lift（保留可观测告警）。
+const FUSE_DRAIN_WAIT: Duration = Duration::from_secs(10);
+
+/// 写/删 pause 键（幂等；删不存在的键不算错）。
+fn offload_pause_set(key: &SodaTuple, on: bool) -> std::io::Result<()> {
+    let Some(m) = OFFLOAD_PAUSE.get() else {
+        return Err(std::io::Error::other("pause map 未初始化"));
+    };
+    let Ok(mut m) = m.lock() else {
+        return Err(std::io::Error::other("pause map 锁中毒"));
+    };
+    if on {
+        m.insert(key, 1u8, 0)
+            .map_err(|e| std::io::Error::other(e.to_string()))
+    } else {
+        match m.remove(key) {
+            Ok(()) => Ok(()),
+            Err(aya::maps::MapError::SyscallError(e))
+                if e.io_error.raw_os_error() == Some(libc::ENOENT) =>
+            {
+                Ok(())
+            }
+            Err(e) => Err(std::io::Error::other(e.to_string())),
+        }
+    }
+}
+
+/// 只读求和 `offload_sent` 的 per-CPU 记账（不删除；fuse 的 backlog 计算用）。
+fn offload_sent_read(key: &SodaTuple) -> u64 {
+    let Some(m) = OFFLOAD_SENT.get() else {
+        return 0;
+    };
+    let Ok(m) = m.lock() else { return 0 };
+    m.get(key, 0).map(|v| v.iter().copied().sum::<u64>()).unwrap_or(0)
+}
+
+/// 读一侧 socket 的累计接收字节（TCP_INFO.tcpi_bytes_received）。
+fn tcp_conn_rx_bytes(fd: RawFd) -> Option<u64> {
+    let mut info: libc::tcp_info = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::tcp_info>() as libc::socklen_t;
+    let ret = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_INFO,
+            &mut info as *mut libc::tcp_info as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    if ret != 0 {
+        return None;
+    }
+    Some(info.tcpi_bytes_received)
+}
+
+/// fuse 期间的转发泵：poll 两 fd → 可读即读到干→写对端；`stop` 置位且两侧读干后
+/// 置 `drained` 并退出（lift 前置条件，对照 dae `drainResidual`；防数据乱序）。
+fn spawn_fuse_pump(
+    left_fd: RawFd,
+    right_fd: RawFd,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    drained: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pass_bytes: std::sync::Arc<AtomicU64>,
+) -> std::io::Result<std::thread::JoinHandle<()>> {
+    std::thread::Builder::new()
+        .name("fuse-pump".into())
+        .spawn(move || {
+            let mut buf = vec![0u8; 64 * 1024];
+            loop {
+                let mut pfds = [
+                    libc::pollfd {
+                        fd: left_fd,
+                        events: libc::POLLIN,
+                        revents: 0,
+                    },
+                    libc::pollfd {
+                        fd: right_fd,
+                        events: libc::POLLIN,
+                        revents: 0,
+                    },
+                ];
+                let stopped = stop.load(Ordering::Relaxed);
+                let timeout = if stopped { 50 } else { 200 };
+                let rc = unsafe { libc::poll(pfds.as_mut_ptr(), 2, timeout) };
+                let mut moved = 0u64;
+                if rc > 0 {
+                    for i in 0..2usize {
+                        if pfds[i].revents & (libc::POLLIN | libc::POLLRDHUP) == 0 {
+                            continue;
+                        }
+                        let (from, to) = if i == 0 {
+                            (left_fd, right_fd)
+                        } else {
+                            (right_fd, left_fd)
+                        };
+                        loop {
+                            let n = unsafe {
+                                libc::read(from, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
+                            };
+                            if n <= 0 {
+                                break;
+                            }
+                            let n = n as usize;
+                            let mut off = 0usize;
+                            while off < n {
+                                let w = unsafe {
+                                    libc::write(
+                                        to,
+                                        buf[off..].as_ptr() as *const libc::c_void,
+                                        n - off,
+                                    )
+                                };
+                                if w <= 0 {
+                                    break;
+                                }
+                                off += w as usize;
+                            }
+                            moved += n as u64;
+                            if n < buf.len() {
+                                break;
+                            }
+                        }
+                    }
+                }
+                if moved > 0 {
+                    pass_bytes.fetch_add(moved, Ordering::Relaxed);
+                }
+                if stopped && rc == 0 && moved == 0 {
+                    drained.store(true, Ordering::Relaxed);
+                    return;
+                }
+            }
+        })
+}
+
+/// fuse 的单轮判定结果（抽成纯函数以便单测：真实对端积压在本地回环夹具下
+/// 不可自然构造，判定逻辑用单测锁定）。
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum FuseDecision {
+    None,
+    Engage,
+    /// backlog 回落（或 engage 超时）→ 先停泵让用户态把残余数据排空（drain）。
+    /// 不能直接 lift：两侧接收队列里可能还有 SK_PASS 数据，未 drain 就恢复内核
+    /// 拼接会与用户态晚写的字节乱序（对照 dae `drainResidual` 前置）。
+    DrainStart,
+    /// 已 drain → 正常 lift（删 pause 键）。
+    Lift,
+    /// drain 超时 → 强制 lift（打告警）。
+    LiftTimeout,
+}
+
+/// backlog = inflow −（内核推送 sent + 用户态泵 pass）；fused 时两阶段：
+/// ① backlog 回落或超时 → DrainStart（置 stop）；② drained 或 drain 超时 → Lift。
+/// 对照 dae `fuseStep`（`control/tcp_offload_linux.go:371-460`）。
+#[allow(clippy::too_many_arguments)]
+fn fuse_decision(
+    inflow: u64,
+    sent: u64,
+    pass: u64,
+    fused: bool,
+    drained: bool,
+    drain_started: bool,
+    since_engage: Option<Duration>,
+    since_drain_start: Option<Duration>,
+    max_backlog: u64,
+) -> (FuseDecision, i64) {
+    let backlog = inflow as i64 - (sent as i64 + pass as i64);
+    if fused {
+        if drain_started {
+            if drained {
+                return (FuseDecision::Lift, backlog);
+            }
+            if since_drain_start.map(|d| d > FUSE_DRAIN_WAIT).unwrap_or(false) {
+                return (FuseDecision::LiftTimeout, backlog);
+            }
+            return (FuseDecision::None, backlog);
+        }
+        if backlog <= FUSE_RESUME_BYTES as i64
+            || since_engage.map(|d| d > FUSE_DRAIN_WAIT).unwrap_or(false)
+        {
+            return (FuseDecision::DrainStart, backlog);
+        }
+        return (FuseDecision::None, backlog);
+    }
+    if backlog > max_backlog as i64 {
+        return (FuseDecision::Engage, backlog);
+    }
+    (FuseDecision::None, backlog)
+}
+
+/// 每轮看门狗对单个 offload 会话调一次：计算 backlog → engage/lift。
+/// backlog = （两侧 TCP_INFO 接收字节增量）− （内核推送字节 + 用户态泵字节）。
+fn offload_fuse_step(e: &mut OffloadWatchEntry) {
+    let Some((k_up, k_cl)) = e.keys.as_ref() else {
+        return;
+    };
+    // 首轮采样 baseline（注册后尽快形成干净基线，对照 dae `newTCPRelayOffloadSession`）。
+    if e.fuse_rx_base.is_none() {
+        if let (Some(l), Some(r)) = (tcp_conn_rx_bytes(e.client_fd), tcp_conn_rx_bytes(e.upstream_fd)) {
+            e.fuse_rx_base = Some((l, r));
+        }
+        return;
+    }
+    let (Some(lr), Some(rr)) = (tcp_conn_rx_bytes(e.client_fd), tcp_conn_rx_bytes(e.upstream_fd))
+    else {
+        return;
+    };
+    let (lb, rb) = e.fuse_rx_base.unwrap();
+    let inflow = lr.saturating_sub(lb) + rr.saturating_sub(rb);
+    let sent = offload_sent_read(k_up) + offload_sent_read(k_cl);
+    let pass = e.fuse_pass_bytes.load(Ordering::Relaxed);
+    let drained = e
+        .fuse_drained
+        .as_ref()
+        .map(|d| d.load(Ordering::Relaxed))
+        .unwrap_or(false);
+    let (decision, backlog) = fuse_decision(
+        inflow,
+        sent,
+        pass,
+        e.fuse_fused,
+        drained,
+        e.fuse_drain_started,
+        e.fuse_since.map(|t| t.elapsed()),
+        e.fuse_drain_since.map(|t| t.elapsed()),
+        fuse_max_backlog(),
+    );
+
+    match decision {
+        FuseDecision::None => {}
+        FuseDecision::DrainStart => {
+            if let Some(stop) = &e.fuse_stop {
+                stop.store(true, Ordering::Relaxed);
+            }
+            e.fuse_drain_started = true;
+            e.fuse_drain_since = Some(Instant::now());
+            log(&format!(
+                "offload fuse: #{id} backlog 回落，开始 drain（backlog={backlog}，泵转发 {pass} B）",
+                id = e.id
+            ));
+        }
+        FuseDecision::Lift | FuseDecision::LiftTimeout => {
+            if decision == FuseDecision::LiftTimeout {
+                log(&format!(
+                    "offload fuse: #{id} drain 超时（{FUSE_DRAIN_WAIT:?}）但强制 lift（backlog={backlog}）",
+                    id = e.id
+                ));
+            }
+            if let Some(stop) = e.fuse_stop.take() {
+                stop.store(true, Ordering::Relaxed);
+            }
+            let _ = offload_pause_set(k_up, false);
+            let _ = offload_pause_set(k_cl, false);
+            e.fuse_fused = false;
+            e.fuse_since = None;
+            e.fuse_drained = None;
+            e.fuse_drain_started = false;
+            e.fuse_drain_since = None;
+            RELAY_STATS.fuse_lifts.fetch_add(1, Ordering::Relaxed);
+            log(&format!(
+                "offload fuse: #{id} 已 lift（backlog={backlog}，泵转发 {pass} B）",
+                id = e.id
+            ));
+        }
+        FuseDecision::Engage => {
+            // all-or-nothing engage（对照 dae：部分失败回滚，保可用性）。
+            if offload_pause_set(k_up, true).is_ok() && offload_pause_set(k_cl, true).is_ok() {
+                let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let drained = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                match spawn_fuse_pump(
+                    e.client_fd,
+                    e.upstream_fd,
+                    stop.clone(),
+                    drained.clone(),
+                    e.fuse_pass_bytes.clone(),
+                ) {
+                    Ok(_) => {
+                        e.fuse_fused = true;
+                        e.fuse_since = Some(Instant::now());
+                        e.fuse_drain_started = false;
+                        e.fuse_drain_since = None;
+                        e.fuse_stop = Some(stop);
+                        e.fuse_drained = Some(drained);
+                        RELAY_STATS.fuse_engages.fetch_add(1, Ordering::Relaxed);
+                        log(&format!(
+                            "offload fuse: #{id} 已 engage（backlog={backlog}，阈值={}）",
+                            fuse_max_backlog(),
+                            id = e.id
+                        ));
+                    }
+                    Err(err) => {
+                        let _ = offload_pause_set(k_up, false);
+                        let _ = offload_pause_set(k_cl, false);
+                        RELAY_STATS.fuse_failures.fetch_add(1, Ordering::Relaxed);
+                        log(&format!(
+                            "offload fuse: #{id} 泵线程创建失败（{err}），已回滚",
+                            id = e.id
+                        ));
+                    }
+                }
+            } else {
+                let _ = offload_pause_set(k_up, false);
+                let _ = offload_pause_set(k_cl, false);
+                RELAY_STATS.fuse_failures.fetch_add(1, Ordering::Relaxed);
+                log(&format!("offload fuse: #{id} pause 键写入失败，已回滚", id = e.id));
+            }
+        }
+    }
+}
+
+/// 连接收尾：停泵、清 pause 键（幂等；键注销前的 fuse 残留必须清干净）。
+fn offload_fuse_release(e: &mut OffloadWatchEntry) {
+    if let Some(stop) = e.fuse_stop.take() {
+        stop.store(true, Ordering::Relaxed);
+    }
+    if let Some((k_up, k_cl)) = e.keys.as_ref() {
+        let _ = offload_pause_set(k_up, false);
+        let _ = offload_pause_set(k_cl, false);
+    }
+    e.fuse_fused = false;
+    e.fuse_drain_started = false;
+    e.fuse_drain_since = None;
+}
+
 struct OffloadWatchEntry {
     id: u64,
     client_fd: RawFd,
@@ -2924,6 +3518,16 @@ struct OffloadWatchEntry {
     upstream_closed: bool,
     first_close: Option<Instant>,
     err_logged: bool,
+    /// 背压 fuse 状态（对照 dae `tcpRelayOffloadSession` 的 fuse 字段）。
+    fuse_rx_base: Option<(u64, u64)>,
+    fuse_fused: bool,
+    fuse_since: Option<Instant>,
+    /// 两阶段 lift：先 DrainStart（置 stop、等泵排空），再 Lift（删 pause 键）。
+    fuse_drain_started: bool,
+    fuse_drain_since: Option<Instant>,
+    fuse_stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    fuse_drained: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    fuse_pass_bytes: std::sync::Arc<AtomicU64>,
 }
 
 static OFFLOAD_WATCH: std::sync::LazyLock<(Mutex<Vec<OffloadWatchEntry>>, std::sync::Condvar)> =
@@ -2931,6 +3535,12 @@ static OFFLOAD_WATCH: std::sync::LazyLock<(Mutex<Vec<OffloadWatchEntry>>, std::s
 
 /// 注册一个 offload 连接（在 `handle_relay_conn` 内，注册后直接返回）。
 fn offload_watch_register(e: OffloadWatchEntry) {
+    // 注册时清残余 pause 键（对照 dae `tcp_offload_linux.go:306-333`：
+    // 新连接不能继承上一条连接的暂停状态，否则下一跳永久暂停且无法自洽）。
+    if let Some((k_up, k_cl)) = &e.keys {
+        let _ = offload_pause_set(k_up, false);
+        let _ = offload_pause_set(k_cl, false);
+    }
     let (m, cv) = &*OFFLOAD_WATCH;
     match m.lock() {
         Ok(mut v) => v.push(e),
@@ -2987,6 +3597,8 @@ fn offload_watch_loop() {
                     if e.handle.stop.load(Ordering::Relaxed) {
                         remove = true;
                     } else {
+                        // 背压 fuse：每轮 tick 评估一次 backlog（engage/lift）。
+                        offload_fuse_step(e);
                         let ce = if e.client_closed {
                             0
                         } else {
@@ -3030,7 +3642,8 @@ fn offload_watch_loop() {
                     }
                 }
                 if remove {
-                    let e = v.swap_remove(i);
+                    let mut e = v.swap_remove(i);
+                    offload_fuse_release(&mut e);
                     offload_watch_cleanup(e.id, &e.keys);
                     continue; // swap_remove 后 i 指向新元素，不递增
                 }
@@ -3087,9 +3700,52 @@ fn sodama_tuple_of_proto(remote: SocketAddr, local: SocketAddr, l4proto: u8) -> 
     })
 }
 
-/// P19：按连接 5 元组从 conn_state_map 回读数据面选中的 outbound（raw lookup）。
+/// P19 + 兜底：按 5 元组回读数据面选中的 outbound。
+/// 优先序对照 dae `RetrieveRoutingResult`（`control/utils.go:64-80`）：
+/// 先 conn_state（且 `has_routing`），miss/无路由再读 `routing_handoff_map`
+/// （首包重定向时的交接条目，TTL 内有效）。
 fn lookup_conn_outbound(remote: SocketAddr, local: SocketAddr, l4proto: u8) -> Option<u8> {
-    lookup_conn_state(remote, local, l4proto).map(|st| st.outbound)
+    if let Some(st) = lookup_conn_state(remote, local, l4proto) {
+        if st.has_routing != 0 {
+            return Some(st.outbound);
+        }
+    }
+    lookup_routing_handoff(remote, local, l4proto).map(|e| (e.result & 0xff) as u8)
+}
+
+/// 读 routing_handoff_map（raw lookup；陈旧条目（> TTL）不采信）。
+fn lookup_routing_handoff(
+    remote: SocketAddr,
+    local: SocketAddr,
+    l4proto: u8,
+) -> Option<SodaRoutingHandoffEntry> {
+    let fd = HANDOFF_MAP_FD.load(Ordering::Relaxed);
+    if fd < 0 {
+        return None;
+    }
+    let key = sodama_tuple_of_proto(remote, local, l4proto)?;
+    let mut e = SodaRoutingHandoffEntry::default();
+    let keyb = unsafe {
+        std::slice::from_raw_parts(
+            &key as *const SodaTuple as *const u8,
+            std::mem::size_of::<SodaTuple>(),
+        )
+    };
+    let valb = unsafe {
+        std::slice::from_raw_parts_mut(
+            &mut e as *mut SodaRoutingHandoffEntry as *mut u8,
+            std::mem::size_of::<SodaRoutingHandoffEntry>(),
+        )
+    };
+    if bpf_map_lookup_raw(fd, keyb, valb).is_err() {
+        return None;
+    }
+    // 陈旧判定：now - last_seen > TTL → 不采信（dae 无显式 TTL，靠 reload 换代自然失效）。
+    let now = monotonic_now_ns();
+    if now.saturating_sub(e.last_seen_ns) > SODAMA_HANDOFF_TTL_NS {
+        return None;
+    }
+    Some(e)
 }
 
 /// 能力缺口 #1：回读整条 conn_state（含 must）——DNS 交付侧据此区分
@@ -3739,6 +4395,14 @@ fn handle_relay_conn(mut client: TcpStream) {
                 upstream_closed: false,
                 first_close: None,
                 err_logged: false,
+                fuse_rx_base: None,
+                fuse_fused: false,
+                fuse_since: None,
+                fuse_drain_started: false,
+                fuse_drain_since: None,
+                fuse_stop: None,
+                fuse_drained: None,
+                fuse_pass_bytes: std::sync::Arc::new(AtomicU64::new(0)),
             });
             return;
         }
@@ -4293,6 +4957,9 @@ fn do_reload(args: &Args, ebpf: &mut Ebpf, startup: bool, fast: bool) -> ReloadO
     // 新一代替换代际前不继承上一代可能已污染的代理 IP/失败状态）。
     if !startup {
         crate::sticky::reset();
+        // 数据面代次递增：跨 reload 的旧缓存 → 纯 SYN 按「异代重路由」处理
+        // （对照 dae 每次换代写新 datapath_generation，datapath_generation.go:20-27）。
+        bump_datapath_generation(ebpf);
     }
     // P23/P33：配置解析一次，供 bootstrap / DNS 选项 / 运行时参数热更新共用。
     let cfg_loaded = args
@@ -5934,7 +6601,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     log(&format!("loading {}", args.ebpf));
     let data =
         std::fs::read(&args.ebpf).map_err(|e| format!("read eBPF object {}: {e}", args.ebpf))?;
-    let mut ebpf = Ebpf::load(&data).map_err(|e| format!("Ebpf::load: {e}"))?;
+    // bpf_conn_state_map_size（dae 同名 global 键，默认 262144）：启动时生效。
+    // 变更需重启（dae 在代次交接时重建 map；sodama 无代次交接——偏离见 ADR-0067）。
+    let conn_state_size: u32 = args
+        .config
+        .as_ref()
+        .and_then(|p| config::load(std::path::Path::new(p)).ok())
+        .and_then(|cfg| config::global_value(&cfg, "bpf_conn_state_map_size"))
+        .and_then(|v| v.parse::<u32>().ok())
+        .filter(|n| (1024..=4_194_304).contains(n))
+        .unwrap_or(262_144);
+    let mut loader = aya::EbpfLoader::new();
+    loader.set_max_entries("conn_state_map", conn_state_size);
+    let mut ebpf = loader
+        .load(&data)
+        .map_err(|e| format!("Ebpf::load: {e}"))?;
+    migrate_pinned_conn_state(&mut ebpf, conn_state_size);
 
     // P18c+：把 dns_sender_pname_map 的 fd dup 一份给 DNS 线程
     // （raw BPF_MAP_LOOKUP_ELEM；避免 DNS 线程持有 Ebpf 借用）。
@@ -5982,6 +6664,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let dup = unsafe { libc::dup(raw) };
             if dup >= 0 {
                 CONN_STATE_MAP_FD.store(dup, Ordering::Relaxed);
+            }
+        }
+    }
+    if let Some(map) = ebpf.map("routing_handoff_map") {
+        use std::os::fd::{AsFd, AsRawFd};
+        if let aya::maps::Map::HashMap(md) = map {
+            let raw = md.fd().as_fd().as_raw_fd();
+            let dup = unsafe { libc::dup(raw) };
+            if dup >= 0 {
+                HANDOFF_MAP_FD.store(dup, Ordering::Relaxed);
+            }
+        }
+    }
+    // 出口连通性投影 map：交给 2s 投影循环持有（take 后 ebpf 不再持有）。
+    if let Some(s) = ebpf.take_map("outbound_connectivity_map") {
+        if let Ok(arr) = Array::<MapData, u32>::try_from(s) {
+            let _ = OUTBOUND_CONNECTIVITY.set(Mutex::new(arr));
+            if let Err(e) = std::thread::Builder::new()
+                .name("connectivity".into())
+                .spawn(connectivity_loop)
+            {
+                log(&format!("connectivity: 投影循环创建失败（{e}）"));
             }
         }
     }
@@ -6154,20 +6858,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .map_mut("config_map")
             .ok_or("map config_map not found")?;
         let mut config_map: Array<_, SodaConfig> = Array::try_from(map)?;
+        let generation = init_datapath_generation();
         config_map.set(
             0,
             SodaConfig {
                 tproxy_port: args.tproxy_port as u32,
                 dae0_ifindex,
+                datapath_generation: generation,
                 dae0peer_mac,
-                pad: [0; 2],
             },
             0,
         )?;
     }
     log(&format!(
-        "config: dae0 ifindex={dae0_ifindex}, dae0peer mac={:02x?}",
-        dae0peer_mac
+        "config: dae0 ifindex={dae0_ifindex}, dae0peer mac={:02x?}, generation={}",
+        dae0peer_mac,
+        current_datapath_generation()
     ));
 
     let initial = do_reload(&args, &mut ebpf, true, false);
@@ -6262,6 +6968,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Some(s) = ebpf.take_map("offload_sent") {
                 if let Ok(sent) = PerCpuHashMap::<MapData, SodaTuple, u64>::try_from(s) {
                     let _ = OFFLOAD_SENT.set(Mutex::new(sent));
+                }
+            }
+            // 背压 fuse 的 pause 表（键在 = 暂停内核拼接；看门狗 engage/lift）。
+            if let Some(s) = ebpf.take_map("tcp_offload_pause") {
+                if let Ok(p) = HashMap::<MapData, SodaTuple, u8>::try_from(s) {
+                    let _ = OFFLOAD_PAUSE.set(Mutex::new(p));
                 }
             }
             log("TCP offload 已启用（fast_sock + offload_guard + sk_skb/stream_verdict）");
@@ -8374,25 +9086,34 @@ fn read_pname_hits(ebpf: &mut Ebpf) -> u64 {
         Ok(a) => a,
         Err(_) => return 0,
     };
-    // 索引 4 = SODAMA_STAT_PNAME_HITS（与 ebpf-rs/common.rs 对齐）
-    arr.get(&4u32, 0)
+    // 索引 15 = SODAMA_STAT_PNAME_HITS（与 ebpf-rs/common.rs 对齐）
+    arr.get(&15u32, 0)
         .map(|values| values.iter().copied().sum::<u64>())
         .unwrap_or(0)
 }
 
 /// 对标批：`sodama_stats_map` 全量快照（per-CPU 求和；键序对照 ebpf-rs/src/common.rs
-/// 的 SODAMA_STAT_*：0=rebind_rejected 1=redirect_update_failed 2=offload_redirects
-/// 3=offload_verdicts 5=event_drops 6=offload_sent_bytes 7=conn_overflow 8=account_drops）。
+/// 的 `SODAMA_STAT_*`：0..=12 对齐 dae `enum bpf_stats_key`，13+ 为 sodama 自有）。
 #[derive(Default)]
 struct EbpfStats {
-    rebind_rejected: u64,
+    udp_conn_overflow: u64,
+    tcp_conn_overflow: u64,
+    redirect_overflow: u64,
     redirect_update_failed: u64,
+    rebind_rejected: u64,
+    syn_rebind_rejected: u64,
+    stateless_tcp_passthrough: u64,
+    frag_tail_passed: u64,
+    parse_unsupported_l4: u64,
+    unsolicited_udp_seen: u64,
+    sockmark_fallback: u64,
+    event_drops: u64,
+    rebind_rerouted: u64,
     offload_redirects: u64,
     offload_verdicts: u64,
-    event_drops: u64,
     offload_sent_bytes: u64,
-    conn_overflow: u64,
     account_drops: u64,
+    offload_pause_passes: u64,
     /// 对标批：`skb_send_sock` 探针内部计数（0 字节问题的诊断三件套）
     probe_calls: u64,
     probe_parse_fail: u64,
@@ -8413,19 +9134,28 @@ fn read_stats(ebpf: &mut Ebpf) -> EbpfStats {
             .map(|values| values.iter().copied().sum::<u64>())
             .unwrap_or(0)
     };
-    // P9：offload verdict/redirect 计数与数据面同属一个对象（索引 2/3）。
     EbpfStats {
-        rebind_rejected: get(0),
-        redirect_update_failed: get(1),
-        offload_redirects: get(2),
-        offload_verdicts: get(3),
-        event_drops: get(5),
-        offload_sent_bytes: get(6),
-        conn_overflow: get(7),
-        account_drops: get(8),
-        probe_calls: get(9),
-        probe_parse_fail: get(10),
-        probe_guard_miss: get(11),
+        udp_conn_overflow: get(0),
+        tcp_conn_overflow: get(1),
+        redirect_overflow: get(2),
+        redirect_update_failed: get(3),
+        rebind_rejected: get(4),
+        syn_rebind_rejected: get(5),
+        stateless_tcp_passthrough: get(6),
+        frag_tail_passed: get(7),
+        parse_unsupported_l4: get(8),
+        unsolicited_udp_seen: get(9),
+        sockmark_fallback: get(10),
+        event_drops: get(11),
+        rebind_rerouted: get(12),
+        offload_redirects: get(13),
+        offload_verdicts: get(14),
+        offload_sent_bytes: get(16),
+        account_drops: get(17),
+        probe_calls: get(18),
+        probe_parse_fail: get(19),
+        probe_guard_miss: get(20),
+        offload_pause_passes: get(21),
     }
 }
 
@@ -8519,8 +9249,11 @@ fn events_json(stats: &EbpfStats) -> serde_json::Value {
         EV_BLOCKED,
         EV_UDP_CONN_OVERFLOW,
         EV_TCP_CONN_OVERFLOW,
+        EV_BLOCKED_ALIVE,
         EV_REDIRECT_REBIND_REJECTED,
+        EV_SYN_REBIND_REJECTED,
         EV_REDIRECT_UPDATE_FAILED,
+        EV_SYN_REBIND_REROUTED,
     ]
     .into_iter()
     .enumerate()
@@ -8557,6 +9290,7 @@ fn status_json(ebpf: &mut Ebpf) -> serde_json::Value {
     let conn_state = count_map::<SodaTuple, SodaConnState>(ebpf, "conn_state_map");
     let redirect_track = count_map::<SodaTuple, SodaRedirectEntry>(ebpf, "redirect_track");
     let domain_routing = count_map::<SodaEpochIp, SodaDomainRouting>(ebpf, "domain_routing_map");
+    let routing_handoff = count_map::<SodaTuple, SodaRoutingHandoffEntry>(ebpf, "routing_handoff_map");
     // P17b：cookie→pname 条目数 + 规则 VM 的 pname 命中计数
     let cookie_pid = count_map::<u64, SodaPidPname>(ebpf, "cookie_pid_map");
     let pname_hits = read_pname_hits(ebpf);
@@ -8708,13 +9442,23 @@ fn status_json(ebpf: &mut Ebpf) -> serde_json::Value {
         },
         "hooks": HOOKS.lock().map(|h| h.clone()).unwrap_or_default(),
         "rules": rules_state.as_ref().map(|c| json!({"count": c.sets.len()})),
-        "maps": {"conn_state": conn_state, "redirect_track": redirect_track, "domain_routing": domain_routing, "fast_sock": fast_sock},
+        "maps": {"conn_state": conn_state, "redirect_track": redirect_track, "domain_routing": domain_routing, "fast_sock": fast_sock, "routing_handoff": routing_handoff, "connectivity_dead_groups": CONNECTIVITY_DEAD_GROUPS.load(Ordering::Relaxed)},
         "stats": {
-            "rebind_rejected": stats.rebind_rejected,
+            "udp_conn_overflow": stats.udp_conn_overflow,
+            "tcp_conn_overflow": stats.tcp_conn_overflow,
+            "redirect_overflow": stats.redirect_overflow,
             "redirect_update_failed": stats.redirect_update_failed,
+            "rebind_rejected": stats.rebind_rejected,
+            "syn_rebind_rejected": stats.syn_rebind_rejected,
+            "stateless_tcp_passthrough": stats.stateless_tcp_passthrough,
+            "frag_tail_passed": stats.frag_tail_passed,
+            "parse_unsupported_l4": stats.parse_unsupported_l4,
+            "unsolicited_udp_seen": stats.unsolicited_udp_seen,
+            "sockmark_fallback": stats.sockmark_fallback,
+            "rebind_rerouted": stats.rebind_rerouted,
             "offload_redirects": stats.offload_redirects,
             "offload_verdicts": stats.offload_verdicts,
-            "conn_overflow": stats.conn_overflow,
+            "offload_pause_passes": stats.offload_pause_passes,
             "event_drops": stats.event_drops,
         },
         "events": events_json(&stats),
@@ -8726,6 +9470,14 @@ fn status_json(ebpf: &mut Ebpf) -> serde_json::Value {
             "probe_calls": stats.probe_calls,
             "probe_parse_fail": stats.probe_parse_fail,
             "probe_guard_miss": stats.probe_guard_miss,
+        },
+        // 背压 fuse（对照 dae tcp_offload_pause / fuseStep）
+        "offload_fuse": {
+            "engages": RELAY_STATS.fuse_engages.load(Ordering::Relaxed),
+            "lifts": RELAY_STATS.fuse_lifts.load(Ordering::Relaxed),
+            "failures": RELAY_STATS.fuse_failures.load(Ordering::Relaxed),
+            "threshold": fuse_max_backlog(),
+            "pause_passes": stats.offload_pause_passes,
         },
         // C4：未挂载 XDP 探针时为 null（区分「0 包」与「没探针」）
         "xdp": match xdp {
@@ -9172,18 +9924,30 @@ fn handle_status_query(cmd: &str, ebpf: &mut Ebpf, args: &Args) -> String {
             let domain_routing =
                 count_map::<SodaEpochIp, SodaDomainRouting>(ebpf, "domain_routing_map");
             let fast_sock = count_fast_sock(ebpf);
+            let routing_handoff = count_map::<SodaTuple, SodaRoutingHandoffEntry>(ebpf, "routing_handoff_map");
             let stats = read_stats(ebpf);
             json!({
                 "conn_state": conn_state,
                 "redirect_track": redirect_track,
                 "domain_routing": domain_routing,
                 "fast_sock": fast_sock,
+                "routing_handoff": routing_handoff,
+                "connectivity_dead_groups": CONNECTIVITY_DEAD_GROUPS.load(Ordering::Relaxed),
                 "rebind_rejected": stats.rebind_rejected,
                 "redirect_update_failed": stats.redirect_update_failed,
+                "syn_rebind_rejected": stats.syn_rebind_rejected,
+                "rebind_rerouted": stats.rebind_rerouted,
+                "redirect_overflow": stats.redirect_overflow,
                 "offload_redirects": stats.offload_redirects,
                 "offload_verdicts": stats.offload_verdicts,
+                "offload_pause_passes": stats.offload_pause_passes,
                 "event_drops": stats.event_drops,
-                "conn_overflow": stats.conn_overflow,
+                "udp_conn_overflow": stats.udp_conn_overflow,
+                "tcp_conn_overflow": stats.tcp_conn_overflow,
+                "stateless_tcp_passthrough": stats.stateless_tcp_passthrough,
+                "frag_tail_passed": stats.frag_tail_passed,
+                "parse_unsupported_l4": stats.parse_unsupported_l4,
+                "unsolicited_udp_seen": stats.unsolicited_udp_seen,
                 "offload_sent_bytes": stats.offload_sent_bytes,
                 "account_drops": stats.account_drops,
             })
@@ -9201,6 +9965,111 @@ fn handle_status_query(cmd: &str, ebpf: &mut Ebpf, args: &Args) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- eBPF 缺口批次：offload 背压 fuse 的判定逻辑（纯函数锁定） ----
+
+    #[test]
+    fn fuse_decision_engage_drain_and_lift() {
+        let none = None;
+        // 未 fused：backlog 超阈值 → Engage
+        let (d, backlog) = fuse_decision(100_000, 10, 0, false, false, false, none, none, 65_536);
+        assert_eq!(d, FuseDecision::Engage);
+        assert_eq!(backlog, 99_990);
+        // 未超阈值 → None
+        let (d, _) = fuse_decision(1_000, 10, 0, false, false, false, none, none, 65_536);
+        assert_eq!(d, FuseDecision::None);
+        // fused、未开始 drain、backlog 回落 → DrainStart（先停泵排空，不直接删键）
+        let (d, _) = fuse_decision(
+            100_000,
+            99_000,
+            500,
+            true,
+            false,
+            false,
+            Some(Duration::from_secs(1)),
+            none,
+            65_536,
+        );
+        assert_eq!(d, FuseDecision::DrainStart);
+        // fused、未 drain_started 且 backlog 高 → 保持（继续 pause）
+        let (d, _) = fuse_decision(
+            10_000_000,
+            10,
+            0,
+            true,
+            false,
+            false,
+            Some(Duration::from_secs(1)),
+            none,
+            65_536,
+        );
+        assert_eq!(d, FuseDecision::None);
+        // fused、未 drain_started、engage 超时 → 也进入 DrainStart（不能卡死）
+        let (d, _) = fuse_decision(
+            10_000_000,
+            10,
+            0,
+            true,
+            false,
+            false,
+            Some(Duration::from_secs(11)),
+            none,
+            65_536,
+        );
+        assert_eq!(d, FuseDecision::DrainStart);
+        // drain_started + drained → Lift
+        let (d, _) = fuse_decision(
+            100_000,
+            99_000,
+            500,
+            true,
+            true,
+            true,
+            Some(Duration::from_secs(2)),
+            Some(Duration::from_secs(1)),
+            65_536,
+        );
+        assert_eq!(d, FuseDecision::Lift);
+        // drain_started + 未 drained（未超时）→ 保持（等泵排空）
+        let (d, _) = fuse_decision(
+            100_000,
+            99_000,
+            500,
+            true,
+            false,
+            true,
+            Some(Duration::from_secs(2)),
+            Some(Duration::from_secs(1)),
+            65_536,
+        );
+        assert_eq!(d, FuseDecision::None);
+        // drain_started + drain 超时 → LiftTimeout（强制 lift 但可观测）
+        let (d, _) = fuse_decision(
+            100_000,
+            10,
+            0,
+            true,
+            false,
+            true,
+            Some(Duration::from_secs(12)),
+            Some(Duration::from_secs(11)),
+            65_536,
+        );
+        assert_eq!(d, FuseDecision::LiftTimeout);
+        // 计数回退（inflow < sent）→ backlog 负值，不 engage
+        let (d, backlog) = fuse_decision(0, 1_000, 0, false, false, false, none, none, 65_536);
+        assert_eq!(d, FuseDecision::None);
+        assert_eq!(backlog, -1_000);
+    }
+
+    #[test]
+    fn fuse_threshold_env_override() {
+        // SODAMA_FUSE_MAX_BACKLOG 可调（测试用）；未设时默认 64 MiB。
+        // 注意：env 是进程级，测试不写它（避免并行测试互相干扰），只验证默认值。
+        if std::env::var("SODAMA_FUSE_MAX_BACKLOG").is_err() {
+            assert_eq!(fuse_max_backlog(), 64 << 20);
+        }
+    }
 
     // ---- P37（2026-10-13）SubFetchMode 合并语义 ----
 

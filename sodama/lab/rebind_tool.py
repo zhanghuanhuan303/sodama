@@ -196,7 +196,31 @@ def _counter_sum(vals):
 
 
 def cmd_stats(_):
-    names = {0: "rebind_rejected", 1: "redirect_update_failed"}
+    # 键域对齐 dae `enum bpf_stats_key`（0..=12）+ sodama 自有（13+）
+    names = {
+        0: "udp_conn_overflow",
+        1: "tcp_conn_overflow",
+        2: "redirect_overflow",
+        3: "redirect_update_failed",
+        4: "redirect_rebind_rejected",
+        5: "syn_rebind_rejected",
+        6: "stateless_tcp_passthrough",
+        7: "frag_tail_passed",
+        8: "parse_unsupported_l4",
+        9: "unsolicited_udp_seen",
+        10: "sockmark_fallback",
+        11: "event_drops",
+        12: "rebind_rerouted",
+        13: "offload_redirects",
+        14: "offload_verdicts",
+        15: "pname_hits",
+        16: "offload_sent_bytes",
+        17: "account_drops",
+        18: "probe_calls",
+        19: "probe_parse_fail",
+        20: "probe_guard_miss",
+        21: "offload_pause_passes",
+    }
     for e in map_dump("sodama_stats_map"):
         key_raw = raw_bytes(e.get("key")) or b"\x00\x00\x00\x00"
         key = struct.unpack("<I", key_raw[:4].ljust(4, b"\x00"))[0]

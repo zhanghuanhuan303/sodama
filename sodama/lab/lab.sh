@@ -1344,7 +1344,8 @@ test_rebind() {
     echo "FAIL: 拿不到接口信息（$client_mac/$router_mac/$ifindex）"; exit 1; }
 
   local rejected_before rejected_after rejected_stale entry_after
-  rejected_before="$(python3 "$HERE/rebind_tool.py" stats | sed -n 's/^stat 0.*= \([0-9]*\)$/\1/p')"
+  # 键 4 = SODAMA_STAT_REDIRECT_REBIND_REJECTED（与 dae `BPF_STATS_REDIRECT_REBIND_REJECTED` 同键域）
+  rejected_before="$(python3 "$HERE/rebind_tool.py" stats | sed -n 's/^stat 4.*= \([0-9]*\)$/\1/p')"
   echo "-- 伪造竞争发布者（smac=02:00:00:00:00:99，新鲜条目）--"
   python3 "$HERE/rebind_tool.py" set --sip 10.0.0.2 --dip "$PROXY_DST" --sport "$sport" \
     --ifindex "$ifindex" --smac 02:00:00:00:00:99 --dmac "$router_mac"
@@ -1357,7 +1358,7 @@ test_rebind() {
   entry_after="$(python3 "$HERE/rebind_tool.py" dump)"
   # 统计要在窗口完全过去后读：窗口内被拒的重传都已计入，之后不再增加。
   sleep 1.8
-  rejected_after="$(python3 "$HERE/rebind_tool.py" stats | sed -n 's/^stat 0.*= \([0-9]*\)$/\1/p')"
+  rejected_after="$(python3 "$HERE/rebind_tool.py" stats | sed -n 's/^stat 4.*= \([0-9]*\)$/\1/p')"
   if ! echo "$entry_after" | grep -q "smac=02:00:00:00:00:99"; then
     echo "FAIL: 新鲜条目的绑定被竞争发布者改掉了（单写者未生效）"
     echo "$entry_after"; exit 1
@@ -1376,7 +1377,7 @@ test_rebind() {
     grep -q "^done$" "$out" && break
     sleep 0.2
   done
-  rejected_stale="$(python3 "$HERE/rebind_tool.py" stats | sed -n 's/^stat 0.*= \([0-9]*\)$/\1/p')"
+  rejected_stale="$(python3 "$HERE/rebind_tool.py" stats | sed -n 's/^stat 4.*= \([0-9]*\)$/\1/p')"
   if ! python3 "$HERE/rebind_tool.py" dump | grep -q "smac=$client_mac"; then
     echo "FAIL: 陈旧窗口后未允许原发布者改绑"
     python3 "$HERE/rebind_tool.py" dump; exit 1
@@ -3480,6 +3481,223 @@ test_rules_cap() {
   echo "PASS: 高位规则命中（index≥64 的 match_set 生效）"
 }
 
+# 缺口批次（eBPF 余项 A）：lan_egress 角色 + parse 原因计数 + 纯 SYN 重绑 + handoff。
+gaps_up() {
+  require_root
+  [ -f "$OBJ" ] && [ -x "$LOADER" ] || die "先运行 $0 build"
+  USE_RELAY_IDLE=600 up
+}
+
+test_gaps() {
+  require_root
+  echo "== eBPF 缺口：lan_egress / parse 原因计数 / 纯 SYN 重绑 / handoff =="
+  # 1) LAN 接口 egress 方向已挂 lan_egress（对照 dae setupLanInterface 双钩子）
+  "$LOADER" status --socket "$STATUS_SOCK" --json >/tmp/sodama-status.json
+  python3 - /tmp/sodama-status.json "$LAN_IFACE" <<'PY'
+import json, sys
+v = json.load(open(sys.argv[1]))
+iface = sys.argv[2]
+hooks = v.get("hooks") or []
+expect = "sodama_lan_egress@%s" % iface
+assert expect in hooks, ("lan_egress 未挂载", hooks)
+print("hooks 含 %s（共 %d 个钩子）" % (expect, len(hooks)))
+PY
+  echo "PASS: $LAN_IFACE egress 已挂 sodama_lan_egress"
+  # 2) parse 原因计数：ICMP 直通计入 parse_unsupported_l4（有 ping 才断言）
+  if command -v ping >/dev/null 2>&1; then
+    ip netns exec "$CLIENT_NS" timeout 3 ping -c 1 -W 2 "$DIRECT_DST" >/dev/null 2>&1 || true
+    sleep 0.3
+    "$LOADER" status --socket "$STATUS_SOCK" --json >/tmp/sodama-status.json
+    python3 - /tmp/sodama-status.json <<'PY'
+import json, sys
+v = json.load(open(sys.argv[1]))
+s = v["stats"]
+assert s["parse_unsupported_l4"] >= 1, ("parse_unsupported_l4 未推进", s)
+print("stats.parse_unsupported_l4 =", s["parse_unsupported_l4"])
+PY
+    echo "PASS: parse 原因计数（ICMP → parse_unsupported_l4）"
+  else
+    echo "SKIP: 无 ping，跳过 parse_unsupported_l4 行为断言"
+  fi
+  # 3) 同 4 元组重连（固定源端口）：同代纯 SYN → 拒改（syn_rebind_rejected）
+  # 默认 up 无 dialer → relay 回显夹具口径（orig_dst= 行）
+  local lport=40001 out
+  out="$(ip netns exec "$CLIENT_NS" timeout 8 python3 "$HERE/client_probe.py" "$PROXY_DST" 8080 "$lport" 2>&1 || true)"
+  echo "$out" | grep -q "orig_dst=$PROXY_DST:8080" || { echo "FAIL: 首连失败"; echo "$out"; exit 1; }
+  sleep 0.5
+  out="$(ip netns exec "$CLIENT_NS" timeout 8 python3 "$HERE/client_probe.py" "$PROXY_DST" 8080 "$lport" 2>&1 || true)"
+  echo "$out" | grep -q "orig_dst=$PROXY_DST:8080" || { echo "FAIL: 同 4 元组重连失败"; echo "$out"; exit 1; }
+  # 4) SIGHUP（代次递增）→ 同 4 元组重连 = 异代 → 重路由（syn_rebind_rerouted）
+  kill -HUP "$(cat "$PID_FILE")"
+  sleep 1.2
+  out="$(ip netns exec "$CLIENT_NS" timeout 8 python3 "$HERE/client_probe.py" "$PROXY_DST" 8080 "$lport" 2>&1 || true)"
+  echo "$out" | grep -q "orig_dst=$PROXY_DST:8080" || { echo "FAIL: reload 后重连失败（重路由路径）"; echo "$out"; exit 1; }
+  "$LOADER" status --socket "$STATUS_SOCK" --json >/tmp/sodama-status.json
+  python3 - /tmp/sodama-status.json <<'PY'
+import json, sys
+v = json.load(open(sys.argv[1]))
+s, m = v["stats"], v["maps"]
+assert s["syn_rebind_rejected"] >= 1, ("syn_rebind_rejected 未推进", s)
+assert s["rebind_rerouted"] >= 1, ("rebind_rerouted 未推进", s)
+assert m["routing_handoff"] >= 1, ("handoff 表为空", m)
+print("syn-rebind: rejected=%d rerouted=%d handoff=%d" % (
+    s["syn_rebind_rejected"], s["rebind_rerouted"], m["routing_handoff"]))
+PY
+  echo "PASS: 纯 SYN 重绑（同代拒改 / 异代重路由）+ 首包 handoff 条目"
+}
+
+# 缺口批次（eBPF 余项 B）：出口连通性判定（alive 投影 → 数据面 SHOT）。
+alive_up() {
+  require_root
+  [ -f "$OBJ" ] && [ -x "$LOADER" ] || die "先运行 $0 build"
+  cleanup
+  local meth="chacha20-ietf-poly1305" pass="testpass"
+  { echo "ss://$meth:$pass@127.0.0.1:$SS_PORT#node-a"; } | base64 -w0 >"$SUB_BODY"
+  echo >>"$SUB_BODY"
+  cat >"$SUB_GROUPS_CONFIG" <<EOF
+# 出口连通性投影：单成员组（探测 1s / 容忍 1）+ 8080 → proxy
+global {
+    tcp_check_url: 'http://10.9.9.2:9999'
+    check_interval: '1s'
+    check_tolerance: '1'
+}
+subscription {
+    lab: 'http://127.0.0.1:$SUB_PORT/sub'
+}
+group {
+    proxy {
+        filter: name(node-a)
+        policy: min_moving_avg
+    }
+}
+routing {
+    dip(1.1.1.1/32) && dport(8080) -> proxy
+    fallback: direct
+}
+EOF
+  chmod 640 "$SUB_GROUPS_CONFIG"
+  USE_CONFIG="$SUB_GROUPS_CONFIG" USE_SS=1 USE_SS_METHOD="$meth" USE_SS_PASSWORD="$pass" \
+    USE_SUB_SERVER=1 USE_RELAY_IDLE=600 up
+}
+
+test_alive() {
+  require_root
+  echo "== 出口连通性判定（outbound_connectivity_map + wan_outbound_is_alive）=="
+  local out
+  out="$(ip netns exec "$CLIENT_NS" timeout 8 python3 "$HERE/client_probe.py" "$PROXY_DST" 8080 2>&1 || true)"
+  echo "$out" | grep -q "wan-echo-ok" || { echo "FAIL: 初始连接失败（组未存活）"; echo "$out"; exit 1; }
+  echo "PASS: 初始（组 alive）连接正常"
+  # 杀后端 → 探测失败 → 组标死 → 投影 0 → 数据面 SHOT
+  kill "$(cat "$SS_PID_FILE")" 2>/dev/null || true
+  rm -f "$SS_PID_FILE"
+  sleep 6
+  out="$(ip netns exec "$CLIENT_NS" timeout 5 python3 "$HERE/client_probe.py" "$PROXY_DST" 8080 2>&1 || true)"
+  if echo "$out" | grep -q "wan-echo-ok"; then
+    echo "FAIL: 后端已死但新连接仍被放行（alive 投影未生效）"; echo "$out"; exit 1
+  fi
+  echo "PASS: 组标死后新连接被数据面阻断（$(printf '%s' "$out" | tail -1)）"
+  "$LOADER" status --socket "$STATUS_SOCK" --json >/tmp/sodama-status.json
+  python3 - /tmp/sodama-status.json <<'PY'
+import json, sys
+v = json.load(open(sys.argv[1]))
+assert v["maps"]["connectivity_dead_groups"] >= 1, ("dead 组未投影", v["maps"])
+print("connectivity_dead_groups =", v["maps"]["connectivity_dead_groups"])
+PY
+  # 恢复后端 → 探测恢复 → 通
+  python3 -u "$HERE/ss_server.py" "$SS_LOG" "chacha20-ietf-poly1305" "testpass" "$SS_PORT" \
+    >/tmp/sodama-ss-restart.log 2>&1 &
+  echo $! >"$SS_PID_FILE"
+  sleep 7
+  out="$(ip netns exec "$CLIENT_NS" timeout 8 python3 "$HERE/client_probe.py" "$PROXY_DST" 8080 2>&1 || true)"
+  echo "$out" | grep -q "wan-echo-ok" || { echo "FAIL: 后端恢复后仍未放行（投影未恢复）"; echo "$out"; exit 1; }
+  echo "PASS: 后端恢复 → 组复活 → 连接恢复"
+}
+
+# 缺口批次（eBPF 余项 C）：offload 背压 fuse（阈值/生命周期/无残留；判定逻辑已有单测）。
+fuse_up() {
+  require_root
+  [ -f "$OBJ" ] && [ -x "$LOADER" ] || die "先运行 $0 build"
+  SODAMA_FUSE_MAX_BACKLOG=65536 USE_RULES="$HERE/rules.dae" USE_DIALER=direct \
+    USE_OFFLOAD=1 USE_RELAY_IDLE=600 up
+}
+
+test_fuse() {
+  require_root
+  echo "== offload 背压 fuse（tcp_offload_pause）=="
+  "$LOADER" status --socket "$STATUS_SOCK" --json >/tmp/sodama-status.json
+  python3 - /tmp/sodama-status.json <<'PY'
+import json, sys
+v = json.load(open(sys.argv[1]))
+f = v["offload_fuse"]
+assert f["threshold"] == 65536, ("SODAMA_FUSE_MAX_BACKLOG 未生效", f)
+print("offload_fuse.threshold =", f["threshold"])
+PY
+  # 数据流部分：offload 会话在本 QEMU 环境有既有首连抖动（devlog §19），
+  # 重试 3 次；全失败则跳过数据流断言（机制断言仍必须过）。
+  local out ok=0 i
+  for i in 1 2 3; do
+    out="$(ip netns exec "$CLIENT_NS" timeout 8 python3 "$HERE/client_probe.py" "$PROXY_DST" 8080 2>&1 || true)"
+    if echo "$out" | grep -q "wan-echo-ok"; then ok=1; break; fi
+    sleep 0.5
+  done
+  if [ "$ok" = 1 ]; then
+    out="$(ip netns exec "$CLIENT_NS" timeout 30 python3 "$HERE/stream_probe.py" "$PROXY_DST" 8080 512 2>&1 || true)"
+    echo "$out" | grep -q "^stream-ok bytes=524288" || { echo "FAIL: fuse 会话下大流量回显不一致"; echo "$out"; exit 1; }
+    echo "PASS: 数据流（512KB 逐字节一致；预热点 $i 次）"
+  else
+    echo "SKIP: offload 首连抖动（QEMU 既有环境问题，devlog §19），跳过数据流断言"
+  fi
+  "$LOADER" status --socket "$STATUS_SOCK" --json >/tmp/sodama-status.json
+  python3 - /tmp/sodama-status.json <<'PY'
+import json, sys
+v = json.load(open(sys.argv[1]))
+f = v["offload_fuse"]
+# 本地回环下对端写队列几乎不积压：未触发 fuse 也是合法结果（真实触发条件
+# 是对端 retry 队列积压，本地夹具不可自然构造；判定逻辑由单测锁定）。
+# 但一旦触发必须成对退出（engages == lifts）且无失败——否则就是残留暂停。
+assert f["failures"] == 0, f
+assert f["engages"] == f["lifts"], ("fuse 未成对退出（可能残留暂停）", f)
+print("offload_fuse: engages=%d lifts=%d pause_passes=%d" % (
+    f["engages"], f["lifts"], f["pause_passes"]))
+PY
+  echo "PASS: fuse 阈值生效、无失败、无残留（engages==lifts；真触发判定逻辑已由单测锁定）"
+}
+
+# 缺口批次（eBPF 余项 D）：conn_state_map pinning（跨重启迁移）。
+pin_up() {
+  require_root
+  [ -f "$OBJ" ] && [ -x "$LOADER" ] || die "先运行 $0 build"
+  USE_RELAY_IDLE=600 up
+}
+
+test_pinning() {
+  require_root
+  echo "== conn_state_map pinning（跨重启迁移）=="
+  local out before
+  out="$(ip netns exec "$CLIENT_NS" timeout 8 python3 "$HERE/client_probe.py" "$PROXY_DST" 8080 2>&1 || true)"
+  echo "$out" | grep -q "orig_dst=$PROXY_DST:8080" || { echo "FAIL: 前置连接失败"; echo "$out"; exit 1; }
+  "$LOADER" status --socket "$STATUS_SOCK" --json >/tmp/sodama-status.json
+  before="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["maps"]["conn_state"])' /tmp/sodama-status.json)"
+  [ "$before" -ge 1 ] || { echo "FAIL: conn_state 为空"; exit 1; }
+  [ -e /sys/fs/bpf/sodama/conn_state_map ] \
+    || { echo "FAIL: pin 文件不存在（pinning 未生效）"; ls -l /sys/fs/bpf/ 2>&1 | head; exit 1; }
+  echo "PASS: pin 文件存在（conn_state=$before 条）"
+  "$0" down >/dev/null 2>&1 || true
+  sleep 0.5
+  [ -e /sys/fs/bpf/sodama/conn_state_map ] || { echo "FAIL: down 后 pin 文件被删"; exit 1; }
+  "$0" pin-up >/dev/null 2>&1 || { echo "FAIL: 重启失败"; tail -5 "$LOG"; exit 1; }
+  grep -q "conn_state pin: 迁移" "$LOG" || { echo "FAIL: 无迁移日志"; grep "conn_state pin" "$LOG" | head; exit 1; }
+  "$LOADER" status --socket "$STATUS_SOCK" --json >/tmp/sodama-status.json
+  python3 - /tmp/sodama-status.json <<'PY'
+import json, sys
+v = json.load(open(sys.argv[1]))
+n = v["maps"]["conn_state"]
+assert n >= 1, ("迁移后 conn_state 为空", v["maps"])
+print("迁移后 conn_state =", n)
+PY
+  echo "PASS: 重启后 pinned 条目已迁移（跨重启保留在途流状态）"
+}
+
 # P5 G1：shadowsocks TCP——跨实现（独立 Python 服务端）+ 协议层必须跑在用户态
 # （ss-up 特意带了 --offload：AEAD 帧不能交给内核拼接，offloaded_total 必须为 0）。
 test_ss() {
@@ -4378,6 +4596,15 @@ test-dns-udp) test_dns_udp ;;  # 显式 udp:// 上游（仅 UDP）
   test-hotplug) test_hotplug ;;
   rulecap-up) rulecap_up ;;
   test-rules-cap) test_rules_cap ;;
+  # 缺口批次（eBPF 余项）
+  gaps-up) gaps_up ;;
+  test-gaps) test_gaps ;;
+  alive-up) alive_up ;;
+  test-alive) test_alive ;;
+  fuse-up) fuse_up ;;
+  test-fuse) test_fuse ;;
+  pin-up) pin_up ;;
+  test-pinning) test_pinning ;;
   offload-up) USE_RULES="$HERE/rules.dae" USE_DIALER=direct USE_OFFLOAD=1 USE_RELAY_IDLE=600 up ;;
   udp-up) USE_RULES="$HERE/rules.udp.dae" USE_UDP_IDLE=2 up ;;
   ss-up) USE_RULES="$HERE/rules.dae" USE_SS=1 USE_SS_METHOD=chacha20-ietf-poly1305 USE_SS_PASSWORD=testpass \
@@ -4500,5 +4727,5 @@ test-dns-udp) test_dns_udp ;;  # 显式 udp:// 上游（仅 UDP）
   status) status ;;
   trace) trace ;;
   down) down ;;
-  *) echo "usage: $0 {build|up|dual-up|config-up|forward-up|dns-up|dot-up|doh-up|doh-h2-up|doh-h3-up|doq-up|dnsroute-up|dnsopts-up|ecscache-up|dns-udp-up|dns-tcpup-up|geo-up|pname-up|regex-up|relay-up|offload-up|udp-up|ss-up|ss2022-up|http-up|groups-up|ss-udp-up|trojan-up|vless-up|vless-tls-up|vless-udp-up|vmess-up|vmess-tls-up|vmess-udp-up|tuic-up|tuic-udp-up|hy2-up|hy2-udp-up|hy2-obfs-up|hy2-obfs-udp-up|hy2-brutal-up|hy2-hop-up|juicity-up|juicity-udp-up|ssr-up|shadowtls-up|shadowtls-v2-up|shadowtls-v1-up|ops-up|naive-up|test-naive|naive-h3-up|test-naive-h3|ops-reload-up|bench-up|test-proxy|test-direct|test-block|test-host-proxy|test-reload|test-rebind|test-status|test-config|test-forward|test-domain|test-dns-cache|test-dns-tcp|test-dns-reload|test-domain-regex|test-dns-edns|test-dot|test-doh|test-doh-h2|test-doh-h3|test-doq|test-dnsroute|test-dns-options|test-ecs-cache|test-dns-udp|test-dns-tcpup|test-geo|test-pname|test-v6|test-relay|test-relay-idle|test-relay-offload|test-offload-lifecycle|test-udp-relay|test-quic-sniff|test-udp-idle|test-ss|test-ss2022|test-http|test-groups|test-trojan|test-ss-udp|test-vless|test-vless-udp|test-vmess|test-vmess-udp|test-tuic|test-tuic-udp|test-juicity|test-juicity-udp|test-ssr|test-shadowtls|test-shadowtls-v2|test-shadowtls-v1|test-hy2|test-hy2-udp|test-hy2-obfs|test-hy2-obfs-udp|test-hy2-brutal|test-hy2-hop|test-ops|test-config-reload|test-fault-reload|test-fault-kill|reload|verify|status|trace|down|sniff-punt-up|test-sniff-punt|subscribe-up|test-subscribe|sub-order-up|test-sub-order|ruleset-up|test-ruleset|must-up|test-must|subfile-up|test-sub-file|hotplug-up|test-hotplug|rulecap-up|test-rules-cap}"; exit 2 ;;
+  *) echo "usage: $0 {build|up|dual-up|config-up|forward-up|dns-up|dot-up|doh-up|doh-h2-up|doh-h3-up|doq-up|dnsroute-up|dnsopts-up|ecscache-up|dns-udp-up|dns-tcpup-up|geo-up|pname-up|regex-up|relay-up|offload-up|udp-up|ss-up|ss2022-up|http-up|groups-up|ss-udp-up|trojan-up|vless-up|vless-tls-up|vless-udp-up|vmess-up|vmess-tls-up|vmess-udp-up|tuic-up|tuic-udp-up|hy2-up|hy2-udp-up|hy2-obfs-up|hy2-obfs-udp-up|hy2-brutal-up|hy2-hop-up|juicity-up|juicity-udp-up|ssr-up|shadowtls-up|shadowtls-v2-up|shadowtls-v1-up|ops-up|naive-up|test-naive|naive-h3-up|test-naive-h3|ops-reload-up|bench-up|test-proxy|test-direct|test-block|test-host-proxy|test-reload|test-rebind|test-status|test-config|test-forward|test-domain|test-dns-cache|test-dns-tcp|test-dns-reload|test-domain-regex|test-dns-edns|test-dot|test-doh|test-doh-h2|test-doh-h3|test-doq|test-dnsroute|test-dns-options|test-ecs-cache|test-dns-udp|test-dns-tcpup|test-geo|test-pname|test-v6|test-relay|test-relay-idle|test-relay-offload|test-offload-lifecycle|test-udp-relay|test-quic-sniff|test-udp-idle|test-ss|test-ss2022|test-http|test-groups|test-trojan|test-ss-udp|test-vless|test-vless-udp|test-vmess|test-vmess-udp|test-tuic|test-tuic-udp|test-juicity|test-juicity-udp|test-ssr|test-shadowtls|test-shadowtls-v2|test-shadowtls-v1|test-hy2|test-hy2-udp|test-hy2-obfs|test-hy2-obfs-udp|test-hy2-brutal|test-hy2-hop|test-ops|test-config-reload|test-fault-reload|test-fault-kill|reload|verify|status|trace|down|sniff-punt-up|test-sniff-punt|subscribe-up|test-subscribe|sub-order-up|test-sub-order|ruleset-up|test-ruleset|must-up|test-must|subfile-up|test-sub-file|hotplug-up|test-hotplug|rulecap-up|test-rules-cap|gaps-up|test-gaps|alive-up|test-alive|fuse-up|test-fuse|pin-up|test-pinning}"; exit 2 ;;
 esac

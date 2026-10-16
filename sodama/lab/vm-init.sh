@@ -53,10 +53,12 @@ done
 # 对标批（ADR-0065）：L3 端到端（经 ipip 隧道）已并入 verify() 门禁（l3 用例），
 # 此处不再单列。
 # 能力缺口批次（#1–#4）：must 糖 / 订阅 -file scheme / 接口热插拔 / match_set 容量。
+# eBPF 余项批次（ADR-0067）：lan_egress/parse 计数/SYN 重绑/handoff、出口连通性、
+# offload 背压 fuse、conn_state pinning。
 # 每个用例一个专用会话（与 offload 同模式）；全部计入 cap= 汇总。
 cap=FAIL
 cap_ok=1
-for pair in must-up:test-must subfile-up:test-sub-file hotplug-up:test-hotplug rulecap-up:test-rules-cap dns-up:test-domain; do
+for pair in must-up:test-must subfile-up:test-sub-file hotplug-up:test-hotplug rulecap-up:test-rules-cap dns-up:test-domain gaps-up:test-gaps alive-up:test-alive fuse-up:test-fuse pin-up:test-pinning; do
   cap_up="${pair%%:*}"
   cap_tst="${pair##*:}"
   if "$BASE/lab/lab.sh" "$cap_up" >/dev/null 2>&1 && "$BASE/lab/lab.sh" "$cap_tst" >/dev/null 2>&1; then

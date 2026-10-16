@@ -18,14 +18,34 @@ use aya_ebpf_bindings::{
 };
 
 use crate::common::*;
+use crate::event::bump_stat;
 use crate::flow::*;
 use crate::maps::*;
-use crate::parse::{parse_ip, parse_ip_at};
+use crate::parse::{parse_ip, parse_ip_at_reason, ParseSkip};
 
 /// 控制面自己的 socket：直接放行（防自环）。
 #[inline(always)]
 fn dae_socket(ctx: &TcContext) -> bool {
     unsafe { (*ctx.skb.skb).mark == SODAMA_DAE_SOCKET_MARK }
+}
+
+/// 带原因计数的解析：分片尾/L4 不支持分别计数后直通（对照 dae 的
+/// `report_parse_passthrough`：BPF_STATS_FRAG_TAIL_PASSED /
+/// BPF_STATS_PARSE_UNSUPPORTED_L4，tproxy.c:540-580/1131/1214）。
+#[inline(always)]
+fn parse_or_count(ctx: &TcContext, link_h_len: u32) -> Option<SodaParseResult> {
+    match parse_ip_at_reason(ctx, link_h_len) {
+        Ok(p) => Some(p),
+        Err(ParseSkip::FragTail) => {
+            unsafe { bump_stat(SODAMA_STAT_FRAG_TAIL_PASSED) };
+            None
+        }
+        Err(ParseSkip::UnsupportedL4) => {
+            unsafe { bump_stat(SODAMA_STAT_PARSE_UNSUPPORTED_L4) };
+            None
+        }
+        Err(ParseSkip::Other) => None,
+    }
 }
 
 /* ---------------- LAN ingress：分流（split_flow is_wan=0） ---------------- */
@@ -38,7 +58,7 @@ fn lan_ingress_body(ctx: &mut TcContext, link_h_len: u32) -> i32 {
     if suspended() {
         return tc_ok();
     }
-    let Some(p) = parse_ip_at(ctx, link_h_len) else {
+    let Some(p) = parse_or_count(ctx, link_h_len) else {
         return tc_ok();
     };
     unsafe { split_flow(ctx, &p, 0, link_h_len) }
@@ -54,6 +74,30 @@ pub fn sodama_lan_ingress_l3(mut ctx: TcContext) -> i32 {
     lan_ingress_body(&mut ctx, 0)
 }
 
+/* ---------------- LAN egress：反向 conntrack 刷新（容器/独立 netns 出口） ---------------- */
+
+/// LAN egress 角色（对照 dae `tproxy_lan_egress_l2/_l3`，tproxy.c:2771-2855）：
+/// LAN 接口**出方向**的反向 conntrack 刷新——独立 netns/容器场景下，容器内流量
+/// 经 veth 出口时，回程状态靠这里保活（dae 在每个 LAN 接口上同时挂 ingress+egress）。
+#[inline(always)]
+fn lan_egress_body(ctx: &TcContext, link_h_len: u32) -> i32 {
+    let Some(p) = parse_or_count(ctx, link_h_len) else {
+        return tc_ok();
+    };
+    unsafe { refresh_reverse_state(&p) };
+    tc_ok()
+}
+
+#[classifier]
+pub fn sodama_lan_egress(ctx: TcContext) -> i32 {
+    lan_egress_body(&ctx, ETH_HLEN)
+}
+
+#[classifier]
+pub fn sodama_lan_egress_l3(ctx: TcContext) -> i32 {
+    lan_egress_body(&ctx, 0)
+}
+
 /* ---------------- WAN egress：分流（is_wan=1） ---------------- */
 
 #[inline(always)]
@@ -64,7 +108,7 @@ fn wan_egress_body(ctx: &mut TcContext, link_h_len: u32) -> i32 {
     if suspended() {
         return tc_ok();
     }
-    let Some(p) = parse_ip_at(ctx, link_h_len) else {
+    let Some(p) = parse_or_count(ctx, link_h_len) else {
         return tc_ok();
     };
     unsafe { split_flow(ctx, &p, 1, link_h_len) }
@@ -84,7 +128,7 @@ pub fn sodama_wan_egress_l3(mut ctx: TcContext) -> i32 {
 
 #[inline(always)]
 fn wan_ingress_body(ctx: &TcContext, link_h_len: u32) -> i32 {
-    let Some(p) = parse_ip_at(ctx, link_h_len) else {
+    let Some(p) = parse_or_count(ctx, link_h_len) else {
         return tc_ok();
     };
     unsafe { refresh_reverse_state(&p) };
@@ -108,7 +152,7 @@ fn wan_lan_ingress_body(ctx: &mut TcContext, link_h_len: u32) -> i32 {
     if suspended() {
         return tc_ok();
     }
-    let Some(p) = parse_ip_at(ctx, link_h_len) else {
+    let Some(p) = parse_or_count(ctx, link_h_len) else {
         return tc_ok();
     };
     unsafe { refresh_reverse_state(&p) };
@@ -132,7 +176,7 @@ fn lan_wan_egress_body(ctx: &mut TcContext, link_h_len: u32) -> i32 {
     if suspended() {
         return tc_ok();
     }
-    let Some(p) = parse_ip_at(ctx, link_h_len) else {
+    let Some(p) = parse_or_count(ctx, link_h_len) else {
         return tc_ok();
     };
     unsafe { refresh_reverse_state(&p) };

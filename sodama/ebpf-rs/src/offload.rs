@@ -3,7 +3,7 @@
 use aya_ebpf::{bindings::sk_action::SK_PASS, macros::stream_verdict, programs::SkBuffContext};
 
 use crate::common::*;
-use crate::maps::{fast_sock, sodama_stats_map, offload_guard};
+use crate::maps::{fast_sock, offload_guard, sodama_stats_map, tcp_offload_pause};
 
 #[stream_verdict]
 pub fn sodama_tcp_offload(skb: SkBuffContext) -> u32 {
@@ -33,6 +33,15 @@ pub fn sodama_tcp_offload(skb: SkBuffContext) -> u32 {
 
     /* 预检镜像：未命中必须 SK_PASS（redirect 未命中会丢包） */
     if unsafe { offload_guard.get(&peer) }.is_none() {
+        return SK_PASS;
+    }
+
+    /* 背压 fuse（对照 dae tproxy.c:4290-4294）：键在 = 暂停内核拼接，数据 SK_PASS
+     * 交用户态泵转发；fast_sock 条目保留，内核继续排空 retry 队列。 */
+    if unsafe { tcp_offload_pause.get(&peer) }.is_some() {
+        if let Some(c) = sodama_stats_map.get_ptr_mut(SODAMA_STAT_OFFLOAD_PAUSE_PASSES) {
+            unsafe { *c += 1 };
+        }
         return SK_PASS;
     }
 

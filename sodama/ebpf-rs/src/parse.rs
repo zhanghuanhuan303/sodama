@@ -8,6 +8,18 @@ use aya_ebpf::programs::TcContext;
 
 use crate::common::*;
 
+/// 解析未产出可路由报文的原因（对照 dae `parse_transport` 的「正返回 = 直通并计数」
+/// 与「负返回 = 错误」两分法；sodama 把可计数的直通类原因显式区分出来）。
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ParseSkip {
+    /// 非首分片（v4 或 v6）：无完整 L4 头，交内核原路径（计 `FRAG_TAIL_PASSED`）。
+    FragTail,
+    /// L4 非 TCP/UDP：交内核原路径（计 `PARSE_UNSUPPORTED_L4`）。
+    UnsupportedL4,
+    /// 其它（非 IP、截断、扩展头超限——按现状放行不计数）。
+    Other,
+}
+
 /// 统一的 v4/v6 解析入口（TC classifier 用，链路头 14B）。
 #[inline(always)]
 pub fn parse_ip(ctx: &TcContext) -> Option<SodaParseResult> {
@@ -18,13 +30,19 @@ pub fn parse_ip(ctx: &TcContext) -> Option<SodaParseResult> {
 /// `link_h_len == 0`（L3 设备）取 `skb->protocol`，地址/端口布局不变，MAC 置 0。
 #[inline(always)]
 pub fn parse_ip_at(ctx: &TcContext, link_h_len: u32) -> Option<SodaParseResult> {
+    parse_ip_at_reason(ctx, link_h_len).ok()
+}
+
+/// 带原因的解析（新调用点用它把分片尾/L4 不支持计数）。
+#[inline(always)]
+pub fn parse_ip_at_reason(ctx: &TcContext, link_h_len: u32) -> Result<SodaParseResult, ParseSkip> {
     let mut smac = [0u8; 6];
     let mut dmac = [0u8; 6];
     /* proto 的取值口径与 dae 一致：L2 直接读以太类型字段；L3 读 skb->protocol
      * （内核把该字段按网络序映射成与以太类型字段**同一字节形态**的 u16，故两者
      * 可直接比较、也可原样写入补出的以太头，见 kern/tproxy.c:1103/2261）。 */
     let proto = if link_h_len == ETH_HLEN {
-        let eth: EthHdr = ctx.load(0).ok()?;
+        let eth: EthHdr = ctx.load(0).map_err(|_| ParseSkip::Other)?;
         smac = eth.h_source;
         dmac = eth.h_dest;
         eth.h_proto
@@ -37,27 +55,27 @@ pub fn parse_ip_at(ctx: &TcContext, link_h_len: u32) -> Option<SodaParseResult> 
     } else if proto == ETH_P_IPV6.to_be() {
         parse_v6_at(ctx, link_h_len)?
     } else {
-        return None;
+        return Err(ParseSkip::Other);
     };
     out.smac = smac;
     out.dmac = dmac;
-    Some(out)
+    Ok(out)
 }
 
 /// IPv4 解析：`off` = 链路头长度（以太 14 / L3 0）。
 #[inline(always)]
-pub fn parse_v4_at(ctx: &TcContext, link_h_len: u32) -> Option<SodaParseResult> {
-    let iph: IpHdr = ctx.load(link_h_len as usize).ok()?;
+pub fn parse_v4_at(ctx: &TcContext, link_h_len: u32) -> Result<SodaParseResult, ParseSkip> {
+    let iph: IpHdr = ctx.load(link_h_len as usize).map_err(|_| ParseSkip::Other)?;
     if (iph.vihl >> 4) != 4 {
-        return None;
+        return Err(ParseSkip::Other);
     }
     let ihl = ((iph.vihl & 0x0f) as u32) * 4;
     if ihl < 20 {
-        return None;
+        return Err(ParseSkip::Other);
     }
     // 分片：非首片（offset != 0）没有完整 L4 头，交内核原路径（对照 dae tproxy.c:1131）。
     if (u16::from_be(iph.frag_off) & 0x1fff) != 0 {
-        return None;
+        return Err(ParseSkip::FragTail);
     }
 
     let mut out = SodaParseResult::default();
@@ -69,27 +87,27 @@ pub fn parse_v4_at(ctx: &TcContext, link_h_len: u32) -> Option<SodaParseResult> 
     out.dscp = (iph.tos >> 2) & 0x3f;
 
     load_l4(ctx, link_h_len + ihl, iph.protocol, &mut out)?;
-    Some(out)
+    Ok(out)
 }
 
 /// IPv6 解析：固定头 + 跳过 hop-by-hop/routing/dest-opts 扩展头（最多 4 个）；
-/// 分片（44）与其余扩展头不处理（返回 None，交内核原路径）。
+/// 分片（44）与其余扩展头不处理（返回 `FragTail`，交内核原路径）。
 #[inline(always)]
-pub fn parse_v6_at(ctx: &TcContext, link_h_len: u32) -> Option<SodaParseResult> {
-    let iph: Ipv6Hdr = ctx.load(link_h_len as usize).ok()?;
+pub fn parse_v6_at(ctx: &TcContext, link_h_len: u32) -> Result<SodaParseResult, ParseSkip> {
+    let iph: Ipv6Hdr = ctx.load(link_h_len as usize).map_err(|_| ParseSkip::Other)?;
     let word = u32::from_be(iph.vtc_flow);
     if (word >> 28) != 6 {
-        return None;
+        return Err(ParseSkip::Other);
     }
     let mut next = iph.next_header;
     let mut off = link_h_len + 40;
     let mut hops = 0u8;
     while next == 0x00 || next == 0x2b || next == 0x3c {
         if hops >= 4 {
-            return None;
+            return Err(ParseSkip::Other);
         }
-        let ext_next: u8 = ctx.load(off as usize).ok()?;
-        let ext_len: u8 = ctx.load(off as usize + 1).ok()?;
+        let ext_next: u8 = ctx.load(off as usize).map_err(|_| ParseSkip::Other)?;
+        let ext_len: u8 = ctx.load(off as usize + 1).map_err(|_| ParseSkip::Other)?;
         let hdr_len = (ext_len as u32 + 1) * 8;
         off += hdr_len;
         next = ext_next;
@@ -97,10 +115,10 @@ pub fn parse_v6_at(ctx: &TcContext, link_h_len: u32) -> Option<SodaParseResult> 
     }
     // 分片头（44）：非首片交内核；首片跳过 8B 继续解 L4（对照 dae tproxy.c:1214）。
     if next == 0x2c {
-        let frag_next: u8 = ctx.load(off as usize).ok()?;
-        let frag_word: u16 = ctx.load(off as usize + 2).ok()?;
+        let frag_next: u8 = ctx.load(off as usize).map_err(|_| ParseSkip::Other)?;
+        let frag_word: u16 = ctx.load(off as usize + 2).map_err(|_| ParseSkip::Other)?;
         if (u16::from_be(frag_word) & 0xfff8) != 0 {
-            return None;
+            return Err(ParseSkip::FragTail);
         }
         off += 8;
         next = frag_next;
@@ -115,14 +133,14 @@ pub fn parse_v6_at(ctx: &TcContext, link_h_len: u32) -> Option<SodaParseResult> 
     out.dscp = ((word >> 22) & 0x3f) as u8;
 
     load_l4(ctx, off, next, &mut out)?;
-    Some(out)
+    Ok(out)
 }
 
 #[inline(always)]
-fn load_l4(ctx: &TcContext, off: u32, proto: u8, out: &mut SodaParseResult) -> Option<()> {
+fn load_l4(ctx: &TcContext, off: u32, proto: u8, out: &mut SodaParseResult) -> Result<(), ParseSkip> {
     match proto {
         IPPROTO_TCP => {
-            let th: TcpHdr = ctx.load(off as usize).ok()?;
+            let th: TcpHdr = ctx.load(off as usize).map_err(|_| ParseSkip::Other)?;
             out.tuples.sport = th.source;
             out.tuples.dport = th.dest;
             out.h_sport = u16::from_be(th.source);
@@ -131,17 +149,17 @@ fn load_l4(ctx: &TcContext, off: u32, proto: u8, out: &mut SodaParseResult) -> O
              * rst=bit10, psh=bit11, ack=bit12（C 的位段等价写法）。 */
             let flags = (th.doff_flags >> 8) as u8;
             out.new_flow = ((flags & 0x02) != 0 && (flags & 0x10) == 0) as u8;
-            Some(())
+            Ok(())
         }
         IPPROTO_UDP => {
-            let uh: UdpHdr = ctx.load(off as usize).ok()?;
+            let uh: UdpHdr = ctx.load(off as usize).map_err(|_| ParseSkip::Other)?;
             out.tuples.sport = uh.source;
             out.tuples.dport = uh.dest;
             out.h_sport = u16::from_be(uh.source);
             out.h_dport = u16::from_be(uh.dest);
             out.new_flow = 1;
-            Some(())
+            Ok(())
         }
-        _ => None,
+        _ => Err(ParseSkip::UnsupportedL4),
     }
 }

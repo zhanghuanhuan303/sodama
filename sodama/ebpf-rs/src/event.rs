@@ -47,31 +47,34 @@ unsafe fn rate_limited(key: u32) -> bool {
 /// `pid/pname` 恒置 0：TC/sk_skb 上下文拿不到进程信息（sodama 的 pname 采集在
 /// cgroup 钩子，只有 WAN egress 新连接能按 socket cookie 反查），dae 的 TC 路径
 /// 同样传 `pid=0, pname=NULL`。
+/// 事件结构写进 `event_scratch_map`（不占栈；verifier combined stack 限制下
+/// 72B 的栈上结构会把热路径推过 512 限）。
 #[inline(always)]
 pub unsafe fn send_event(type_: u32, outbound: u8, l4proto: u8, tuple: Option<&SodaTuple>) {
-    let mut ev = SodaEvent {
-        timestamp: bpf_ktime_get_ns(),
-        type_,
-        pid: 0,
-        pname: [0u8; 16],
-        outbound,
-        l4proto,
-        pad: [0u8; 2],
-        sip: [0u8; 16],
-        dip: [0u8; 16],
-        sport: 0,
-        dport: 0,
+    let Some(ev) = event_scratch_map.get_ptr_mut(0) else {
+        return;
     };
+    (*ev).timestamp = bpf_ktime_get_ns();
+    (*ev).type_ = type_;
+    (*ev).pid = 0;
+    (*ev).pname = [0u8; 16];
+    (*ev).outbound = outbound;
+    (*ev).l4proto = l4proto;
+    (*ev).pad = [0u8; 2];
+    (*ev).sip = [0u8; 16];
+    (*ev).dip = [0u8; 16];
+    (*ev).sport = 0;
+    (*ev).dport = 0;
     if let Some(t) = tuple {
-        ev.sip = t.sip;
-        ev.dip = t.dip;
-        ev.sport = t.sport;
-        ev.dport = t.dport;
-        ev.l4proto = t.l4proto;
+        (*ev).sip = t.sip;
+        (*ev).dip = t.dip;
+        (*ev).sport = t.sport;
+        (*ev).dport = t.dport;
+        (*ev).l4proto = t.l4proto;
     }
 
     /* 满（-E2BIG/-ENOSPC）与其它错误都只记一次丢弃：事件本身就丢了。 */
-    if event_ringbuf.output(&ev, 0).is_err() {
+    if event_ringbuf.output(&*ev, 0).is_err() {
         bump_stat(SODAMA_STAT_EVENT_DROPS);
     }
 }
