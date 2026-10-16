@@ -372,6 +372,34 @@ print("vmess://" + base64.b64encode(json.dumps(obj).encode()).decode())
 PY
 }
 
+# P38：控制面对建设（对照 dae `setupVethOrNetkit`）：内核 ≥ 6.7 且 iproute2 支持时优先
+# **netkit**（强制 `mode l2`——内核默认 l3 无 MAC，会破坏以太/NDP 数据面；尝试
+# `scrub none` 保留 skb->mark），任一步失败/旧内核回退 veth。`USE_NETKIT=0` 强制 veth。
+# 创建 dae0 <-> dae0peer（对端进 $1 netns）；两者都是 L2 设备，其余配置不变。
+make_control_pair() {
+  local ns="$1"
+  local kern_maj kern_min use_netkit=1
+  kern_maj="$(uname -r | cut -d. -f1)"
+  kern_min="$(uname -r | cut -d. -f2)"
+  if [ "${USE_NETKIT:-1}" = 0 ] || [ "${kern_maj:-0}" -lt 6 ] \
+    || { [ "${kern_maj:-0}" -eq 6 ] && [ "${kern_min:-0}" -lt 7 ]; }; then
+    use_netkit=0
+  fi
+  if [ "$use_netkit" = 1 ]; then
+    # scrub none 保留 skb->mark（对照 dae：只在确认支持时启用）；一次性创建参数，
+    # 不支持 scrub 的内核直接创建失败 → 回退 veth（不做“先建后改”，netkit 无该操作）。
+    if ip link add dae0 type netkit mode l2 scrub none peer name dae0peer 2>/dev/null; then
+      ip link set dae0peer netns "$ns"
+      echo "控制面对: netkit（mode l2 + scrub none）"
+      return 0
+    fi
+    echo "netkit 创建失败（旧内核/旧 iproute2/scrub none 不支持），回退 veth" >&2
+  fi
+  ip link add dae0 type veth peer name dae0peer
+  ip link set dae0peer netns "$ns"
+  echo "控制面对: veth"
+}
+
 build() {
   echo "== cargo: 加载器 =="
   (cd "$ROOT" && as_user cargo build --release)
@@ -622,9 +650,8 @@ up() {
   # 对照 v4 的 1.1.1.1 兜底路由：未拦住时从 WAN 出去（fail-open 可观测）
   ip -6 route add 2001:db8:aa::1/128 via 2001:db8:9::2 dev wan
 
-  # 控制面对：dae0 <-> dae0peer（dae0peer 在 daens）
-  ip link add dae0 type veth peer name dae0peer
-  ip link set dae0peer netns "$DAE_NS"
+  # 控制面对：dae0 <-> dae0peer（dae0peer 在 daens）——P38：netkit 优先（可回退 veth）
+  make_control_pair "$DAE_NS"
   ip link set dae0 up
   ip -n "$DAE_NS" link set lo up
   ip -n "$DAE_NS" link set dae0peer up
@@ -1132,9 +1159,8 @@ dual_up() {
   ip route add "$PROXY_DST/32" via "$DIRECT_DST" dev single
   ip route add 10.9.10.0/24 via "$DIRECT_DST" dev single
 
-  # 控制面对（与标准拓扑一致）
-  ip link add dae0 type veth peer name dae0peer
-  ip link set dae0peer netns "$DAE_NS"
+  # 控制面对（与标准拓扑一致）——P38：netkit 优先（可回退 veth）
+  make_control_pair "$DAE_NS"
   ip link set dae0 up
   ip -n "$DAE_NS" link set lo up
   ip -n "$DAE_NS" link set dae0peer up
