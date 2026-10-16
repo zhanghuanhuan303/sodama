@@ -15,12 +15,12 @@
   --rule-strong:#1a1a1a;
   --accent:#7a1f1f;
   --blue:#1f4e79;
-  --blue-lt:#4a7ba7;
-  --sienna:#a0522d;
-  --green:#2e7d4f;
-  --ochre:#8a6d3b;
-  --plum:#6b5b8a;
+  --blue-lt:#9db6cc;
   --panel:#f8f5ea;
+  --text:40rem;      /* 正文栏 */
+  --note:13.25rem;   /* 边注栏 */
+  --ngap:1.75rem;    /* 栏间距 */
+  --float:calc(var(--note) + var(--ngap));  /* 宽元素溢出量（= 边注栏 + 间距） */
 }
 *{box-sizing:border-box}
 html{-webkit-text-size-adjust:100%}
@@ -30,26 +30,26 @@ body{
   color:var(--ink);
   font-family:Palatino,"Palatino Linotype","Book Antiqua","Source Han Serif SC","Noto Serif CJK SC","Songti SC",Georgia,serif;
   font-size:17px;
-  line-height:1.64;
+  line-height:1.68;
   font-kerning:normal;
 }
+
+/* ---- 政策条 ---- */
 .classbar{
-  background:#5c1a1a;
-  color:#f6efe2;
+  background:#5c1a1a;color:#f6efe2;
   font-family:"SFMono-Regular",Menlo,Consolas,monospace;
-  font-size:.72rem;
-  letter-spacing:.06em;
+  font-size:.72rem;letter-spacing:.06em;
   padding:.42rem 1.4rem;
-  display:flex;
-  flex-wrap:wrap;
-  gap:.4rem 1.6rem;
-  align-items:center;
+  display:flex;flex-wrap:wrap;gap:.4rem 1.6rem;align-items:center;
 }
 .classbar .cls{font-weight:700;letter-spacing:.18em;border:1px solid #f6efe2;padding:.05rem .45rem;border-radius:2px}
 .classbar .push{margin-left:auto;opacity:.82}
 
-.page{max-width:1150px;margin:0 auto;padding:0 2.5rem 6rem}
-article > *{max-width:43rem}
+/* ---- Tufte 版面：正文栏 + 右侧边注栏 ---- */
+.page{max-width:61rem;margin:0 auto;padding:0 2.5rem 6rem}
+article > *{max-width:var(--text)}
+article > header.title-block,
+article > h2{max-width:calc(var(--text) + var(--float))}
 
 .title-block{margin:3.6rem 0 2rem;padding-bottom:1.4rem;border-bottom:2.5px solid var(--rule-strong)}
 .title-block .kicker{
@@ -57,62 +57,72 @@ article > *{max-width:43rem}
   font-size:.72rem;letter-spacing:.22em;color:var(--accent);text-transform:uppercase;
 }
 h1{font-size:2.7rem;line-height:1.1;font-weight:400;letter-spacing:-.005em;margin:.7rem 0 .5rem}
-.title-block .sub{font-size:1.06rem;color:var(--ink-soft);font-style:italic;margin:0 0 1.4rem}
-.title-block dl.meta{margin:0;font-size:.79rem;color:var(--muted);line-height:1.72}
+.title-block .sub{font-size:1.06rem;color:var(--ink-soft);font-style:italic;margin:0 0 1.4rem;max-width:36rem}
+.title-block dl.meta{margin:0;font-size:.79rem;color:var(--muted);line-height:1.75}
 .title-block dl.meta div{display:flex;gap:.6rem}
 .title-block dl.meta dt{min-width:5.2rem;color:var(--ink-soft)}
 .title-block dl.meta dd{margin:0}
 
 h2{
-  font-size:1.24rem;font-weight:400;margin:4rem 0 1rem;padding-top:.75rem;
+  font-size:1.26rem;font-weight:400;margin:4.2rem 0 1.1rem;padding-top:.75rem;
   border-top:1.5px solid var(--rule-strong);letter-spacing:.01em;
 }
 h2 .num{
   font-family:"SFMono-Regular",Menlo,Consolas,monospace;
   font-size:.82em;color:var(--accent);margin-right:.6em;letter-spacing:.02em;
 }
-h3{font-size:1.03rem;font-weight:600;margin:2.2rem 0 .5rem;font-style:italic}
+h3{font-size:1.04rem;font-weight:600;margin:2.3rem 0 .55rem}
 h4{font-size:.95rem;font-weight:600;margin:1.6rem 0 .4rem}
-p{margin:0 0 1rem}
+p{margin:0 0 1.05rem}
 a{color:var(--accent);text-decoration:none;border-bottom:1px solid rgba(122,31,31,.3)}
 a:hover{border-bottom-color:var(--accent)}
 em.term{font-style:normal;border-bottom:1px dotted var(--muted)}
 strong{font-weight:600}
+small{font-size:.82em;color:var(--muted)}
 
-.sn{
-  float:right;clear:right;width:16.5rem;margin:.4rem 0 1.2rem 1.5rem;margin-right:-19.5rem;
-  font-size:.775rem;line-height:1.5;color:#5c5647;text-align:left;
+/* ---- Tufte 边注 / 脚注体系 ---- */
+article{counter-reset:sidenote-counter}
+input.margin-toggle{display:none}
+label.margin-toggle{display:none}
+label.sidenote-number{display:inline;counter-increment:sidenote-counter;cursor:pointer}
+label.sidenote-number::after{
+  content:counter(sidenote-counter);
+  font-family:"SFMono-Regular",Menlo,Consolas,monospace;
+  font-size:.62em;color:var(--accent);
+  vertical-align:super;line-height:0;margin-left:.18em;
 }
-.sn::before{
-  counter-increment:sn;content:"边注 " counter(sn) " · ";
-  color:var(--accent);letter-spacing:.04em;
+.sidenote,.marginnote{
+  float:right;clear:right;width:var(--note);
+  margin:.4rem calc(-1 * var(--float)) 1.15rem var(--ngap);
+  font-size:.775rem;line-height:1.52;color:#5c5647;
 }
-article{counter-reset:sn}
-.sn b{color:var(--ink);font-weight:600}
-.sn code{font-size:.94em}
-sup.fnref{font-size:.66em;line-height:0;vertical-align:super;margin-left:.1em}
-sup.fnref a{color:var(--accent);border:0;font-family:"SFMono-Regular",Menlo,Consolas,monospace}
+.sidenote::before{
+  content:counter(sidenote-counter) " · ";
+  color:var(--accent);font-weight:600;
+  font-family:"SFMono-Regular",Menlo,Consolas,monospace;font-size:.92em;
+}
+.sidenote b,.marginnote b{color:var(--ink);font-weight:600}
+.sidenote code,.marginnote code{font-size:.94em}
 
-.kv{
-  display:grid;grid-template-columns:repeat(3,1fr);gap:1px;
-  background:var(--rule);border:1px solid var(--rule);margin:1.8rem 0 2rem;
-}
-.kv div{background:var(--bg);padding:.75rem .85rem}
-.kv b{display:block;font-size:1.34rem;font-weight:500;color:var(--blue);line-height:1.2;font-variant-numeric:tabular-nums}
-.kv span{display:block;font-size:.73rem;color:var(--muted);margin-top:.18rem;line-height:1.4}
+/* ---- 关键数字表（表 0）的强调行 ---- */
+tbody tr.hi td{background:#f7f2e4}
 
+/* ---- 引用块 / 提示 ---- */
 .callout{
   border-left:3px solid var(--accent);background:var(--panel);
-  padding:.9rem 1.1rem;margin:1.5rem 0;font-size:.885rem;line-height:1.6;
+  padding:.9rem 1.15rem;margin:1.6rem 0;font-size:.885rem;line-height:1.62;
 }
 .callout > :last-child{margin-bottom:0}
 .callout.plain{border-left-color:var(--rule-strong)}
+.callout ol,.callout ul{margin:.35rem 0 .2rem;padding-left:1.3rem}
+.callout li{margin-bottom:.3rem}
 .epigraph{
   font-style:italic;color:var(--muted);font-size:.95rem;line-height:1.62;
   margin:0 0 2rem;padding-left:1.1rem;border-left:2px solid var(--rule-soft);
 }
 
-table{width:100%;border-collapse:collapse;font-size:.845rem;line-height:1.44;margin:1.3rem 0 1.7rem}
+/* ---- 表格（Tufte：无竖线、顶底重线、脚注在底） ---- */
+table{width:100%;border-collapse:collapse;font-size:.845rem;line-height:1.46;margin:1.3rem 0 1.7rem}
 thead th{
   border-top:1.6px solid var(--rule-strong);border-bottom:.9px solid var(--rule-strong);
   padding:.45rem .55rem;text-align:left;font-weight:600;
@@ -121,63 +131,63 @@ tbody td{padding:.42rem .55rem;border-bottom:.5px solid var(--rule-soft);vertica
 tbody tr:last-child td{border-bottom:1.6px solid var(--rule-strong)}
 td.num,th.num{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
 td.c,th.c{text-align:center}
-tbody tr.hi td{background:#f7f2e4}
 table caption{caption-side:bottom;text-align:left;font-size:.765rem;color:var(--muted);padding-top:.6rem;line-height:1.5}
 table.tight{font-size:.8rem}
 table.tight td,table.tight th{padding:.34rem .5rem}
+table.wide{width:calc(var(--text) + var(--float));max-width:none;margin-right:0}
 
-figure{margin:2.1rem 0 2.5rem}
-figure.wide{width:calc(100% + 312px)}
+/* ---- 图 ---- */
+figure{margin:2.2rem 0 2.6rem}
+figure.wide{width:calc(var(--text) + var(--float));max-width:none;margin-right:0}
 figure svg{display:block;width:100%;height:auto}
-figcaption{font-size:.765rem;color:var(--muted);line-height:1.52;margin-top:.6rem}
+figure svg text{font-family:inherit}
+figcaption{font-size:.765rem;color:var(--muted);line-height:1.55;margin-top:.65rem}
 figcaption b{color:var(--ink);font-weight:600}
 
+/* ---- 代码 ---- */
 code{
   font-family:"SFMono-Regular",Menlo,Consolas,"Liberation Mono",monospace;
   font-size:.815em;background:#f4f0e2;padding:.08em .3em;border-radius:2px;
 }
 pre{
   background:#f8f5ea;border-left:3px solid var(--rule-strong);
-  padding:.9rem 1.05rem;overflow-x:auto;font-size:.765rem;line-height:1.58;margin:1.2rem 0;
+  padding:.9rem 1.05rem;overflow-x:auto;font-size:.765rem;line-height:1.6;margin:1.2rem 0;
 }
 pre code{background:none;padding:0;font-size:1em}
 
-.notes-list{margin:1.4rem 0 0;padding:0;list-style:none;counter-reset:pit}
-.notes-list li{
-  counter-increment:pit;position:relative;padding:0 0 1.25rem 2.6rem;margin-bottom:0;
-  border-bottom:.5px solid var(--rule-soft);
-}
-.notes-list li:last-child{border-bottom:1.6px solid var(--rule-strong)}
-.notes-list li::before{
-  content:counter(pit,decimal-leading-zero);position:absolute;left:0;top:.15rem;
-  font-family:"SFMono-Regular",Menlo,Consolas,monospace;font-size:.78rem;color:var(--accent);
-  letter-spacing:.02em;
-}
-.notes-list h4{margin:.15rem 0 .35rem;font-size:.95rem}
-.notes-list p{font-size:.885rem;margin:0 0 .45rem}
-.notes-list .lesson{font-size:.845rem;color:var(--ink-soft)}
-.notes-list .lesson b{color:var(--accent);font-weight:600}
+/* ---- 列表 ---- */
+article ol,article ul{margin:0 0 1.1rem;padding-left:1.5rem}
+article li{margin-bottom:.45rem}
+article ol li::marker{color:var(--accent)}
 
-nav.toc{border-top:1.5px solid var(--rule-strong);border-bottom:1.5px solid var(--rule-strong);padding:1rem 0;margin:2rem 0 3rem}
-nav.toc ol{margin:0;padding-left:1.4rem;font-size:.85rem;line-height:1.85;color:var(--ink-soft)}
-nav.toc ol ol{font-size:.8rem;line-height:1.7;padding-left:1.2rem}
-nav.toc a{border-bottom:0;color:var(--ink-soft)}
-nav.toc a:hover{color:var(--accent)}
-
-ol.endnotes{font-size:.79rem;line-height:1.6;color:var(--ink-soft);padding-left:1.6rem}
-ol.endnotes li{margin-bottom:.5rem}
-.colophon{font-size:.76rem;color:var(--muted);line-height:1.6;border-top:1.5px solid var(--rule-strong);padding-top:1rem;margin-top:4rem}
+/* ---- 收尾 ---- */
+.colophon{font-size:.77rem;color:var(--muted);line-height:1.65;border-top:1.5px solid var(--rule-strong);padding-top:1rem;margin-top:4rem}
 .classbar.bottom{margin-top:4rem}
 
-@media (max-width:1120px){
-  .page{padding:0 1.5rem 4.5rem}
-  .sn{
-    float:none;width:auto;margin:.9rem 0 1.3rem;padding:.55rem 0 .1rem 1rem;
-    border-left:3px solid var(--rule-soft);
+/* ---- 窄屏（边注折叠为可展开块） ---- */
+@media (max-width:1000px){
+  .page{padding:0 1.4rem 4.5rem}
+  h1{font-size:2.15rem}
+  article > header.title-block,article > h2{max-width:var(--text)}
+  label.margin-toggle:not(.sidenote-number){display:inline;color:var(--accent);
+    font-family:"SFMono-Regular",Menlo,Consolas,monospace;font-size:.8em;padding:0 .25em}
+  .sidenote,.marginnote{
+    float:none;display:none;width:auto;
+    margin:.9rem 0 1.2rem 1.2rem;padding:.5rem 0 .2rem 1rem;
+    border-left:2px solid var(--rule-soft);
   }
-  figure.wide{width:100%}
-  h1{font-size:2.2rem}
-  .kv{grid-template-columns:repeat(2,1fr)}
+  input.margin-toggle:checked + .sidenote,
+  input.margin-toggle:checked + .marginnote{display:block}
+  figure.wide,table.wide{width:100%;max-width:100%;margin-right:0}
+}
+
+/* ---- 打印 ---- */
+@media print{
+  .classbar{display:none}
+  .page{max-width:none;padding:0}
+  body{font-size:10.5pt;background:#fff}
+  figure.wide,table.wide{width:100%;max-width:100%;margin-right:0}
+  .sidenote,.marginnote{float:none;width:auto;margin:.6rem 0 .8rem 1.2rem;padding-left:1rem;border-left:2px solid var(--rule-soft)}
 }
 </style>
 </head>
@@ -211,9 +221,9 @@ ol.endnotes li{margin-bottom:.5rem}
 <h2><span class="num">§0</span>摘要 · 当期状态一页</h2>
 
 <p><strong>一句话</strong>：把 dae（Go + C eBPF 的透明代理网关）用 <strong>Rust（用户态）+ Rust eBPF（数据面）</strong>
-重写一遍，逐语义对齐，并在真实软路由上跑完多轮生产验证；过程中把「能力、性能、内存、可观测、可复现」全部量化。</p>
+重写一遍，逐语义对齐，并在真实软路由上跑完多轮生产验证；过程中把「能力、性能、内存、可观测、可复现」全部量化。<label for="mn1" class="margin-toggle">⊕</label><input type="checkbox" id="mn1" class="margin-toggle"><span class="marginnote">本图集是<em class="term">研究档案</em>而非发布说明：所有结论须可追溯、所有优势须给出适用边界、所有未完成项须显式登记——这三条编辑纪律贯穿全篇。</span></p>
 
-<table class="kv">
+<table>
   <caption>表 0 · 当期关键数字（全部有数据源索引；口径见各节）</caption>
   <thead><tr><th>维度</th><th>sodama（当期）</th><th>对照 / 参照</th></tr></thead>
   <tbody>
@@ -226,18 +236,18 @@ ol.endnotes li{margin-bottom:.5rem}
     <tr><td>UDP（40 000×256 B @20 000 pps）</td><td><b>41.0 Mbps 零丢包</b>，CPU <b>1 020 ms / 40 k 包</b>（五方最优）</td><td>sing-box 1 610 · v2ray 1 820 · dae 2 170 · mihomo 2 460 ms</td></tr>
     <tr><td>真实公网轮（CF 边缘订阅节点 · 17 轮 ×4）</td><td>19.3 Mbps；<b>进程 CPU 2 952 ms/GB</b>（合计含内核 12.6 k）</td><td>dae 18.6 Mbps / 4 266 ms/GB；sing-box 19.3 / 4 111；节点出口 ≈19 Mbps 为共同上限</td></tr>
     <tr><td>生产（软路由）</td><td>72h 链：旧轮 21.4 h 收口 RSS 平台 <b>53.5 MB</b>、<code>dial_errors</code>/<code>stragglers</code> 全程 0；新轮 2026-10-17 03:22 起跑</td><td>对 dae 生产口径见 §8</td></tr>
-    <tr><td>质量门禁</td><td>单测 <b>351</b>（348 + 3 BPF 逻辑）· <code>verify 12/12</code> + <code>cap 12/12</code>（QEMU 7.2.8）· 宿主 6.18 与生产 6.12.92 双内核实载</td><td>dae：Go 单测 + CI；本项目额外要求「对象在真实宿主/生产内核上必须能加载」</td></tr>
+    <tr><td>质量门禁</td><td>单测 <b>351</b>（348 + 3 BPF 逻辑）· <code>verify 12/12</code> + <code>cap 12/12</code>（QEMU 7.2.8）· 宿主 6.18 与生产 6.12.92 双内核实载</td><td>本项目额外要求「对象在真实宿主/生产内核上必须能加载」</td></tr>
   </tbody>
 </table>
 
 <div class="callout">
   <p><b>三条口径声明（先读）</b></p>
   <ol>
-    <li><b>本机吞吐的口径</b>：lab 拓扑在历史各轮**默认开启**网卡 offload；v1.x 时代新 lab 曾无条件关闭
+    <li><b>本机吞吐的口径</b>：lab 拓扑在历史各轮<strong>默认开启</strong>网卡 offload；v1.x 时代新 lab 曾无条件关闭
     dae0/dae0peer offload（会把标准代理路径砍半），该动作已收进 L3 用例，现为默认口径。</li>
     <li><b>「修复后值」的标注</b>：vless 17.3 G 与 ss 9 265 是 <b>2026-10-16/17 修复轮之后</b>的值；
     未复测的路径（TLS）沿用同轮实测值。每次数字都标来源。</li>
-    <li><b>公网轮与生产**不是**同一件事</b>：公网轮（§4.5）测的是「客户端效率」，节点出口带宽是共同天花板；
+    <li><b>公网轮与生产<strong>不是</strong>同一件事</b>：公网轮（§4.5）测的是「客户端效率」，节点出口带宽是共同天花板；
     生产（§8）测的是「长期稳态有没有界」。</li>
   </ol>
 </div>
@@ -247,11 +257,11 @@ ol.endnotes li{margin-bottom:.5rem}
 <h2><span class="num">§1</span>缘起 · 三个研究问题</h2>
 <ol>
   <li><b>数据面能不能整段换成 Rust eBPF？</b>——dae 用 C 写 eBPF（4 400 行）+ Go 控制面；本项目押注
-  Rust 生态（aya + Rust→BPF），代价是 CO-RE/BTF/verifier 的硬约束要逐个趟。</li>
+  Rust 生态（aya + Rust→BPF），代价是 CO-RE/BTF/verifier 的硬约束要逐个趟。<label for="sn1" class="margin-toggle sidenote-number"></label><input type="checkbox" id="sn1" class="margin-toggle"><span class="sidenote">Rust→BPF 工具链（nightly + bpf-linker）对内核版本与对象格式的要求比 clang 路径更窄：C 侧 4 400 行译到 Rust 的同时，还要在宿主（6.18）与生产（6.12）两类内核的 verifier 上都通过。</span></li>
   <li><b>换语言能不能同时换掉「每连接一线程」？</b>——Reactor（epoll + splice 零拷贝 + codec 状态机）
   把每连接线程成本降为 0 线程，代价是编解码路径要自己写 WS/VLESS/ss 帧层。</li>
   <li><b>能否做到「可验证」而不只是「能跑」？</b>——跨实现逐字节对拍、内核级用例矩阵、
-  真实节点公网轮、72h 生产轮；每个数字都带口径与出处。</li>
+  真实节点公网轮、72h 生产轮；每个数字都带口径与出处。<label for="mn2" class="margin-toggle">⊕</label><input type="checkbox" id="mn2" class="margin-toggle"><span class="marginnote">「带口径与出处」落实为 §5.3 的七条口径纪律与 §9.3 的数据源索引：任何数字都能指到某轮的 TSV 或日志。</span></li>
 </ol>
 <p>押注的结果：数据面 24 程序 / 28 map（≈95% 对齐 dae），用户态全 Rust（12 协议家族），
 生产连续多轮 72h 量级验证。这条路径的代价与边界都写 §6/§7。</p>
@@ -260,8 +270,98 @@ ol.endnotes li{margin-bottom:.5rem}
 <section id="s2">
 <h2><span class="num">§2</span>能力地图 · 十五个功能域与上游对照</h2>
 <p>覆盖度是<b>功能点粗估</b>（我方可用 ÷ dae 等价能力），不是代码行数、不是性能等价；逐行证据见
-<code>docs/parity-status.md</code> v2.20 表 A。</p>
-<table class="tight">
+<code>docs/parity-status.md</code> v2.20 表 A。<label for="sn2" class="margin-toggle sidenote-number"></label><input type="checkbox" id="sn2" class="margin-toggle"><span class="sidenote">当期最低的是域 11 部署自动化（≈74%）：Docker / 发行包 / 发行 CI 三项归 A 类打包待办（§7）；覆盖度口径的分母是 dae 全功能面，含 daemon 侧生态。</span></p>
+<figure class="wide">
+<svg viewBox="0 0 880 430" role="img" aria-label="十五域覆盖度点图">
+<line x1="190.0" y1="36.0" x2="190.0" y2="43.0" stroke="#c9c2ae" stroke-width="0.8"/>
+<text x="190.0" y="30.0" font-size="9.5" fill="#6f6a5c" text-anchor="middle">70%</text>
+<line x1="393.3" y1="36.0" x2="393.3" y2="43.0" stroke="#c9c2ae" stroke-width="0.8"/>
+<text x="393.3" y="30.0" font-size="9.5" fill="#6f6a5c" text-anchor="middle">80%</text>
+<line x1="596.7" y1="36.0" x2="596.7" y2="43.0" stroke="#c9c2ae" stroke-width="0.8"/>
+<text x="596.7" y="30.0" font-size="9.5" fill="#6f6a5c" text-anchor="middle">90%</text>
+<line x1="800.0" y1="36" x2="800.0" y2="408" stroke="#c9c2ae" stroke-width="0.8"/>
+<text x="800.0" y="30.0" font-size="9.5" fill="#6f6a5c" text-anchor="middle">dae = 100%</text>
+<text x="178.0" y="61.4" font-size="10.5" fill="#151515" text-anchor="end">1 eBPF 数据面</text>
+<line x1="184.0" y1="58.0" x2="800.0" y2="58.0" stroke="#e4dfd0" stroke-width="0.9"/>
+<line x1="190.0" y1="58.0" x2="698.3" y2="58.0" stroke="#b9b2a0" stroke-width="1.3"/>
+<circle cx="698.3" cy="58.0" r="3.3" fill="#1f4e79"/>
+<text x="706.3" y="61.4" font-size="10" fill="#1f4e79" font-weight="600">95%</text>
+<text x="178.0" y="86.0" font-size="10.5" fill="#151515" text-anchor="end">2 分流主链路</text>
+<line x1="184.0" y1="82.6" x2="800.0" y2="82.6" stroke="#e4dfd0" stroke-width="0.9"/>
+<line x1="190.0" y1="82.6" x2="698.3" y2="82.6" stroke="#b9b2a0" stroke-width="1.3"/>
+<circle cx="698.3" cy="82.6" r="3.3" fill="#1f4e79"/>
+<text x="706.3" y="86.0" font-size="10" fill="#1f4e79" font-weight="600">95%</text>
+<text x="178.0" y="110.6" font-size="10.5" fill="#151515" text-anchor="end">3 规则引擎</text>
+<line x1="184.0" y1="107.2" x2="800.0" y2="107.2" stroke="#e4dfd0" stroke-width="0.9"/>
+<line x1="190.0" y1="107.2" x2="718.7" y2="107.2" stroke="#b9b2a0" stroke-width="1.3"/>
+<circle cx="718.7" cy="107.2" r="3.3" fill="#1f4e79"/>
+<text x="726.7" y="110.6" font-size="10" fill="#1f4e79" font-weight="600">96%</text>
+<text x="178.0" y="135.2" font-size="10.5" fill="#151515" text-anchor="end">4 配置系统</text>
+<line x1="184.0" y1="131.8" x2="800.0" y2="131.8" stroke="#e4dfd0" stroke-width="0.9"/>
+<line x1="190.0" y1="131.8" x2="393.3" y2="131.8" stroke="#b9b2a0" stroke-width="1.3"/>
+<circle cx="393.3" cy="131.8" r="3.3" fill="#1f4e79"/>
+<text x="401.3" y="135.2" font-size="10" fill="#6f6a5c">80%</text>
+<text x="178.0" y="159.8" font-size="10.5" fill="#151515" text-anchor="end">5 DNS 子系统</text>
+<line x1="184.0" y1="156.4" x2="800.0" y2="156.4" stroke="#e4dfd0" stroke-width="0.9"/>
+<line x1="190.0" y1="156.4" x2="759.3" y2="156.4" stroke="#b9b2a0" stroke-width="1.3"/>
+<circle cx="759.3" cy="156.4" r="3.3" fill="#1f4e79"/>
+<text x="767.3" y="159.8" font-size="10" fill="#1f4e79" font-weight="600">98%</text>
+<text x="178.0" y="184.4" font-size="10.5" fill="#151515" text-anchor="end">6 出站协议栈</text>
+<line x1="184.0" y1="181.0" x2="800.0" y2="181.0" stroke="#e4dfd0" stroke-width="0.9"/>
+<line x1="190.0" y1="181.0" x2="515.3" y2="181.0" stroke="#b9b2a0" stroke-width="1.3"/>
+<circle cx="515.3" cy="181.0" r="3.3" fill="#1f4e79"/>
+<text x="523.3" y="184.4" font-size="10" fill="#6f6a5c">86%</text>
+<text x="178.0" y="209.0" font-size="10.5" fill="#151515" text-anchor="end">7 转发面</text>
+<line x1="184.0" y1="205.6" x2="800.0" y2="205.6" stroke="#e4dfd0" stroke-width="0.9"/>
+<line x1="190.0" y1="205.6" x2="515.3" y2="205.6" stroke="#b9b2a0" stroke-width="1.3"/>
+<circle cx="515.3" cy="205.6" r="3.3" fill="#1f4e79"/>
+<text x="523.3" y="209.0" font-size="10" fill="#6f6a5c">86%</text>
+<text x="178.0" y="233.6" font-size="10.5" fill="#151515" text-anchor="end">8 多节点·订阅·健康</text>
+<line x1="184.0" y1="230.2" x2="800.0" y2="230.2" stroke="#e4dfd0" stroke-width="0.9"/>
+<line x1="190.0" y1="230.2" x2="637.3" y2="230.2" stroke="#b9b2a0" stroke-width="1.3"/>
+<circle cx="637.3" cy="230.2" r="3.3" fill="#1f4e79"/>
+<text x="645.3" y="233.6" font-size="10" fill="#1f4e79" font-weight="600">92%</text>
+<text x="178.0" y="258.2" font-size="10.5" fill="#151515" text-anchor="end">9 嗅探与 dial_mode</text>
+<line x1="184.0" y1="254.8" x2="800.0" y2="254.8" stroke="#e4dfd0" stroke-width="0.9"/>
+<line x1="190.0" y1="254.8" x2="637.3" y2="254.8" stroke="#b9b2a0" stroke-width="1.3"/>
+<circle cx="637.3" cy="254.8" r="3.3" fill="#1f4e79"/>
+<text x="645.3" y="258.2" font-size="10" fill="#1f4e79" font-weight="600">92%</text>
+<text x="178.0" y="282.8" font-size="10.5" fill="#151515" text-anchor="end">10 IPv6</text>
+<line x1="184.0" y1="279.4" x2="800.0" y2="279.4" stroke="#e4dfd0" stroke-width="0.9"/>
+<line x1="190.0" y1="279.4" x2="698.3" y2="279.4" stroke="#b9b2a0" stroke-width="1.3"/>
+<circle cx="698.3" cy="279.4" r="3.3" fill="#1f4e79"/>
+<text x="706.3" y="282.8" font-size="10" fill="#1f4e79" font-weight="600">95%</text>
+<text x="178.0" y="307.4" font-size="10.5" fill="#151515" text-anchor="end">11 部署自动化</text>
+<line x1="184.0" y1="304.0" x2="800.0" y2="304.0" stroke="#e4dfd0" stroke-width="0.9"/>
+<line x1="190.0" y1="304.0" x2="271.3" y2="304.0" stroke="#b9b2a0" stroke-width="1.3"/>
+<circle cx="271.3" cy="304.0" r="3.3" fill="#1f4e79"/>
+<text x="279.3" y="307.4" font-size="10" fill="#6f6a5c">74%</text>
+<text x="178.0" y="332.0" font-size="10.5" fill="#151515" text-anchor="end">12 运维面</text>
+<line x1="184.0" y1="328.6" x2="800.0" y2="328.6" stroke="#e4dfd0" stroke-width="0.9"/>
+<line x1="190.0" y1="328.6" x2="698.3" y2="328.6" stroke="#b9b2a0" stroke-width="1.3"/>
+<circle cx="698.3" cy="328.6" r="3.3" fill="#1f4e79"/>
+<text x="706.3" y="332.0" font-size="10" fill="#1f4e79" font-weight="600">95%</text>
+<text x="178.0" y="356.6" font-size="10.5" fill="#151515" text-anchor="end">13 质量工程</text>
+<line x1="184.0" y1="353.2" x2="800.0" y2="353.2" stroke="#e4dfd0" stroke-width="0.9"/>
+<line x1="190.0" y1="353.2" x2="535.7" y2="353.2" stroke="#b9b2a0" stroke-width="1.3"/>
+<circle cx="535.7" cy="353.2" r="3.3" fill="#1f4e79"/>
+<text x="543.7" y="356.6" font-size="10" fill="#6f6a5c">87%</text>
+<text x="178.0" y="381.2" font-size="10.5" fill="#151515" text-anchor="end">14 性能</text>
+<line x1="184.0" y1="377.8" x2="800.0" y2="377.8" stroke="#e4dfd0" stroke-width="0.9"/>
+<line x1="190.0" y1="377.8" x2="495.0" y2="377.8" stroke="#b9b2a0" stroke-width="1.3"/>
+<circle cx="495.0" cy="377.8" r="3.3" fill="#1f4e79"/>
+<text x="503.0" y="381.2" font-size="10" fill="#6f6a5c">85%</text>
+<text x="178.0" y="405.8" font-size="10.5" fill="#151515" text-anchor="end">15 真实订阅生态</text>
+<line x1="184.0" y1="402.4" x2="800.0" y2="402.4" stroke="#e4dfd0" stroke-width="0.9"/>
+<line x1="190.0" y1="402.4" x2="495.0" y2="402.4" stroke="#b9b2a0" stroke-width="1.3"/>
+<circle cx="495.0" cy="402.4" r="3.3" fill="#1f4e79"/>
+<text x="503.0" y="405.8" font-size="10" fill="#6f6a5c">85%</text>
+</svg>
+<figcaption><b>图 1 · 十五域覆盖度（点图，距右缘越近越完整）。</b>最右列的浅色竖线为
+「dae = 100%」参照；95% 以上的九个域集中在右端，域 4/11 是当期两个显式低点（配置系统的 global 余 9 键、
+部署的打包三件套）。逐域证据见 <code>parity-status.md</code> 表 A。</figcaption>
+</figure>
+<table class="tight wide">
   <caption>表 1 · 十五域覆盖度（2026-10-17 状态）</caption>
   <thead><tr><th>#</th><th>域</th><th class="num">覆盖</th><th>当期要点与余项</th></tr></thead>
   <tbody>
@@ -284,7 +384,7 @@ ol.endnotes li{margin-bottom:.5rem}
 </table>
 <p>面板（域 12 的落地形态）v2.0：<b>55 项</b>内核参数可视化、数据面卡片（UDP NAT/GSO、卸载记账、错误面）、
 取证入口（<code>trace</code> 短时抓取 / <code>sysdump</code> 一键下载 / 构建信息 / <code>--drain</code>/<code>--abort</code>）；
-UDP 功能面在面板的进一步呈现列为 J 类余项（§7）。</p>
+UDP 功能面在面板的进一步呈现列为 J 类余项（§7）。<label for="mn3" class="margin-toggle">⊕</label><input type="checkbox" id="mn3" class="margin-toggle"><span class="marginnote">J 类（§7）＝「引擎已具备、面板未呈现」的 12 项：UDP 走向可视化、组级探测呈现、事件流、<code>xdp</code>/<code>offload</code> 明细等。</span></p>
 </section>
 
 <section id="s3">
@@ -294,80 +394,82 @@ UDP 功能面在面板的进一步呈现列为 J 类余项（§7）。</p>
   双 epoch、<code>redirect_track</code>、<code>domain_routing</code> 域位图、<code>routing_handoff</code> 首包交接、
   ringbuf 事件、<code>trace_filter_map</code> 内核侧过滤、offload 记账（fentry/kprobe）、XDP 计量。</li>
   <li><b>Reactor 用户态</b>（每连接 0 线程）：epoll 事件循环 × N worker，<b>每 worker 独立投递通道 + 轮询定向分派</b>
-  （2026-10-17 修 ss 双峰回归）；splice 零拷贝（明文路径）+ codec 状态机（AEAD/WS/VLESS 帧层）；管道池与 fd 预算治理。</li>
+  （2026-10-17 修 ss 双峰回归）；splice 零拷贝（明文路径）+ codec 状态机（AEAD/WS/VLESS 帧层）；管道池与 fd 预算治理。<label for="sn3" class="margin-toggle sidenote-number"></label><input type="checkbox" id="sn3" class="margin-toggle"><span class="sidenote">「独立投递通道 + 定向分派」替代共享队列 drain-all 认领：后者会让单 worker 领走全部连接，在 ss 上退化为单核 AEAD 瓶颈、吞吐双峰（踩坑 5）。</span></li>
   <li><b>控制面</b>：配置即唯一事实来源（<code>config.dae</code>），inotify 热驱动 + 双 epoch 原子切换；
   订阅周期刷新与负缓存；DNS 控制面（多上游/路由/ECS/缓存）；组健康探测（活跃/空闲退避 + 墙钟看门狗）。</li>
   <li><b>观测面</b>：<code>status --json</code>（traffic / real_domain / stats / offload_* / xdp / sysctl / trace 等段）、
-  Prometheus <code>metrics</code>、状态 socket 控制命令、面板 v2.0、<code>sysdump</code> 现场归档。</li>
+  Prometheus <code>metrics</code>、状态 socket 控制命令、面板 v2.0、<code>sysdump</code> 现场归档。<label for="mn4" class="margin-toggle">⊕</label><input type="checkbox" id="mn4" class="margin-toggle"><span class="marginnote">观测面按「人看什么」组织：面板给日常，<code>status</code> 给脚本，Prometheus 给长期存储，<code>sysdump</code> 给一次性的现场归档。</span></li>
 </ol>
-<div class="callout"><p><b>当期新增（相对 v1.x 叙事）</b>：<code>config-watch</code>、1h 流量历史、<code>real_domain_runtime</code>、
+<div class="callout plain"><p><b>当期新增（相对 v1.x 叙事）</b>：<code>config-watch</code>、1h 流量历史、<code>real_domain_runtime</code>、
 <code>--drain</code>/<code>--abort</code>、UDP GSO、UDP full-cone 端点池/<code>raw_udp</code>、<code>tls_fragment*</code>、
 <code>pprof_port</code>、<code>bandwidth_max_*</code>、<code>sd_notify</code>、CLI 取证五件套、面板 v2.0。</p></div>
 </section>
+
 <section id="s4">
 <h2><span class="num">§4</span>性能与资源边界 · 实测数据全集（2026-10-16/17 两轮）</h2>
 
 <h3 id="s41">4.1 · 本机吞吐四方（5 轮中位；VLESS/ss 为修复后口径）</h3>
 <figure class="wide">
-<svg viewBox="0 0 880 400" role="img" aria-label="四方四路径吞吐">
-  <text x="112" y="60" text-anchor="end" font-size="10.5" fill="#6f6a5c">direct（夹具上限 ≈24.5 G）</text>
-  <rect x="120" y="48" width="699" height="13" fill="#1f4e79" opacity="0.95"/>
-  <text x="824" y="59" font-size="9.5" fill="#3d3a33">25 463 · sodama</text>
-  <rect x="120" y="64" width="685" height="13" fill="#a0522d" opacity="0.55"/>
-  <text x="810" y="75" font-size="9.5" fill="#3d3a33">24 956 · dae</text>
-  <rect x="120" y="80" width="621" height="13" fill="#2e7d4f" opacity="0.55"/>
-  <text x="746" y="91" font-size="9.5" fill="#3d3a33">22 613 · sing-box</text>
-  <rect x="120" y="96" width="385" height="13" fill="#8a6d3b" opacity="0.55"/>
-  <text x="510" y="107" font-size="9.5" fill="#3d3a33">14 035 · v2ray</text>
-  <text x="112" y="140" text-anchor="end" font-size="10.5" fill="#6f6a5c">VLESS 明文</text>
-  <rect x="120" y="128" width="475" height="13" fill="#1f4e79" opacity="0.95"/>
-  <text x="600" y="139" font-size="9.5" fill="#3d3a33">17 300 · sodama</text>
-  <rect x="120" y="144" width="358" height="13" fill="#a0522d" opacity="0.55"/>
-  <text x="483" y="155" font-size="9.5" fill="#3d3a33">13 048 · dae</text>
-  <rect x="120" y="160" width="443" height="13" fill="#2e7d4f" opacity="0.55"/>
-  <text x="568" y="171" font-size="9.5" fill="#3d3a33">16 142 · sing-box</text>
-  <rect x="120" y="176" width="294" height="13" fill="#8a6d3b" opacity="0.55"/>
-  <text x="419" y="187" font-size="9.5" fill="#3d3a33">10 714 · v2ray</text>
-  <text x="112" y="220" text-anchor="end" font-size="10.5" fill="#6f6a5c">ss（chacha20）</text>
-  <rect x="120" y="208" width="254" height="13" fill="#1f4e79" opacity="0.95"/>
-  <text x="379" y="219" font-size="9.5" fill="#3d3a33">9 265 · sodama</text>
-  <rect x="120" y="224" width="256" height="13" fill="#a0522d" opacity="0.55"/>
-  <text x="381" y="235" font-size="9.5" fill="#3d3a33">9 326 · dae</text>
-  <rect x="120" y="240" width="283" height="13" fill="#2e7d4f" opacity="0.55"/>
-  <text x="408" y="251" font-size="9.5" fill="#3d3a33">10 292 · sing-box</text>
-  <rect x="120" y="256" width="170" height="13" fill="#8a6d3b" opacity="0.55"/>
-  <text x="295" y="267" font-size="9.5" fill="#3d3a33">6 192 · v2ray</text>
-  <text x="112" y="300" text-anchor="end" font-size="10.5" fill="#6f6a5c">VLESS+TLS（rustls）</text>
-  <rect x="120" y="288" width="332" height="13" fill="#1f4e79" opacity="0.95"/>
-  <text x="457" y="299" font-size="9.5" fill="#3d3a33">12 088 · sodama</text>
-  <rect x="120" y="304" width="315" height="13" fill="#a0522d" opacity="0.55"/>
-  <text x="440" y="315" font-size="9.5" fill="#3d3a33">11 486 · dae</text>
-  <rect x="120" y="320" width="334" height="13" fill="#2e7d4f" opacity="0.55"/>
-  <text x="459" y="331" font-size="9.5" fill="#3d3a33">12 176 · sing-box</text>
-  <rect x="120" y="336" width="214" height="13" fill="#8a6d3b" opacity="0.55"/>
-  <text x="339" y="347" font-size="9.5" fill="#3d3a33">7 812 · v2ray</text>
-  <line x1="120" y1="36" x2="120" y2="360" stroke="#c9c2ae"/>
-  <line x1="120" y1="36" x2="120" y2="360" stroke="#eee8d8"/>
-  <text x="120" y="374" text-anchor="middle" font-size="10" fill="#6f6a5c">0</text>
-  <line x1="257" y1="36" x2="257" y2="360" stroke="#eee8d8"/>
-  <text x="257" y="374" text-anchor="middle" font-size="10" fill="#6f6a5c">5</text>
-  <line x1="395" y1="36" x2="395" y2="360" stroke="#eee8d8"/>
-  <text x="395" y="374" text-anchor="middle" font-size="10" fill="#6f6a5c">10</text>
-  <line x1="532" y1="36" x2="532" y2="360" stroke="#eee8d8"/>
-  <text x="532" y="374" text-anchor="middle" font-size="10" fill="#6f6a5c">15</text>
-  <line x1="669" y1="36" x2="669" y2="360" stroke="#eee8d8"/>
-  <text x="669" y="374" text-anchor="middle" font-size="10" fill="#6f6a5c">20</text>
-  <line x1="806" y1="36" x2="806" y2="360" stroke="#eee8d8"/>
-  <text x="806" y="374" text-anchor="middle" font-size="10" fill="#6f6a5c">25</text>
-  <text x="127" y="390" text-anchor="middle" font-size="10.5" fill="#6f6a5c">Gbps（越高越好；sodama 行含修复后值：vless / ss）</text>
+<svg viewBox="0 0 880 352" role="img" aria-label="四路径四方吞吐斜线图">
+<text x="40.0" y="42.0" font-size="10.5" fill="#6f6a5c">Gbps</text>
+<line x1="60.0" y1="207.2" x2="850.0" y2="207.2" stroke="#e8e3d4" stroke-width="0.8"/>
+<text x="52.0" y="210.4" font-size="9.5" fill="#6f6a5c" text-anchor="end">10</text>
+<line x1="60.0" y1="114.3" x2="850.0" y2="114.3" stroke="#e8e3d4" stroke-width="0.8"/>
+<text x="52.0" y="117.5" font-size="9.5" fill="#6f6a5c" text-anchor="end">20</text>
+<line x1="60.0" y1="300.0" x2="850.0" y2="300.0" stroke="#c9c2ae" stroke-width="1.0"/>
+<text x="52.0" y="303.2" font-size="9.5" fill="#6f6a5c" text-anchor="end">0</text>
+<text x="210.0" y="330.0" font-size="10.5" fill="#151515" text-anchor="middle">direct</text>
+<text x="420.0" y="330.0" font-size="10.5" fill="#151515" text-anchor="middle">VLESS 明文</text>
+<text x="620.0" y="330.0" font-size="10.5" fill="#151515" text-anchor="middle">ss（chacha20）</text>
+<text x="800.0" y="330.0" font-size="10.5" fill="#151515" text-anchor="middle">VLESS+TLS</text>
+<path d="M210 63.6 L420 139.4 L620 214.0 L800 187.8" fill="none" stroke="#1f4e79" stroke-width="1.8" opacity="1.0"/>
+<path d="M210 68.3 L420 178.9 L620 213.4 L800 193.4" fill="none" stroke="#5b5f66" stroke-width="1.1" opacity="0.85"/>
+<path d="M210 90.1 L420 150.2 L620 204.5 L800 187.0" fill="none" stroke="#8a8f96" stroke-width="1.1" opacity="0.85"/>
+<path d="M210 169.7 L420 200.5 L620 242.5 L800 227.5" fill="none" stroke="#b4b8bd" stroke-width="1.1" opacity="0.85"/>
+<circle cx="210.0" cy="63.6" r="3.4" fill="#1f4e79"/>
+<text x="210.0" y="53.6" font-size="10" fill="#1f4e79" text-anchor="middle" font-weight="700">25 463</text>
+<circle cx="420.0" cy="139.4" r="3.4" fill="#1f4e79"/>
+<text x="420.0" y="129.4" font-size="10" fill="#1f4e79" text-anchor="middle" font-weight="700">17 300</text>
+<circle cx="620.0" cy="214.0" r="3.4" fill="#1f4e79"/>
+<text x="620.0" y="204.0" font-size="10" fill="#1f4e79" text-anchor="middle" font-weight="700">9 265</text>
+<circle cx="800.0" cy="187.8" r="3.4" fill="#1f4e79"/>
+<text x="800.0" y="177.8" font-size="10" fill="#1f4e79" text-anchor="middle" font-weight="700">12 088</text>
+<circle cx="210.0" cy="68.3" r="2.9" fill="#fffff8" stroke="#5b5f66" stroke-width="1.3"/>
+<text x="210.0" y="84.3" font-size="10" fill="#6f6a5c" text-anchor="middle">24 956</text>
+<circle cx="420.0" cy="178.9" r="2.9" fill="#fffff8" stroke="#5b5f66" stroke-width="1.3"/>
+<text x="420.0" y="194.9" font-size="10" fill="#6f6a5c" text-anchor="middle">13 048</text>
+<circle cx="620.0" cy="213.4" r="2.9" fill="#fffff8" stroke="#5b5f66" stroke-width="1.3"/>
+<text x="620.0" y="229.4" font-size="10" fill="#6f6a5c" text-anchor="middle">9 326</text>
+<circle cx="800.0" cy="193.4" r="2.9" fill="#fffff8" stroke="#5b5f66" stroke-width="1.3"/>
+<text x="800.0" y="209.4" font-size="10" fill="#6f6a5c" text-anchor="middle">11 486</text>
+<circle cx="210.0" cy="90.1" r="2.9" fill="#fffff8" stroke="#8a8f96" stroke-width="1.3"/>
+<text x="210.0" y="106.1" font-size="10" fill="#6f6a5c" text-anchor="middle">22 613</text>
+<circle cx="420.0" cy="150.2" r="2.9" fill="#fffff8" stroke="#8a8f96" stroke-width="1.3"/>
+<text x="476.0" y="140.2" font-size="10" fill="#6f6a5c" text-anchor="middle">16 142</text>
+<circle cx="620.0" cy="204.5" r="2.9" fill="#fffff8" stroke="#8a8f96" stroke-width="1.3"/>
+<text x="676.0" y="194.5" font-size="10" fill="#6f6a5c" text-anchor="middle">10 292</text>
+<circle cx="800.0" cy="187.0" r="2.9" fill="#fffff8" stroke="#8a8f96" stroke-width="1.3"/>
+<text x="844.0" y="177.0" font-size="10" fill="#6f6a5c" text-anchor="middle">12 176</text>
+<circle cx="210.0" cy="169.7" r="2.9" fill="#fffff8" stroke="#b4b8bd" stroke-width="1.3"/>
+<text x="210.0" y="159.7" font-size="10" fill="#6f6a5c" text-anchor="middle">14 035</text>
+<circle cx="420.0" cy="200.5" r="2.9" fill="#fffff8" stroke="#b4b8bd" stroke-width="1.3"/>
+<text x="420.0" y="216.5" font-size="10" fill="#6f6a5c" text-anchor="middle">10 714</text>
+<circle cx="620.0" cy="242.5" r="2.9" fill="#fffff8" stroke="#b4b8bd" stroke-width="1.3"/>
+<text x="620.0" y="258.5" font-size="10" fill="#6f6a5c" text-anchor="middle">6 192</text>
+<circle cx="800.0" cy="227.5" r="2.9" fill="#fffff8" stroke="#b4b8bd" stroke-width="1.3"/>
+<text x="800.0" y="217.5" font-size="10" fill="#6f6a5c" text-anchor="middle">7 812</text>
+<text x="60.0" y="240.0" font-size="10" fill="#1f4e79" font-weight="600">sodama（本项目）</text>
+<text x="60.0" y="253.0" font-size="10" fill="#6f6a5c">dae v2.1.1</text>
+<text x="60.0" y="266.0" font-size="10" fill="#6f6a5c">sing-box 1.14.2</text>
+<text x="60.0" y="279.0" font-size="10" fill="#6f6a5c">v2ray 5.52.0</text>
 </svg>
-<figcaption><b>图 1 · 四路径 × 四实现（本机 netns 对拍，384 MB 双工 / 48 MB×4 流）</b>。
-direct 受夹具 ≈24.5 Gbps 上限约束（下界）；修复后 sodama 的 VLESS 回到 <b>17.3 Gbps</b>（此前被 lab offload 口径砍半到 8.5），
-ss 从 6 228 的中位双峰回到 <b>9 265</b>（10 轮 8 624–9 908）；TLS 路径四方接近、v2ray 明显落后。
-<b>口径</b>：host 6.18 内核、lab 默认 offload、每轮取中位；ss 上游为 ssserver（Rust）。</figcaption>
+<figcaption><b>图 2 · 四路径 × 四实现（本机 netns 对拍，384 MB 双工 / 48 MB×4 流）。</b>
+每条折线一个实现、四个节点 = 四条路径；粗蓝线为 sodama。两条形态直接可读：
+direct 与 VLESS 明文上 sodama 在右端（25.5 / 17.3 Gbps），ss 上四家挤在 6–10 Gbps 区间（单核 AEAD 瓶颈），
+TLS 路径四方接近（12 附近）。<b>口径</b>：宿主 6.18 内核、lab 默认 offload、每轮取中位；
+ss 上游为 ssserver（Rust）；direct 受夹具 ≈24.5 Gbps 上限约束（下界）。</figcaption>
 </figure>
-
-<table class="tight">
+<table class="tight wide">
   <caption>表 2 · 同轮四方的延迟 / CPU / 内存（VLESS 路径；CPU = 搬运 384 MB 双工的进程 utime+stime）</caption>
   <thead><tr><th>实现</th><th class="num">direct</th><th class="num">direct p50</th><th class="num">VLESS</th><th class="num">VLESS p50</th><th class="num">VLESS CPU</th><th class="num">RSS</th><th class="num">线程</th></tr></thead>
   <tbody>
@@ -379,50 +481,67 @@ ss 从 6 228 的中位双峰回到 <b>9 265</b>（10 轮 8 624–9 908）；TLS 
 </table>
 <p>direct 行四方接近且 CPU≈0（eBPF 内核转发）；VLESS 行的 CPU 差距是「用户态搬运成本」的直接读数
 （70 ms vs 80 / 400 / 730 ms）。ss 是 sodama 的<b>历史短板</b>（chacha20 单核 AEAD 上限），修复后与 dae 持平、
-低于 sing-box（其优势来自 Go 侧并行 AEAD）；VLESS+TLS 走 AES-NI GCM，比 ss 更快更省。</p>
+低于 sing-box（其优势来自 Go 侧并行 AEAD）；VLESS+TLS 走 AES-NI GCM，比 ss 更快更省。<label for="sn4" class="margin-toggle sidenote-number"></label><input type="checkbox" id="sn4" class="margin-toggle"><span class="sidenote">direct 行为<b>下界口径</b>：夹具上限 ≈24.5 Gbps 先于实现撞线，故 25.5/25.0/22.6 的差别在噪声内；CPU≈0 是因为数据包走内核 eBPF 路径、根本未进用户态。</span><label for="mn5" class="margin-toggle">⊕</label><input type="checkbox" id="mn5" class="margin-toggle"><span class="marginnote">表 0 中的「M1 锚点 9 840」为 2026-10 月初 io_uring 试验期的旧读数，保留作对照；现行口径以修复后 10 轮（8 624–9 908）为准。</span></p>
 
 <h3 id="s42">4.2 · 并发扩展与瓶颈排序</h3>
 <ul>
   <li><b>direct 64×1 MB 口径 38.7 Gbps</b>（v3.0 时代 35.2）；VLESS 8×64 MB 15.2 Gbps（受修复前口径影响，修复后按 4.1 的新基线外推更高）。</li>
   <li><b>relay（无加密用户态泵）</b>8 流 20.1 Gbps（splice 零拷贝路径）。</li>
   <li>瓶颈排序（先撞到者）：<b>单核 AEAD（ss）→ 用户态内存带宽（v2ray 类拷贝泵）→ TCP 栈/软中断</b>；
-  sodama 的两条快路径（direct / splice）把成本推到内核侧后就接近线速。</li>
+  sodama 的两条快路径（direct / splice）把成本推到内核侧后就接近线速。<label for="sn5" class="margin-toggle sidenote-number"></label><input type="checkbox" id="sn5" class="margin-toggle"><span class="sidenote">「先撞到者即瓶颈」是一个可操作的判断法：依次抬高负载，第一条被压住的资源就是当期瓶颈——ss 在 9 G 处被单核 AEAD 压住，v2ray 在 10 G 处被拷贝带宽压住。</span></li>
 </ul>
 
 <h3 id="s43">4.3 · 内存四层模型（进程 / 内核 / 系统总量 / 每连接）</h3>
 <figure class="wide">
-<svg viewBox="0 0 880 270" role="img" aria-label="hold 2000 RSS 五方">
-  <text x="142" y="51" text-anchor="end" font-size="11" fill="#151515">sodama</text>
-  <rect x="150" y="36" width="56" height="22" fill="#1f4e79" opacity="1.0"/>
-  <text x="212" y="51" font-size="10" fill="#3d3a33">32.1 MB</text>
-  <text x="142" y="91" text-anchor="end" font-size="11" fill="#151515">sing-box 1.14.2</text>
-  <rect x="150" y="76" width="148" height="22" fill="#6b5b8a" opacity="0.6"/>
-  <text x="304" y="91" font-size="10" fill="#3d3a33">84.3 MB</text>
-  <text x="142" y="131" text-anchor="end" font-size="11" fill="#151515">v2ray 5.52.0</text>
-  <rect x="150" y="116" width="251" height="22" fill="#6b5b8a" opacity="0.6"/>
-  <text x="407" y="131" font-size="10" fill="#3d3a33">143.3 MB</text>
-  <text x="142" y="171" text-anchor="end" font-size="11" fill="#151515">mihomo 1.19.32</text>
-  <rect x="150" y="156" width="299" height="22" fill="#6b5b8a" opacity="0.6"/>
-  <text x="455" y="171" font-size="10" fill="#3d3a33">171.0 MB</text>
-  <text x="142" y="211" text-anchor="end" font-size="11" fill="#151515">dae v2.1.1</text>
-  <rect x="150" y="196" width="529" height="22" fill="#6b5b8a" opacity="0.6"/>
-  <text x="685" y="211" font-size="10" fill="#3d3a33">302.4 MB</text>
-  <line x1="150" y1="24" x2="150" y2="218" stroke="#c9c2ae"/>
-  <line x1="150" y1="24" x2="150" y2="218" stroke="#eee8d8"/>
-  <text x="150" y="234" text-anchor="middle" font-size="10" fill="#6f6a5c">0</text>
-  <line x1="325" y1="24" x2="325" y2="218" stroke="#eee8d8"/>
-  <text x="325" y="234" text-anchor="middle" font-size="10" fill="#6f6a5c">100</text>
-  <line x1="500" y1="24" x2="500" y2="218" stroke="#eee8d8"/>
-  <text x="500" y="234" text-anchor="middle" font-size="10" fill="#6f6a5c">200</text>
-  <line x1="675" y1="24" x2="675" y2="218" stroke="#eee8d8"/>
-  <text x="675" y="234" text-anchor="middle" font-size="10" fill="#6f6a5c">300</text>
-  <text x="430" y="238" text-anchor="middle" font-size="10.5" fill="#6f6a5c">RSS（MB）· hold 2 000 连接峰值口径</text>
+<svg viewBox="0 0 880 250" role="img" aria-label="五方内存范围与 hold 点">
+<line x1="290.0" y1="46.0" x2="290.0" y2="53.0" stroke="#c9c2ae" stroke-width="0.8"/>
+<text x="290.0" y="40.0" font-size="9.5" fill="#6f6a5c" text-anchor="middle">100</text>
+<line x1="430.0" y1="46.0" x2="430.0" y2="53.0" stroke="#c9c2ae" stroke-width="0.8"/>
+<text x="430.0" y="40.0" font-size="9.5" fill="#6f6a5c" text-anchor="middle">200</text>
+<line x1="570.0" y1="46.0" x2="570.0" y2="53.0" stroke="#c9c2ae" stroke-width="0.8"/>
+<text x="570.0" y="40.0" font-size="9.5" fill="#6f6a5c" text-anchor="middle">300</text>
+<line x1="710.0" y1="46.0" x2="710.0" y2="53.0" stroke="#c9c2ae" stroke-width="0.8"/>
+<text x="710.0" y="40.0" font-size="9.5" fill="#6f6a5c" text-anchor="middle">400</text>
+<line x1="850.0" y1="46.0" x2="850.0" y2="53.0" stroke="#c9c2ae" stroke-width="0.8"/>
+<text x="850.0" y="40.0" font-size="9.5" fill="#6f6a5c" text-anchor="middle">500</text>
+<text x="500.0" y="20.0" font-size="10" fill="#6f6a5c" text-anchor="middle">RSS（MB）</text>
+<text x="140.0" y="81.4" font-size="10.5" fill="#151515" text-anchor="end" font-weight="600">sodama</text>
+<line x1="191.0" y1="78.0" x2="196.1" y2="78.0" stroke="#cfc9b8" stroke-width="3.2"/>
+<circle cx="191.0" cy="78.0" r="2.2" fill="#b4b8bd"/>
+<circle cx="194.9" cy="78.0" r="3.6" fill="#1f4e79"/>
+<text x="194.9" y="67.0" font-size="10" fill="#1f4e79" text-anchor="middle" font-weight="700">32.1</text>
+<text x="204.1" y="81.4" font-size="9.5" fill="#6f6a5c">churn 峰值 32.9</text>
+<text x="140.0" y="115.4" font-size="10.5" fill="#6f6a5c" text-anchor="end">sing-box</text>
+<line x1="231.1" y1="112.0" x2="279.2" y2="112.0" stroke="#cfc9b8" stroke-width="3.2"/>
+<circle cx="231.1" cy="112.0" r="2.2" fill="#b4b8bd"/>
+<circle cx="268.0" cy="112.0" r="3.6" fill="#5b5f66"/>
+<text x="268.0" y="101.0" font-size="10" fill="#151515" text-anchor="middle">84.3</text>
+<text x="287.2" y="115.4" font-size="9.5" fill="#6f6a5c">churn 峰值 92.3</text>
+<text x="140.0" y="149.4" font-size="10.5" fill="#6f6a5c" text-anchor="end">v2ray</text>
+<line x1="213.4" y1="146.0" x2="828.7" y2="146.0" stroke="#cfc9b8" stroke-width="3.2"/>
+<circle cx="213.4" cy="146.0" r="2.2" fill="#b4b8bd"/>
+<circle cx="350.6" cy="146.0" r="3.6" fill="#5b5f66"/>
+<text x="350.6" y="135.0" font-size="10" fill="#151515" text-anchor="middle">143.3</text>
+<text x="824.7" y="160.0" font-size="9.5" fill="#6f6a5c" text-anchor="end">churn 峰值 484.8</text>
+<text x="140.0" y="183.4" font-size="10.5" fill="#6f6a5c" text-anchor="end">mihomo</text>
+<line x1="216.6" y1="180.0" x2="471.0" y2="180.0" stroke="#cfc9b8" stroke-width="3.2"/>
+<circle cx="216.6" cy="180.0" r="2.2" fill="#b4b8bd"/>
+<circle cx="389.4" cy="180.0" r="3.6" fill="#5b5f66"/>
+<text x="389.4" y="169.0" font-size="10" fill="#151515" text-anchor="middle">171.0</text>
+<text x="479.0" y="183.4" font-size="9.5" fill="#6f6a5c">churn 峰值 229.3</text>
+<text x="140.0" y="217.4" font-size="10.5" fill="#6f6a5c" text-anchor="end">dae v2.1.1</text>
+<line x1="219.6" y1="214.0" x2="630.3" y2="214.0" stroke="#cfc9b8" stroke-width="3.2"/>
+<circle cx="219.6" cy="214.0" r="2.2" fill="#b4b8bd"/>
+<circle cx="573.4" cy="214.0" r="3.6" fill="#5b5f66"/>
+<text x="573.4" y="203.0" font-size="10" fill="#151515" text-anchor="middle">302.4</text>
+<text x="638.3" y="217.4" font-size="9.5" fill="#6f6a5c">churn 峰值 343.1</text>
+<text x="150.0" y="238.0" font-size="9.5" fill="#6f6a5c">细条起端 = idle；实点 = hold 2 000；条右端 = churn 峰值</text>
 </svg>
-<figcaption><b>图 2 · hold 2 000 连接的 RSS 峰值（五方）。</b>sodama 32.1 MB 与其余四家（84–302 MB）不在一个量级；
-churn（2 000 连接风暴）后 sodama 完全回落（31 线程 / 359 fd），dae 静置 81.8 MB 不回落（GC 保留）、
-v2ray 静置 314 MB（分配器滞留）。</figcaption>
+<figcaption><b>图 3 · 五方内存的「稳态点 + 动态范围」（hold 2 000 连接）。</b>细条为 idle → churn 风暴峰值
+的波动范围、实点为 hold 2 000 稳态；sodama 的条短且平（29.3→32.9 MB），v2ray 的条最长（45.3→484.8 MB，
+分配器滞留）、dae 的稳态点最高（302.4 MB，GC 保留）。churn 后 sodama 完全回落（31 线程 / 359 fd）。</figcaption>
 </figure>
-<table class="tight">
+<table class="tight wide">
   <caption>表 3 · 五方五阶段 RSS（MB）与每连接边际成本</caption>
   <thead><tr><th>实现</th><th class="num">idle</th><th class="num">hold 2 000</th><th class="num">churn 峰值</th><th class="num">静置 30 s</th><th class="num">每连接边际</th></tr></thead>
   <tbody>
@@ -435,90 +554,75 @@ v2ray 静置 314 MB（分配器滞留）。</figcaption>
 </table>
 <p><b>系统总量（四层模型的第三层）</b>：5 万连接扫描下 sodama 系统净增 ≈<b>2.0 GB</b>（≈40.9 KB/连接，
 含共享链路），dae ≈<b>8.2 GB</b>（172.7 KB/连接）——<b>RSS 优势 ≠ 系统优势</b>，两层都测才完整。
-5 万连接时 sodama RSS 55.6 MB / 31 线程 / 100 008 fd（2/连接，含 offload 前峰值无瞬态）。</p>
+5 万连接时 sodama RSS 55.6 MB / 31 线程 / 100 008 fd。<label for="sn6" class="margin-toggle sidenote-number"></label><input type="checkbox" id="sn6" class="margin-toggle"><span class="sidenote">四层 = ① 进程 RSS ② 内核侧（eBPF/socket/软中断）③ 系统总量 ④ 每连接边际。只看 ① 会漏掉内核成本——反向地，只看 ③ 会低估用户态的差异；四层齐了才能做取舍。</span><label for="mn6" class="margin-toggle">⊕</label><input type="checkbox" id="mn6" class="margin-toggle"><span class="marginnote">100 008 fd ÷ 50 004 连接 = 2/连接：两个 socket（LAN/WAN 侧）；pipe 为懒建且空闲释放，不占常量 fd。</span></p>
 
 <h3 id="s44">4.4 · UDP 路径（40 000×256 B @20 000 pps）</h3>
 <figure class="wide">
-<svg viewBox="0 0 880 270" role="img" aria-label="UDP 20k pps 五方 CPU">
-  <text x="142" y="51" text-anchor="end" font-size="11" fill="#151515">sodama</text>
-  <rect x="150" y="36" width="220" height="22" fill="#1f4e79" opacity="1.0"/>
-  <text x="376" y="51" font-size="10" fill="#3d3a33">1020 ms</text>
-  <text x="142" y="91" text-anchor="end" font-size="11" fill="#151515">sing-box 1.14.2</text>
-  <rect x="150" y="76" width="347" height="22" fill="#6b5b8a" opacity="0.6"/>
-  <text x="503" y="91" font-size="10" fill="#3d3a33">1610 ms</text>
-  <text x="142" y="131" text-anchor="end" font-size="11" fill="#151515">v2ray 5.52.0</text>
-  <rect x="150" y="116" width="392" height="22" fill="#6b5b8a" opacity="0.6"/>
-  <text x="548" y="131" font-size="10" fill="#3d3a33">1820 ms</text>
-  <text x="142" y="171" text-anchor="end" font-size="11" fill="#151515">dae v2.1.1</text>
-  <rect x="150" y="156" width="467" height="22" fill="#6b5b8a" opacity="0.6"/>
-  <text x="623" y="171" font-size="10" fill="#3d3a33">2170 ms</text>
-  <text x="142" y="211" text-anchor="end" font-size="11" fill="#151515">mihomo 1.19.32</text>
-  <rect x="150" y="196" width="530" height="22" fill="#6b5b8a" opacity="0.6"/>
-  <text x="686" y="211" font-size="10" fill="#3d3a33">2460 ms</text>
-  <line x1="150" y1="24" x2="150" y2="218" stroke="#c9c2ae"/>
-  <line x1="150" y1="24" x2="150" y2="218" stroke="#eee8d8"/>
-  <text x="150" y="234" text-anchor="middle" font-size="10" fill="#6f6a5c">0</text>
-  <line x1="258" y1="24" x2="258" y2="218" stroke="#eee8d8"/>
-  <text x="258" y="234" text-anchor="middle" font-size="10" fill="#6f6a5c">500</text>
-  <line x1="365" y1="24" x2="365" y2="218" stroke="#eee8d8"/>
-  <text x="365" y="234" text-anchor="middle" font-size="10" fill="#6f6a5c">1000</text>
-  <line x1="473" y1="24" x2="473" y2="218" stroke="#eee8d8"/>
-  <text x="473" y="234" text-anchor="middle" font-size="10" fill="#6f6a5c">1500</text>
-  <line x1="581" y1="24" x2="581" y2="218" stroke="#eee8d8"/>
-  <text x="581" y="234" text-anchor="middle" font-size="10" fill="#6f6a5c">2000</text>
-  <line x1="688" y1="24" x2="688" y2="218" stroke="#eee8d8"/>
-  <text x="688" y="234" text-anchor="middle" font-size="10" fill="#6f6a5c">2500</text>
-  <text x="430" y="238" text-anchor="middle" font-size="10.5" fill="#6f6a5c">ms / 40 k 包 · 40 000×256 B @20 000 pps（零丢包口径，sodama 为修复后值）</text>
+<svg viewBox="0 0 880 208" role="img" aria-label="UDP 两万 pps 五方进程 CPU">
+<text x="168.0" y="26.0" font-size="10" fill="#6f6a5c">进程 CPU（ms / 40 000 包）</text>
+<text x="156.0" y="57.4" font-size="10.5" fill="#151515" text-anchor="end" font-weight="600">sodama</text>
+<line x1="168.0" y1="54.0" x2="434.8" y2="54.0" stroke="#cfc9b8" stroke-width="1.6"/>
+<circle cx="434.8" cy="54.0" r="6.1" fill="none" stroke="#1f4e79" stroke-width="1.1"/><circle cx="434.8" cy="54.0" r="4.0" fill="#1f4e79"/>
+<text x="446.8" y="57.6" font-size="10" fill="#1f4e79" font-weight="700">1 020</text>
+<text x="156.0" y="87.4" font-size="10.5" fill="#6f6a5c" text-anchor="end">sing-box</text>
+<line x1="168.0" y1="84.0" x2="589.1" y2="84.0" stroke="#cfc9b8" stroke-width="1.3"/>
+<circle cx="589.1" cy="84.0" r="3.2" fill="#8a8f96"/>
+<text x="601.1" y="87.6" font-size="10" fill="#151515">1 610</text>
+<text x="156.0" y="117.4" font-size="10.5" fill="#6f6a5c" text-anchor="end">v2ray</text>
+<line x1="168.0" y1="114.0" x2="644.0" y2="114.0" stroke="#cfc9b8" stroke-width="1.3"/>
+<circle cx="644.0" cy="114.0" r="3.2" fill="#8a8f96"/>
+<text x="656.0" y="117.6" font-size="10" fill="#151515">1 820</text>
+<text x="156.0" y="147.4" font-size="10.5" fill="#6f6a5c" text-anchor="end">dae v2.1.1</text>
+<line x1="168.0" y1="144.0" x2="735.5" y2="144.0" stroke="#cfc9b8" stroke-width="1.3"/>
+<circle cx="735.5" cy="144.0" r="3.2" fill="#8a8f96"/>
+<text x="747.5" y="147.6" font-size="10" fill="#151515">2 170</text>
+<text x="156.0" y="177.4" font-size="10.5" fill="#6f6a5c" text-anchor="end">mihomo</text>
+<line x1="168.0" y1="174.0" x2="811.4" y2="174.0" stroke="#cfc9b8" stroke-width="1.3"/>
+<circle cx="811.4" cy="174.0" r="3.2" fill="#8a8f96"/>
+<text x="823.4" y="177.6" font-size="10" fill="#151515">2 460</text>
 </svg>
-<figcaption><b>图 3 · UDP 20 000 pps 五方进程 CPU（零丢包）。</b>sodama 1 020 ms / 40 k 包为五方最优；
+<figcaption><b>图 4 · UDP 20 000 pps 五方进程 CPU（零丢包）。</b>sodama 1 020 ms / 40 k 包为五方最优（次优 sing-box 1 610）；
 手段是 recvmmsg/sendmmsg 批量收发 + 16 分片会话表 + <b>UDP GSO 聚合发送</b>（<code>UDP_SEGMENT</code>，回落逐包）。
 本口径 256 B 包的线速即 41 Mbps，故分辨力在 CPU 与丢包、不在带宽。</figcaption>
 </figure>
-<p>UDP NAT 面（生产与 lab 口径）：full-cone 端点池 + 分类 TTL/负缓存/1s janitor + <code>raw_udp</code> 回退；
-GSO 三段计数（<code>gso_sends</code>/<code>gso_datagrams</code>/<code>gso_unsupported</code>）进状态面与面板数据面卡片。</p>
+<p>UDP NAT 面（生产与 lab 口径）：full-cone 端点池 + 分类 TTL/负缓存/1s janitor + <code>raw_udp</code> 回退。<label for="mn7" class="margin-toggle">⊕</label><input type="checkbox" id="mn7" class="margin-toggle"><span class="marginnote">GSO 三段计数（<code>gso_sends</code>/<code>gso_datagrams</code>/<code>gso_unsupported</code>）进状态面与面板数据面卡片；内核返回 EMGSIZE/EINVAL/EOPNOTSUPP 时逐包回落，不重试、不丢包。</span></p>
 
 <h3 id="s45">4.5 · 真实公网轮（CF 边缘订阅节点，17 轮 ×4）</h3>
 <figure class="wide">
-<svg viewBox="0 0 880 250" role="img" aria-label="真实公网轮 CPU/GB">
-  <text x="142" y="59" text-anchor="end" font-size="11" fill="#151515">sodama</text>
-  <rect x="150" y="44" width="61" height="22" fill="#1f4e79"/>
-  <rect x="211" y="44" width="200" height="22" fill="#6b5b8a" opacity="0.6"/>
-  <text x="417" y="59" font-size="10" fill="#3d3a33">12 642（进程 2 952 + 内核 9 690）</text>
-  <text x="142" y="103" text-anchor="end" font-size="11" fill="#151515">dae v2.1.1</text>
-  <rect x="150" y="88" width="88" height="22" fill="#1f4e79"/>
-  <rect x="238" y="88" width="417" height="22" fill="#6b5b8a" opacity="0.6"/>
-  <text x="661" y="103" font-size="10" fill="#3d3a33">24 431（进程 4 266 + 内核 20 165）</text>
-  <text x="142" y="147" text-anchor="end" font-size="11" fill="#151515">sing-box 1.14.2</text>
-  <rect x="150" y="132" width="85" height="22" fill="#1f4e79"/>
-  <rect x="235" y="132" width="510" height="22" fill="#6b5b8a" opacity="0.6"/>
-  <text x="751" y="147" font-size="10" fill="#3d3a33">28 770（进程 4 111 + 内核 24 659）</text>
-  <text x="142" y="191" text-anchor="end" font-size="11" fill="#151515">direct 基线</text>
-  <rect x="150" y="176" width="0" height="22" fill="#1f4e79"/>
-  <rect x="150" y="176" width="273" height="22" fill="#6b5b8a" opacity="0.6"/>
-  <text x="429" y="191" font-size="10" fill="#3d3a33">13 210（进程 0 + 内核 13 210）</text>
-  <line x1="150" y1="30" x2="150" y2="198" stroke="#c9c2ae"/>
-  <line x1="150" y1="30" x2="150" y2="198" stroke="#eee8d8"/>
-  <text x="150" y="214" text-anchor="middle" font-size="10" fill="#6f6a5c">0k</text>
-  <line x1="253" y1="30" x2="253" y2="198" stroke="#eee8d8"/>
-  <text x="253" y="214" text-anchor="middle" font-size="10" fill="#6f6a5c">5k</text>
-  <line x1="357" y1="30" x2="357" y2="198" stroke="#eee8d8"/>
-  <text x="357" y="214" text-anchor="middle" font-size="10" fill="#6f6a5c">10k</text>
-  <line x1="460" y1="30" x2="460" y2="198" stroke="#eee8d8"/>
-  <text x="460" y="214" text-anchor="middle" font-size="10" fill="#6f6a5c">15k</text>
-  <line x1="563" y1="30" x2="563" y2="198" stroke="#eee8d8"/>
-  <text x="563" y="214" text-anchor="middle" font-size="10" fill="#6f6a5c">20k</text>
-  <line x1="667" y1="30" x2="667" y2="198" stroke="#eee8d8"/>
-  <text x="667" y="214" text-anchor="middle" font-size="10" fill="#6f6a5c">25k</text>
-  <line x1="770" y1="30" x2="770" y2="198" stroke="#eee8d8"/>
-  <text x="770" y="214" text-anchor="middle" font-size="10" fill="#6f6a5c">30k</text>
-  <text x="439" y="226" text-anchor="middle" font-size="10.5" fill="#6f6a5c">ms / GB（越低越好）</text>
+<svg viewBox="0 0 880 250" role="img" aria-label="公网轮每 GB 客户端 CPU 分解">
+<line x1="384.7" y1="40.0" x2="384.7" y2="47.0" stroke="#c9c2ae" stroke-width="0.8"/>
+<text x="384.7" y="34.0" font-size="9.5" fill="#6f6a5c" text-anchor="middle">10k</text>
+<line x1="601.3" y1="40.0" x2="601.3" y2="47.0" stroke="#c9c2ae" stroke-width="0.8"/>
+<text x="601.3" y="34.0" font-size="9.5" fill="#6f6a5c" text-anchor="middle">20k</text>
+<line x1="818.0" y1="40.0" x2="818.0" y2="47.0" stroke="#c9c2ae" stroke-width="0.8"/>
+<text x="818.0" y="34.0" font-size="9.5" fill="#6f6a5c" text-anchor="middle">30k</text>
+<text x="168.0" y="20.0" font-size="10" fill="#6f6a5c">每 GB 客户端 CPU（ms；左段 = 进程 · 右段 = 内核侧）</text>
+<text x="156.0" y="74.0" font-size="10.5" fill="#151515" text-anchor="end" font-weight="600">sodama</text>
+<rect x="168" y="63" width="64.0" height="14" fill="#1f4e79"/>
+<rect x="234.0" y="64.5" width="208.0" height="11" fill="#9db6cc"/>
+<text x="226.0" y="74.0" font-size="9.5" fill="#fffff8" text-anchor="end" font-weight="600">2 952</text>
+<text x="451.9" y="74.0" font-size="10" fill="#1f4e79" font-weight="700">合计 12 642</text>
+<text x="156.0" y="116.0" font-size="10.5" fill="#6f6a5c" text-anchor="end">dae v2.1.1</text>
+<rect x="168" y="105" width="92.4" height="14" fill="#5b5f66"/>
+<rect x="262.4" y="106.5" width="434.9" height="11" fill="#c3c7cc"/>
+<text x="254.4" y="116.0" font-size="9.5" fill="#fffff8" text-anchor="end" font-weight="600">4 266</text>
+<text x="707.3" y="116.0" font-size="10" fill="#151515">合计 24 431</text>
+<text x="156.0" y="158.0" font-size="10.5" fill="#6f6a5c" text-anchor="end">sing-box</text>
+<rect x="168" y="147" width="89.1" height="14" fill="#5b5f66"/>
+<rect x="259.1" y="148.5" width="532.3" height="11" fill="#c3c7cc"/>
+<text x="251.1" y="158.0" font-size="9.5" fill="#fffff8" text-anchor="end" font-weight="600">4 111</text>
+<text x="801.4" y="158.0" font-size="10" fill="#151515">合计 28 770</text>
+<text x="156.0" y="200.0" font-size="10.5" fill="#6f6a5c" text-anchor="end">direct（无代理）</text>
+<rect x="168" y="189" width="0.0" height="14" fill="#5b5f66"/>
+<rect x="170.0" y="190.5" width="284.2" height="11" fill="#c3c7cc"/>
+<text x="464.2" y="200.0" font-size="10" fill="#151515">合计 13 210</text>
 </svg>
-<figcaption><b>图 4 · 每 GB 的客户端 CPU（进程 + 内核侧）。</b>节点出口 ≈19 Mbps 是三方共同上限，
+<figcaption><b>图 5 · 每 GB 的客户端 CPU（深色 = 进程 · 浅色 = 内核侧）。</b>节点出口 ≈19 Mbps 是三方共同上限，
 区分度全在 CPU/GB：sodama 进程口径比 dae 低 <b>31%</b>、比 sing-box 低 <b>28%</b>；
-把内核侧（eBPF/软中断）计入后差距扩大到 <b>−48% / −56%</b>（该口径含宿主噪声，作上界估计）。
+把内核侧（eBPF/软中断）计入后合计差距扩大到 <b>−48% / −56%</b>（内核口径含宿主噪声，作上界估计）。
 direct 基线跑在 2 倍速率上，仅作数量级参照。</figcaption>
 </figure>
-<table class="tight">
+<table class="tight wide">
   <caption>表 4 · 真实节点轮（目标 proof.ovh.net；节点只接受域名目标，三方均「嗅探 → 域名拨号」）</caption>
   <thead><tr><th>实现</th><th class="num">吞吐 Mbps 中位</th><th class="num">进程 CPU ms/GB</th><th class="num">内核侧净 ms/GB</th><th class="num">合计 ms/GB</th></tr></thead>
   <tbody>
@@ -532,17 +636,16 @@ direct 基线跑在 2 倍速率上，仅作数量级参照。</figcaption>
 这本身是能力对照点；② 出口池抖动：默认 8 出口路径下参考客户端 20 轮 17 轮被截断，固定单一健康出口后残余 ~25%，
 靠「短传输判定 + 单轮重试」消化；③ CacheFly 对节点出口有配额限流（403）、speed.cloudflare.com 经该 worker 超时，
 最终选 proof.ovh.net；④ <b>sing-box 1.14 移除了嗅探回写拨号目标的能力</b>（sniff action 无 override 字段，
-遗留键为 no-op）——只能用 route action 的 <code>override_address</code> 或 FakeIP。</p>
+遗留键为 no-op）——只能用 route action 的 <code>override_address</code> 或 FakeIP。<label for="sn7" class="margin-toggle sidenote-number"></label><input type="checkbox" id="sn7" class="margin-toggle"><span class="sidenote">④ 是本轮最有份量的<em class="term">能力对照点</em>：在「域名目标节点」上 sing-box 只能绕道 route action / FakeIP，而 sodama 与 dae 都保留了「嗅探 → 回写域名」的原生路径。</span></p>
 
 <h3 id="s46">4.6 · 长稳与有界性</h3>
 <ul>
   <li><b>本机 60 min</b>：RSS +17.6% <b>FAIL 判据</b>（单次 4.5 MB 台阶，非持续泄漏形态；
-  Slab +0.26% / SUnreclaim +0.88% / fd 无增长 / 零失败；RTT p50 中位 44 µs）——列为待 2–3 h 复测项。</li>
+  Slab +0.26% / SUnreclaim +0.88% / fd 无增长 / 零失败；RTT p50 中位 44 µs）——列为待 2–3 h 复测项。<label for="sn8" class="margin-toggle sidenote-number"></label><input type="checkbox" id="sn8" class="margin-toggle"><span class="sidenote">台阶 ≠ 泄漏：判据看<b>稳态段斜率与窗口极差</b>——单次分配台阶（一次性抬升）与持续增长（斜率恒正）是两种形态；72h 轮通过前不启用「bounded-memory」表述。</span></li>
   <li><b>生产 72h 链</b>（软路由 2C/4G，真实负载）：旧轮 21.4 h 收口 —— <code>dial_errors</code>/<code>stragglers</code> 全程 <b>0</b>、
   RSS 冷启 43.8 → 预热台阶后稳态 <b>53.5 MB</b>（14 h 窗口极差 3.66 MB、稳态斜率 −47.8 KB/h ≈ 0）、
   FD 133（103–184）、线程 18、<code>reactor_codec_sessions == conns_total</code>；
-  <b>新轮 2026-10-17 03:22 起跑</b>（新构建冷启基线 RSS 54.6 MB / 线程 20 / fd 143，判据同 §12 记分板）。</li>
-  <li>「bounded-memory」的绝对表述<b>仍不启用</b>——直到新 72h 轮通过。</li>
+  <b>新轮 2026-10-17 03:22 起跑</b>。<label for="mn8" class="margin-toggle">⊕</label><input type="checkbox" id="mn8" class="margin-toggle"><span class="marginnote">新引擎轮冷启基线：RSS 54.6 MB / 线程 20 / fd 143——比旧轮高（功能面更大），属预期；对照曲线见 §8.2。</span></li>
 </ul>
 </section>
 
@@ -552,7 +655,7 @@ direct 基线跑在 2 倍速率上，仅作数量级参照。</figcaption>
 <p>单测（351）只证明函数级行为；<b>lab 专项</b>在 netns 真实拓扑里跑（双拓扑 × 九用例、嗅探 punt、
 UDP full-cone、v6、DoH-h2、Vision XTLS 状态机、钩子生命周期……）；<b>跨实现逐字节</b>才证明「正确」——
 规则编译与 Go 版对拍 5/5、Vision 帧层与 Xray 夹具四模式逐字节、TLS 记录层与 Go/quic-go 互操作、
-shadow-tls 三版交叉。第四级是<b>真实世界</b>：真实节点公网轮 + 生产 72h 链。</p>
+shadow-tls 三版交叉。第四级是<b>真实世界</b>：真实节点公网轮 + 生产 72h 链。<label for="sn9" class="margin-toggle sidenote-number"></label><input type="checkbox" id="sn9" class="margin-toggle"><span class="sidenote">级别即证据强度（成本也递增）：单测（秒级）＜ lab 专项（分钟级）＜ 跨实现逐字节（小时级）＜ 真实世界（天级）。缺一级就会留一类盲区——R11 加载失败正是「只跑 QEMU、未跑宿主」漏掉的。</span></p>
 <h3>5.2 · 夹具工程学</h3>
 <p>吞吐夹具（<code>bench_io</code> 48 MB×4 流全双工）、连接夹具（<code>conn_scale</code> hold/churn）、
 回显夹具（万级连接）、UDP 冲击器、Vision 夹具（Xray 交叉）——夹具自身的缺陷会伪装成被测实现的问题
@@ -563,7 +666,7 @@ shadow-tls 三版交叉。第四级是<b>真实世界</b>：真实节点公网�
   <li>对照必须同轮同拓扑（跨轮漂移用双数据集交叉验证）；</li>
   <li>「未做」写成「未做」，不写成「等效」；</li>
   <li>时长要诚实（60 min ≠ 72 h，72 h ≠ 永久）；</li>
-  <li>数字异常先怀疑口径与就绪状态（daе 未就绪时的「假公网兜底」曾造出 24.6 G/CPU 0 的假读数）；</li>
+  <li>数字异常先怀疑口径与就绪状态（dae 未就绪时的「假公网兜底」曾造出 24.6 G / CPU 0 的假读数）；</li>
   <li>修复后必须复测并更新原始数字（本版把 vless/ss 的修复后值直接替换进表，而不是并列旧值）；</li>
   <li>数据源可复算：报告与图集的每个数字都能指到某轮的 TSV/日志。</li>
 </ol>
@@ -573,7 +676,7 @@ shadow-tls 三版交叉。第四级是<b>真实世界</b>：真实节点公网�
 
 <section id="s6">
 <h2><span class="num">§6</span>踩坑档案 · 十六则</h2>
-<table class="tight">
+<table class="tight wide">
   <caption>表 5 · 现场笔记（★ = 2026-10-16/17 修复轮新增）</caption>
   <thead><tr><th>#</th><th>现象</th><th>根因与处置</th></tr></thead>
   <tbody>
@@ -583,7 +686,7 @@ shadow-tls 三版交叉。第四级是<b>真实世界</b>：真实节点公网�
     <tr><td>★4</td><td>OpenWrt（musl）交叉构建失败</td><td>GSO 的 cmsg 用了 glibc 专有 <code>msghdr</code> 字面量（musl 字段类型不同 + 私有填充）；改 <code>zeroed()</code> + <code>as _</code>；教训：<b>开发机 glibc 单测会掩盖交叉目标问题</b></td></tr>
     <tr><td>5</td><td>ss 吞吐双峰（5.8–9.0 G）</td><td>共享 mpsc + drain-all 认领 → 单 worker 全领单核 AEAD 瓶颈；改每 worker 独立通道 + 轮询定向分派</td></tr>
     <tr><td>6</td><td>新 lab 使标准路径吞吐砍半</td><td><code>up()</code> 无条件关 dae0/dae0peer offload；治理收进 L3 用例（关→用→恢复）</td></tr>
-    <tr><td>7</td><td>daе「高分假象」（24.6 G / CPU 0）</td><td>启动未就绪 → 流量被假公网兜底直通；判定法：vless≈direct 或 CPU≈0 即假象</td></tr>
+    <tr><td>7</td><td>dae「高分假象」（24.6 G / CPU 0）</td><td>启动未就绪 → 流量被假公网兜底直通；判定法：vless≈direct 或 CPU≈0 即假象</td></tr>
     <tr><td>8</td><td>CF 额度事故（自建订阅 68k/100k 请求）</td><td>「有长连接」被恒判为忙 + 探测循环被流量叫醒 → 6× 超速；P37/P37b 治理 + 生产回验（32 次/分 = 设计值）</td></tr>
     <tr><td>9</td><td>DoH 连接 3 s 生命周期（≈1.4 万重连/天）</td><td>拨号看门狗未解除 → 3 s 掐断持久连接；审计实锤并修复（生产 40 s 端口不变回验）</td></tr>
     <tr><td>10</td><td>重定向表暴增导致断网</td><td><code>redirect_track</code> 清理不及时；janitor + 容量治理（生产事故复盘见 notes）</td></tr>
@@ -595,16 +698,18 @@ shadow-tls 三版交叉。第四级是<b>真实世界</b>：真实节点公网�
     <tr><td>16</td><td>状态查询把探测退避永久重置</td><td>P37：状态查询不再回写「有人在看」；仅新连接 Touch（与 mihomo/sing-box 惯例对齐）</td></tr>
   </tbody>
 </table>
+<p><label for="mn9" class="margin-toggle">⊕</label><input type="checkbox" id="mn9" class="margin-toggle"><span class="marginnote">★1–★4 为本轮（2026-10-16/17）新增；完整现场（时间线、证据、命令）见 <code>phase2-devlog.md</code> §24 与 <code>memory-safety-audit.html</code>。</span></p>
 </section>
+
 <section id="s7">
 <h2><span class="num">§7</span>余项地图 · A–J 类待办与永久边界</h2>
-<table class="tight">
+<table class="tight wide">
   <caption>表 6 · 余项（✅ = 已交付；余项均有验收条件，见 <code>docs/backlog.md</code>）</caption>
   <thead><tr><th>类</th><th>主题</th><th>当期状态</th><th class="num">优先级</th></tr></thead>
   <tbody>
     <tr><td class="c">A</td><td>工程化与发布</td><td>✅ shell 补全 · ✅ <code>--version</code>；余：Docker 镜像 · 发行包（tarball）· 发行 CI · CHANGELOG 生成</td><td class="num">最高</td></tr>
     <tr><td class="c">B</td><td>出站协议余项</td><td>余：其余 SIP003 插件（simple-obfs/v2ray-plugin）· SSR <code>auth_*</code>/<code>obfs_*</code> 与 UDP · ECH（已评估边界，显式报错不静默）· naive 边界（Basic 依赖外层 TLS）</td><td class="num">低</td></tr>
-    <tr><td class="c">C</td><td>eBPF 数据面</td><td>余：事件限速 per-CPU 粒度（无 64 位原子）· <code>bpf_conn_state_map_size</code> 运行期变更 · xdp 探针在软路由网卡的计数实测（native/generic 可用性）</td><td class="num">低</td></tr>
+    <tr><td class="c">C</td><td>eBPF 数据面</td><td>余：事件限速 per-CPU 粒度（无 64 位原子）· <code>bpf_conn_state_map_size</code> 运行期变更 · <code>xdp</code> 探针在软路由网卡的计数实测（native/generic 可用性）</td><td class="num">低</td></tr>
     <tr><td class="c">D</td><td>配置系统</td><td>余：global 余 9 键不生效（全部显式告警或 ADR 边界）· <code>config_merger</code> deferred 收尾</td><td class="num">中</td></tr>
     <tr><td class="c">E</td><td>转发面</td><td>✅ full-cone/raw_udp · ✅ 背压 fuse · ✅ UDP GSO（含 2026-10-17 修复）；余：连接计费/backlog 计费</td><td class="num">中</td></tr>
     <tr><td class="c">F</td><td>嗅探 / IPv6</td><td>余：QUIC 观测→拨号联动 · UDP punt 细节 · ICMPv6/分片</td><td class="num">中</td></tr>
@@ -614,6 +719,8 @@ shadow-tls 三版交叉。第四级是<b>真实世界</b>：真实节点公网�
     <tr class="hi"><td class="c">J</td><td><b>面板能力面（新增，用户点名）</b></td><td><b>UDP 功能面呈现</b>：① UDP 走向可视化（哪类流量走代理 UDP、哪些 direct 回退、<code>raw_udp</code> 回退原因）；② 组级 <code>udp_check_dns</code> 探测结果与节点 UDP 能力联动提示；③ 生产未启用 UDP NAT 时的显式说明（避免「计数恒 0」被误读为故障）；④ UDP 相关旋钮的「改了就生效」回执。<b>其他能力面缺口</b>：<code>export outline</code> schema 浏览 · <code>dns-bench</code> 一键入口 · <code>status.events</code> 事件流可视 · <code>xdp</code>/<code>offload_fuse</code>/<code>offload_sent</code> 明细视图 · Prometheus 端点导出 · <code>pprof_port</code> 链接 · 日志轮转三参 · 订阅缓存命中/失败负缓存生效面标注</td><td class="num">高</td></tr>
   </tbody>
 </table>
+<p>J 类为本轮新增的最高优先级面板项——它不属于「引擎能力」缺口，而是<b>呈现层缺口</b>：引擎侧数据已全部可得（
+status / metrics / 事件流），差的是面板上的可视化与回执。<label for="sn10" class="margin-toggle sidenote-number"></label><input type="checkbox" id="sn10" class="margin-toggle"><span class="sidenote">判 J 类是否完成的办法：验收标准都写成「呈现/回执」而非「实现」——例如 J1 要求能把 UDP 流量按「代理 / direct 回退 / <code>raw_udp</code> 回退」三类下钻，数据来源为既有计数，不需要引擎改动。</span></p>
 <div class="callout"><p><b>永久不在范围</b>：daed Web UI/GraphQL（自研面板为其等价替代）· 与 dae 二进制/配置 100% 兼容 · Windows/macOS（数据面依赖 Linux eBPF）。</p></div>
 </section>
 
@@ -622,7 +729,7 @@ shadow-tls 三版交叉。第四级是<b>真实世界</b>：真实节点公网�
 <p><b>考场</b>：一台 2 核 x86_64 软路由（OpenWrt，4 GB 内存，内核 <b>6.12.92</b>），同时承担
 「家庭网关路由转发」与「透明代理」两种角色；节点来自真实订阅，客户端是家里的真实设备。</p>
 
-<table class="tight">
+<table class="tight wide">
   <caption>表 7 · 生产观测（多轮综合 + 当期轮）</caption>
   <thead><tr><th>场景</th><th>观测</th><th>解释</th></tr></thead>
   <tbody>
@@ -632,14 +739,69 @@ shadow-tls 三版交叉。第四级是<b>真实世界</b>：真实节点公网�
     <tr><td>节点健康探测</td><td>CPU +5~8% 周期性尖峰（活跃档）；空闲退避到 600 s 后 ≈0</td><td>「有人看/有流量」才活跃；夜间无流量自动退避</td></tr>
     <tr><td>内存（旧轮 21.4 h）</td><td>冷启 43.8 → 预热台阶后稳态 <b>53.5 MB</b>（14 h 极差 3.66 MB，斜率≈0）</td><td>台阶形态与本地 soak 同型；不是泄漏（见 §4.6）</td></tr>
     <tr><td>线路质量（旧轮全程）</td><td><code>dial_errors</code> 0 · <code>stragglers</code> 0 · <code>probes_fail</code> 0.1% · DoH <code>upstream_errors</code> 0（96 703 查询）</td><td>引擎侧零故障；探针失败来自节点侧波动</td></tr>
-    <tr><td>新引擎轮（2026-10-17 03:22 起）</td><td>部署就绪 8 s；36 节点全活；对象在 6.12.92 加载并挂钩（br-lan/eth0/dae0/cgroup）；冷启基线 RSS 54.6 MB / 线程 20 / fd 143</td><td>新构建功能面更大，基线高于旧轮属预期；72h 判据同 §12 记分板</td></tr>
+    <tr><td>新引擎轮（2026-10-17 03:22 起）</td><td>部署就绪 8 s；36 节点全活；对象在 6.12.92 加载并挂钩（br-lan/eth0/dae0/cgroup）；冷启基线 RSS 54.6 MB / 线程 20 / fd 143</td><td>新构建功能面更大，基线高于旧轮属预期；72h 判据同 §8.2</td></tr>
   </tbody>
 </table>
+
+<figure class="wide">
+<svg viewBox="0 0 880 448" role="img" aria-label="生产 21.4 小时 RSS/FD/线程小倍数">
+<text x="20.0" y="34.0" font-size="10.5" fill="#151515" font-weight="600">RSS</text>
+<text x="20.0" y="47.0" font-size="9" fill="#6f6a5c">MB</text>
+<line x1="60.0" y1="127.2" x2="846.0" y2="127.2" stroke="#e8e3d4" stroke-width="0.8"/>
+<text x="54.0" y="130.4" font-size="9" fill="#6f6a5c" text-anchor="end">44</text>
+<line x1="60.0" y1="102.3" x2="846.0" y2="102.3" stroke="#e8e3d4" stroke-width="0.8"/>
+<text x="54.0" y="105.5" font-size="9" fill="#6f6a5c" text-anchor="end">48</text>
+<line x1="60.0" y1="77.5" x2="846.0" y2="77.5" stroke="#e8e3d4" stroke-width="0.8"/>
+<text x="54.0" y="80.7" font-size="9" fill="#6f6a5c" text-anchor="end">52</text>
+<line x1="60.0" y1="52.6" x2="846.0" y2="52.6" stroke="#e8e3d4" stroke-width="0.8"/>
+<text x="54.0" y="55.8" font-size="9" fill="#6f6a5c" text-anchor="end">56</text>
+<path d="M84.0 100.2 L85.8 142.2 L87.5 134.1 L89.3 133.2 L91.1 135.1 L92.8 135.1 L94.6 136.6 L96.4 134.3 L98.1 134.8 L99.9 122.8 L101.7 127.4 L103.4 129.5 L105.2 125.4 L107.0 125.6 L108.7 124.7 L110.5 128.3 L112.3 132.5 L114.0 133.2 L115.8 126.7 L117.6 126.6 L119.3 125.1 L121.1 122.5 L122.9 124.1 L124.6 121.3 L126.4 117.6 L128.2 118.2 L129.9 114.5 L131.7 114.3 L133.5 121.7 L135.2 120.2 L137.0 119.7 L138.8 119.4 L140.5 117.9 L142.3 118.2 L144.1 119.1 L145.8 113.1 L147.6 120.2 L149.4 121.5 L151.1 121.5 L152.9 121.7 L154.7 121.6 L156.4 122.0 L158.2 121.7 L160.0 122.0 L161.7 120.4 L163.5 120.9 L165.3 120.6 L167.0 120.9 L168.8 120.7 L170.6 120.9 L172.3 120.9 L174.1 121.9 L175.9 122.2 L177.6 113.8 L179.4 121.5 L181.2 120.8 L182.9 121.0 L184.7 120.6 L186.5 120.0 L188.2 120.0 L190.0 119.6 L191.8 119.5 L193.5 120.3 L195.3 116.8 L197.1 120.1 L198.8 120.2 L200.6 120.1 L202.4 119.6 L204.1 119.6 L205.9 119.7 L207.7 120.0 L209.4 119.7 L211.2 120.0 L213.0 120.1 L214.7 111.3 L216.5 115.9 L218.3 118.6 L220.0 118.4 L221.8 118.4 L223.6 118.5 L225.3 118.6 L227.1 118.7 L228.9 118.1 L230.6 117.1 L232.4 116.9 L234.2 115.0 L235.9 118.3 L237.7 118.1 L239.5 117.8 L241.2 116.8 L243.0 116.2 L244.8 110.6 L246.5 112.0 L248.3 108.4 L250.1 107.6 L251.8 108.9 L253.6 109.1 L255.4 107.7 L257.1 102.1 L258.9 101.5 L260.7 103.3 L262.4 103.3 L264.2 103.7 L266.0 100.1 L267.7 92.5 L269.5 91.1 L271.3 91.0 L273.0 82.0 L274.8 83.4 L276.6 82.8 L278.3 86.2 L280.1 87.0 L281.9 87.6 L283.6 88.1 L285.4 87.7 L287.2 87.9 L288.9 87.9 L290.7 87.5 L292.5 87.3 L294.2 87.2 L296.0 87.5 L297.8 85.9 L299.5 86.4 L301.3 86.5 L303.1 86.5 L304.8 86.4 L306.6 81.9 L308.4 56.4 L310.1 64.3 L311.9 66.6 L313.7 67.7 L315.4 73.3 L317.2 73.7 L319.0 74.6 L320.7 76.7 L322.5 77.7 L324.3 77.8 L326.0 78.1 L327.8 76.0 L329.6 61.0 L331.3 50.8 L333.1 63.0 L334.9 68.4 L336.6 60.5 L338.4 65.4 L340.2 68.4 L341.9 63.0 L343.7 70.0 L345.5 64.1 L347.2 63.4 L349.0 64.7 L350.8 64.5 L352.5 65.4 L354.3 66.6 L356.1 64.0 L357.8 63.1 L359.6 66.8 L361.4 68.3 L363.1 68.5 L364.9 67.0 L366.7 67.2 L368.4 67.0 L370.2 68.9 L372.0 68.8 L373.7 66.5 L375.5 70.5 L377.3 65.7 L379.0 67.2 L380.8 64.6 L382.6 66.6 L384.3 65.6 L386.1 63.6 L388.4 62.4 L390.2 61.7 L392.0 60.1 L393.7 60.6 L395.5 60.3 L397.3 60.6 L399.0 61.3 L400.8 76.9 L402.6 74.2 L404.3 77.5 L406.1 77.6 L407.9 77.2 L409.6 75.3 L411.4 77.3 L413.2 77.4 L414.9 77.1 L416.7 77.6 L418.5 75.6 L420.2 76.3 L422.6 76.0 L424.4 76.7 L426.1 76.7 L427.9 76.5 L429.7 75.8 L431.4 76.9 L433.2 76.8 L435.0 76.9 L436.7 79.6 L438.5 78.8 L440.3 78.7 L442.0 79.0 L443.8 79.5 L445.6 79.3 L447.3 79.3 L449.1 79.6 L450.9 78.2 L452.6 73.1 L454.4 72.3 L456.2 76.3 L457.9 77.9 L459.7 78.3 L461.5 80.8 L463.2 83.2 L465.0 77.4 L466.8 83.3 L468.5 83.1 L470.3 83.0 L472.1 81.9 L473.8 82.3 L475.6 78.7 L477.4 74.8 L479.1 77.9 L480.9 77.3 L482.7 76.7 L484.4 75.8 L486.2 79.4 L488.0 79.4 L489.7 79.2 L491.5 79.4 L493.3 75.4 L495.0 68.8 L496.8 75.8 L498.6 71.8 L500.3 74.1 L502.1 75.0 L503.9 75.7 L505.6 75.4 L507.4 75.2 L509.2 75.7 L510.9 72.2 L512.7 75.6 L514.5 72.4 L516.2 73.8 L518.0 71.6 L519.8 75.8 L521.5 75.7 L523.3 75.5 L525.1 75.7 L526.8 80.8 L528.6 80.8 L530.4 81.0 L532.1 80.5 L533.9 80.3 L535.7 81.0 L537.4 74.6 L539.2 81.1 L541.0 81.2 L542.7 81.1 L544.5 81.2 L546.3 81.1 L548.0 80.9 L549.8 81.1 L551.6 81.4 L553.3 81.4 L555.1 81.4 L556.9 81.4 L558.6 81.4 L560.4 81.1 L562.2 81.4 L563.9 81.3 L565.7 80.9 L567.5 80.9 L569.2 81.0 L571.0 70.1 L572.8 74.7 L574.5 74.9 L576.3 75.7 L578.1 70.7 L579.8 63.8 L581.6 64.9 L583.4 70.2 L585.1 70.4 L586.9 72.4 L588.7 73.0 L590.4 73.3 L592.2 73.8 L594.0 72.5 L595.7 71.7 L597.5 78.4 L599.3 78.7 L601.0 78.2 L602.8 73.1 L604.6 75.9 L606.3 73.3 L608.1 73.2 L609.9 75.2 L611.6 70.0 L613.4 73.8 L615.2 74.0 L616.9 75.4 L618.7 74.5 L620.5 75.2 L622.2 72.4 L624.0 77.4 L625.8 77.5 L627.5 77.4 L629.3 77.5 L631.1 77.5 L632.8 76.6 L634.6 65.3 L636.4 66.3 L638.1 70.2 L639.9 70.7 L641.7 75.9 L643.4 75.8 L645.2 69.4 L647.0 71.3 L648.7 70.2 L650.5 74.4 L652.3 75.6 L654.0 70.5 L655.8 68.9 L657.6 66.0 L659.3 62.1 L661.1 59.6 L662.9 61.0 L664.6 54.3 L666.4 53.9 L668.2 56.1 L669.9 63.3 L671.7 66.6 L673.5 68.0 L675.2 70.3 L677.0 71.0 L678.8 77.7 L680.5 77.5 L682.3 77.6 L684.1 77.1 L685.8 77.3 L687.6 77.0 L689.4 77.4 L691.1 77.4 L692.9 70.7 L694.7 77.6 L696.4 77.6 L698.2 77.9 L700.0 78.2 L701.7 78.0 L703.5 78.0 L705.3 78.0 L707.0 78.2 L708.8 83.0 L710.6 83.1 L712.3 84.3 L714.1 84.0 L715.9 84.1 L717.6 84.0 L719.4 84.2 L721.2 84.2 L722.9 84.1 L724.7 84.6 L726.5 84.3 L728.2 83.7 L730.6 83.8 L732.3 83.3 L734.1 84.0 L735.9 84.1 L737.6 84.1 L739.4 83.8 L741.2 84.0 L742.9 84.0 L744.7 83.0 L746.5 82.9 L748.2 83.0 L750.0 70.4 L751.8 76.7 L753.5 76.3 L755.3 77.0 L757.1 77.4 L758.8 77.6 L760.6 77.5 L762.4 78.0 L764.1 77.9 L765.3 78.0 L767.1 84.2 L768.9 84.1 L771.2 80.4 L773.0 83.0 L774.7 83.8 L776.5 84.1 L778.3 84.2 L780.0 81.4 L781.8 83.5 L783.6 82.3 L785.3 80.5 L787.1 82.4 L788.9 82.8 L790.6 80.4 L792.4 81.1 L794.2 63.5 L795.9 68.0 L797.7 70.8 L799.5 68.6 L801.2 70.1 L803.0 70.1 L804.8 44.3 L806.5 46.7 L808.3 56.1 L810.1 41.0 L811.8 52.4 L813.6 66.4 L815.4 60.7 L817.1 70.4 L818.9 73.0 L820.7 66.0 L822.4 62.0 L824.2 60.7 L826.0 59.5 L827.7 56.2 L829.5 59.2 L831.3 61.1 L833.0 56.1" fill="none" stroke="#1f4e79" stroke-width="1.25"/>
+<text x="89.9" y="148.0" font-size="9.5" fill="#1f4e79">冷启 43.8</text>
+<line x1="531.5" y1="68.2" x2="846.0" y2="68.2" stroke="#8a8f96" stroke-width="0.9"/>
+<text x="602.2" y="61.2" font-size="9.5" fill="#151515">平台 53.5</text>
+<text x="172.3" y="66.0" font-size="9.5" fill="#6f6a5c">预热台阶（≈ 前 7 h）</text>
+<text x="20.0" y="196.0" font-size="10.5" fill="#151515" font-weight="600">FD</text>
+<line x1="60.0" y1="296.0" x2="846.0" y2="296.0" stroke="#e8e3d4" stroke-width="0.8"/>
+<text x="54.0" y="299.2" font-size="9" fill="#6f6a5c" text-anchor="end">80</text>
+<line x1="60.0" y1="262.7" x2="846.0" y2="262.7" stroke="#e8e3d4" stroke-width="0.8"/>
+<text x="54.0" y="265.9" font-size="9" fill="#6f6a5c" text-anchor="end">120</text>
+<line x1="60.0" y1="229.3" x2="846.0" y2="229.3" stroke="#e8e3d4" stroke-width="0.8"/>
+<text x="54.0" y="232.5" font-size="9" fill="#6f6a5c" text-anchor="end">160</text>
+<line x1="60.0" y1="196.0" x2="846.0" y2="196.0" stroke="#e8e3d4" stroke-width="0.8"/>
+<text x="54.0" y="199.2" font-size="9" fill="#6f6a5c" text-anchor="end">200</text>
+<path d="M88.4 228.5 L110.8 240.2 L146.1 273.5 L181.5 271.8 L216.8 264.3 L252.1 252.2 L287.5 259.3 L322.8 235.6 L358.1 214.3 L393.7 224.3 L429.1 261.0 L464.1 241.8 L499.4 246.8 L534.8 263.5 L570.1 256.8 L605.4 245.2 L640.8 253.5 L676.1 245.2 L711.4 273.5 L747.4 276.8 L782.4 270.2 L817.1 211.8" fill="none" stroke="#1f4e79" stroke-width="1.25"/>
+<text x="20.0" y="314.0" font-size="9" fill="#6f6a5c">FD / 线程：逐小时中位（与收口口径一致；原始采样含任务与采集瞬态尖峰）</text>
+<text x="20.0" y="334.0" font-size="10.5" fill="#151515" font-weight="600">线程</text>
+<line x1="60.0" y1="386.5" x2="846.0" y2="386.5" stroke="#e8e3d4" stroke-width="0.8"/>
+<text x="54.0" y="389.7" font-size="9" fill="#6f6a5c" text-anchor="end">14</text>
+<line x1="60.0" y1="369.0" x2="846.0" y2="369.0" stroke="#e8e3d4" stroke-width="0.8"/>
+<text x="54.0" y="372.2" font-size="9" fill="#6f6a5c" text-anchor="end">18</text>
+<line x1="60.0" y1="351.5" x2="846.0" y2="351.5" stroke="#e8e3d4" stroke-width="0.8"/>
+<text x="54.0" y="354.7" font-size="9" fill="#6f6a5c" text-anchor="end">22</text>
+<line x1="60.0" y1="334.0" x2="846.0" y2="334.0" stroke="#e8e3d4" stroke-width="0.8"/>
+<text x="54.0" y="337.2" font-size="9" fill="#6f6a5c" text-anchor="end">26</text>
+<path d="M88.4 373.4 L110.8 373.4 L146.1 373.4 L181.5 373.4 L216.8 373.4 L252.1 373.4 L287.5 373.4 L322.8 369.0 L358.1 369.0 L393.7 369.0 L429.1 369.0 L464.1 369.0 L499.4 369.0 L534.8 369.0 L570.1 369.0 L605.4 369.0 L640.8 369.0 L676.1 369.0 L711.4 369.0 L747.4 369.0 L782.4 369.0 L817.1 369.0" fill="none" stroke="#1f4e79" stroke-width="1.25"/>
+<line x1="84.0" y1="428.0" x2="84.0" y2="435.0" stroke="#c9c2ae" stroke-width="0.8"/>
+<text x="84.0" y="446.0" font-size="9" fill="#6f6a5c">05:44</text>
+<line x1="296.0" y1="428.0" x2="296.0" y2="435.0" stroke="#c9c2ae" stroke-width="0.8"/>
+<text x="296.0" y="446.0" font-size="9" fill="#6f6a5c" text-anchor="middle">11:44</text>
+<line x1="508.0" y1="428.0" x2="508.0" y2="435.0" stroke="#c9c2ae" stroke-width="0.8"/>
+<text x="508.0" y="446.0" font-size="9" fill="#6f6a5c" text-anchor="middle">17:44</text>
+<line x1="720.0" y1="428.0" x2="720.0" y2="435.0" stroke="#c9c2ae" stroke-width="0.8"/>
+<text x="720.0" y="446.0" font-size="9" fill="#6f6a5c" text-anchor="middle">23:44</text>
+<line x1="846.0" y1="428.0" x2="846.0" y2="435.0" stroke="#c9c2ae" stroke-width="0.8"/>
+<text x="846.0" y="446.0" font-size="9" fill="#6f6a5c" text-anchor="end">02:58</text>
+</svg>
+<figcaption><b>图 6 · 生产 21.4 h 的 RSS / FD / 线程小倍数（旧轮，2026-10-16 05:44 起）。</b>
+RSS 为逐点（15 分钟抽稀）；FD 与线程为逐小时中位（与收口口径一致）。形态三要点：
+① 前 7 h 的<b>预热台阶</b>（44→53 MB，一次性、非持续）；② 12 h 后的<b>平台化</b>（52–54 MB、14 h 极差 3.66 MB、斜率 −47.8 KB/h ≈ 0）；
+③ FD 中位 133、线程中位恒 18（原始采样含任务/采集瞬态尖峰，口径见 <code>notes/prod-audit-2026-10-17/analyze.py</code>）。</figcaption>
+</figure>
 
 <h3>8.1 · 生产线上的事故与治理（当选修复批）</h3>
 <ul>
   <li><b>CF 额度事故</b>（自建订阅当日 68k/100k 请求）：状态查询恒判「有人在看」+ 探测循环被流量叫醒 → 6× 超速；
-  P37/P37b 治理（不 touch、退避态才提前唤醒、失败源负缓存），生产回验 32 次/分 = 设计值。</li>
+  P37/P37b 治理（不 touch、退避态才提前唤醒、失败源负缓存），生产回验 32 次/分 = 设计值。<label for="sn11" class="margin-toggle sidenote-number"></label><input type="checkbox" id="sn11" class="margin-toggle"><span class="sidenote">该事故的通用教训：<b>状态查询是写操作</b>——只要它回写「有人在看」，面板刷新频率就会污染探测调度；修复后的语义是「仅新连接 Touch」。</span></li>
   <li><b>DoH 连接 3 s 生命周期</b>（≈1.4 万重连/天）：拨号看门狗未解除；内存安全审计（167 处 unsafe 逐处审读）
   用 2d5h39m 生产数据把该假设<b>实锤</b>并修复，同时把「退出残留」预测<b>证伪降级</b>。</li>
   <li><b>重定向表治理</b>：<code>redirect_track</code> 清理不及时引发断网事故 → janitor + 容量可配。</li>
@@ -649,9 +811,7 @@ shadow-tls 三版交叉。第四级是<b>真实世界</b>：真实节点公网�
 <h3>8.2 · 轮次链与当前状态</h3>
 <p>2026-10-11 第一轮 72h（§12 记分板口径）→ 10-14 新一轮（P37 治理后）→ 10-16 05:44
 审计修复批上线轮 → <b>21.4 h 收口</b>（用户决定为新引擎让路；判据全绿，见 §4.6）→
-<b>2026-10-17 03:22 新引擎轮起跑</b>（A2 收口 + 四项修复 + ws EOF 修复 + 面板 v2.0）。
-判据（24/48/72 h 检查点）：RSS/FD 漂移 ≤5%（稳态段）、失败指标零增长、<code>stragglers</code> 恒 0、
-无重启；<code>bounded-memory</code> 表述待通过后启用。</p>
+<b>2026-10-17 03:22 新引擎轮起跑</b>（A2 收口 + 四项修复 + ws EOF 修复 + 面板 v2.0）。<label for="mn10" class="margin-toggle">⊕</label><input type="checkbox" id="mn10" class="margin-toggle"><span class="marginnote">判据（24/48/72 h 检查点）：RSS/FD 漂移 ≤5%（稳态段）、失败指标零增长、<code>stragglers</code> 恒 0、无重启；「bounded-memory」表述待 72h 通过后启用。</span></p>
 </section>
 
 <section id="s9">
@@ -680,7 +840,7 @@ sh docs/notes/deploy-engine.sh            # 备份 → validate → 停服 → �
 
 # 面板（wasm + musl）
 cd panel &amp;&amp; scripts/build-router.sh &amp;&amp; PASS=xxx scripts/deploy.sh</code></pre>
-
+<p><label for="mn11" class="margin-toggle">⊕</label><input type="checkbox" id="mn11" class="margin-toggle"><span class="marginnote">全部脚本位于仓库 <code>lab/</code> 与 <code>docs/notes/</code>；QEMU 矩阵需要 KVM 与已构建的 <code>ebpf-rs.o</code>（构建顺序见首行）。</span></p>
 <h3>9.2 · ADR 索引</h3>
 <p><code>docs/adr/ADR-0001..0069</code>：数据面复现（0002/0006/0009/0010/0033）· 协议家族（0016–0020/0026/0027/0041/0042/0048–0057）·
 DNS（0034–0040/0047/0050/0052/0053）· 内存与 FD（0015/0022/0025）· 控制面/订阅（0029/0031/0042/0043/0047/0061/0062）·
@@ -703,6 +863,13 @@ AF-XDP 否决（0058 及专文）· ECH 边界（0056）· 数据面对标（006
   </tbody>
 </table>
 </section>
+
+<div class="colophon">
+  <p>所有数字均为本机或真实环境实测，未做外推；所有「未做」项均显式登记。口径与边界见 §5.3。
+  项目以 AGPL-3.0 授权（许可证头一致性审计待办，见 §7 A8）。版式为 Tufte 式三栏（正文 / 边注 / 宽图对齐），
+  边注编号全局连续；窄屏与打印时边注折叠为可展开块。</p>
+</div>
+
 </article>
 </div>
 
@@ -714,3 +881,4 @@ AF-XDP 否决（0058 及专文）· ECH 边界（0056）· 数据面对标（006
 
 </body>
 </html>
+
