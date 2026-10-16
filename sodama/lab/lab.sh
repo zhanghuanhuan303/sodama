@@ -2518,6 +2518,42 @@ test_dns_bind() {
   echo "PASS: dns.bind（明文监听 → routing/上游/缓存 同一链路）"
 }
 
+test_hooks() {
+  require_root
+  echo "== A2 #15：钩子生命周期（reload/suspend 幂等；跨代无需交接）=="
+  local before
+  "$LOADER" status --socket "$STATUS_SOCK" --json >/tmp/sodama-hooks-before.json
+  before="$(python3 -c 'import json,sys;v=json.load(open(sys.argv[1]));h=sorted(v.get("hooks") or []);print("\n".join(h))' /tmp/sodama-hooks-before.json)"
+  [ -n "$before" ] || { echo "FAIL: status 无 hooks"; exit 1; }
+  echo "hooks（初始，$(printf '%s\n' "$before" | grep -c .) 个）："
+  printf '%s\n' "$before" | sed 's/^/  - /'
+  # reload（切代）→ 钩子集合必须不变（单进程形态：钩子常驻，无跨代交接/无重复挂载；
+  # dae 的 tc_hook_handoff 在 sodama 为「形态消解」，本用例把该结论变成可检验断言）。
+  "$LOADER" reload --socket "$STATUS_SOCK" >/dev/null
+  "$LOADER" status --socket "$STATUS_SOCK" --json >/tmp/sodama-hooks-after.json
+  python3 - /tmp/sodama-hooks-before.json /tmp/sodama-hooks-after.json <<'HOOKPY'
+import json, sys
+a = json.load(open(sys.argv[1])); b = json.load(open(sys.argv[2]))
+ha, hb = sorted(a.get("hooks") or []), sorted(b.get("hooks") or [])
+assert ha, "初始 hooks 为空"
+assert ha == hb, ("reload 改变了钩子集合（交接幂等性被破坏）", ha, hb)
+print("reload 前后钩子集合一致（%d 个）" % len(ha))
+HOOKPY
+  echo "PASS: reload 不改钩子（无跨代交接、无重复挂载）"
+  # suspend/resume 是控制位（no-load），不是摘钩：钩子集合同样不变。
+  "$LOADER" suspend --socket "$STATUS_SOCK" >/dev/null
+  "$LOADER" resume --socket "$STATUS_SOCK" >/dev/null
+  "$LOADER" status --socket "$STATUS_SOCK" --json >/tmp/sodama-hooks-after2.json
+  python3 - /tmp/sodama-hooks-before.json /tmp/sodama-hooks-after2.json <<'HOOKPY2'
+import json, sys
+a = json.load(open(sys.argv[1])); b = json.load(open(sys.argv[2]))
+assert sorted(a.get("hooks") or []) == sorted(b.get("hooks") or []), "suspend/resume 改变了钩子集合"
+print("suspend/resume 前后钩子集合一致")
+HOOKPY2
+  echo "PASS: suspend/resume 不改钩子（no-load 是控制位）"
+  echo "（显式摘钩语义：TCX 钩子随进程退出由内核摘除——由 verify 的 fault/kill 用例覆盖）"
+}
+
 # P16：IPv6 全链（tproxy v6 → relay → ss v6 目标；v6 direct 内核转发对照）。
 test_v6() {
   require_root
@@ -4777,6 +4813,7 @@ test-dns-udp) test_dns_udp ;;  # 显式 udp:// 上游（仅 UDP）
   test-udp-idle) test_udp_idle ;;
   test-udp-cone) test_udp_cone ;;  # P38：full-cone（单客户端 src 多目标复用 1 个出口端点）
   test-dns-bind) test_dns_bind ;;  # P38：dns.bind（明文监听复用透明 DNS 全链路）
+  test-hooks) test_hooks ;;  # A2 #15：钩子生命周期（reload/suspend 幂等）
   test-relay-offload) test_relay_offload ;;
   test-offload-lifecycle) test_offload_lifecycle ;;
   test-ss) test_ss ;;

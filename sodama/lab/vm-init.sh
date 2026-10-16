@@ -58,7 +58,7 @@ done
 # 每个用例一个专用会话（与 offload 同模式）；全部计入 cap= 汇总。
 cap=FAIL
 cap_ok=1
-for pair in must-up:test-must subfile-up:test-sub-file hotplug-up:test-hotplug rulecap-up:test-rules-cap dns-up:test-domain gaps-up:test-gaps alive-up:test-alive fuse-up:test-fuse pin-up:test-pinning cone-up:test-udp-cone dnsbind-up:test-dns-bind; do
+for pair in must-up:test-must subfile-up:test-sub-file hotplug-up:test-hotplug rulecap-up:test-rules-cap dns-up:test-domain gaps-up:test-gaps alive-up:test-alive fuse-up:test-fuse pin-up:test-pinning cone-up:test-udp-cone dnsbind-up:test-dns-bind relay-up:test-hooks; do
   cap_up="${pair%%:*}"
   cap_tst="${pair##*:}"
   if "$BASE/lab/lab.sh" "$cap_up" >/dev/null 2>&1 && "$BASE/lab/lab.sh" "$cap_tst" >/dev/null 2>&1; then

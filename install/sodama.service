@@ -27,31 +27,49 @@
 #       RuntimeDirectory=sodama
 #       RuntimeDirectoryMode=0750
 #   - systemd 单元里 URL 的 `%` 必须写成 `%%`；把订阅 URL 放进文件（chmod 600）可避免。
+#   - A2 #18：`ExecStartPre` 用 `validate` 做启动前配置门禁（同 dae：只读本地资产、
+#     不加载 eBPF/不联网）；`Type=notify` 依赖进程的 sd_notify("READY=1")
+#     （`main.rs::sd_notify`，无 systemd 时 no-op；用单元时请确保命令不丢 NOTIFY_SOCKET）。
+#     若你的 drop-in 覆盖了 ExecStart 且不希望 notify 语义，把 Type= 改回 simple 即可。
 #
 # SIGHUP = 重读 --config/--rules 热重载 + reopen --log-file（对照 dae reload）。
 
 [Unit]
 Description=sodama transparent proxy gateway (eBPF datapath)
 Documentation=https://github.com/zhanghuanhuan303/dae-rust/blob/main/docs/deploy.md
-After=network-online.target
+After=network-online.target systemd-sysctl.service
 Wants=network-online.target
+# 崩溃环熔断：5 分钟内 5 次重启后放弃（对照 dae `StartLimitIntervalSec=300/StartLimitBurst=5`）。
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
-Type=simple
+Type=notify
+ExecStartPre=/usr/local/bin/sodama validate /etc/sodama/config.dae
 ExecStart=/usr/local/bin/sodama --config /etc/sodama/config.dae --ebpf /usr/lib/sodama/sodama-ebpf
 
 # SIGHUP = 热重载（等价 sodama reload）；systemctl reload sodama 触发。
 ExecReload=/bin/kill -HUP $MAINPID
 
-Restart=on-failure
-RestartSec=3
+# 重启策略：on-abnormal 让「配置被拒」（ExecStartPre 非零退出）不无限重试；
+# 突发上限再兜一层（对照 dae `Restart=on-abnormal`）。
+Restart=on-abnormal
+RestartSec=5s
+
+# 启动/停止超时（对照 dae TimeoutStartSec=120）：启动含订阅拉取与资产展开。
+TimeoutStartSec=120
+TimeoutStopSec=30
+
+# 降低被 OOM kill 的优先级（对照 dae `OOMScoreAdjust=-100`）。
+OOMScoreAdjust=-100
 
 # 加载 eBPF（CAP_BPF）、tc/tproxy/网络配置（CAP_NET_ADMIN）、setns/挂载等（CAP_SYS_ADMIN）。
 AmbientCapabilities=CAP_BPF CAP_NET_ADMIN CAP_SYS_ADMIN
 CapabilityBoundingSet=CAP_BPF CAP_NET_ADMIN CAP_SYS_ADMIN
 
-# relay/连接多时的 fd 上限。
+# relay/连接多时的 fd 上限；订阅并发与线程池的进程上限（对照 dae LimitNPROC）。
 LimitNOFILE=1048576
+LimitNPROC=4096
 
 # 可选：把状态面 socket 放 /run 下时取消注释（与 ExecStart 的 --status-socket 配套）。
 # RuntimeDirectory=sodama

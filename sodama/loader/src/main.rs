@@ -7876,6 +7876,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // P38：pid 文件（对照 dae）：就绪后写 /var/run/sodama.pid；`--disable-pidfile` 跳过写；
     // 退出清理无条件执行（与 dae 一致）；写失败静默（/var/run 不可写不影响主流程）。
     write_pidfile(args.disable_pidfile);
+    // A2 #18：`Type=notify` 就绪上报（规则已下发、监听已就绪、pid 已写）。
+    sd_notify("READY=1\nSTATUS=sodama ready (rules loaded)");
 
     // 主循环：状态查询 + 检查重载标志 + 定期清扫 conn_state
     // O8：50ms tick 一并发控：SIGTERM 检测/热重载响应更快（20 次/s 空转可忽略）。
@@ -7913,7 +7915,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         if RELOAD.swap(false, Ordering::SeqCst) {
             reopen_log();
+            sd_notify("RELOADING=1");
             do_reload(&args, &mut ebpf, false, false);
+            sd_notify("READY=1\nSTATUS=sodama reloaded");
         }
         // A2 #3：trace 会话到期（清数据面过滤器位；未激活时是一次原子读）。
         trace_maybe_expired(&mut ebpf);
@@ -8013,6 +8017,46 @@ fn remove_pidfile() {
 
 /// O8：优雅退出——有界等待在途连接收尾（≤300ms），随后退出。
 /// 数据面钩子是 TCX bpf_link：fd 随进程关闭由内核原子摘除，不残留过滤器（不会黑洞）。
+// ---------------------------------------------------------------- A2 #18：sd_notify
+/// `sd_notify(3)` 的最小实现（不引入依赖）：向 `$NOTIFY_SOCKET` 发一条状态行。
+/// systemd 单元的 `Type=notify` 依赖它；无该环境变量（非 systemd 启动/命令行调试）时是
+/// 静默 no-op。抽象 socket（名字以 `@` 开头）= 首字节 NUL 的 Linux 抽象地址。
+fn sd_notify(state: &str) {
+    let Some(sock) = std::env::var_os("NOTIFY_SOCKET") else {
+        return;
+    };
+    let name = sock.to_string_lossy().to_string();
+    let mut addr: Vec<u8> = if let Some(rest) = name.strip_prefix('@') {
+        let mut v = vec![0u8];
+        v.extend_from_slice(rest.as_bytes());
+        v
+    } else {
+        name.as_bytes().to_vec()
+    };
+    addr.truncate(107); // sockaddr_un.sun_path 上限（含 NUL 结束位）
+    let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
+    if fd < 0 {
+        return;
+    }
+    let mut sa: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    sa.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    for (i, b) in addr.iter().enumerate() {
+        sa.sun_path[i] = *b as libc::c_char;
+    }
+    let len = (std::mem::size_of::<libc::sa_family_t>() + addr.len()) as libc::socklen_t;
+    let _ = unsafe {
+        libc::sendto(
+            fd,
+            state.as_ptr() as *const libc::c_void,
+            state.len(),
+            0,
+            &sa as *const _ as *const libc::sockaddr,
+            len,
+        )
+    };
+    let _ = unsafe { libc::close(fd) };
+}
+
 fn graceful_shutdown() -> ! {
     let t0 = std::time::Instant::now();
     let active = RELAY_STATS.conns_active.load(Ordering::Relaxed);
@@ -8030,6 +8074,7 @@ fn graceful_shutdown() -> ! {
         t0.elapsed().as_millis(),
         RELAY_STATS.conns_active.load(Ordering::Relaxed)
     ));
+    sd_notify("STOPPING=1");
     remove_pidfile();
     std::process::exit(0);
 }
@@ -11882,6 +11927,8 @@ fn status_json(ebpf: &mut Ebpf) -> serde_json::Value {
             "offload_verdicts": stats.offload_verdicts,
             "offload_pause_passes": stats.offload_pause_passes,
             "event_drops": stats.event_drops,
+            "domain_publish_retries": PUBLISH_RETRIES.load(Ordering::Relaxed),
+            "domain_publish_dropped": PUBLISH_DROPPED.load(Ordering::Relaxed),
         },
         "events": events_json(&stats),
         "traffic": traffic_snapshot_json(),
