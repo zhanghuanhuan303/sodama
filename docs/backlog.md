@@ -4,7 +4,7 @@
 **如实**（不把未做写成已做）、**有验收条件**（每条给出可判定的完成标准）、
 **与 ADR/parity 互链**（决策理由见 ADR；覆盖度口径见 `parity-status.md`）。
 
-当前状态（main@a00d74a；ADR-0058；单测 257/257；架构档案 HTML v2.43 / VLESS 提案 v1.9）：
+当前状态（main@0faa85d + A1 批次（dev 待合）；ADR-0068；单测 329（326 + ebpf-logic 3）；ATLAS v1.7；决策档案 HTML v2.46 / VLESS 提案 v1.9）：
 核心数据面复现（K0–K3）、分流主链路、DNS 子系统、出站 12 家族 + shadow-tls 插件、
 真网关可用、规则编译逐字节对拍、M1–M4 性能项（O3/O4/O5/O9）与 O6/O7/O8、
 G1 同机 + 真实节点口径均已交付。以下为余项。
@@ -14,10 +14,10 @@ G1 同机 + 真实节点口径均已交付。以下为余项。
 | 资产 | 现状 |
 |---|---|
 | 构建 | `cargo build --release` + `lab/build-ebpf-rs.sh`（nightly 固定日期 + bpf-linker 0.11.1） |
-| CI | `.github/workflows/ci.yml`：eBPF 对象构建 + loader 编译/单测（无特权内核加载） |
+| CI | `.github/workflows/ci.yml`：eBPF 对象构建 + loader 编译/单测 + **lint 门禁（v1.4：fmt --check + clippy -D warnings）**（无特权内核加载） |
 | 部署 | `install/install.sh`（--dry-run/--uninstall）+ `install/sodama.service`（capability 最小集 + ExecReload）+ `docs/deploy.md` |
 | 实验 | lab.sh（netns/verify/专项）、gateway.sh（真网关一键 + 启动自检回滚）、bench/soak/matrix/parity |
-| 文档 | ADR-0001..0056 + parity-status.md + HTML 决策档案 + NOTES §11.x + 协议模块规格 `docs/modules/` |
+| 文档 | ADR-0001..0068 + parity-status.md + ATLAS HTML v1.7 + NOTES §11.x + 协议模块规格 `docs/modules/` + 配置参考 `docs/config-reference.md`（v1.4，生成器 + drift 单测） |
 
 ## A. 工程化与发布（打包，最高优先级）
 
@@ -27,7 +27,7 @@ G1 同机 + 真实节点口径均已交付。以下为余项。
 | A2 | **发行包（tarball）** | dae 有 release 工件（多架构） | tag 产出 `sodama-<ver>-x86_64.tar.zst`：loader、`ebpf-rs.o`、systemd、install.sh、示例配置、README/LICENSE；解包后 `install.sh` 可装可卸 |
 | A3 | **发行 CI** | dae 有 release/prerelease/daily-build 工作流 | tag `v*` 触发：构建 → 冒烟（容器内 `--version`/单测）→ 上传 release 工件 + SHA256SUMS；失败不产出 |
 | A4 | **版本与 CHANGELOG** | 当前 Cargo 0.1.0、无 CHANGELOG | `--version` 输出语义化版本 + git sha；CHANGELOG 从提交生成；README 顶部版本徽章 |
-| A5 | **shell 补全** | dae 有 `install/shell-completion/`（bash/zsh/fish） | 补全 CLI 全部参数（`--config/--dialer/--subscribe/--listen-socks/...`）；安装脚本可选部署 |
+| A5 | **shell 补全** | ✅ **已完成（2026-10-16，v1.4，ADR-0068）**：`sodama completion bash\|zsh\|fish`（脚本内嵌，零外部文件依赖）+ 预生成副本 `install/shell-completion/sodama.{bash,zsh,fish}`（与生成器一致性由单测锁定）+ `install/install.sh` 部署（补全目录自动探测） | 补全覆盖 CLI 顶层子命令与常用参数；bash/zsh/fish 三份可用 |
 | A6 | **Makefile / 任务入口** | dae 有 Makefile（build/test/release 单入口） | `make build / test / lab / install / release` 目标；与新贡献者文档一致 |
 | A7 | **发行包体系** | 本机 Arch；dae 上游有 AUR/发行版打包路径 | 至少 `PKGBUILD`（本机可 `makepkg` 构建安装）；deb 可选 |
 | A8 | **许可证一致性审计** | `LICENSE`=AGPL-3.0，但部分源码头为 `SPDX GPL-2.0`（不一致）；依赖需 SBOM | 全部源码/配置文件头统一为 AGPL-3.0-only（或逐文件说明例外）；`cargo deny`/SBOM 跑通并记录第三方许可证清单 |
@@ -67,7 +67,7 @@ G1 同机 + 真实节点口径均已交付。以下为余项。
 
 | # | 事项 | 现状 | 验收标准 |
 |---|---|---|---|
-| E1 | UDP endpoint pool / full-cone NAT（网关侧 UDP 代理） | ✅ 网关侧全链已真机验证（2026-10-08）：数据面 UDP 重定向 → UDP NAT 会话（QUIC 嗅探/组分派/janitor）→ 组内挑选支持 UDP 成员 → vless 流式 UDP 上行；同批修复组 `dial_udp` 只看延迟榜前 3 名的缺陷（真实订阅下前列被 anytls/reality 占据 → UDP 永远回退直连）；测试机场（CF 优选）节点侧禁 UDP 转发，下行未观测（换支持 UDP 的机场即可） | full-cone 行为测试（外部多映射） |
+| E1 | UDP endpoint pool / full-cone NAT（网关侧 UDP 代理） | ✅ **已完成（2026-10-16，v1.4，ADR-0068）**：full-cone 端点池（同一客户端 src 多目标复用 1 出口端点，回包按上游真实来源注入）+ 分类 TTL（DNS 17s / QUIC·域名 300s / 代理地板 300s）+ 负缓存 + 1s janitor；内核级 `test-udp-cone`（双目标 4 报文复用 1 端点）；前置事实仍成立：网关侧全链真机验证（2026-10-08） | ✅ 已达（`test-udp-cone`）；边界：full-cone 仅直连型出口，代理型仍 dest-affine（ADR-0068 偏离 1） |
 | E2 | backlog fuse / 连接计费 | **fuse 已交付（ADR-0067，2026-10-16）**：`tcp_offload_pause` + 两阶段 drain/lift + 用户态泵 + `SODAMA_FUSE_MAX_BACKLOG`；余：连接计费未做 | 压测下 fuse 生效（真实触发留生产观测；判定逻辑单测锁定）+ 计费可导出 |
 | E3 | offload 完整形态（fuse 失效路径与统计） | **fuse 已交付（ADR-0067）**：生命周期/回收（O4/O8）+ pause engage/lift/失败计数（`status.offload_fuse`）+ 注册时清残留 | ✅ 失效全路径与计数可观测（无失败残留由 `test-fuse` 断言） |
 
@@ -85,7 +85,7 @@ G1 同机 + 真实节点口径均已交付。以下为余项。
 |---|---|---|---|
 | G1 | 与 Go 版**同机对拍** + **异机/公网口径**（六路径基准） | **已完成**：P33.2 四方对比（direct/ss，ssserver 上游 + 全双工夹具 + 5 次中位数；并发扩展/内存/线程/perf 剖面齐备；`docs/benchmark-report.html` §3）——sodama 与 dae 同机同拓扑；UDP 四方对拍补齐（`lab/perf/udp.sh`：20k pps 0 丢包，sodama CPU 630 ms/40k 包 vs dae 2140 / sing-box 1580 / v2ray 1780；O7）；ss 方法 A/B（chacha vs aes-256-gcm）已做（O6）；**真实节点/公网口径（2026-10-05）**：`lab/perf/real.sh` 三方共用同一节点 + 固定后端 IP（VLESS-REALITY+Vision，v2ray skip）、8 MiB×17 轮：客户端 CPU_ms/GB sodama **6 233** vs dae 8 820（-29%）/ sing-box 8 557（-27%）；同后端轮 4 987 vs 8 613 / 10 290（见 roadmap P5） | 同机 + 异机口径均无回退；余：kTLS 目标异机重测（G2） |
 | G2 | 生产级优化（THP/连接池/看门狗内存上限） | **M1+M2+M4+O8 已交付**：splice 零拷贝（Direct/VLESS 明文/kTLS 成功的 TLS，`--no-splice` 可关；vless 12.2→16.9 Gbps / CPU 380→60 ms；relay 8 流 15→21.6 Gbps） + eBPF printk 门控 + **kTLS 内核 TLS 实验（`--ktls`：TLS 48MB×4 11.67→12.32 Gbps、memcpy 29.4%→1.6%、TX+RX+splice 全链路，默认关）** + **M4 epoll worker 池：10k 连接 28 线程 / 32.1 MB、fail=0、风暴 25 606/s；stage 2 codec 全协议面（VLESS 全组合含 reality/vision/ws、Trojan、vmess、ss/ssr/anytls）vless-tls 2 000 连接 27 线程 / 61 MB（线程模型 4 011 / 222 MB）；offload 看门狗单线程化（每 offload 连接 0 线程）；io_uring A/B 结论不引入；`SODAMA_NO_REACTOR=1` / `SODAMA_REACTOR_CODEC=0` 可关（ADR-0058）**；**O8 缓冲池/回收：按字节封顶 8MB 池 + UDP 槽按需增长 + SIGTERM 有界优雅退出（50 在途整机 462ms、无 tc 残留）+ 30s malloc_trim（churn 300 条 RSS 无增长）**；方向与待办（ss 路径 O1/O2 按用户方向暂缓——以 VLESS 为基准；kTLS 异机复测）在 `docs/optimization-roadmap.md`（O1–O10） | 各优化项有开关与压测数据；M2 对账：memcpy ✓；≥13 Gbps/≤1000 ms 受本机夹具（≈12.5 Gbps 封顶）与内核密码引擎速度限制，待异机口径重测；M4：✅ 10k 连接 28 线程 / 32.1 MB、fail=0；stage 2 验收：ss/ssr/ss2022/anytls 均逐连接确认 codec 投递、offload 200 条 0 线程回收全过；O8：churn/退出均有界 |
-| G3 | fuzz（`.dae` 解析 / DNS 报文 / CH 解析） | 未做 | 至少 3 个 fuzz target 跑通 |
+| G3 | fuzz（`.dae` 解析 / DNS 报文 / CH 解析） | ✅ **已完成（2026-10-16，v1.4，ADR-0068，确定性形态）**：`loader/src/fuzz_smoke.rs`（固定种子 xorshift 变异器 + 真实语料种子；覆盖 .dae 配置含 include / DNS 报文 / 出站链接全家族 / 订阅含 SIP008 / TLS CH / QUIC Initial / HPACK-QPACK；`SODAMA_FUZZ_ITERS` 可调，默认 4000 轮 ≈1-2s）；不走 libFuzzer（不可复现工具链） | ✅ 已达（2 项测试常态运行；口径为确定性变异测试） |
 | G6 | `lab.sh verify` 探针陈旧 | `test_proxy`/`test_host_proxy`/`test_reload`/`test_rebind`/`test_fault_*` 断言 回包含 `orig_dst=`，但仓库内无任何夹具产生该字段（历史遗留）；O8 期间实测 6 项因断言失败 | 修复夹具或断言（使 verify 回到 9/9）；在此之前专项用例（test-ss/vless/offload/udp）为准 |
 | G4 | 特权内核加载类 CI | CI 只编译+单测 | self-hosted runner 或 QEMU 中跑 verify 子集 |
 | G5 | 长稳 soak 纳入 CI（夜间） | 手动 | 夜间任务 + 失败告警 |
@@ -95,7 +95,7 @@ G1 同机 + 真实节点口径均已交付。以下为余项。
 | # | 事项 | 现状 | 验收标准 |
 |---|---|---|---|
 | H1 | 顶层 `README.md` 状态区重写 | 数字停留在 P5 时期（121/121、ADR-0031 等），与当前（257 单测、ADR-0058、G1 真实节点数据）脱节 | 状态表与实际一致；仓库结构/快速开始重写 |
-| H2 | 用户手册（配置参考 + Go dae → sodama 迁移指南） | 散在 README/NOTES | 独立章节：逐项差异表（配置/CLI/部署） |
+| H2 | 用户手册（配置参考 + Go dae → sodama 迁移指南） | 配置参考 ✅ **已生成（v1.4，ADR-0068）**：`docs/config-reference.md`（由 `sodama config-doc` 从 `key_docs()` 生成 + drift 单测锁定）；迁移指南仍散在 README/deploy | 迁移指南单独立文：逐项差异表（配置/CLI/部署） |
 | H3 | 基准报告 | bench.sh 有输出 | `docs/bench.md` 固化方法与结果 |
 
 ## I. 资源/系统内存专项（第三方评审采纳，2026-10-05）

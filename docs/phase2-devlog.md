@@ -1427,6 +1427,66 @@ cap 阶段才暴露。修复（`lab/lab.sh`）：
 
 ---
 
+## 22 · A1 批次（除工程打包）：CLI/配置/控制面/工程质量 17 项（2026-10-16）
+
+对应 `docs/capability-gap-review.md` 附 A 的 A1（未做 20 项）中剔除 3 项发布工程后的 **17 项**
+（用户指令「除了工程打包之外先把 a1 做完」）；决策与偏离清单见 ADR-0068。本批后 A1 未做 20 → **3**。
+
+### 实施（按域，均有行号）
+
+1. **CLI**：`--disable-timestamp`（`main.rs:1778/2125` + config 扩展键 `:6520-6526` + `log_line` 单测）、
+   pid 文件（就绪后写 `/var/run/sodama.pid`，退出无条件删；`:7183-7185/7296-7312`）、
+   `completion bash|zsh|fish`（脚本内嵌 `:9646+`；预生成副本 `install/shell-completion/`；
+   一致性由单测锁定 `:11211+`；`install/install.sh:158+` 部署）。
+2. **配置**：`dns.bind`（`:8295-8440`，UDP/TCP 监听复用透明 DNS 全链路）；
+   group 级 `tcp_check_http_method`（`:5497-5511`、`group.rs:345/997/1021-1025`；默认 HEAD、
+   非法回落 CONNECT）；`check_interval` 校验（`config.rs:1390-1456`，global>0、group≥0）；
+   SIP008（`subscribe.rs:702-780`，JSON 优先于 base64）；`chains`（`outbound.rs:2057-2160`，
+   左出口右首跳 + loopback 桥；`lab/chain_test.sh` 无 root e2e）。
+3. **控制面**：UDP 端点池/full-cone（`main.rs:674-697`；分类 TTL `udp_ttl_secs :8871+`；
+   负缓存 + 1s janitor）；`raw_udp` 回退（`:7419-7430/8826-8870`）；
+   `reload/suspend --abort`（代次化会话登记 + `AbortScope`，`:9174-9250/10972-10982`）。
+4. **lab**：netkit 优先（`lab/lab.sh:376-396`，`mode l2 + scrub none` 一次性创建，失败回退 veth）。
+5. **工程**：`config-doc` 生成 + drift 单测（`main.rs:9747-9800/11157`）→ `docs/config-reference.md`；
+   `ebpf-logic` crate（BPF 纯逻辑 3 项 host 单测，数据面同源引用）；确定性 fuzz
+   （`fuzz_smoke.rs`，固定种子 + 语料，2 项测试）；fmt/clippy 门禁（`ci.yml:106-120` +
+   `[workspace.lints.clippy]` 放行清单）。
+
+### 开发期抓到并修掉的真实缺陷
+
+1. **出口连通性投影冷启动死角**（P38，本批最重要的一条）：`outbound_connectivity_map` 零初始化
+   （0 = 死），而旧投影只遍历「组」——「无 group 段」配置下路由给隐式 proxy 索引（`GROUP_INDEX_BASE`）
+   永远不被覆盖 → **新流首包 100% 被门禁 SHOT**。debug7 实锤：`route outbound=0x2 ... dport=9998`
+   打出后 `udp_nat.sessions_total=0`。修复三层：**全键域投影**（`main.rs:581-626`，未覆盖索引写 1）+
+   **取图乐观初值**（`:6843-6853`）+ **先投影再 sleep**（`:637-642`）。`test-udp-cone` FAIL → PASS。
+2. **`test-dns-bind` 断言锚定错误**（lab，非产品缺陷）：dns_probe 输出行形如
+   `ancount=1 from=127.0.0.1:15353`，旧断言 `^from=` 永不匹配（debug8 实锤应答本身正常：
+   rcode=0 / answer=10.9.10.3 / from=127.0.0.1:15353）；改 ` from=...$` 后 PASS。
+3. **cone 回包源断言过时**：echo 夹具通配绑定，内核按出接口主地址选源——回包源是 `10.9.9.2`
+   （wanpeer 主地址），`2.2.2.2` 只是 /32 别名；顺带修 `test-udp-relay` 同类断言。
+
+### 验收（实测）
+
+- 单测：`cargo test --release` **326 通过 + 7 ignored** + `ebpf-logic` **3 通过**；`fmt --check` /
+  `clippy -D warnings` 清零（CI 门禁同款命令）。
+- 内核级（QEMU 7.2.8，`QEMU_TIMEOUT=1500 sh lab/matrix.sh vm`）：`verify=PASS` 12/12；
+  **`cap=11/11 PASS`**（既有 9 项 + `test-udp-cone` + `test-dns-bind`）；`offload=FAIL` 为既有
+  抖动——已用「`connectivity_dead_groups=0` + offload keys 已登记 + `kernel_bytes=0`」三证归因，
+  与连通性修复无关（信息项）。
+- 无 root：`lab/chain_test.sh`（链式 A->B 端到端）；`sub-parse`/`config-doc`/`completion` 子命令
+  可离线验证。
+
+### 边界（与 ADR-0068 偏离清单同源）
+
+1. full-cone 仅直连型出口；代理型仍 dest-affine；
+2. `dns.bind` UDP 单线程串行、reload 不重启监听；
+3. abort 对 QUIC 系协议（tuic/hy2/juicity）只置 `stop` 位；
+4. `chains` 仅 TCP 链、每跳一次用户态字节桥；
+5. netkit 一次性创建（失败回退 veth）；fuzz 为确定性形态（非 libFuzzer）；
+6. 发布工程 3 项（容器镜像/发行 CI/版本与 CHANGELOG）按用户指令仍后置。
+
+---
+
 ## 附 A · 路由器侧工具清单（**不入库**，仅存在于软路由）
 
 | 路径 | 用途 | 部署时间 |

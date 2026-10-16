@@ -330,6 +330,25 @@ P6（suspend/reload/metrics/sysdump/日志轮转/整配置热重载）已完成*
   （新增 `test-gaps` / `test-alive` / `test-fuse` / `test-pinning`）；
   **栈预算教训**：新增写入把 `split_flow` 链路 combined stack 推过 512（verifier 实测 528）→
   事件/conn_state/handoff 三结构全部移入 per-CPU scratch + 四函数改子程序帧（详见 ADR-0067）
+- **A1 批次（除工程打包）（完成，2026-10-16）**：按 `docs/capability-gap-review.md` **附 A・A1**
+  除 3 项发布工程外的 17 项一次收口（ADR-0068、devlog §22；A1 未做 20 → **3**）——
+  **① CLI 三件套**（`--disable-timestamp`（+ config 扩展键）/ pid 文件与 `--disable-pidfile` /
+  `completion bash|zsh|fish` 子命令与 `install/shell-completion/` 预生成工件）；
+  **② 配置面**（`dns.bind` 明文 UDP/TCP 监听复用透明 DNS 全链路、group 级 `tcp_check_http_method`
+  （默认 HEAD、非法回落 CONNECT）、`check_interval` 校验（global>0 / group≥0）、SIP008 JSON 订阅、
+  `chains` 链式代理 A->B「左出口右首跳 + loopback 桥」）；
+  **③ 控制面**（UDP 端点池/full-cone + 分类 TTL + 负缓存 + 1s janitor、`raw_udp` 回退、
+  `reload/suspend --abort` 代次化会话管理、lab netkit 优先（`mode l2 + scrub none`，失败回退 veth））；
+  **④ 工程质量**（`sodama config-doc` → `docs/config-reference.md` + drift 单测、`ebpf-logic`
+  crate（BPF 纯逻辑 host 单测 3 项，数据面同源引用）、确定性 fuzz（`fuzz_smoke.rs`）、
+  fmt/clippy 门禁（`ci.yml` + `[workspace.lints.clippy]` 放行清单））。
+  实测：`cargo test` **326 + 3（ebpf-logic）**；内核级 QEMU 7.2.8 **`verify` 12/12 + cap 阶段 11/11**
+  （新增 `test-udp-cone` / `test-dns-bind`）；
+  **同批修实测缺陷**：出口连通性投影冷启动死角（`outbound_connectivity_map` 零初始化 + 旧投影
+  只遍历「组」→ 无 group 段配置下隐式 proxy 索引恒 0 → 新流首包被门禁 SHOT；修为**全键域投影** +
+  取图乐观初值 + 先投影再 sleep；`test-udp-cone` FAIL → PASS）；
+  边界（偏离清单 10 项）：full-cone 仅直连型出口、`dns.bind` UDP 单线程且 reload 不重启监听、
+  abort 对 QUIC 系只置 `stop` 位、`chains` 仅 TCP（每跳一次用户态字节桥）、netkit 一次性创建
 
 原理与 dae 源码对照见 [NOTES.md](./NOTES.md)。
 
