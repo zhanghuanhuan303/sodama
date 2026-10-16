@@ -8719,47 +8719,29 @@ static UDP_GSO_UNSUPPORTED: AtomicBool = AtomicBool::new(false);
 #[cfg(target_os = "linux")]
 const UDP_SEGMENT_OPT: libc::c_int = 103;
 
-/// 给 fd 开 `UDP_SEGMENT`（幂等；失败置 unsupported 标志）。
-fn udp_gso_enable(fd: RawFd) -> bool {
-    if UDP_GSO_UNSUPPORTED.load(Ordering::Relaxed) {
-        return false;
-    }
-    let one: libc::c_int = 1;
-    let rc = unsafe {
-        libc::setsockopt(
-            fd,
-            libc::SOL_UDP,
-            UDP_SEGMENT_OPT,
-            &one as *const _ as *const libc::c_void,
-            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-        )
-    };
-    if rc != 0 {
-        UDP_GSO_UNSUPPORTED.store(true, Ordering::Relaxed);
-        log_warn(&format!(
-            "udp GSO: UDP_SEGMENT 不可用（{}），回落逐报发送",
-            std::io::Error::last_os_error()
-        ));
-        return false;
-    }
-    true
-}
-
 /// GSO 聚合发送：`datas` 必须同目的、等长（调用方保证）；成功返回 `true`。
 /// 单次上限 `UDP_MAX_SEGMENTS`（对照内核 gso_max_size 的保守值：64 段 × 单段 ≤ 64KB 内）。
+///
+/// ⚠ 两个已踩过的内核行为（2026-10-17 实测，勿回退）：
+///   1. cmsg 自体即可工作——**无需**任何 `setsockopt(UDP_SEGMENT, …)` 前置
+///      （实测：零 setsockopt 下 12 B + SCM seg=4 → 3×4 B 数据报）。
+///   2. `setsockopt(UDP_SEGMENT, 1)` 不是「能力探测」而是把 socket 级默认
+///      `gso_size` 设为 1：此后该 socket 上**一切普通发送**（sendto/sendmmsg）
+///      直接 EINVAL（实测）。A2 批次 5 曾用该探测，造成 UDP 回复路径在
+///      ≥10k pps 触发批次发送后被永久污染（回程全灭事故根因）——禁止再引入。
 fn send_gso_udp(fd: RawFd, to: SocketAddr, datas: &[&[u8]]) -> std::io::Result<bool> {
     const UDP_MAX_SEGMENTS: usize = 64;
     if datas.len() < 2 {
         return Ok(false);
     }
+    if UDP_GSO_UNSUPPORTED.load(Ordering::Relaxed) {
+        return Ok(false);
+    }
     let seg_len = datas[0].len();
-    if seg_len == 0 || datas.iter().any(|d| d.len() != seg_len) {
+    if seg_len == 0 || seg_len > u16::MAX as usize || datas.iter().any(|d| d.len() != seg_len) {
         return Ok(false);
     }
     let n = datas.len().min(UDP_MAX_SEGMENTS);
-    if !udp_gso_enable(fd) {
-        return Ok(false);
-    }
     let (st, name_len) = sockaddr_any_of(to);
     let mut payload: Vec<u8> = Vec::with_capacity(seg_len * n);
     for d in datas.iter().take(n) {
@@ -8769,23 +8751,25 @@ fn send_gso_udp(fd: RawFd, to: SocketAddr, datas: &[&[u8]]) -> std::io::Result<b
         iov_base: payload.as_mut_ptr() as *mut libc::c_void,
         iov_len: payload.len(),
     };
-    // cmsg：UDP_SEGMENT = 单段长度（u16）。
+    // cmsg：UDP_SEGMENT = 单段长度（u16）。msg_controllen 必须先设好：
+    // glibc CMSG_FIRSTHDR 以 msg_controllen >= sizeof(cmsghdr) 作为取头前提，
+    // 置 0 时恒返回 NULL（旧实现由此恒走回落，GSO 从未真正发出过）。
     #[repr(align(8))]
     struct Ctl([u8; 64]);
     let mut ctl = Ctl([0u8; 64]);
-    let mut hdr = libc::msghdr {
+    let cmsg_len = unsafe { libc::CMSG_SPACE(std::mem::size_of::<u16>() as u32) } as usize;
+    if cmsg_len > ctl.0.len() {
+        return Ok(false);
+    }
+    let hdr = libc::msghdr {
         msg_name: &st as *const _ as *mut libc::c_void,
         msg_namelen: name_len,
         msg_iov: &mut iov,
         msg_iovlen: 1,
         msg_control: ctl.0.as_mut_ptr() as *mut libc::c_void,
-        msg_controllen: 0,
+        msg_controllen: cmsg_len,
         msg_flags: 0,
     };
-    let cmsg_len = unsafe { libc::CMSG_SPACE(std::mem::size_of::<u16>() as u32) } as usize;
-    if cmsg_len > ctl.0.len() {
-        return Ok(false);
-    }
     unsafe {
         let cmsg = libc::CMSG_FIRSTHDR(&hdr);
         if cmsg.is_null() {
@@ -8796,17 +8780,19 @@ fn send_gso_udp(fd: RawFd, to: SocketAddr, datas: &[&[u8]]) -> std::io::Result<b
         (*cmsg).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<u16>() as u32) as usize;
         let data = libc::CMSG_DATA(cmsg) as *mut u16;
         *data = seg_len as u16;
-        hdr.msg_controllen = cmsg_len;
-    }
-    if seg_len > u16::MAX as usize {
-        return Ok(false);
     }
     let rc = unsafe { libc::sendmsg(fd, &hdr, 0) };
     if rc < 0 {
         let e = std::io::Error::last_os_error();
-        // EMSGSIZE/EINVAL 等：内核/网卡拒绝该 GSO 尺寸 → 回落逐报（不是致命错误）。
+        // EMSGSIZE/EINVAL：内核/网卡拒绝该 GSO 尺寸 → 回落逐报（非致命）。
         return match e.raw_os_error() {
-            Some(libc::EMSGSIZE) | Some(libc::EINVAL) | Some(libc::EOPNOTSUPP) => Ok(false),
+            Some(libc::EMSGSIZE) | Some(libc::EINVAL) => Ok(false),
+            Some(libc::EOPNOTSUPP) => {
+                if !UDP_GSO_UNSUPPORTED.swap(true, Ordering::Relaxed) {
+                    log_warn("udp GSO: 内核不支持 UDP_SEGMENT，回落逐报发送");
+                }
+                Ok(false)
+            }
             _ => Err(e),
         };
     }
@@ -13108,24 +13094,31 @@ mod tests {
         let recv_addr = recv.local_addr().unwrap();
         let send = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         use std::os::fd::AsRawFd as _;
-        if !udp_gso_enable(send.as_raw_fd()) {
-            eprintln!("SKIP: 内核不支持 UDP_SEGMENT");
-            return;
-        }
+        recv.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
         let payloads: Vec<Vec<u8>> = vec![b"aaaa".to_vec(), b"bbbb".to_vec(), b"cccc".to_vec()];
         let refs: Vec<&[u8]> = payloads.iter().map(|p| p.as_slice()).collect();
-        if !send_gso_udp(send.as_raw_fd(), recv_addr, &refs).unwrap() {
-            eprintln!("SKIP: GSO 发送被内核拒绝");
-            return;
+        let gso_sent = send_gso_udp(send.as_raw_fd(), recv_addr, &refs).unwrap();
+        if gso_sent {
+            let mut got = Vec::new();
+            for _ in 0..3 {
+                let mut buf = [0u8; 64];
+                let (n, _) = recv.recv_from(&mut buf).expect("GSO 后应收到 3 个数据报");
+                got.push(buf[..n].to_vec());
+            }
+            assert_eq!(got, payloads, "GSO 应被内核切成 3 个独立数据报");
+        } else {
+            eprintln!("SKIP: GSO 发送被内核拒绝（回落路径已验证普通发送可用）");
         }
-        recv.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
-        let mut got = Vec::new();
-        for _ in 0..3 {
-            let mut buf = [0u8; 64];
-            let (n, _) = recv.recv_from(&mut buf).expect("GSO 后应收到 3 个数据报");
-            got.push(buf[..n].to_vec());
-        }
-        assert_eq!(got, payloads, "GSO 应被内核切成 3 个独立数据报");
+        // 回归守护（A2-5 事故）：无论 GSO 与否，socket 必须保持干净——
+        // 普通发送永远可用。（历史实现用 `setsockopt(UDP_SEGMENT, 1)` 做“探测”，
+        // 该值 = socket 级默认 gso_size=1 → 此后普通 send 恒 EINVAL，UDP 回复全灭。）
+        let sn = send
+            .send_to(&payloads[0], recv_addr)
+            .expect("GSO 之后同 socket 的普通发送必须可用");
+        assert_eq!(sn, 4);
+        let mut buf = [0u8; 64];
+        let (n, _) = recv.recv_from(&mut buf).expect("GSO 后普通发送应送达");
+        assert_eq!(&buf[..n], payloads[0].as_slice());
     }
 
     #[test]
