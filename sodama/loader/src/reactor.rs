@@ -43,10 +43,15 @@ const MAX_WORKERS: usize = 16;
 const MIN_WORKERS: usize = 2;
 
 static ENABLED: OnceLock<bool> = OnceLock::new();
-/// stage 2 codec 会话开关（`SODAMA_REACTOR_CODEC=0` 关闭；默认开）。
+
 static CODEC_ENABLED: OnceLock<bool> = OnceLock::new();
 static WORKERS: OnceLock<Vec<Arc<Mutex<Worker>>>> = OnceLock::new();
-static SUBMIT_TX: OnceLock<Sender<Session>> = OnceLock::new();
+/// 会话投递：**每 worker 独立 channel**（提交时轮询定向）。
+/// 历史（A2-2 前）为共享 channel + 单次 wake——worker 醒来后 drain-all 认领，
+/// 一簇新会话会被先醒的单个 worker 全量领走（4 条 ss 流 → 单核 AEAD 上限
+/// ≈6.2 Gbps；分散到 ≥2-4 个 worker 时才达 9.9 Gbps）。即 ss 双峰回归的根因：
+/// 认领竞态。改为定向分派后每字节成本高的 codec 会话结构性均担到多核。
+static SUBMIT_TX: OnceLock<Vec<Sender<Session>>> = OnceLock::new();
 static NEXT_WORKER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 /// 会话 → worker 索引（看门狗 `kill` 需要跨线程定位）。
 static LOCATIONS: OnceLock<Mutex<HashMap<u64, usize>>> = OnceLock::new();
@@ -1238,10 +1243,9 @@ pub fn init() {
         .map(|n| n.get())
         .unwrap_or(4)
         .clamp(MIN_WORKERS, MAX_WORKERS);
-    let (tx, rx) = std::sync::mpsc::channel::<Session>();
-    let rx = Arc::new(Mutex::new(rx));
     let _ = LOCATIONS.set(Mutex::new(HashMap::new()));
     let mut workers = Vec::with_capacity(threads);
+    let mut txs = Vec::with_capacity(threads);
     for i in 0..threads {
         let w = match Worker::new(i) {
             Ok(w) => Arc::new(Mutex::new(w)),
@@ -1250,8 +1254,11 @@ pub fn init() {
                 continue;
             }
         };
+        // 每 worker 独立 channel：提交侧轮询定向，认领侧只取自己那份（无竞态）。
+        let (tx, rx) = std::sync::mpsc::channel::<Session>();
+        let rx = Arc::new(Mutex::new(rx));
         workers.push(w.clone());
-        let rx = rx.clone();
+        txs.push(tx);
         std::thread::spawn(move || worker_loop(w, rx, i));
     }
     if workers.is_empty() {
@@ -1263,7 +1270,7 @@ pub fn init() {
         workers.len()
     ));
     let _ = WORKERS.set(workers);
-    let _ = SUBMIT_TX.set(tx);
+    let _ = SUBMIT_TX.set(txs);
 }
 
 /// 交一条 splice 会话给 reactor。所有权：client/upstream fd 全部移交。
@@ -1271,6 +1278,20 @@ pub fn init() {
 /// `prelude`：需要先消费协议响应头（VLESS）的读半。存在时下行（u2c）暂停，
 /// 由 worker 内 `PreludeBuf` 非阻塞消费响应头/首块并写给客户端（每连接 0 线程）。
 /// 返回 false 表示 reactor 不可用或投递失败（fd 已关闭，调用方自行收尾统计）。
+/// 轮询选取目标 worker 并投递会话（每 worker 独立 channel；返回目标下标）。
+fn submit_to_worker(sess: Session) -> Option<usize> {
+    let txs = SUBMIT_TX.get()?;
+    if txs.is_empty() {
+        return None;
+    }
+    let idx = NEXT_WORKER.fetch_add(1, Ordering::Relaxed) % txs.len();
+    if txs[idx].send(sess).is_err() {
+        return None;
+    }
+    wake(idx);
+    Some(idx)
+}
+
 pub fn submit(
     client: TcpStream,
     upstream: TcpStream,
@@ -1286,13 +1307,13 @@ pub fn submit(
     );
     let client: OwnedFd = client.into();
     let upstream: OwnedFd = upstream.into();
-    let Some(tx) = SUBMIT_TX.get() else {
+    if SUBMIT_TX.get().is_none() {
         // 未初始化：fd 随 OwnedFd 关闭，调用方收尾统计
         return false;
-    };
+    }
     let paused = prelude.is_some();
     let sess = new_session(id, client, upstream, handle.clone(), prelude);
-    if tx.send(sess).is_err() {
+    if submit_to_worker(sess).is_none() {
         return false;
     }
     if dbg_on() {
@@ -1301,7 +1322,6 @@ pub fn submit(
             paused,
         ));
     }
-    wake_next();
     true
 }
 
@@ -1339,19 +1359,18 @@ pub fn submit_codec(
     reader: Box<dyn crate::outbound::ReadHalf>,
     writer: Box<dyn crate::outbound::WriteHalf>,
 ) -> bool {
-    let Some(tx) = SUBMIT_TX.get() else {
+    if SUBMIT_TX.get().is_none() {
         return false;
-    };
+    }
     // 握手期读写超时对非阻塞数据面无意义（且在 epoll 下行为微妙），清掉。
     let _ = client.set_read_timeout(None);
     let _ = client.set_write_timeout(None);
     let _ = upstream.set_read_timeout(None);
     let _ = upstream.set_write_timeout(None);
     let sess = new_codec_session(id, client.into(), upstream.into(), handle, reader, writer);
-    if tx.send(sess).is_err() {
+    if submit_to_worker(sess).is_none() {
         return false;
     }
-    wake_next();
     if dbg_on() {
         log(&format!("reactor-dbg: codec 投递 #{id}"));
     }
@@ -1406,12 +1425,11 @@ fn new_codec_session(
 }
 
 /// 唤醒一个 worker（轮转）认领会话队列；`submit`/`submit_codec` 共用。
-fn wake_next() {
+fn wake(idx: usize) {
     if let Some(workers) = WORKERS.get() {
-        if workers.is_empty() {
+        if idx >= workers.len() {
             return;
         }
-        let idx = NEXT_WORKER.fetch_add(1, Ordering::Relaxed) % workers.len();
         let v: u64 = 1;
         unsafe {
             libc::write(
@@ -1494,7 +1512,7 @@ fn worker_loop(worker: Arc<Mutex<Worker>>, rx: Arc<Mutex<Receiver<Session>>>, _i
     loop {
         let epfd = worker.lock().unwrap().epfd.as_raw_fd();
         let n = unsafe { libc::epoll_wait(epfd, events.as_mut_ptr(), events.len() as i32, 1000) };
-        // 先认领新会话（可能被其它 worker 抢走）
+        // 先认领新会话（本 worker 专属 channel：提交侧轮询定向，无跨 worker 竞态）
         loop {
             let sess = {
                 let r = rx.lock().unwrap();
