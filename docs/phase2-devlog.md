@@ -1130,6 +1130,8 @@ worker 停摆现象加诊断日志后未再复现；全链路日志（“后台�
   4. **M2/M3 回验**（若启用 UDP NAT）：reader 退出即摘表；`reply_sockets_evicted` 随目的地址多样性增长而有界；
   5. 常规判据（同 §16）：探测节奏/CF 额度、订阅计数、内存与线程有界、stragglers=0。
 - 数据回填：按 §12 协议；本代起点 2026-10-16 05:44（health/mem-track 持续运行）。
+- **收官：2026-10-17 03:15（21.4 h，按用户决定提前收官，为新引擎上线让路）**。收口数据与分析：
+  `docs/notes/prod-audit-2026-10-17/`；判据结果与缺陷发现见 §24.4/§24.2。
 
 ## 19 · 数据面对标批次：L3 变体 · ringbuf 事件 · skb_send_sock 记账 · XDP 计量（2026-10-16）
 
@@ -1575,6 +1577,71 @@ EMGSIZE/EINVAL/EOPNOTSUPP 回落逐包；status `gso_sends/gso_datagrams/gso_uns
 
 ---
 
+## 24 · A2 收口后的修复轮 · 生产 72h 轮收口 · 新引擎上线与新 72h 起点（2026-10-17）
+
+### 24.1 四项修复（本机全量轮暴露，§8.1–§8.4 of benchmark-report-v4）
+
+- **R11 宿主验证器拒载（阻断性）**：`e87ea69` 的 7 参数 BPF 调用在宿主 6.18 被拒（`R11 is invalid`）
+  ——「补全后内核」在真实宿主上原本无法加载。修法：`conn_save` 参数打包 7→4
+  （`meta = outbound | must<<8 | l4proto<<16 | slot_enc<<24`）；`verify 12/12` 回归。
+- **UDP GSO 回归**：A2 用 `setsockopt(UDP_SEGMENT,1)` 当能力探测，实为「设 socket 级 gso_size=1」
+  ——设后同一 socket 普通 `sendto` 恒 EINVAL，回程全灭。修法：删污染性探测 + 修 cmsg 构造
+  （`CMSG_FIRSTHDR` 前置 `msg_controllen`）+ 回归守护单测。
+- **ss reactor 双峰**：`b030f90` 的「共享 mpsc + drain-all 认领」在 4 条 ss 流下被单 worker 全领
+  → 单核 AEAD 瓶颈（中位 6 228 Mbps、双峰）。修法：**每 worker 独立 channel + 轮询定向分派**；
+  修后 10 轮 8 624–9 908（中位 9 265），vless 无回退。
+- **lab offload 口径**：`up()` 无条件关闭 dae0/dae0peer offload 使标准代理路径吞吐砍半
+  （17.3 → 8.5 Gbps）。修法：治理移入 `test_l3`（关→用→恢复）。四项全部入库（`71decb9..9f1179a`）。
+
+### 24.2 ws 干净 EOF 误报修复（`71fb211`，生产收口分析发现）
+
+生产 21 h 窗口内 `reactor: codec 泵失败` **10 818 条 / 13 902 会话（78%）**，全部取证归因于
+`ws.rs` 把「帧边界处的干净 EOF」误判为「帧被截断」：`read_frame_header` 的
+`ensure_buffered(2)==false` 同时覆盖「0 字节残留 + EOF」（正常收尾）与「残半个头 + EOF」（真截断）。
+**强判别**：同窗口 `ws: 数据帧被截断` 仅 **1** 条、控制帧截断 **0** 条——真截断的断点应落在 data 帧上。
+修复：读帧头前先探 EOF，仅无残留字节时记 `Ok(0)`；与 `anytls.rs`/`ss.rs` 既有口径对齐。
+单测 +2（346 → 348，+3 ebpf-logic = 351）。**上线 10 分钟验证：20 个会话 0 条误报**（旧构建为每会话一条）。
+
+### 24.3 musl 交叉构建修复（`5d3d9a0`，部署前构建暴露）
+
+GSO 的 cmsg 构造用了 glibc 专有的 `libc::msghdr` 字面量——musl 下 `msg_controllen` 是 `u32`
+且含私有填充字段 → `cargo zigbuild --target x86_64-unknown-linux-musl` 直接编译失败
+（开发机 glibc 单测掩盖）。修法：`zeroed()` + 逐字段 `as _`（类型交编译期推导）。
+产物 `sodama 8.1M / sodama-ebpf 988K`。
+
+### 24.4 旧 72h 轮收口（2026-10-16 05:44 → 2026-10-17 03:15，21.4 h）
+
+按用户决定在 21.4 h 收官，为「新引擎上线 + 新 72h」让路。数据与分析：
+`docs/notes/prod-audit-2026-10-17/`（health/mem-track 导出 + `status-closeout.json` + `analyze.py` + README）。
+
+| 判据 | 结果 |
+|---|---|
+| 崩溃/重启 | 无（uptime 76 457 s = 21.24 h 与窗口一致）|
+| `dial_errors` / `stragglers` | **0 / 0**（全程）|
+| `probes_fail` | +87 / 87 501 探测 = 0.1%（节点侧波动）|
+| RSS | 冷启 43.8 → 预热台阶后稳态 **53.5 MB**（14 h 极差 3.66 MB，稳态斜率 −47.8 KB/h ≈ 0）|
+| FD / 线程 | 133（103–184）/ 18（启动 19）|
+| reactor codec 覆盖 | `reactor_codec_sessions == conns_total`（13 837）|
+| splice / pipe / offload | 全 0（ws 编解码路径无零拷贝；与预期一致）|
+| H2 DoH | `upstream_errors=0`（96 703 查询）|
+| UDP NAT（M2/M3）| 生产未启用 → 不适用 |
+
+### 24.5 新引擎上线（2026-10-17 03:22）与新 72h 起点
+
+- 部署：`dev@5d3d9a0` OpenWrt x86_64 产物（`sodama` md5 `0f630fc8…`、`sodama-ebpf` md5 `4884fcf0…`；
+  `--version` = `0.1.0-g5d3d9a08e6ca`，无 dirty）；旧二进制备份 `/root/binbak-20261017-0320/`
+  （`a5aa0d09…` / `2413574e…`）。部署前 `validate`：16 条 routing 全编译、0 deferred。
+  就绪 **8 s**，36 节点全活。
+- 面板：`panel@v2.0` 同步上线（md5 `78cc36c4…`；`/api/v1/engine/version` 返回 5d3d9a0；
+  `status` 含 udp_nat/gso、traffic、real_domain、trace、sysctl、engine_build 等新段）。
+- 追踪器：旧轮数据归档 `/root/72h-archive-20261017-0322/`；health/mem-track 以新文件重启。
+  **起点 2026-10-17 03:23:53**（tracker 首个采样）；冷启基线 RSS **54.6 MB** / RssAnon **47.4 MB** /
+  线程 **20** / fd **143**（新构建功能面更大，基线高于旧轮 42.5 MB 属预期）。
+- 本轮新增观察项：① ws 误报修复的持续性（`帧被截断` 应仅零星出现，与真截断/RST 区分）；
+  ② 新构建的 `traffic`/`trace`/`real_domain` 计数器与 `sysctl.watched/rewrites`；
+  ③ A2 的 `config-watch`（inotify 已启用）与订阅周期刷新（21600s ±10%）在长期运行下的行为；
+  ④ 内存台阶与稳态（与旧轮 53.5 MB 稳态对照）。
+
 ## 附 A · 路由器侧工具清单（**不入库**，仅存在于软路由）
 
 | 路径 | 用途 | 部署时间 |
@@ -1602,6 +1669,6 @@ EMGSIZE/EINVAL/EOPNOTSUPP 回落逐包；status `gso_sends/gso_datagrams/gso_uns
 | B3 | 开机自启采集 | crontab `@reboot` 行是注释；`/etc/rc.local` 存在且为空 | 把 `sh /root/sodama-health-track.sh start` 加进 rc.local |
 | B4 | 日志归档 | cron */30 正常（两份归档 12.9 / 8.4 MB）；当前日志在 tmpfs | 保持 |
 | B5 | 计数重置瑕疵 | `probes_ok/fail/stragglers` 随订阅热更新归零 | 已知；跨世代看进程级指标 |
-| B6 | 72h 生产测试 | **已启动**（2026-10-11，§12）；判据/脚本就绪 | 按 §12 记分板回填 24/48/72 h；bounded-memory 表述待通过后启用 |
-| B7 | Vision/WS 长跑 | `reactor_codec_sessions` 100%；泵失败均为客户端 RST | 继续观察 |
+| B6 | 72h 生产测试 | 多轮：§12（10-11）→ §16（10-14）→ §18（10-16 05:44，**21.4 h 收官**）→ **新引擎轮（2026-10-17 03:22 起，§24.5）** | 新轮按 §12 记分板回填 24/48/72 h；bounded-memory 表述待通过后启用 |
+| B7 | Vision/WS 长跑 | `reactor_codec_sessions` 100%；~~泵失败均为客户端 RST~~ **该判断已被 2026-10-17 收口分析推翻**：78% 会话的 `ws: 帧被截断` 是「帧边界干净 EOF 被误报」（`ws.rs` 修复 `71fb211`；真失败面 = RST 864 / vless 头 EOF 106 / 数据帧截断 1）。新轮观察：误报应≈0 | 继续观察（判据更新：`帧被截断` 与 `数据帧被截断` 分开计数） |
 | B8 | P37 待验收（dev 分支已提交） | ADR-0064（A1/B1/B2/B3/C1）已部署生产；B1 实测 0 请求✓；待观察：夜间「空闲退避」日志、失败源 `Heal` 定向重拉 | **稳定观察 ≥1 晚后提醒用户合并 dev → main** |
