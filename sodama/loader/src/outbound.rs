@@ -1007,6 +1007,9 @@ pub enum Outbound {
     },
     /// P15：节点组（订阅/内联节点池）+ policy + 健康检查；拨号层选择与失败切换。
     Group(std::sync::Arc<GroupRuntime>),
+    /// P38：链式代理（`A -> B`，左侧为出口、右侧为第一跳；对照 dae `register.go`）。
+    /// 仅 TCP 型协议可作链节点（QUIC 型无静态 TCP 服务端地址，无法被上一跳承载）。
+    Chain { hops: Vec<std::sync::Arc<Outbound>> },
 }
 
 impl Outbound {
@@ -1060,6 +1063,11 @@ impl Outbound {
             } => format!("naive+quic://{server}"),
             Self::Naive { server, .. } => format!("naive+https://{server}"),
             Self::Group(g) => format!("group:{}（{} 节点）", g.name, g.member_count()),
+            Self::Chain { hops } => hops
+                .iter()
+                .map(|h| h.name())
+                .collect::<Vec<_>>()
+                .join("->"),
         }
     }
 
@@ -1087,6 +1095,7 @@ impl Outbound {
             Self::Naive { h3: true, .. } => "naive-quic",
             Self::Naive { .. } => "naive",
             Self::Group(_) => "group",
+            Self::Chain { .. } => "chain",
         }
     }
 
@@ -1198,6 +1207,7 @@ impl Outbound {
             Self::Naive { h3: true, .. } => ("naive", "quic", "tls"),
             Self::Naive { .. } => ("naive", "h2", "tls"),
             Self::Group(_) => ("group", "—", "—"),
+            Self::Chain { .. } => ("chain", "tcp", "—"),
         };
         NodeFacts {
             protocol,
@@ -1240,8 +1250,108 @@ impl Outbound {
             | Self::AnyTls { server, .. } => Some(*server),
             Self::Naive { server, .. } => Some(*server),
             Self::Ssr { dialer } => Some(dialer.server()),
+            // P38：链式代理不参与粘滞 IP 反馈（各跳 server 均已解析为 SocketAddr）。
+            Self::Chain { .. } => None,
             _ => None,
         }
+    }
+
+    /// P38：链式代理桥——拷贝一个「服务端地址换成 `addr`」的等价出站（仅 TCP 型协议；
+    /// 桥接到本地 loopback 中转口，见 `chain_bridge_port`）。
+    fn with_server_addr(&self, addr: SocketAddr) -> Option<Outbound> {
+        Some(match self {
+            Self::Socks5 { .. } => Self::Socks5 { server: addr },
+            Self::Http { auth, .. } => Self::Http {
+                server: addr,
+                auth: auth.clone(),
+            },
+            Self::Shadowsocks {
+                method,
+                master,
+                shadowtls,
+                ..
+            } => Self::Shadowsocks {
+                server: addr,
+                method: *method,
+                master: master.clone(),
+                shadowtls: shadowtls.clone(),
+            },
+            Self::Trojan {
+                password,
+                sni,
+                insecure,
+                ..
+            } => Self::Trojan {
+                server: addr,
+                password: password.clone(),
+                sni: sni.clone(),
+                insecure: *insecure,
+            },
+            Self::Vless {
+                uuid,
+                tls,
+                sni,
+                insecure,
+                transport,
+                reality,
+                flow,
+                ..
+            } => Self::Vless {
+                server: addr,
+                uuid: *uuid,
+                tls: *tls,
+                sni: sni.clone(),
+                insecure: *insecure,
+                transport: transport.clone(),
+                reality: reality.clone(),
+                flow: flow.clone(),
+            },
+            Self::Vmess {
+                uuid,
+                security,
+                tls,
+                sni,
+                insecure,
+                ..
+            } => Self::Vmess {
+                server: addr,
+                uuid: *uuid,
+                security: *security,
+                tls: *tls,
+                sni: sni.clone(),
+                insecure: *insecure,
+            },
+            Self::AnyTls {
+                password_sha256,
+                sni,
+                insecure,
+                ..
+            } => Self::AnyTls {
+                server: addr,
+                password_sha256: *password_sha256,
+                sni: sni.clone(),
+                insecure: *insecure,
+            },
+            Self::Naive {
+                user,
+                pass,
+                sni,
+                insecure,
+                h3,
+                ..
+            } => Self::Naive {
+                server: addr,
+                user: user.clone(),
+                pass: pass.clone(),
+                sni: sni.clone(),
+                insecure: *insecure,
+                h3: *h3,
+            },
+            Self::Ssr { dialer } => Self::Ssr {
+                dialer: std::sync::Arc::new(dialer.with_server(addr)),
+            },
+            _ => return None,
+        })
     }
 
     pub fn dial_tcp(&self, target: &Target, timeout: Duration) -> io::Result<DialedStream> {
@@ -1656,6 +1766,7 @@ impl Outbound {
                 })
             }
             Self::Group(g) => g.dial_tcp(target, timeout),
+            Self::Chain { hops } => chain_dial(hops, target, timeout),
         }
     }
 
@@ -1813,6 +1924,14 @@ impl Outbound {
 /// 解析 `--dialer`：direct / socks5:// / ss:// / trojan:// / vless:// / vmess:// / tuic:// /
 /// hysteria2://（别名 hy2://）。（为兼容也接受裸 host:port = socks5）。
 pub fn parse(url: &str) -> Result<Outbound, String> {
+    // P38：链式代理（对照 dae `register.go`：`A -> B`，左侧为出口、右侧为第一跳）。
+    // 名字段（`#` 之后）不参与链拆分（订阅行的节点名可能含 `->`）。
+    if url.contains("->") {
+        let body = url.split('#').next().unwrap_or(url);
+        if body.contains("->") {
+            return parse_chain(body);
+        }
+    }
     if url == "direct" || url.starts_with("direct://") {
         return Ok(Outbound::Direct);
     }
@@ -1874,6 +1993,132 @@ pub fn parse(url: &str) -> Result<Outbound, String> {
 fn resolve(hostport: &str) -> Result<SocketAddr, String> {
     // P23：域名地址走粘滞 IP 缓存（dae StickyIpDialer）：固定 IP + 失败阈值后重解析。
     crate::sticky::resolve(hostport)
+}
+
+// ---------------------------------------------------------------- P38：链式代理
+
+/// P38：链式代理解析（对照 dae `outbound/dialer/register.go`）：按 `->` 硬切、
+/// 各段 `TrimSpace`、无转义；每段必须是完整链接且**可被上一跳承载**（TCP 型协议）。
+fn parse_chain(raw: &str) -> Result<Outbound, String> {
+    let segments: Vec<&str> = raw.split("->").collect();
+    let mut hops: Vec<std::sync::Arc<Outbound>> = Vec::with_capacity(segments.len());
+    for (i, seg) in segments.iter().enumerate() {
+        let seg = seg.trim();
+        if seg.is_empty() {
+            return Err(format!("链式代理第 {} 段为空（语法：`A -> B`）", i + 1));
+        }
+        let o = parse(seg).map_err(|e| format!("链式代理第 {} 段（{seg}）: {e}", i + 1))?;
+        hops.push(std::sync::Arc::new(o));
+    }
+    for (i, h) in hops.iter().enumerate() {
+        if h.server_addr().is_none() {
+            return Err(format!(
+                "链式代理第 {} 段（{}）不能作链节点：无 TCP 服务端地址（QUIC/UDP 型、direct 或组）",
+                i + 1,
+                h.name()
+            ));
+        }
+    }
+    Ok(Outbound::Chain { hops })
+}
+
+/// P38：链式拨号（对照 dae：最右节点先建（以 direct 为 next），逐级向左包装）。
+/// `hops[i]` 作为出口时，它「连自己 server」的一步被桥接到 `hops[i+1..]` 链上。
+/// 实现取舍（偏离）：非最右 hop 经**本地 loopback 桥**中转——避免为全部协议族改泛型
+/// 流接口；代价是每跳一次用户态字节桥（仅链式配置付出）。
+fn chain_dial(
+    hops: &[std::sync::Arc<Outbound>],
+    target: &Target,
+    timeout: Duration,
+) -> io::Result<DialedStream> {
+    chain_dial_from(hops, 0, target, timeout)
+}
+
+fn chain_dial_from(
+    hops: &[std::sync::Arc<Outbound>],
+    i: usize,
+    target: &Target,
+    timeout: Duration,
+) -> io::Result<DialedStream> {
+    let hop = &hops[i];
+    if i + 1 == hops.len() {
+        // 最右 hop（第一跳）：直接连自己的 server，不再套桥。
+        return hop.dial_tcp(target, timeout);
+    }
+    let port = chain_bridge_port(hop, hops, i)?;
+    let bridged = hop
+        .with_server_addr(SocketAddr::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            port,
+        ))
+        .ok_or_else(|| io::Error::other("链式代理：该段协议不支持桥接"))?;
+    bridged.dial_tcp(target, timeout)
+}
+
+/// P38：惰性创建（每段一条，复用）本地桥：accept 后以 `hops[i+1..]` 链连到
+/// `hops[i]` 的 server，双向字节泵；桥随进程生命周期存活（进程退出即回收）。
+fn chain_bridge_port(
+    hop: &std::sync::Arc<Outbound>,
+    hops: &[std::sync::Arc<Outbound>],
+    i: usize,
+) -> io::Result<u16> {
+    static BRIDGES: std::sync::LazyLock<Mutex<std::collections::HashMap<(usize, usize), u16>>> =
+        std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+    let key = (std::sync::Arc::as_ptr(hop) as usize, i);
+    if let Ok(g) = BRIDGES.lock() {
+        if let Some(p) = g.get(&key) {
+            return Ok(*p);
+        }
+    }
+    let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))?;
+    let port = listener.local_addr()?.port();
+    let server = hop
+        .server_addr()
+        .ok_or_else(|| io::Error::other("链式代理：该段无 TCP 服务端地址"))?;
+    let down: Vec<std::sync::Arc<Outbound>> = hops[i + 1..].to_vec();
+    std::thread::spawn(move || {
+        for conn in listener.incoming() {
+            let Ok(client) = conn else { continue };
+            let down = down.clone();
+            std::thread::spawn(move || {
+                let Ok(t) = Target::from_socket_addr(server) else {
+                    return;
+                };
+                match chain_dial_from(&down, 0, &t, Duration::from_secs(10)) {
+                    Ok(up) => chain_pump(client, up),
+                    // 桥接失败：直接关闭（调用方看到 EOF/RST，与其自行拨号失败同形态）
+                    Err(_) => drop(client),
+                }
+            });
+        }
+    });
+    if let Ok(mut g) = BRIDGES.lock() {
+        g.insert(key, port);
+    }
+    Ok(port)
+}
+
+/// P38：桥的双向字节泵（EOF 时半关闭对侧；`socket` 包着保活到泵结束）。
+fn chain_pump(client: TcpStream, up: DialedStream) {
+    let DialedStream {
+        from_remote,
+        to_remote,
+        socket: _kill,
+        ..
+    } = up;
+    let mut up_r = from_remote;
+    let mut up_w = to_remote;
+    let Ok(mut c_read) = client.try_clone() else {
+        return;
+    };
+    let mut c_write = client;
+    let t = std::thread::spawn(move || {
+        let _ = io::copy(&mut up_r, &mut c_write);
+        let _ = c_write.shutdown(std::net::Shutdown::Write);
+    });
+    let _ = io::copy(&mut c_read, &mut up_w);
+    let _ = up_w.shutdown_write();
+    let _ = t.join();
 }
 
 /// `anytls://password@host:port?sni=...&insecure=1`（anytls-go 协议，见 `anytls.rs`）。
@@ -2877,6 +3122,45 @@ mod tests {
 
     use std::io::{Read, Write};
     use std::net::ToSocketAddrs;
+
+    #[test]
+    fn parse_chain_direction_and_metadata() {
+        let o = parse(" socks5://1.1.1.1:1 -> socks5://2.2.2.2:2 ").unwrap();
+        let Outbound::Chain { hops } = &o else {
+            panic!("应解析为链：{o:?}");
+        };
+        assert_eq!(hops.len(), 2);
+        // 方向约定（对照 dae）：hops[0] = 左侧出口，hops[last] = 第一跳
+        assert_eq!(hops[0].server_addr(), Some("1.1.1.1:1".parse().unwrap()));
+        assert_eq!(hops[1].server_addr(), Some("2.2.2.2:2".parse().unwrap()));
+        assert_eq!(o.name(), "socks5://1.1.1.1:1->socks5://2.2.2.2:2");
+        assert_eq!(o.protocol(), "chain");
+        assert!(!o.supports_udp());
+        assert!(o.server_addr().is_none());
+        // 桥接拷贝（服务端地址替换）对每段可用
+        assert!(hops[0].with_server_addr("127.0.0.1:9".parse().unwrap()).is_some());
+        // 名字段（# 之后）的 `->` 不参与拆分
+        let o = parse("ss://chacha20-ietf-poly1305:pw@1.1.1.1:1#a -> b").unwrap();
+        assert!(matches!(o, Outbound::Shadowsocks { .. }), "{o:?}");
+        // 三段链
+        let o = parse("socks5://1.1.1.1:1 -> http://2.2.2.2:2 -> socks5://3.3.3.3:3").unwrap();
+        let Outbound::Chain { hops } = &o else { panic!() };
+        assert_eq!(hops.len(), 3);
+        assert_eq!(hops[2].protocol(), "socks5");
+    }
+
+    #[test]
+    fn parse_chain_rejects_bad_segments_and_unsupported_hops() {
+        // 空段（含首尾）
+        assert!(parse("socks5://1.1.1.1:1 -> ").is_err());
+        assert!(parse("-> socks5://1.1.1.1:1").is_err());
+        // direct / 组 / QUIC 型均无 TCP 服务端地址，不能作链节点
+        assert!(parse("direct -> socks5://1.1.1.1:1").is_err());
+        assert!(parse("hysteria2://pw@1.1.1.1:443 -> socks5://1.1.1.1:1").unwrap_err().contains("无 TCP 服务端地址"));
+        // 段内链接本身非法 → 报第几段
+        let e = parse("bogus://x -> socks5://1.1.1.1:1").unwrap_err();
+        assert!(e.contains("第 1 段"), "{e}");
+    }
 
     #[test]
     fn parse_ss_shadowtls_plugin() {

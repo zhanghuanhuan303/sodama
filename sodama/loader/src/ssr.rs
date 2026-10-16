@@ -53,6 +53,16 @@ impl SsrDialer {
         self.cfg.server
     }
 
+    /// P38：链式代理桥用——把服务端地址换成 `addr` 的副本（其余配置不变）。
+    pub fn with_server(&self, addr: SocketAddr) -> Self {
+        Self {
+            cfg: SsrConfig {
+                server: addr,
+                ..self.cfg.clone()
+            },
+        }
+    }
+
     pub fn config(&self) -> &SsrConfig {
         &self.cfg
     }
