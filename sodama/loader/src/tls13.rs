@@ -329,6 +329,26 @@ impl RecordKeys {
     }
 }
 
+// ---------------------------------------------------------------- A2 #6：CH 分片
+/// A2 #6：`tls_fragment*` 配置（None = 关；`(len_min, len_max, int_min_ms, int_max_ms)`）。
+/// 解析在 `main.rs` 完成（`tls_fragment_length` = `50-100` 字节区间；
+/// `tls_fragment_interval` = `10-20` 毫秒区间，对照 dae 全局配置默认值）。
+static TLS_FRAGMENT: std::sync::OnceLock<(usize, usize, u64, u64)> = std::sync::OnceLock::new();
+
+/// A2 #6：设置 CH 分片参数（进程内一次；仅影响自实现 TLS 路径 = REALITY/自实现 TLS1.3）。
+pub fn configure_fragment(len_min: usize, len_max: usize, int_min_ms: u64, int_max_ms: u64) {
+    let _ = TLS_FRAGMENT.set((
+        len_min.clamp(1, 8192),
+        len_max.clamp(len_min, 8192),
+        int_min_ms,
+        int_max_ms,
+    ));
+}
+
+fn fragment_config() -> Option<(usize, usize, u64, u64)> {
+    TLS_FRAGMENT.get().copied()
+}
+
 // ---------------------------------------------------------------- ClientHello
 
 /// ClientHello 构造参数（绕开 rustls 的可控字段）。
@@ -774,14 +794,47 @@ pub fn client_handshake<S: Read + Write>(
         pending: Vec::new(),
     };
 
-    // 发送 ClientHello（明文记录，允许 >16KB 分片；本实现 <16KB 单记录）。
+    // 发送 ClientHello。A2 #6：`tls_fragment` 开启时按 `tls_fragment_length`
+    // （字节范围）把 CH 切成多个明文记录、按 `tls_fragment_interval`（毫秒范围）
+    // 间隔发送（对照 dae/utls 的 SNI 分片抗阻断；TLS 允许握手消息跨多条记录）。
+    // 未开启时保持单记录（本实现 CH <16KB）。
     let ch_len = client_hello.len();
-    let mut rec = Vec::with_capacity(5 + ch_len);
-    rec.extend_from_slice(&[CT_HANDSHAKE, 0x03, 0x01]);
-    rec.extend_from_slice(&(ch_len as u16).to_be_bytes());
-    rec.extend_from_slice(client_hello);
-    s.write_all(&rec)?;
-    s.flush()?;
+    let frag = fragment_config();
+    match frag {
+        Some((len_min, len_max, int_min_ms, int_max_ms)) if ch_len > 0 => {
+            let mut off = 0usize;
+            let mut first = true;
+            while off < ch_len {
+                let want = len_min + (rand_u16() as usize) % (len_max - len_min + 1).max(1);
+                let end = (off + want).min(ch_len);
+                let part = &client_hello[off..end];
+                let mut rec = Vec::with_capacity(5 + part.len());
+                rec.extend_from_slice(&[CT_HANDSHAKE, 0x03, 0x01]);
+                rec.extend_from_slice(&(part.len() as u16).to_be_bytes());
+                rec.extend_from_slice(part);
+                s.write_all(&rec)?;
+                s.flush()?;
+                off = end;
+                if !first || off < ch_len {
+                    // 首片后（或仍有后续片）按区间随机间隔——乱序/分片观测更自然。
+                    if int_max_ms > 0 {
+                        let wait =
+                            int_min_ms + (rand_u16() as u64) % (int_max_ms - int_min_ms + 1).max(1);
+                        std::thread::sleep(std::time::Duration::from_millis(wait));
+                    }
+                }
+                first = false;
+            }
+        }
+        _ => {
+            let mut rec = Vec::with_capacity(5 + ch_len);
+            rec.extend_from_slice(&[CT_HANDSHAKE, 0x03, 0x01]);
+            rec.extend_from_slice(&(ch_len as u16).to_be_bytes());
+            rec.extend_from_slice(client_hello);
+            s.write_all(&rec)?;
+            s.flush()?;
+        }
+    }
 
     let mut transcript = client_hello.to_vec();
     let mut suite: Option<Suite> = None;

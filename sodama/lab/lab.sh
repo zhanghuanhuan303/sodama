@@ -1044,6 +1044,16 @@ up() {
   fi
   local rules_args fwd_args dns_args extra_args
   if [ -n "${USE_CONFIG:-}" ]; then
+    # A2 批次 5 修：--config 的 .dae 权限必须 ≤0640（config::load 校验拒绝
+    # group 可写/other 可读）。git checkout/stash 会按 umask 重建文件（0644），
+    # dnsbind 用例曾因此假失败（诊断只报计数，已改为带详情）。对源文件做一次
+    # 幂等收紧（只收不放：已是 0600/0640 的不动）。
+    if [ -f "$USE_CONFIG" ]; then
+      case "$(stat -c %a "$USE_CONFIG" 2>/dev/null || echo)" in
+        600 | 640 | 400 | 440 | "") ;;
+        *) chmod 640 "$USE_CONFIG" 2>/dev/null || true ;;
+      esac
+    fi
     rules_args=(--config "$USE_CONFIG")
   elif [ -n "${USE_RULES:-}" ]; then
     rules_args=(--rules "$USE_RULES")
@@ -1103,8 +1113,11 @@ up() {
   fi
   # P23：就绪等待——状态面 socket 出现 = 初始 reload 完成（DNS/relay 线程随后启动），
   # 避免“进程活着但数据面尚未就绪”的用例竞态。
+  # A2 批次 5 修：预算 20s -> 50s。启动路径里 `wait_for_network` 上限 30s
+  # （隔离/无外网环境会等满，见 ADR-0069），20s 预算曾让用例在 daemon 未就绪
+  # 窗口里跑（VM 矩阵 verify/cap 集体假失败，2026-10-16 定位）。
   local _i
-  for _i in $(seq 1 80); do
+  for _i in $(seq 1 200); do
     [ -S "$STATUS_SOCK" ] && break
     sleep 0.25
   done
@@ -1205,6 +1218,12 @@ dual_up() {
     cat "$LOG"
     die "启动失败"
   fi
+  # 与 up() 同口径的就绪等待（wait_for_network 上限 30s + eBPF 加载）。
+  local _i
+  for _i in $(seq 1 200); do
+    [ -S "$STATUS_SOCK" ] && break
+    sleep 0.25
+  done
   echo "== sodama 运行中 (pid $(cat "$PID_FILE"))，日志：$LOG =="
   cat "$LOG"
 }

@@ -74,6 +74,7 @@ mod quicsniff;
 mod quicsock;
 mod quicvarint;
 mod reactor;
+mod real_domain;
 mod reality;
 mod rules;
 mod ruleset;
@@ -279,6 +280,35 @@ fn dial_mode_name(mode: u8) -> &'static str {
         1 => "domain",
         2 => "domain+",
         _ => "ip",
+    }
+}
+
+/// A2 #10：`dial_mode: domain` 的「真实域名」判定（对照 dae `ChooseDialTarget`）：
+/// 1. DNS 控制器已知（我们的 DNS 缓存在任意作用域有 A/AAAA 新鲜记录）→ 确认 + 域名拨号；
+/// 2. 确认集命中 → 域名拨号；
+/// 3. 负缓存命中 → 按 IP 拨号（不再探测）；
+/// 4. 未知 → 异步探测 + **本连接按 IP 拨号**（不阻塞首屏路径；与 dae 同）。
+fn real_domain_ok(domain: &str) -> bool {
+    if real_domain::is_ip_like(domain) {
+        return false;
+    }
+    // 1) DNS 已知（任一 IP 版本的新鲜记录都算「像真实域名」）。
+    let now = Instant::now();
+    let dns_known = DNS_CACHE.lock().ok().is_some_and(|c| {
+        c.has_fresh_any_scope(domain, 1, now) || c.has_fresh_any_scope(domain, 28, now)
+    });
+    if dns_known {
+        real_domain::remember(domain);
+        return true;
+    }
+    match real_domain::lookup(domain, now) {
+        Some(true) => true,
+        Some(false) => false,
+        None => {
+            // 异步探测（单飞近似）；本次按 IP 拨号。
+            real_domain::trigger_probe(domain);
+            false
+        }
     }
 }
 
@@ -2101,6 +2131,107 @@ fn log_debug(msg: &str) {
     log_at(4, msg);
 }
 
+/// A2 #6：解析 `min-max` / 单值区间（`50-100` → (50,100)；`64` → (64,64)；
+/// 非法/倒置 → 默认值）。用于 `tls_fragment_length`/`tls_fragment_interval`。
+fn parse_range(v: &str, dmin: usize, dmax: usize) -> (usize, usize) {
+    let t = v.trim();
+    let (a, b) = match t.split_once('-') {
+        Some((a, b)) => (a.trim(), b.trim()),
+        None => (t, t),
+    };
+    match (a.parse::<usize>(), b.parse::<usize>()) {
+        (Ok(a), Ok(b)) if a > 0 && b >= a => (a, b),
+        _ => (dmin, dmax),
+    }
+}
+
+/// A2 #6：`pprof_port` 的等价形态——本机诊断端口（只读快照；对照 dae 用 Go
+/// `net/http/pprof`，Rust 侧没有 pprof 生态等价物，提供可移植的运行时快照：
+/// 线程数/RSS/fd/会话/关键计数；`/json` 为结构化输出）。
+/// 只 bind 127.0.0.1（诊断面不对公网暴露）。
+fn diag_port_loop(port: u16) {
+    let listener = match std::net::TcpListener::bind(("127.0.0.1", port)) {
+        Ok(l) => l,
+        Err(e) => {
+            log_warn(&format!("pprof_port: 绑定 127.0.0.1:{port} 失败（{e}）"));
+            return;
+        }
+    };
+    for conn in listener.incoming() {
+        let Ok(mut stream) = conn else { continue };
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+        let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
+        // 读请求行（只需要 path）。
+        let mut buf = [0u8; 1024];
+        let n = stream.read(&mut buf).unwrap_or(0);
+        let req = String::from_utf8_lossy(&buf[..n]).to_string();
+        let path = req
+            .lines()
+            .next()
+            .and_then(|l| l.split_whitespace().nth(1))
+            .unwrap_or("/")
+            .to_string();
+        let body = if path.starts_with("/json") {
+            diag_snapshot_json().to_string()
+        } else {
+            let v = diag_snapshot_json();
+            format!(
+                "sodama diagnostics（Rust 无 Go pprof：本页为运行时快照）\n\
+                 threads={} rss_kb={} fds={} conns_active={} udp_sessions={} \n\
+                 traffic_up_rate={} traffic_down_rate={}\n\
+                 events_total={} event_drops={}\n\
+                 更多结构化数据：GET /json\n",
+                v["threads"],
+                v["rss_kb"],
+                v["fds"],
+                v["conns_active"],
+                v["udp_sessions"],
+                v["traffic_up_rate"],
+                v["traffic_down_rate"],
+                v["events_total"],
+                v["event_drops"],
+            )
+        };
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: {}; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            if path.starts_with("/json") { "application/json" } else { "text/plain" },
+            body.len(),
+            body
+        );
+        let _ = stream.write_all(resp.as_bytes());
+    }
+}
+
+/// 快照数据源：/proc/self 三件套 + 进程内计数。
+fn diag_snapshot_json() -> serde_json::Value {
+    let read = |p: &str| std::fs::read_to_string(p).unwrap_or_default();
+    let status = read("/proc/self/status");
+    let get = |k: &str| -> String {
+        status
+            .lines()
+            .find_map(|l| l.strip_prefix(&format!("{k}:")))
+            .map(|v| v.trim().to_string())
+            .unwrap_or_default()
+    };
+    let fds = std::fs::read_dir("/proc/self/fd")
+        .map(|d| d.count())
+        .unwrap_or(0);
+    json!({
+        "threads": get("Threads").parse::<u64>().unwrap_or(0),
+        "rss_kb": get("VmRSS").split_whitespace().next().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0),
+        "vm_size_kb": get("VmSize").split_whitespace().next().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0),
+        "fds": fds,
+        "conns_active": RELAY_STATS.conns_active.load(Ordering::Relaxed),
+        "conns_total": RELAY_STATS.conns_total.load(Ordering::Relaxed),
+        "udp_sessions": UDP_NAT_STATS.sessions_total.load(Ordering::Relaxed).saturating_sub(UDP_NAT_STATS.evicted.load(Ordering::Relaxed)),
+        "traffic_up_rate": TRAFFIC_UP_RATE.load(Ordering::Relaxed),
+        "traffic_down_rate": TRAFFIC_DOWN_RATE.load(Ordering::Relaxed),
+        "events_total": EVENTS_TOTAL.load(Ordering::Relaxed),
+        "events_unknown": EVENT_UNKNOWN_TOTAL.load(Ordering::Relaxed),
+        "uptime_secs": STARTED.get().map(|t| t.elapsed().as_secs()).unwrap_or(0),
+    })
+}
+
 /// A2 #6：读 global 布尔的统一口径（true/1/yes/on/enable 为真）。
 fn global_on(cfg: Option<&config::Config>, key: &str) -> bool {
     cfg.and_then(|c| config::global_value(c, key))
@@ -2157,6 +2288,76 @@ fn apply_global_effective_knobs(cfg: Option<&config::Config>, args: &Args) {
             Err(e) => log_warn(&format!("{e}（忽略）")),
         }
     }
+    // tls_fragment*（对照 dae：`tls_fragment` 开关 + `tls_fragment_length`=`50-100` 字节
+    // 区间 + `tls_fragment_interval`=`10-20` 毫秒区间）。生效面 = **自实现 TLS 路径**
+    // （REALITY/自实现 TLS1.3 的 ClientHello）；rustls/quinn 路径无法分片（ADR-0069 偏离）。
+    if global_on(cfg, "tls_fragment") {
+        let (lmin, lmax) = g("tls_fragment_length")
+            .map(|v| parse_range(&v, 50, 100))
+            .unwrap_or((50, 100));
+        let (imin, imax) = g("tls_fragment_interval")
+            .map(|v| parse_range(&v, 10, 20))
+            .unwrap_or((10, 20));
+        crate::tls13::configure_fragment(lmin, lmax, imin as u64, imax as u64);
+        log(&format!(
+            "tls_fragment: CH 分片 {lmin}-{lmax} 字节 / 间隔 {imin}-{imax} ms（自实现 TLS 路径；rustls/quinn 路径不支持——ADR-0069）"
+        ));
+    }
+    // utls_imitate / tls_implementation（对照 dae）：sodama 的指纹实现固定为 Chrome-120
+    // （REALITY 路径）；`chrome`/`utls` 接受，其余取值显式告警并沿用 chrome（不静默）。
+    if let Some(v) = g("utls_imitate") {
+        let v = v.trim().to_ascii_lowercase();
+        if v.is_empty() || v == "chrome" {
+            log("utls_imitate: chrome（= 内置 Chrome-120 指纹）");
+        } else {
+            log_warn(&format!(
+                "utls_imitate '{v}' 暂不支持（仅内置 chrome/Chrome-120），沿用 chrome——ADR-0069"
+            ));
+        }
+    }
+    if let Some(v) = g("tls_implementation") {
+        let v = v.trim().to_ascii_lowercase();
+        match v.as_str() {
+            "" | "utls" => log("tls_implementation: utls（= 自实现 Chrome-120 指纹）"),
+            "tls" => log("tls_implementation: tls（rustls 路径；REALITY 仍走自实现指纹）"),
+            other => log_warn(&format!(
+                "tls_implementation '{other}' 未知（tls|utls），按 utls 处理——ADR-0069"
+            )),
+        }
+    }
+    // pprof_port：sodama 的等价形态 = 本机诊断端口（Rust 无 Go pprof；提供线程/fd/RSS/
+    // 会话/计数快照，见 `diag_port_loop`）。
+    if let Some(v) = g("pprof_port") {
+        if let Some(port) = v.trim().parse::<u16>().ok().filter(|p| *p != 0) {
+            std::thread::Builder::new()
+                .name("diag-port".into())
+                .spawn(move || diag_port_loop(port))
+                .ok();
+            log(&format!(
+                "pprof_port: 诊断端口 127.0.0.1:{port}（/ 文本摘要、/json 结构化；Rust 无 Go pprof 等价——ADR-0069）"
+            ));
+        }
+    }
+    // bandwidth_max_tx/rx（A2 #6）：relay 泵令牌桶限额；设置后新连接走拷贝泵。
+    for (key, limiter, name) in [
+        ("bandwidth_max_tx", limiter_tx(), "上行"),
+        ("bandwidth_max_rx", limiter_rx(), "下行"),
+    ] {
+        if let Some(v) = g(key) {
+            match parse_bandwidth(&v) {
+                Ok(bps) => {
+                    limiter.set_rate(bps);
+                    if bps > 0 {
+                        log(&format!(
+                            "bandwidth_max: {name} {bps} B/s（≈{:.1} Mbit/s；relay 新连接走拷贝泵以节流）",
+                            bps as f64 * 8.0 / 1_000_000.0
+                        ));
+                    }
+                }
+                Err(e) => log_warn(&format!("{key} '{v}' 非法（{e}），忽略")),
+            }
+        }
+    }
     // disable_thp：仅影响本进程（对照 dae `PR_SET_THP_DISABLE`；不改系统全局策略）。
     if global_on(cfg, "disable_thp") {
         let rc = unsafe { libc::prctl(libc::PR_SET_THP_DISABLE, 1u64, 0u64, 0u64, 0u64) };
@@ -2168,16 +2369,7 @@ fn apply_global_effective_knobs(cfg: Option<&config::Config>, args: &Args) {
     }
 
     // 未生效键的显式告警（清点要求；后续批次逐项补齐，见 ADR-0069 余项）。
-    const INERT_KEYS: &[&str] = &[
-        "tls_fragment",
-        "tls_fragment_length",
-        "tls_fragment_interval",
-        "utls_imitate",
-        "tls_implementation",
-        "pprof_port",
-        "bandwidth_max_tx",
-        "bandwidth_max_rx",
-    ];
+    const INERT_KEYS: &[&str] = &[];
     let inert: Vec<String> = INERT_KEYS
         .iter()
         .filter(|k| g(k).is_some())
@@ -3486,6 +3678,7 @@ fn pump(
     bytes: ByteSink,
     offloaded: bool,
     stop: Option<&AtomicBool>,
+    limiter: &'static RateLimiter,
 ) {
     // O8：64KB 读缓冲走池（短连接 churn 下免 malloc/页抖动）。
     let mut buf = bufpool::PoolBuf::zeroed(65536);
@@ -3527,6 +3720,8 @@ fn pump(
             Ok(n) => {
                 last_ns.store(monotonic_now_ns(), Ordering::Relaxed);
                 bytes.add(n as u64);
+                // A2 #6：带宽限额（令牌桶；不足阻塞凑令牌 → 端到端背压）。
+                limiter.throttle(n as u64);
                 if let Err(e) = w.write_all(&buf[..n]) {
                     log(&format!("pump: 写失败（{e}）"));
                     break;
@@ -3535,6 +3730,103 @@ fn pump(
         }
     }
     let _ = w.shutdown_write();
+}
+
+// ---------------------------------------------------------------- A2 #6：带宽限额
+/// `bandwidth_max_tx`/`bandwidth_max_rx`（字节/秒；0 = 不限）。
+/// 落点在**用户态拷贝泵**（`pump`）做令牌桶节流 → 端到端背压。splice 零拷贝路径
+/// 无法在用户态节流，因此限额生效时 relay 新连接强制走拷贝泵（见 `splice` 判定）。
+/// 对照 dae：其限额在 outbound dialer 侧实现；sodama 无集中 dialer，等价落点在 relay 泵。
+/// 进程级单例：所有连接共享配额；`set_rate` 可在配置 reload 时更新。
+pub(crate) struct RateLimiter {
+    /// 字节/秒（0 = 不限；运行期可改）。
+    rate_bps: AtomicU64,
+    /// (可用令牌, 上次补充时刻)。桶容量 = 1 秒的量。
+    state: Mutex<(f64, Instant)>,
+}
+
+impl RateLimiter {
+    fn new() -> Self {
+        Self {
+            rate_bps: AtomicU64::new(0),
+            state: Mutex::new((0.0, Instant::now())),
+        }
+    }
+
+    fn rate(&self) -> u64 {
+        self.rate_bps.load(Ordering::Relaxed)
+    }
+
+    /// 更新速率；桶重置为满（新速率下不继承旧状态的欠账）。
+    fn set_rate(&self, bps: u64) {
+        self.rate_bps.store(bps, Ordering::Relaxed);
+        let mut g = match self.state.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        *g = (bps as f64, Instant::now());
+    }
+
+    /// 为 `n` 字节发放令牌；不足则阻塞凑够。单次 sleep 上限 1s，小速率下分多轮补齐
+    /// （不丢令牌也不超速）。
+    fn throttle(&self, n: u64) {
+        let rate = self.rate_bps.load(Ordering::Relaxed);
+        if rate == 0 || n == 0 {
+            return;
+        }
+        let rate = rate as f64;
+        loop {
+            let mut g = match self.state.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            let now = Instant::now();
+            let dt = now.saturating_duration_since(g.1).as_secs_f64();
+            g.0 = (g.0 + dt * rate).min(rate);
+            g.1 = now;
+            if g.0 >= n as f64 {
+                g.0 -= n as f64;
+                return;
+            }
+            let wait = (n as f64 - g.0) / rate;
+            drop(g);
+            std::thread::sleep(Duration::from_secs_f64(wait.min(1.0)));
+        }
+    }
+}
+
+fn limiter_tx() -> &'static RateLimiter {
+    static L: OnceLock<RateLimiter> = OnceLock::new();
+    L.get_or_init(RateLimiter::new)
+}
+
+fn limiter_rx() -> &'static RateLimiter {
+    static L: OnceLock<RateLimiter> = OnceLock::new();
+    L.get_or_init(RateLimiter::new)
+}
+
+/// 解析带宽限额（`100`=100 Mbit/s；`10mbps`/`10mbit`/`10m`=10 Mbit/s；
+/// `1gbps`/`1g`；`500kb`/`500kbps`；`8192b`/`8192bytes` = 字节/秒；`0`/空 = 不限）。
+fn parse_bandwidth(v: &str) -> Result<u64, String> {
+    let t = v.trim().to_ascii_lowercase();
+    if t.is_empty() || t == "0" {
+        return Ok(0);
+    }
+    // 去掉可选的 "ps" 后缀（mbps → mb、kbps → kb），再切数字段与单位段。
+    let body = t.strip_suffix("ps").unwrap_or(&t);
+    let idx = body
+        .find(|c: char| !c.is_ascii_digit() && c != '.')
+        .unwrap_or(body.len());
+    let (num, unit) = body.split_at(idx);
+    let n: f64 = num.parse().map_err(|_| format!("带宽数值非法: {v:?}"))?;
+    let bps = match unit.trim() {
+        "" | "m" | "mbit" | "mb" => n * 1_000_000.0 / 8.0,
+        "g" | "gbit" | "gb" => n * 1_000_000_000.0 / 8.0,
+        "k" | "kbit" | "kb" => n * 1_000.0 / 8.0,
+        "b" | "byte" | "bytes" => n,
+        other => return Err(format!("带宽单位未知: {other:?}（mbit/kbit/gbit/bytes）")),
+    };
+    Ok(bps.round().max(0.0) as u64)
 }
 
 // ---------------------------------------------------------------- M1：splice 零拷贝泵
@@ -3761,7 +4053,15 @@ fn pump_or_splice_down(
             }
         }
     }
-    pump(from_remote, Box::new(client), last_ns, sink, false, stop);
+    pump(
+        from_remote,
+        Box::new(client),
+        last_ns,
+        sink,
+        false,
+        stop,
+        limiter_rx(),
+    );
 }
 
 // ---------------- offload 背压 fuse（对照 dae `fuseStep` / `tcp_offload_pause`） ----------------
@@ -4685,6 +4985,7 @@ fn handle_socks_conn(mut client: TcpStream) {
             ByteSink::single(up2.as_ref()),
             false,
             None,
+            limiter_tx(),
         );
     });
     pump(
@@ -4694,6 +4995,7 @@ fn handle_socks_conn(mut client: TcpStream) {
         ByteSink::single(down.as_ref()),
         false,
         None,
+        limiter_rx(),
     );
     log(&format!(
         "SOCKS {tname} closed（up={}B down={}B）",
@@ -4835,7 +5137,13 @@ fn handle_relay_conn(mut client: TcpStream) {
                         }
                     }
                 } else {
-                    target::Target::domain(name, orig.port())
+                    // A2 #10：`dial_mode: domain`（严格档）按「真实域名」判定决定是否域名拨号；
+                    // domain+（=2）按 dae 语义始终域名拨号（DomainPlus 分支）。
+                    if mode == 1 && !real_domain_ok(&name) {
+                        target::Target::Ip(orig.ip(), orig.port())
+                    } else {
+                        target::Target::domain(name, orig.port())
+                    }
                 }
             }
             None => {
@@ -4925,7 +5233,13 @@ fn handle_relay_conn(mut client: TcpStream) {
     // I2：fd 预算压力（>80% soft limit）时新连接降级走用户态泵（保可用性，记账）。
     let fd_high = fd_pressure();
     // M1：splice 零拷贝（仅未 offload 时；直接拨号/VLESS 明文在拨号层置位）。
-    let splice = wire_splice && !offloaded && RELAY_SPLICE.load(Ordering::Relaxed) && !fd_high;
+    // A2 #6：设置带宽限额时强制拷贝泵（splice 绕过用户态，无法节流）。
+    let splice = wire_splice
+        && !offloaded
+        && limiter_tx().rate() == 0
+        && limiter_rx().rate() == 0
+        && RELAY_SPLICE.load(Ordering::Relaxed)
+        && !fd_high;
     if fd_high && wire_splice && !offloaded && RELAY_SPLICE.load(Ordering::Relaxed) {
         RELAY_STATS.splice_fd_budget.fetch_add(1, Ordering::Relaxed);
     }
@@ -5112,6 +5426,7 @@ fn handle_relay_conn(mut client: TcpStream) {
                     ByteSink::new(&RELAY_STATS.bytes_up, Some(&h2.bytes_up)),
                     offloaded,
                     Some(&h2.stop),
+                    limiter_tx(),
                 );
             }
             done();
@@ -5135,6 +5450,7 @@ fn handle_relay_conn(mut client: TcpStream) {
             ByteSink::new(&RELAY_STATS.bytes_down, Some(&handle.bytes_down)),
             offloaded,
             Some(&handle.stop),
+            limiter_rx(),
         ),
     }
     // P7：注销 fast_sock 键（sockmap 条目持有 socket 引用，不删会泄漏）；
@@ -5441,6 +5757,18 @@ impl UpstreamSet {
     }
 }
 
+/// A2 批次 5 修：配置诊断的可读摘要（首条详情 + 总数）——此前只报计数，
+/// `dnsbind.dae` 权限被 git 操作重置为 0644 时日志只显示「1 项诊断」，
+/// 定因需另跑 validate（2026-10-16 VM 矩阵归因教训）。
+fn diag_summary(d: &[config::Diag]) -> String {
+    let first = d.first().map(|x| x.to_string()).unwrap_or_default();
+    if d.len() > 1 {
+        format!("{} 条诊断，首条：{first}", d.len())
+    } else {
+        first
+    }
+}
+
 /// P18c：编译 dns.routing（None = 未配置）。
 fn build_dns_router(
     args: &Args,
@@ -5449,8 +5777,8 @@ fn build_dns_router(
     let Some(path) = &args.config else {
         return Ok(None);
     };
-    let cfg =
-        config::load(Path::new(path)).map_err(|d| format!("加载配置失败（{} 项诊断）", d.len()))?;
+    let cfg = config::load(Path::new(path))
+        .map_err(|d| format!("加载配置失败（{}）", diag_summary(&d)))?;
     let tags = ups.tags_map();
     let geo_lock = geodata_for(args);
     let geo = geo_lock.lock().unwrap();
@@ -5987,8 +6315,8 @@ fn build_groups(args: &Args) -> Option<outbound::Outbound> {
         config::load(std::path::Path::new(p))
             .map_err(|d| {
                 log(&format!(
-                    "订阅/组：配置解析失败（{} 条诊断），跳过组构建",
-                    d.len()
+                    "订阅/组：配置解析失败（{}），跳过组构建",
+                    diag_summary(&d)
                 ));
             })
             .ok()
@@ -6726,7 +7054,7 @@ fn reload_group_members(args: &Args, mode: &SubFetchMode) {
     let cfg = args.config.as_ref().and_then(|p| {
         config::load(std::path::Path::new(p))
             .map_err(|d| {
-                log(&format!("订阅热更新：配置解析失败（{} 条诊断）", d.len()));
+                log(&format!("订阅热更新：配置解析失败（{}）", diag_summary(&d)));
             })
             .ok()
     });
@@ -8380,12 +8708,124 @@ fn send_to_udp(fd: RawFd, to: SocketAddr, data: &[u8]) -> std::io::Result<()> {
 }
 
 /// O7：同一客户端地址批量回包（sendmmsg；回复 socket 绑定原始目的地址、不 connect）。
+/// A2 #17：UDP GSO（`UDP_SEGMENT`）聚合发送计数与能力探测。
+/// 对照 dae `anyfrom_pool.go` 的 GSO 路径：同目的、**等长**的多个数据报可以拼成
+/// 一个大 buffer + `UDP_SEGMENT=<单段长>` cmsg，由内核切分成 N 个数据报（一次 syscall）。
+/// 内核不支持（`UDP_SEGMENT` setsockopt 失败）时自动回落逐报发送（一次性告警）。
+static UDP_GSO_SENDS: AtomicU64 = AtomicU64::new(0);
+static UDP_GSO_DATAGRAMS: AtomicU64 = AtomicU64::new(0);
+static UDP_GSO_UNSUPPORTED: AtomicBool = AtomicBool::new(false);
+
+#[cfg(target_os = "linux")]
+const UDP_SEGMENT_OPT: libc::c_int = 103;
+
+/// 给 fd 开 `UDP_SEGMENT`（幂等；失败置 unsupported 标志）。
+fn udp_gso_enable(fd: RawFd) -> bool {
+    if UDP_GSO_UNSUPPORTED.load(Ordering::Relaxed) {
+        return false;
+    }
+    let one: libc::c_int = 1;
+    let rc = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_UDP,
+            UDP_SEGMENT_OPT,
+            &one as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if rc != 0 {
+        UDP_GSO_UNSUPPORTED.store(true, Ordering::Relaxed);
+        log_warn(&format!(
+            "udp GSO: UDP_SEGMENT 不可用（{}），回落逐报发送",
+            std::io::Error::last_os_error()
+        ));
+        return false;
+    }
+    true
+}
+
+/// GSO 聚合发送：`datas` 必须同目的、等长（调用方保证）；成功返回 `true`。
+/// 单次上限 `UDP_MAX_SEGMENTS`（对照内核 gso_max_size 的保守值：64 段 × 单段 ≤ 64KB 内）。
+fn send_gso_udp(fd: RawFd, to: SocketAddr, datas: &[&[u8]]) -> std::io::Result<bool> {
+    const UDP_MAX_SEGMENTS: usize = 64;
+    if datas.len() < 2 {
+        return Ok(false);
+    }
+    let seg_len = datas[0].len();
+    if seg_len == 0 || datas.iter().any(|d| d.len() != seg_len) {
+        return Ok(false);
+    }
+    let n = datas.len().min(UDP_MAX_SEGMENTS);
+    if !udp_gso_enable(fd) {
+        return Ok(false);
+    }
+    let (st, name_len) = sockaddr_any_of(to);
+    let mut payload: Vec<u8> = Vec::with_capacity(seg_len * n);
+    for d in datas.iter().take(n) {
+        payload.extend_from_slice(d);
+    }
+    let mut iov = libc::iovec {
+        iov_base: payload.as_mut_ptr() as *mut libc::c_void,
+        iov_len: payload.len(),
+    };
+    // cmsg：UDP_SEGMENT = 单段长度（u16）。
+    #[repr(align(8))]
+    struct Ctl([u8; 64]);
+    let mut ctl = Ctl([0u8; 64]);
+    let mut hdr = libc::msghdr {
+        msg_name: &st as *const _ as *mut libc::c_void,
+        msg_namelen: name_len,
+        msg_iov: &mut iov,
+        msg_iovlen: 1,
+        msg_control: ctl.0.as_mut_ptr() as *mut libc::c_void,
+        msg_controllen: 0,
+        msg_flags: 0,
+    };
+    let cmsg_len = unsafe { libc::CMSG_SPACE(std::mem::size_of::<u16>() as u32) } as usize;
+    if cmsg_len > ctl.0.len() {
+        return Ok(false);
+    }
+    unsafe {
+        let cmsg = libc::CMSG_FIRSTHDR(&hdr);
+        if cmsg.is_null() {
+            return Ok(false);
+        }
+        (*cmsg).cmsg_level = libc::SOL_UDP;
+        (*cmsg).cmsg_type = UDP_SEGMENT_OPT;
+        (*cmsg).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<u16>() as u32) as usize;
+        let data = libc::CMSG_DATA(cmsg) as *mut u16;
+        *data = seg_len as u16;
+        hdr.msg_controllen = cmsg_len;
+    }
+    if seg_len > u16::MAX as usize {
+        return Ok(false);
+    }
+    let rc = unsafe { libc::sendmsg(fd, &hdr, 0) };
+    if rc < 0 {
+        let e = std::io::Error::last_os_error();
+        // EMSGSIZE/EINVAL 等：内核/网卡拒绝该 GSO 尺寸 → 回落逐报（不是致命错误）。
+        return match e.raw_os_error() {
+            Some(libc::EMSGSIZE) | Some(libc::EINVAL) | Some(libc::EOPNOTSUPP) => Ok(false),
+            _ => Err(e),
+        };
+    }
+    UDP_GSO_SENDS.fetch_add(1, Ordering::Relaxed);
+    UDP_GSO_DATAGRAMS.fetch_add(n as u64, Ordering::Relaxed);
+    Ok(true)
+}
+
 fn send_batch_to_udp(fd: RawFd, to: SocketAddr, datas: &[&[u8]]) -> std::io::Result<()> {
     if datas.is_empty() {
         return Ok(());
     }
     if datas.len() == 1 {
         return send_to_udp(fd, to, datas[0]);
+    }
+    // A2 #17：先试 GSO 聚合（同目的等长 ≥2 报 → 一次 syscall 内核切分）；
+    // 内核不支持/尺寸被拒 → 回落 sendmmsg（保持原行为）。
+    if datas.len() >= 2 && send_gso_udp(fd, to, datas)? {
+        return Ok(());
     }
     const MAX: usize = 64;
     let n = datas.len().min(MAX);
@@ -10095,6 +10535,42 @@ fn abort_should_kill(scope: AbortScope, session_gen: u16, current_gen: u16) -> b
 /// P38：关闭范围内的已建会话（TCP relay / reactor / UDP NAT）并清理对应 conn_state
 /// （对照 dae `SessionManager.AbortGeneration`：先 TCP 后 UDP、逐流关 socket、再 scrub）。
 /// 返回 (关闭会话数, 清理 conn_state 条数)。
+/// A2 #9：统计在飞会话数（按 abort 范围：`OldGeneration` = 旧代）。
+/// 对照 dae `control_plane_drain.go` 的 `drainTracker`（Acquire/Count/IdleCh）——
+/// sodama 的语义等价物就是「会话登记表里尚存的旧代条目数」。
+fn count_sessions(scope: AbortScope) -> usize {
+    let cur = current_datapath_generation();
+    let mut n = 0usize;
+    if let Ok(g) = RELAY_CONNS.lock() {
+        n += g
+            .values()
+            .filter(|h| abort_should_kill(scope, h.generation, cur))
+            .count();
+    }
+    for shard in UDP_NAT.iter() {
+        if let Ok(t) = shard.lock() {
+            n += t
+                .values()
+                .filter(|s| abort_should_kill(scope, s.generation, cur))
+                .count();
+        }
+    }
+    n
+}
+
+/// A2 #9：**drain 预算**——reload 后等待旧代在飞会话自然结束（最长 `budget`），
+/// 到期仍有余量则如实回报（不强制关闭；要强制请用 `--abort`）。
+/// 返回 `(drained, waited_secs, remaining)`。
+fn drain_old_generation(budget: Duration) -> (bool, f64, usize) {
+    let t0 = Instant::now();
+    let mut remaining = count_sessions(AbortScope::OldGeneration);
+    while remaining > 0 && t0.elapsed() < budget {
+        std::thread::sleep(Duration::from_millis(100));
+        remaining = count_sessions(AbortScope::OldGeneration);
+    }
+    (remaining == 0, t0.elapsed().as_secs_f64(), remaining)
+}
+
 fn abort_sessions(ebpf: &mut Ebpf, scope: AbortScope) -> (usize, usize) {
     let cur = current_datapath_generation();
     // 1) 快照（持锁只收集，不执行关闭）
@@ -10303,10 +10779,29 @@ fn run_subcommand(argv: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         }
         "reload" | "suspend" | "resume" => {
             // P38：`--abort`（对照 dae `reload/suspend --abort`）——随命令发给守护进程。
+            // A2 #9：`--drain <secs>` / `--drain=<secs>`（仅 reload 有意义）——等旧代
+            // 在飞会话自然排空的预算（对照 dae `control_plane_drain.go` 的 drain 语义）。
             let abort = argv.iter().any(|a| a == "--abort");
-            let filtered: Vec<String> = argv.iter().filter(|a| *a != "--abort").cloned().collect();
+            let mut drain_secs = 0u64;
+            let mut filtered: Vec<String> = Vec::new();
+            let mut it = argv.iter();
+            while let Some(a) = it.next() {
+                match a.as_str() {
+                    "--abort" => {}
+                    "--drain" => {
+                        drain_secs = it.next().ok_or("--drain 需要秒数")?.parse()?;
+                    }
+                    other => {
+                        if let Some(v) = other.strip_prefix("--drain=") {
+                            drain_secs = v.parse()?;
+                        } else {
+                            filtered.push(other.to_string());
+                        }
+                    }
+                }
+            }
             let (sock, _) = parse_socket_args(&filtered, 2)?;
-            let cmd = abort_cmd(&argv[1], abort);
+            let cmd = reload_cmd(&argv[1], abort, drain_secs);
             let resp = status::client(Path::new(&sock), &cmd)?;
             println!("{resp}");
             let bad = serde_json::from_str::<serde_json::Value>(&resp)
@@ -10703,7 +11198,8 @@ _sodama() {
     case "${COMP_WORDS[1]}" in
         completion) COMPREPLY=( $(compgen -W "bash zsh fish" -- "$cur") ) ;;
         status) COMPREPLY=( $(compgen -W "--socket --cmd --json" -- "$cur") ) ;;
-        reload|suspend|resume|metrics) COMPREPLY=( $(compgen -W "--socket" -- "$cur") ) ;;
+        reload|suspend|resume) COMPREPLY=( $(compgen -W "--socket --abort --drain=" -- "$cur") ) ;;
+        metrics) COMPREPLY=( $(compgen -W "--socket" -- "$cur") ) ;;
         sysdump) COMPREPLY=( $(compgen -W "--socket --out" -- "$cur") ) ;;
         sub-parse) COMPREPLY=( $(compgen -W "--tag --timeout --limit --json" -- "$cur") ) ;;
         trace) COMPREPLY=( $(compgen -W "--seconds" -- "$cur") ) ;;
@@ -10728,7 +11224,8 @@ _sodama() {
     case "${words[2]}" in
         completion) _values "shell" bash zsh fish ;;
         status) _values "参数" --socket --cmd --json ;;
-        reload|suspend|resume|metrics) _values "参数" --socket ;;
+        reload|suspend|resume) _values "参数" --socket --abort --drain ;;
+        metrics) _values "参数" --socket ;;
         sysdump) _values "参数" --socket --out ;;
         sub-parse) _values "参数" --tag --timeout --limit --json ;;
         trace) _values "参数" --seconds ;;
@@ -11408,6 +11905,15 @@ fn abort_cmd(base: &str, abort: bool) -> String {
     }
 }
 
+/// A2 #9：控制命令拼装（`reload [--abort] [--drain=N]`；拆出便于单测）。
+fn reload_cmd(base: &str, abort: bool, drain_secs: u64) -> String {
+    let mut c = abort_cmd(base, abort);
+    if drain_secs > 0 {
+        c.push_str(&format!(" --drain={drain_secs}"));
+    }
+    c
+}
+
 /// P6：解析 `--socket <path>` / `--out <path>`（子命令公用）。
 fn parse_socket_args(
     argv: &[String],
@@ -11905,6 +12411,9 @@ fn status_json(ebpf: &mut Ebpf) -> serde_json::Value {
             "cone_sessions": UDP_NAT_STATS.cone_sessions.load(Ordering::Relaxed),
             "negcache_hits": UDP_NAT_STATS.negcache_hits.load(Ordering::Relaxed),
             "raw_udp_fallbacks": UDP_NAT_STATS.raw_udp_fallbacks.load(Ordering::Relaxed),
+            "gso_sends": UDP_GSO_SENDS.load(Ordering::Relaxed),
+            "gso_datagrams": UDP_GSO_DATAGRAMS.load(Ordering::Relaxed),
+            "gso_unsupported": UDP_GSO_UNSUPPORTED.load(Ordering::Relaxed),
             "idle_timeout_secs": UDP_IDLE_SECS.load(Ordering::Relaxed),
         },
         "hooks": HOOKS.lock().map(|h| h.clone()).unwrap_or_default(),
@@ -11932,6 +12441,7 @@ fn status_json(ebpf: &mut Ebpf) -> serde_json::Value {
         },
         "events": events_json(&stats),
         "traffic": traffic_snapshot_json(),
+        "real_domain": real_domain::snapshot(),
         "sysctl": {
             "watched": sysctl::expectations().len(),
             "rewrites": sysctl::rewrites(),
@@ -12357,11 +12867,20 @@ fn metrics_text(v: &serde_json::Value) -> String {
 fn handle_status_query(cmd: &str, ebpf: &mut Ebpf, args: &Args) -> String {
     match cmd {
         "status" => status_json(ebpf).to_string(),
-        "reload" | "reload-fast" | "reload --abort" => {
+        cmd if cmd == "reload"
+            || cmd.starts_with("reload ")
+            || cmd == "reload-fast"
+            || cmd.starts_with("reload-fast ") =>
+        {
             // P35：reload-fast（watch 触发的自动 reload）订阅节点走缓存；
             // 手动 reload/SIGHUP 始终强制重拉（P18e 语义）。
             // P38：`reload --abort` 在切代后关闭旧代已建连接（对照 dae abort）。
-            let abort = cmd.ends_with("--abort");
+            let abort = cmd.split_whitespace().any(|a| a == "--abort");
+            let drain_secs = cmd
+                .split_whitespace()
+                .find_map(|a| a.strip_prefix("--drain="))
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(0);
             let out = do_reload(args, ebpf, false, cmd.starts_with("reload-fast"));
             let (killed, scrubbed) = if abort {
                 let (k, s) = abort_sessions(ebpf, AbortScope::OldGeneration);
@@ -12372,6 +12891,17 @@ fn handle_status_query(cmd: &str, ebpf: &mut Ebpf, args: &Args) -> String {
             } else {
                 (0, 0)
             };
+            // A2 #9：drain 预算（`reload --drain=<secs>`）——等旧代在飞会话自然结束。
+            let (drained, waited, remaining) = if drain_secs > 0 {
+                let (d, w, r) = drain_old_generation(Duration::from_secs(drain_secs.min(600)));
+                log(&format!(
+                    "reload --drain={drain_secs}：{}（等待 {w:.1}s，余 {r} 条旧代会话）",
+                    if d { "已排空" } else { "预算内未排空（如实回报，不强制关闭）" }
+                ));
+                (d, w, r)
+            } else {
+                (true, 0.0, 0)
+            };
             json!({
                 "ok": out.ok,
                 "match_sets": out.match_sets,
@@ -12380,6 +12910,7 @@ fn handle_status_query(cmd: &str, ebpf: &mut Ebpf, args: &Args) -> String {
                 "at_sec": out.at_sec,
                 "aborted": killed,
                 "conn_state_scrubbed": scrubbed,
+                "drain": {"budget_secs": drain_secs, "waited_secs": waited, "remaining": remaining, "drained": drained},
             })
             .to_string()
         }
@@ -12540,6 +13071,10 @@ mod tests {
         assert!(!abort_should_kill(AbortScope::OldGeneration, 7, 7));
         assert!(abort_should_kill(AbortScope::OldGeneration, 6, 7));
         assert_eq!(abort_cmd("reload", false), "reload");
+        assert_eq!(reload_cmd("reload", false, 0), "reload");
+        assert_eq!(reload_cmd("reload", true, 0), "reload --abort");
+        assert_eq!(reload_cmd("reload", false, 5), "reload --drain=5");
+        assert_eq!(reload_cmd("reload", true, 5), "reload --abort --drain=5");
         assert_eq!(abort_cmd("reload", true), "reload --abort");
         assert_eq!(abort_cmd("suspend", true), "suspend --abort");
     }
@@ -12563,6 +13098,75 @@ mod tests {
         assert!(parse_dns_bind("udp://127.0.0.1").is_err());
         assert!(parse_dns_bind("127.0.0.1").is_err());
         assert!(parse_dns_bind("  ").is_err());
+    }
+
+    #[test]
+    fn gso_segments_on_loopback() {
+        // A2 #17：loopback 上验证 UDP_SEGMENT 真把大 buffer 切成独立数据报
+        // （内核不支持/拒绝时跳过——单测环境可能为旧内核/受限 netns）。
+        let recv = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let recv_addr = recv.local_addr().unwrap();
+        let send = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        use std::os::fd::AsRawFd as _;
+        if !udp_gso_enable(send.as_raw_fd()) {
+            eprintln!("SKIP: 内核不支持 UDP_SEGMENT");
+            return;
+        }
+        let payloads: Vec<Vec<u8>> = vec![b"aaaa".to_vec(), b"bbbb".to_vec(), b"cccc".to_vec()];
+        let refs: Vec<&[u8]> = payloads.iter().map(|p| p.as_slice()).collect();
+        if !send_gso_udp(send.as_raw_fd(), recv_addr, &refs).unwrap() {
+            eprintln!("SKIP: GSO 发送被内核拒绝");
+            return;
+        }
+        recv.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        let mut got = Vec::new();
+        for _ in 0..3 {
+            let mut buf = [0u8; 64];
+            let (n, _) = recv.recv_from(&mut buf).expect("GSO 后应收到 3 个数据报");
+            got.push(buf[..n].to_vec());
+        }
+        assert_eq!(got, payloads, "GSO 应被内核切成 3 个独立数据报");
+    }
+
+    #[test]
+    fn parse_bandwidth_units() {
+        assert_eq!(parse_bandwidth("0").unwrap(), 0);
+        assert_eq!(parse_bandwidth("").unwrap(), 0);
+        // 裸数字 = Mbit/s
+        assert_eq!(parse_bandwidth("100").unwrap(), 12_500_000);
+        // 带单位
+        assert_eq!(parse_bandwidth("10mbps").unwrap(), 1_250_000);
+        assert_eq!(parse_bandwidth("1g").unwrap(), 125_000_000);
+        assert_eq!(parse_bandwidth("500kb").unwrap(), 62_500);
+        assert_eq!(parse_bandwidth("8192B").unwrap(), 8192);
+        // 纯数字 + ps 后缀（不得 panic）
+        assert_eq!(parse_bandwidth("100ps").unwrap(), 12_500_000);
+        assert!(parse_bandwidth("abc").is_err());
+        assert!(parse_bandwidth("10 furlongs").is_err());
+    }
+
+    #[test]
+    fn rate_limiter_throttles_small_writes() {
+        // 1 MB/s：一次 64KB 写入应放行（桶初始满 = 1s 的量）。
+        let l = RateLimiter::new();
+        l.set_rate(1_000_000);
+        let t0 = Instant::now();
+        l.throttle(65536);
+        assert!(t0.elapsed() < Duration::from_millis(100), "桶满时不应延迟");
+        // 把 1MB 额度花光后，再来 128KB 需要 ~0.13s 等令牌。
+        l.throttle(1_000_000 - 65536);
+        let t1 = Instant::now();
+        l.throttle(131_072);
+        let dt = t1.elapsed();
+        assert!(
+            dt >= Duration::from_millis(100) && dt < Duration::from_millis(500),
+            "节流等待应约 0.13s，实测 {dt:?}"
+        );
+        // rate=0 → 恢复不限速（立即返回）。
+        l.set_rate(0);
+        let t2 = Instant::now();
+        l.throttle(10_000_000);
+        assert!(t2.elapsed() < Duration::from_millis(50), "0 = 不限速");
     }
 
     #[test]

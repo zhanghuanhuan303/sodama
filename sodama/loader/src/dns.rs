@@ -877,6 +877,17 @@ impl DnsCache {
         })
     }
 
+    /// A2 #10：任意作用域是否有新鲜记录（对照 dae `HasDnsKnowledge`——real_domain
+    /// 判定「DNS 控制器已知该域名」时不限定 ECS 作用域）。
+    pub fn has_fresh_any_scope(&self, qname: &str, qtype: u16, now: Instant) -> bool {
+        let qname = normalize(qname);
+        self.map.iter().any(|(k, e)| {
+            k.qname == qname
+                && k.qtype == qtype
+                && (now.saturating_duration_since(e.stored).as_secs() as u32) < e.ttl
+        })
+    }
+
     /// P23：配置（启动/reload 时应用；对照 dae dns.optimistic_cache 系列）。
     pub fn set_options(&mut self, optimistic: bool, optimistic_ttl: u32, stale_reply_ttl: u32) {
         self.optimistic = optimistic;

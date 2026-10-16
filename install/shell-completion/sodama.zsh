@@ -12,7 +12,8 @@ _sodama() {
     case "${words[2]}" in
         completion) _values "shell" bash zsh fish ;;
         status) _values "参数" --socket --cmd --json ;;
-        reload|suspend|resume|metrics) _values "参数" --socket ;;
+        reload|suspend|resume) _values "参数" --socket --abort --drain ;;
+        metrics) _values "参数" --socket ;;
         sysdump) _values "参数" --socket --out ;;
         sub-parse) _values "参数" --tag --timeout --limit --json ;;
         trace) _values "参数" --seconds ;;

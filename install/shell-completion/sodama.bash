@@ -22,7 +22,8 @@ _sodama() {
     case "${COMP_WORDS[1]}" in
         completion) COMPREPLY=( $(compgen -W "bash zsh fish" -- "$cur") ) ;;
         status) COMPREPLY=( $(compgen -W "--socket --cmd --json" -- "$cur") ) ;;
-        reload|suspend|resume|metrics) COMPREPLY=( $(compgen -W "--socket" -- "$cur") ) ;;
+        reload|suspend|resume) COMPREPLY=( $(compgen -W "--socket --abort --drain=" -- "$cur") ) ;;
+        metrics) COMPREPLY=( $(compgen -W "--socket" -- "$cur") ) ;;
         sysdump) COMPREPLY=( $(compgen -W "--socket --out" -- "$cur") ) ;;
         sub-parse) COMPREPLY=( $(compgen -W "--tag --timeout --limit --json" -- "$cur") ) ;;
         trace) COMPREPLY=( $(compgen -W "--seconds" -- "$cur") ) ;;
