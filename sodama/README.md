@@ -314,15 +314,32 @@ P6（suspend/reload/metrics/sysdump/日志轮转/整配置热重载）已完成*
   （`test-must` / `test-sub-file` / `test-hotplug` / `test-rules-cap`（71 match_set + 高位命中）/
   `test-domain`），汇总行 `verify=PASS cap=PASS`（lab 另修一个 VM 环境缺口：最小 initramfs 根 ns
   `lo` 默认 down → `lab.sh up()` 幂等拉起 + 假上游存活检查）
+- **eBPF 余项批次（完成，2026-10-16）**：按 `docs/capability-gap-review.md` §3 数据的全部余项
+  收官（ADR-0067、devlog §21；本批后 §3 判定 24 行全部「已完成」）——
+  **① `lan_egress` 角色**（`sodama_lan_egress{,_l3}`；LAN 接口 ingress+egress 双钩子，反向 conntrack 刷新）；
+  **② 出口连通性判定**（`outbound_connectivity_map` 1536 + `outbound_is_alive` 三处判定 +
+  BLOCKED_ALIVE（限速键 = outbound）+ 控制面 2s 健康投影（`dial_mode=ip` 且策略非 random/fixed
+  且组非空）；组标死 → 新连接被数据面阻断）；
+  **③ offload 背压 fuse**（`tcp_offload_pause` + 两阶段 drain/lift + 用户态泵 + `SODAMA_FUSE_MAX_BACKLOG`）；
+  **④ 首包 handoff**（`routing_handoff_map` + 控制面兑底读取 conn_state → handoff）；
+  **⑤ stats/事件键域对齐 dae**（stats 0..12 + 限速键 0..261 + 6 新计数键 + LAN TCP fail-closed）；
+  **⑥ `conn_state_map` pinning 与容量可配**（`/sys/fs/bpf/sodama` 冷启动全表迁移 +
+  `bpf_conn_state_map_size`（默认 262144 = dae 默认，启动生效））；
+  **⑦ 纯 SYN 重绑**（同代拒改/异代重路由，事件 5/9；`datapath_generation` reload 递增）。
+  实测：`cargo test` **310/310**；内核级 QEMU 7.2.8 **`verify` 12/12 + cap 阶段 9/9**
+  （新增 `test-gaps` / `test-alive` / `test-fuse` / `test-pinning`）；
+  **栈预算教训**：新增写入把 `split_flow` 链路 combined stack 推过 512（verifier 实测 528）→
+  事件/conn_state/handoff 三结构全部移入 per-CPU scratch + 四函数改子程序帧（详见 ADR-0067）
 
 原理与 dae 源码对照见 [NOTES.md](./NOTES.md)。
 
 ## 目录
 
 ```
-ebpf-rs/src/         Rust/aya-ebpf 数据面（唯一）：12 个 TC 程序（6 角色 × L2/L3）+ 6 个 cgroup 程序
-                     （P17b pname 采集）+ sk_skb offload + fentry/kprobe 记账 + xdp 计量
-                     + 规则 VM + conn_state + 单写者；BTF maps（含 map-in-map）
+ebpf-rs/src/         Rust/aya-ebpf 数据面（唯一）：14 个 TC 程序（7 角色 × L2/L3）+ 6 个 cgroup 程序
+                     （P17b pname 采集）+ sk_skb offload（含背压 fuse）+ fentry/kprobe 记账 + xdp 计量
+                     + 规则 VM + conn_state（+pinning 迁移）+ 出口连通性 + handoff + 单写者；
+                     BTF maps（含 map-in-map 与 3 张 per-CPU scratch）
 loader/src/main.rs   Rust + aya：加载、挂钩子、setns、tproxy/UDP socket、规则下发/热重载、
                      relay/Dialer、UDP NAT、offload 注册、janitor、只读状态面、DNS 线程、
                      接口懒绑定/热插拔（启动 specs → `IfWatch` → 主循环每 1s 补挂/清理）

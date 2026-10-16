@@ -49,7 +49,7 @@ G1 同机 + 真实节点口径均已交付。以下为余项。
 
 | # | 事项 | 现状 | 验收标准 |
 |---|---|---|---|
-| C1 | L2/桥接程序族（TC L2 变体） | **L3 变体已补齐（2026-10-16，ADR-0065）**：5 个 `*_l3` 程序（lan_ingress / wan_egress / wan_ingress / wan_lan_ingress / lan_wan_egress）+ `--link-hdr auto\|l2\|l3`（按 arphrd 自动判定，对照 dae `linkHdrLen()`）+ L3 补头/剥头；共 12 个 TC 程序（6 角色 ×2）+ sk_skb offload。余：`lan_egress` 角色（dae 的容器/独立 netns 出口用法）未实现 | 桥接/ tun 拓扑 lab 用例（**待实测**：本机无 CAP_BPF，见 ADR-0065 §验证方式） |
+| C1 | L2/桥接程序族（TC L2 变体） | ✅ **已完成（ADR-0065 + ADR-0067）**：5 个 `*_l3` 程序 + `--link-hdr auto\|l2\|l3`（按 arphrd 自动判定）+ **`lan_egress` 角色（L2/L3，LAN 接口 ingress+egress 双钩子，反向 conntrack 刷新；2026-10-16）**；共 **14 个 TC 程序（7 角色 ×2）** + sk_skb offload | ✅ 内核级已实测（QEMU 7.2.8：`l3-attach`/`l3` 入门禁；`lan_egress` 由 `test-gaps` 断言 hooks） |
 | C2 | cgroup 钩子（connect/bind/sendmsg…） | **6/6 已挂载**（sock_create/release、connect4/6、sendmsg4/6；P17b）——用于 pname 采集与 `pname()` 规则（WAN egress 新连接，见 `status` hooks）；bind 与 sock_addr 重定向用例未做 | 至少 connect/bind 两钩子的 sock_addr 重定向用例 |
 | C3 | ringbuf 事件通道 | ✅ **已完成（2026-10-16，ADR-0065）**：`event_ringbuf`（256KiB）+ `SodaEvent` 72B（对照 `struct dae_event`）+ 5 类事件（blocked/溢出×2/rebind/redirect 失败）+ 1s/键限速 + 丢弃计数；热路径 printk 退出（保留 `--ebpf-debug` 门控）；loader 常驻消费线程（1 条/秒/类型日志限速）+ status `events` + 9 个 metrics；**并批次交付 `skb_send_sock` 记账**（fentry→kprobe 回退 + 用户态 BTF 解析替代 CO-RE + `offload_sent` 键摘除时回收） | 高频事件可采样上报（已具备）；待生产回验：`status.events`/`offload_sent.*` 随流量增长且 `dropped_kernel` 有界 |
 | C4 | XDP 可选路径调研 | ✅ **已完成（2026-10-16）**：调研结论沿用 devlog §15（AF_XDP/数据面搬 XDP 否决），按 backlog 建议落**最小计量探针** `sodama_xdp_observe`（`--xdp <iface>` 可选挂载，恒 `XDP_PASS`、只计数不干预；status `xdp` + 2 个 metrics） | 调研报告（收益/兼容性）已具备；待实测：软路由网卡上的 native/generic 可用性与计数准确性 |
@@ -68,8 +68,8 @@ G1 同机 + 真实节点口径均已交付。以下为余项。
 | # | 事项 | 现状 | 验收标准 |
 |---|---|---|---|
 | E1 | UDP endpoint pool / full-cone NAT（网关侧 UDP 代理） | ✅ 网关侧全链已真机验证（2026-10-08）：数据面 UDP 重定向 → UDP NAT 会话（QUIC 嗅探/组分派/janitor）→ 组内挑选支持 UDP 成员 → vless 流式 UDP 上行；同批修复组 `dial_udp` 只看延迟榜前 3 名的缺陷（真实订阅下前列被 anytls/reality 占据 → UDP 永远回退直连）；测试机场（CF 优选）节点侧禁 UDP 转发，下行未观测（换支持 UDP 的机场即可） | full-cone 行为测试（外部多映射） |
-| E2 | backlog fuse / 连接计费 | 未做 | 压测下 fuse 生效 + 计费可导出 |
-| E3 | offload 完整形态（fuse 失效路径与统计） | 生命周期/回收已交付（O4/O8：每 offload 连接 0 线程、200 条 fds 回收全过、可观测计数）；余 fuse 失效路径（依赖 E2） | 失效全路径与计数可观测 |
+| E2 | backlog fuse / 连接计费 | **fuse 已交付（ADR-0067，2026-10-16）**：`tcp_offload_pause` + 两阶段 drain/lift + 用户态泵 + `SODAMA_FUSE_MAX_BACKLOG`；余：连接计费未做 | 压测下 fuse 生效（真实触发留生产观测；判定逻辑单测锁定）+ 计费可导出 |
+| E3 | offload 完整形态（fuse 失效路径与统计） | **fuse 已交付（ADR-0067）**：生命周期/回收（O4/O8）+ pause engage/lift/失败计数（`status.offload_fuse`）+ 注册时清残留 | ✅ 失效全路径与计数可观测（无失败残留由 `test-fuse` 断言） |
 
 ## F. 嗅探 / IPv6
 

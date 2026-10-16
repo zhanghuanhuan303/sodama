@@ -1342,6 +1342,91 @@ cap 阶段才暴露。修复（`lab/lab.sh`）：
 
 ---
 
+## 21 · eBPF 余项批次：lan_egress · 出口连通性 · 背压 fuse · 首包 handoff · 键域对齐 · pinning（2026-10-16）
+
+对应 `docs/capability-gap-review.md` §3（数据面）的全部余项（4 未做 + 6 部分；用户指令「把 ebpf 缺项
+全部补上」）；决策与偏离清单见 ADR-0067。本批后 §3 判定 24 行全部「已完成」。
+
+### 侦查（源码实测，均有行号）
+
+1. **dae `lan_egress`**：`tproxy.c:2771-2855`（`do_tproxy_lan_egress`/`tproxy_lan_egress_refresh`：反向
+   conn-state 刷新）+ `control_plane_core_bind.go:259-280`（每个 LAN 接口 ingress+egress 双钩子）。
+2. **出口连通性**：`tproxy.c:116`（map 1536 = 256×3×2；键 = outbound×6+domain×2+ipver）、
+   `:3418-3450`（`wan_outbound_is_alive`：保留 outbound/53 放行）、`:3169/:3605/:3758`（三处判定）、
+   `:820-834`（`send_blocked_alive_event`，限速键 = outbound）；Go 侧 `control/connectivity.go`
+   （仅 `dial_mode=ip` 且策略非 random/fixed 投影真实健康）。
+3. **背压 fuse**：`tproxy.c:262-274`（`tcp_offload_pause` 语义）+ `tcp_offload_linux.go:371-460`
+   （backlog 公式/阈值 64 MiB/恢复 1 MiB/drain 上限 10s/all-or-nothing engage/注册时清残留）。
+4. **pinning**：`tproxy.c:530-537`（`LIBBPF_PIN_BY_NAME` +「Loader may override pinning on cold start」）。
+5. **事件 5/9**：`tproxy.c:2591-2621`（`__mark_tcp_seen` 的纯 SYN 重绑：同代拒改/异代重路由，
+   分别计 stats 5/12 与事件 5/9）+ `:3110-3124`（conn_state 存 `routing_epoch_slot`+`datapath_generation`
+   = 「写时代次」）+ `datapath_generation.go:20-27`（代次递增）。
+6. **键域权威**：`control/event_rate_contract.go`（限速键 256..261 + 容量 262）、
+   `tproxy.c:540-600`（stats 键 0..12）。
+7. **handoff**：`tproxy.c:292-295/2120-2134/3618/3771`（写）+ `control/utils.go:64-80`
+   （`RetrieveRoutingResult` 优先序 conn_state → handoff）。
+
+### 实施
+
+- **数据面（`ebpf-rs/src/`）**：新程序 `sodama_lan_egress{,_l3}`（`progs.rs`）；新 map 4 张
+  （`outbound_connectivity_map` 1536、`tcp_offload_pause` LRU 8192、`routing_handoff_map` 65536、
+  `handoff_scratch_map`/`event_scratch_map`/`conn_scratch_map` per-CPU 暂存）；`conn_state_map` 默认
+  容量 262144；`flow.rs` 新增 `outbound_is_alive`/`publish_routing_handoff`/`send_blocked_alive_event`
+  + 纯 SYN 重绑分支 + LAN TCP fail-closed + 计数器铺点（无状态直通/无主 UDP 等）；`parse.rs` 带原因
+  解析（`ParseSkip::{FragTail,UnsupportedL4,Other}`）；`event.rs` 限速键域 0..261；`offload.rs`
+  pause 检查；`common.rs` 键域/结构（`SodaConnState` 增 slot+generation，`SodaConfig` 增 generation）。
+- **控制面（`loader/src/main.rs`）**：连通性投影循环（2s；空组不投影）、fuse 看门狗接入
+  （`offload_fuse_step` + `fuse_decision` 两阶段状态机 + 用户态 drain 泵 + 注册清残留 + 阈值 env）、
+  pinning（加载后 pin + 冷启动全表迁移）、`bpf_conn_state_map_size`（`EbpfLoader::set_max_entries`）、
+  generation 维护（启动随机/ reload 递增，写 `config_map`）、handoff 兑底读取（`HANDOFF_MAP_FD` +
+  30s TTL）、status 新块（`offload_fuse`、`maps.routing_handoff`/`connectivity_dead_groups`、stats 全量）。
+- **lab**：新 4 对用例（`gaps-up/test-gaps`、`alive-up/test-alive`、`fuse-up/test-fuse`、
+  `pin-up/test-pinning`）+ `client_probe.py` 固定源端口（SO_REUSEADDR）+ `rebind_tool.py` 键域同步；
+  `vm-init.sh` cap 阶段 5 → 9 对。
+
+### 开发期抓到的三个真实缺陷（全部已修并回归）
+
+1. **eBPF 栈预算（本批最硬的约束）**：新增 handoff/事件/conn_state 写入把 `split_flow` 调用链的
+   combined stack 推过 512（verifier 实测 `528 > 512`）。修复：`SodaEvent`(72B)、`SodaConnState`(24B)、
+   `SodaRoutingHandoffEntry`(32B) 三结构全部移入 per-CPU scratch map；`conn_save`/
+   `publish_routing_handoff`/`send_blocked_alive_event`/`refresh_reverse_state` 改子程序帧
+   （`#[inline(never)]`）。教训：**热路径加代码前先看 combined stack**。
+2. **fuse 两阶段 lift 死锁**：初版 `lift 需 drained、drained 需 stop、stop 只在 lift 置位`——
+   循环依赖，engage 后将永久 pause（实测 512KB 流超时）。改为 `DrainStart`（置 stop、等泵排空）→
+   `Lift`（删键）状态机，drain 超时 → `LiftTimeout`（强制 lift + 告警）；`fuse_decision` 抽纯函数
+   + 2 项单测锁定。
+3. **stats 键重排的 lab 侧漂移**：`rebind_tool.py`/`test_rebind` 硬编码键 0（旧 rebind_rejected），
+   重排后键 0 = UDP 溢出 → `verify` 的 `rebind` 用例误报。已同步到 dae 键域（键 4）。
+
+### 验收（本机已实测）
+
+| 项 | 结果 |
+|---|---|
+| 单测 | `cargo test --release` **310/310**（新增 fuse 两阶段判定 2 项） |
+| 数据面构建 | `cargo +nightly build --release`（bpfel）通过；新符号 `sodama_lan_egress{,_l3}` 在（llvm-nm） |
+
+### 内核级验收（QEMU 内核矩阵，内核 7.2.8-arch1-2，已实测）
+
+`MATRIX-RESULT kernel=7.2.8-arch1-2 verify=PASS offload=FAIL cap=PASS`：
+
+| 项 | 结果 | 证据 |
+|---|---|---|
+| 回归门禁 | `verify=PASS` 12/12（含 `rebind` 键号修复后复跑） | `lab/matrix/out/vm-kernel-7.2.8-arch1-2.log` |
+| lan_egress/parse/SYN 重绑/handoff | ✅ `cap/test-gaps`：hooks 含 `sodama_lan_egress@landae`；ICMP → `parse_unsupported_l4=15`；同 4 元组重连 `syn_rebind_rejected≥1`；SIGHUP 后再连 `rebind_rerouted≥1`；`maps.routing_handoff≥1` | |
+| 出口连通性 | ✅ `cap/test-alive`：初始通 → 杀后端 6s 后新连接被数据面阻断（`connectivity_dead_groups≥1`）→ 恢复后通 | |
+| 背压 fuse | ✅ `cap/test-fuse`：`threshold=65536`（env 生效）+ `failures=0` + `engages==lifts`（无残留）；真实触发（对端 retry 积压）本地不可构造，判定逻辑由单测锁定 | |
+| pinning | ✅ `cap/test-pinning`：pin 文件存在 → down 后保留 → 重启日志 `conn_state pin: 迁移 N 条` → 新表计数 ≥1 | |
+| offload | ❌ 信息项（既有环境抖动，同 §19；首连问候超时签名本轮复现——`test-fuse` 已按此做重试 + 可跳过） | |
+
+### 未通过 / 待办（诚实边界）
+
+1. **fuse 真实触发未在 lab 复现**（本地回环对端不积压）；生产对端拥塞时的 engage/lift 留实网观测；
+2. `bpf_conn_state_map_size` 运行期变更（不重启）不做（ADR-0067 偏离 2）；
+3. offload 会话的 QEMU 首连抖动仍在（与本批无关）；
+4. per-CPU 事件限速是既有降级（偏离 1）；`SOCKMARK_FALLBACK` 键恒 0（占位）。
+
+---
+
 ## 附 A · 路由器侧工具清单（**不入库**，仅存在于软路由）
 
 | 路径 | 用途 | 部署时间 |
