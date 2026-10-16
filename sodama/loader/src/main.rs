@@ -111,6 +111,8 @@ const EPOCH_SLOT_NUM: u32 = 2;
 const JANITOR_INTERVAL: Duration = Duration::from_secs(5);
 
 static RELOAD: AtomicBool = AtomicBool::new(false);
+/// P38：日志时间戳开关（`--disable-timestamp` / config global.disable_timestamp）。
+static LOG_TS_OFF: AtomicBool = AtomicBool::new(false);
 static ACTIVE_SLOT: AtomicU32 = AtomicU32::new(0);
 /// P6：SIGUSR2（`dae suspend` 同义）/ 状态面 suspend → 主循环置位 control_flags_map；
 /// SIGHUP/reload 清除（对照 dae 「suspend 后用 reload 恢复」）。
@@ -1700,6 +1702,10 @@ struct Args {
     watch_config: Option<u64>,
     /// P34：未给 --config/--rules 时自动采用 ~/.config/sodama/config.dae（仅用于日志明示）
     auto_config: bool,
+    /// P38：关闭日志时间戳（对照 dae `--disable-timestamp`；也可 config global.disable_timestamp）
+    disable_timestamp: bool,
+    /// P38：不写 pid 文件（对照 dae `--disable-pidfile`；默认写 /var/run/sodama.pid）
+    disable_pidfile: bool,
 }
 
 /// 本地时间戳 `YYYY-MM-DD HH:MM:SS`。
@@ -1813,7 +1819,8 @@ fn epoch_to_civil(secs: i64) -> (i64, u32, u32, i64, i64, i64) {
 }
 
 fn log(msg: &str) {
-    let line = format!("[sodama] {} {msg}", now_hms());
+    // P38：`--disable-timestamp` 关闭时间戳前缀（对照 dae `--disable-timestamp`）。
+    let line = log_line(LOG_TS_OFF.load(std::sync::atomic::Ordering::Relaxed), &now_hms(), msg);
     let mut done = false;
     if let Ok(mut g) = LOG_SINK.lock() {
         if let Some(f) = g.as_mut() {
@@ -1831,6 +1838,15 @@ fn log(msg: &str) {
             println!("{line}");
             let _ = std::io::stdout().flush();
         }
+    }
+}
+
+/// P38：日志行组装（时间戳开关拆成纯函数，便于单测；对照 dae `DisableTimestamp`）。
+fn log_line(ts_off: bool, hms: &str, msg: &str) -> String {
+    if ts_off {
+        format!("[sodama] {msg}")
+    } else {
+        format!("[sodama] {hms} {msg}")
     }
 }
 
@@ -1888,6 +1904,8 @@ fn usage() -> ! {
            --dial-mode <m>          P14：ip|domain|domain+（默认 ip；域名模式嗅探 SNI/Host 后远端解析，绕 DNS 污染）
            --sniffing-timeout-ms <n> P14：嗅探等待上限毫秒（默认 100；仅 dial_mode != ip 时生效）
            --sniff-punt             P21：嗅探命中域名后按规则在 relay 侧重选出口（direct/block/用户组）
+           --disable-timestamp      P38：日志关闭时间戳（对照 dae；也可 config global.disable_timestamp）
+           --disable-pidfile        P38：不写 /var/run/sodama.pid（对照 dae）
            --subscribe <url>        P15：订阅（可重复；config subscription 段同源），与 --group 搭配；
                                      P34：多源默认按顺序回退（pacman 风格，subscription_failover）
            --group <name>           P15：选用 config 中的组（默认 proxy / 唯一组）
@@ -1982,6 +2000,8 @@ fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
         log_file: None,
         watch_config: None,
         auto_config: false,
+        disable_timestamp: false,
+        disable_pidfile: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
@@ -2020,6 +2040,8 @@ fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
             }
             "--sniffing-timeout-ms" => args.sniffing_timeout_ms = Some(next()?.parse()?),
             "--sniff-punt" => args.sniff_punt = true,
+            "--disable-timestamp" => args.disable_timestamp = true,
+            "--disable-pidfile" => args.disable_pidfile = true,
             "--subscribe" => args.subscribe.push(next()?),
             "--geodata-dir" => args.geodata_dir.push(next()?),
             "--group" => args.group = Some(next()?),
@@ -5369,6 +5391,22 @@ fn make_group_runtime(
         tolerance,
         udp_check_dns.clone(),
     );
+    // P38：探测 HTTP 方法（对照 dae）：global 默认 HEAD，非法值 warn 后回落 CONNECT；
+    // group 级覆盖（dae 不做 group 级校验，非法值在请求构造时失败）。
+    let global_method = match global_str("tcp_check_http_method") {
+        Some(m) if group::is_valid_http_method(&m) => m,
+        Some(m) => {
+            log(&format!(
+                "tcp_check_http_method '{m}' 非法，回落 CONNECT（对照 dae patchTcpCheckHttpMethod）"
+            ));
+            "CONNECT".to_string()
+        }
+        None => "HEAD".to_string(),
+    };
+    let http_method = spec
+        .and_then(|g| g.tcp_check_http_method.clone())
+        .unwrap_or(global_method);
+    rt.set_http_method(&http_method);
     // P34：订阅顺序回退（pacman 风格）——global `subscription_failover`（默认开）。
     let failover = global_str("subscription_failover")
         .map(|v| !matches!(v.trim(), "false" | "0" | "no" | "off"))
@@ -5380,7 +5418,7 @@ fn make_group_runtime(
         .unwrap_or(600);
     rt.set_idle_cap(idle_cap);
     log(&format!(
-        "节点组 {gname}: {} 个成员, policy={}, check={targets:?} 每 {interval}s, 容忍 {tolerance} 次失败, udp_check={udp_check_dns:?}, 订阅顺序回退={}",
+        "节点组 {gname}: {} 个成员, policy={}, check={targets:?} 每 {interval}s（http={http_method}）, 容忍 {tolerance} 次失败, udp_check={udp_check_dns:?}, 订阅顺序回退={}",
         rt.member_count(),
         group::policy_name(&policy),
         if failover { "开" } else { "关" }
@@ -6363,6 +6401,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if args.log_file.is_none() {
         args.log_file = cfg_boot_val("log_file");
     }
+    // P38：时间戳开关（CLI 显式关优先；否则 config global.disable_timestamp；扩展键，dae 无）。
+    if !args.disable_timestamp {
+        if let Some(v) = cfg_boot_val("disable_timestamp") {
+            args.disable_timestamp = matches!(v.trim(), "true" | "1" | "yes" | "on" | "enable");
+        }
+    }
+    LOG_TS_OFF.store(args.disable_timestamp, Ordering::Relaxed);
     if args.status_socket.is_none() {
         args.status_socket = cfg_boot_val("status_socket");
     }
@@ -7006,6 +7051,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // P4b：UDP NAT janitor（无论是否启用 dialer 都在跑；只清扫非 DNS 的代理 UDP 会话）
     std::thread::spawn(udp_nat_janitor_loop);
 
+    // P38：pid 文件（对照 dae）：就绪后写 /var/run/sodama.pid；`--disable-pidfile` 跳过写；
+    // 退出清理无条件执行（与 dae 一致）；写失败静默（/var/run 不可写不影响主流程）。
+    write_pidfile(args.disable_pidfile);
+
     // 主循环：状态查询 + 检查重载标志 + 定期清扫 conn_state
     // O8：50ms tick 一并发控：SIGTERM 检测/热重载响应更快（20 次/s 空转可忽略）。
     let mut ticks: u64 = 0;
@@ -7114,6 +7163,26 @@ fn trim_allocator() {
 #[cfg(not(target_env = "gnu"))]
 fn trim_allocator() {}
 
+/// P38：pid 文件路径（与 dae `/var/run/dae.pid` 同口径）。
+const PID_FILE_PATH: &str = "/var/run/sodama.pid";
+
+/// 写 pid 文件（disabled=true 跳过）。best-effort：失败静默（对照 dae `_ = os.WriteFile`）。
+fn write_pidfile(disabled: bool) {
+    if disabled {
+        return;
+    }
+    let _ = write_pidfile_at(Path::new(PID_FILE_PATH), std::process::id());
+}
+
+fn write_pidfile_at(path: &Path, pid: u32) -> std::io::Result<()> {
+    std::fs::write(path, pid.to_string())
+}
+
+/// 删除 pid 文件（无条件；对照 dae 的 defer，不因 --disable-pidfile 跳过）。
+fn remove_pidfile() {
+    let _ = std::fs::remove_file(PID_FILE_PATH);
+}
+
 /// O8：优雅退出——有界等待在途连接收尾（≤300ms），随后退出。
 /// 数据面钩子是 TCX bpf_link：fd 随进程关闭由内核原子摘除，不残留过滤器（不会黑洞）。
 fn graceful_shutdown() -> ! {
@@ -7133,6 +7202,7 @@ fn graceful_shutdown() -> ! {
         t0.elapsed().as_millis(),
         RELAY_STATS.conns_active.load(Ordering::Relaxed)
     ));
+    remove_pidfile();
     std::process::exit(0);
 }
 
@@ -8626,7 +8696,15 @@ fn run_subcommand(argv: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             let plain = String::from_utf8_lossy(&body).into_owned();
             let text =
                 subscribe::decode_body(&body).map_err(|e| format!("订阅正文解码失败: {e}"))?;
-            let format = if text == plain { "plain" } else { "base64" };
+            let format = if text == plain {
+                if subscribe::is_sip008(&text) {
+                    "sip008"
+                } else {
+                    "plain"
+                }
+            } else {
+                "base64"
+            };
             let (nodes, errors) = subscribe::parse_subscription(&text, &tag);
             let mut protos: std::collections::BTreeMap<&str, usize> =
                 std::collections::BTreeMap::new();
@@ -9965,6 +10043,33 @@ fn handle_status_query(cmd: &str, ebpf: &mut Ebpf, args: &Args) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- P38：CLI 小件 ----
+
+    #[test]
+    fn log_line_timestamp_toggle() {
+        assert_eq!(
+            log_line(false, "2026-10-16 12:00:00", "hello"),
+            "[sodama] 2026-10-16 12:00:00 hello"
+        );
+        assert_eq!(log_line(true, "2026-10-16 12:00:00", "hello"), "[sodama] hello");
+    }
+
+    #[test]
+    fn pidfile_write_read_remove() {
+        let dir = std::env::temp_dir().join(format!("sodama-pidfile-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("sodama.pid");
+        let _ = std::fs::remove_file(&path);
+        // 写入 → 内容为十进制 pid
+        write_pidfile_at(&path, 4242).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "4242");
+        // 覆盖写（dae 同语义：已存在直接覆盖）
+        write_pidfile_at(&path, 7).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "7");
+        std::fs::remove_file(&path).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     // ---- eBPF 缺口批次：offload 背压 fuse 的判定逻辑（纯函数锁定） ----
 

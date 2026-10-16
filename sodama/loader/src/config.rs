@@ -1161,6 +1161,8 @@ const GLOBAL_KEYS: &[&str] = &[
     "rule_set_cache_dir",
     // 优雅空闲：无人看状态且无流量时，健康探测指数退避到该上限（秒；0 = 不退避）
     "probe_idle_cap",
+    // P38：日志时间戳开关（扩展键，dae 无；对照 dae `--disable-timestamp`）
+    "disable_timestamp",
 ];
 
 const DNS_KEYS: &[&str] = &[
@@ -1376,6 +1378,8 @@ pub fn validate(cfg: &Config) -> Vec<Diag> {
             ));
         }
     }
+    // P38：check_interval 语义校验（对照 dae `config.New` 的 patchCheckInterval）。
+    validate_check_intervals(cfg, &mut out);
     out.sort_by_key(|d| {
         (
             d.file.as_ref().map(|p| p.display().to_string()),
@@ -1384,6 +1388,94 @@ pub fn validate(cfg: &Config) -> Vec<Diag> {
         )
     });
     out
+}
+
+/// P38：`check_interval` 语义校验（对照 dae `config/patch.go` 的 `patchCheckInterval`）：
+/// global 必须为正（0/负会让探测调度的随机错峰失控）；group 不得为负（0 = 继承 global）。
+/// dae 在 config.New 阶段把非正值直接变成加载错误——不 panic。
+fn validate_check_intervals(cfg: &Config, out: &mut Vec<Diag>) {
+    for sec in &cfg.sections {
+        match sec.name.as_str() {
+            "global" => {
+                for item in &sec.items {
+                    let Item::Param(p) = item else { continue };
+                    if p.key.as_deref() != Some("check_interval") {
+                        continue;
+                    }
+                    let Some(v) = p.val.as_deref() else { continue };
+                    match parse_duration_signed_secs(v) {
+                        Some(s) if s > 0 => {}
+                        Some(s) => {
+                            let mut d = p_loc(cfg, p);
+                            d.msg = format!(
+                                "global check_interval 必须为正时长（当前 \"{v}\" = {s}s）；0/负值会破坏探测调度（对照 dae patchCheckInterval）"
+                            );
+                            out.push(d);
+                        }
+                        None => {
+                            let mut d = p_loc(cfg, p);
+                            d.msg = format!(
+                                "global check_interval 无法解析为时长: \"{v}\"（支持 30 / 30s / 5m / 1h）"
+                            );
+                            out.push(d);
+                        }
+                    }
+                }
+            }
+            "group" => {
+                for item in &sec.items {
+                    let Item::Section(g) = item else { continue };
+                    for it in &g.items {
+                        let Item::Param(p) = it else { continue };
+                        if p.key.as_deref() != Some("check_interval") {
+                            continue;
+                        }
+                        let Some(v) = p.val.as_deref() else { continue };
+                        match parse_duration_signed_secs(v) {
+                            Some(s) if s >= 0 => {}
+                            Some(s) => {
+                                let mut d = p_loc(cfg, p);
+                                d.msg = format!(
+                                    "group \"{}\" check_interval 不得为负（当前 \"{v}\" = {s}s；0 = 继承 global）",
+                                    g.name
+                                );
+                                out.push(d);
+                            }
+                            None => {
+                                let mut d = p_loc(cfg, p);
+                                d.msg = format!(
+                                    "group \"{}\" check_interval 无法解析为时长: \"{v}\"（支持 30 / 30s / 5m / 1h）",
+                                    g.name
+                                );
+                                out.push(d);
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// P38：带符号时长解析（秒）——裸数字与 `Ns`/`Nm`/`Nh`；负号保留（校验用）。
+fn parse_duration_signed_secs(v: &str) -> Option<i64> {
+    let t = v.trim();
+    let (neg, rest) = match t.strip_prefix('-') {
+        Some(r) => (true, r.trim()),
+        None => (false, t),
+    };
+    let (num, mul) = if let Some(n) = rest.strip_suffix('h') {
+        (n.trim(), 3600)
+    } else if let Some(n) = rest.strip_suffix('m') {
+        (n.trim(), 60)
+    } else if let Some(n) = rest.strip_suffix('s') {
+        (n.trim(), 1)
+    } else {
+        (rest, 1)
+    };
+    let val: i64 = num.parse().ok()?;
+    Some(if neg { -val * mul } else { val * mul })
 }
 
 fn validate_dns(cfg: &Config, sec: &Section, out: &mut Vec<Diag>) {
@@ -2128,6 +2220,8 @@ pub struct GroupSpec {
     /// 策略字符串（`min` / `min_moving_avg` / `min_avg10` / `random` / `fixed(0)`）。
     pub policy: Option<String>,
     pub tcp_check_urls: Vec<String>,
+    /// P38：group 级探测 HTTP 方法（`tcp_check_http_method`；空 = 继承 global）。
+    pub tcp_check_http_method: Option<String>,
     pub check_interval: Option<String>,
     pub check_tolerance: Option<String>,
     /// P18e：UDP 健康检查目标（`udp_check_dns: 'dns.google:53'`）；空 = 不做 UDP 检查。
@@ -2203,6 +2297,7 @@ pub fn groups(cfg: &Config) -> Vec<GroupSpec> {
                 filters: Vec::new(),
                 policy: None,
                 tcp_check_urls: Vec::new(),
+                tcp_check_http_method: None,
                 check_interval: None,
                 check_tolerance: None,
                 udp_check_dns: None,
@@ -2226,6 +2321,7 @@ pub fn groups(cfg: &Config) -> Vec<GroupSpec> {
                         }
                     }
                     Some("check_interval") => spec.check_interval = p.val.clone(),
+                    Some("tcp_check_http_method") => spec.tcp_check_http_method = p.val.clone(),
                     Some("check_tolerance") => spec.check_tolerance = p.val.clone(),
                     Some("udp_check_dns") => spec.udp_check_dns = p.val.clone(),
                     _ => {}
@@ -2377,6 +2473,60 @@ routing {
         );
         assert_eq!(gs[0].check_interval.as_deref(), Some("15"));
         assert_eq!(gs[0].check_tolerance.as_deref(), Some("2"));
+    }
+
+    #[test]
+    fn validate_check_interval_semantics() {
+        let mk = |src: &str| {
+            let secs = parse(src).unwrap();
+            Config {
+                entry: PathBuf::from("t.dae"),
+                files: vec![PathBuf::from("t.dae")],
+                sections: secs,
+            }
+        };
+        let msgs = |cfg: &Config| {
+            validate(cfg)
+                .iter()
+                .map(|d| d.msg.clone())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        // global 非法：0 / 负 / 不可解析
+        for bad in ["0", "-1", "-5s", "abc"] {
+            let cfg = mk(&format!(
+                "global {{ check_interval: '{bad}' }}\nrouting {{ fallback: direct }}\n"
+            ));
+            let msg = msgs(&cfg);
+            assert!(msg.contains("check_interval"), "global {bad}: {msg}");
+        }
+        // global 合法：裸数字与带单位
+        for ok in ["15", "30s", "2m", "1h"] {
+            let cfg = mk(&format!(
+                "global {{ check_interval: '{ok}' }}\nrouting {{ fallback: direct }}\n"
+            ));
+            let msg = msgs(&cfg);
+            assert!(msg.is_empty(), "global {ok}: {msg}");
+        }
+        // group：0 合法（继承）、负/不可解析报错
+        let cfg = mk(
+            "global {}\nrouting { fallback: direct }\ngroup { g { policy: min\ncheck_interval: '0' } }\n",
+        );
+        assert!(msgs(&cfg).is_empty(), "{}", msgs(&cfg));
+        for bad in ["-3", "nope"] {
+            let cfg = mk(&format!(
+                "global {{}}\nrouting {{ fallback: direct }}\ngroup {{ g {{ policy: min\ncheck_interval: '{bad}' }} }}\n"
+            ));
+            let msg = msgs(&cfg);
+            assert!(msg.contains("check_interval"), "group {bad}: {msg}");
+        }
+        // 时长解析器：带符号/单位
+        assert_eq!(parse_duration_signed_secs("15"), Some(15));
+        assert_eq!(parse_duration_signed_secs("15s"), Some(15));
+        assert_eq!(parse_duration_signed_secs("2m"), Some(120));
+        assert_eq!(parse_duration_signed_secs("1h"), Some(3600));
+        assert_eq!(parse_duration_signed_secs("-5s"), Some(-5));
+        assert_eq!(parse_duration_signed_secs("x"), None);
     }
 
     #[test]

@@ -692,8 +692,86 @@ pub fn disk_load(cfg_dir: &std::path::Path, tag: &str) -> Option<(Vec<u8>, u64)>
     Some((body, age))
 }
 
+/// P38：SIP008（shadowsocks 官方 JSON 订阅）解析——对照 dae `ResolveSubscriptionAsSIP008`。
+/// 判定与原版一致：JSON 可解析且 `version == 1 && servers != null`；每台服务器映射为
+/// `ss://` 链接后复用既有链接解析器（userinfo = base64url(method:password)，不做必填校验）。
+/// 返回 `(remarks, link)`；remarks 可能为空（调用方用 tag-序号 兑底命名）。
+pub fn parse_sip008(text: &str) -> Option<Vec<(String, String)>> {
+    let v: serde_json::Value = serde_json::from_str(text.trim_start_matches('\u{feff}')).ok()?;
+    if v.get("version").and_then(|x| x.as_i64()) != Some(1) {
+        return None;
+    }
+    let servers = v.get("servers")?.as_array()?;
+    let mut out = Vec::with_capacity(servers.len());
+    for s in servers {
+        let server = s.get("server").and_then(|x| x.as_str()).unwrap_or("");
+        let port = s.get("server_port").and_then(|x| x.as_u64()).unwrap_or(0);
+        let method = s.get("method").and_then(|x| x.as_str()).unwrap_or("");
+        let password = s.get("password").and_then(|x| x.as_str()).unwrap_or("");
+        let remarks = s
+            .get("remarks")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string();
+        let userinfo = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(format!("{method}:{password}"));
+        let mut link = format!("ss://{userinfo}@{server}:{port}");
+        if let Some(plugin) = s
+            .get("plugin")
+            .and_then(|x| x.as_str())
+            .filter(|p| !p.is_empty())
+        {
+            let opts = s.get("plugin_opts").and_then(|x| x.as_str()).unwrap_or("");
+            let full = if opts.is_empty() {
+                plugin.to_string()
+            } else {
+                format!("{plugin};{opts}")
+            };
+            link.push_str(&format!(
+                "?plugin={}",
+                percent_encoding::utf8_percent_encode(&full, percent_encoding::NON_ALPHANUMERIC)
+            ));
+        }
+        if !remarks.is_empty() {
+            link.push_str(&format!(
+                "#{}",
+                percent_encoding::utf8_percent_encode(&remarks, percent_encoding::NON_ALPHANUMERIC)
+            ));
+        }
+        out.push((remarks, link));
+    }
+    Some(out)
+}
+
+/// P38：正文是否为 SIP008（供 `sub-parse` 的格式展示）。
+pub fn is_sip008(text: &str) -> bool {
+    parse_sip008(text).is_some()
+}
+
 /// 解析订阅正文为节点列表（`(nodes, errors)`；错误逐行报告，不中断）。
 pub fn parse_subscription(text: &str, tag: &str) -> (Vec<ParsedNode>, Vec<String>) {
+    // P38：SIP008（JSON）优先；不匹配再按 base64 行解析（对照 dae 的识别顺序）。
+    if let Some(servers) = parse_sip008(text) {
+        let mut nodes = Vec::new();
+        let mut errors = Vec::new();
+        for (i, (remarks, link)) in servers.into_iter().enumerate() {
+            let name = if remarks.is_empty() {
+                format!("{tag}-{}", i + 1)
+            } else {
+                remarks
+            };
+            match outbound::parse(&link) {
+                Ok(o) => nodes.push(ParsedNode {
+                    name,
+                    tag: tag.to_string(),
+                    rank: 0,
+                    outbound: o,
+                }),
+                Err(e) => errors.push(format!("SIP008 第 {} 台服务器不支持: {e}", i + 1)),
+            }
+        }
+        return (nodes, errors);
+    }
     let mut nodes = Vec::new();
     let mut errors = Vec::new();
     for (i, raw) in text.lines().enumerate() {
@@ -741,6 +819,32 @@ mod tests {
             fetch_fail_total: 0,
             last_fetch_at: 0,
         }
+    }
+
+    #[test]
+    fn sip008_maps_to_ss_nodes() {
+        let text = r#"{"version":1,"servers":[
+          {"id":"a","remarks":"香港-01","server":"1.1.1.1","server_port":8388,"method":"chacha20-ietf-poly1305","password":"pw1"},
+          {"server":"2.2.2.2","server_port":443,"method":"chacha20-ietf-poly1305","password":"pw2","plugin":"shadow-tls","plugin_opts":"host=bing.com;password=secret"}
+        ],"bytes_used":1,"bytes_remaining":2}"#;
+        let servers = parse_sip008(text).expect("SIP008 应识别");
+        assert_eq!(servers.len(), 2);
+        assert_eq!(servers[0].0, "香港-01");
+        assert!(servers[0].1.starts_with("ss://"));
+        assert!(servers[1].1.contains("?plugin="), "{}", servers[1].1);
+        let (nodes, errors) = parse_subscription(text, "sub");
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(nodes.len(), 2);
+        assert_eq!(nodes[0].name, "香港-01");
+        // 无 remarks → tag-序号 兑底
+        assert_eq!(nodes[1].name, "sub-2");
+        assert!(is_sip008(text));
+        // 非 SIP008：version 不为 1 / servers 为 null / 非 JSON
+        assert!(parse_sip008(r#"{"version":2,"servers":[]}"#).is_none());
+        assert!(parse_sip008(r#"{"version":1,"servers":null}"#).is_none());
+        assert!(parse_sip008("ss://a@1.1.1.1:1").is_none());
+        // 行式订阅不被误判
+        assert!(!is_sip008("ss://YWVzLTEyODpwdw==@1.1.1.1:1#n1"));
     }
 
     #[test]

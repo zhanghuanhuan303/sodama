@@ -275,6 +275,9 @@ pub struct GroupRuntime {
     pub udp_check_dns: Option<(String, u16)>,
     pub check_interval_secs: u64,
     pub check_tolerance: u32,
+    /// P38：探测 HTTP 方法（group 级 `tcp_check_http_method`；dae 默认 HEAD）。
+    /// 热可替换：reload 重建 GroupRuntime，此处仅供同实例内读取。
+    check_http_method: std::sync::RwLock<std::sync::Arc<str>>,
     pub stats: GroupStats,
     /// P34：订阅顺序回退开关（config global `subscription_failover`，默认开）。
     sub_failover: AtomicBool,
@@ -305,6 +308,19 @@ impl std::fmt::Debug for GroupRuntime {
 }
 
 impl GroupRuntime {
+    /// P38：设置探测 HTTP 方法（`make_group_runtime` 在构建后调用；见 config global/group 键）。
+    pub fn set_http_method(&self, m: &str) {
+        if let Ok(mut g) = self.check_http_method.write() {
+            *g = m.into();
+        }
+    }
+
+    fn http_method(&self) -> std::sync::Arc<str> {
+        self.check_http_method
+            .read()
+            .map(|g| g.clone())
+            .unwrap_or_else(|_| "HEAD".into())
+    }
     pub fn new(
         name: String,
         policy: Policy,
@@ -326,6 +342,7 @@ impl GroupRuntime {
             udp_check_dns,
             check_interval_secs,
             check_tolerance,
+            check_http_method: std::sync::RwLock::new("HEAD".into()),
             stats: GroupStats::default(),
             sub_failover: AtomicBool::new(true),
             idle_cap_secs: AtomicU64::new(600),
@@ -977,7 +994,9 @@ impl GroupRuntime {
             }
             let _ = sock.set_write_timeout(Some(Duration::from_secs(3)));
             let mut d = d;
-            let req = format!("GET /generate_204 HTTP/1.0\r\nHost: {host}\r\n\r\n");
+            // P38：方法来自 group/global `tcp_check_http_method`（dae 默认 HEAD，因为部分
+            // 服务端对 HEAD 不计流量账；对照 dae `HttpCheck`）。
+            let req = probe_request_line(&self.http_method(), &host);
             let mut ok_write = d.to_remote.write_all(req.as_bytes()).is_ok();
             ok_write &= d.to_remote.flush().is_ok();
             let mut buf = [0u8; 64];
@@ -992,6 +1011,34 @@ impl GroupRuntime {
             Err(std::io::Error::other("check 无响应"))
         }
     }
+}
+
+/// P38：探测请求构造（方法 + 固定路径 `/generate_204`）；拆成纯函数便于单测。
+fn probe_request_line(method: &str, host: &str) -> String {
+    format!("{method} /generate_204 HTTP/1.0\r\nHost: {host}\r\n\r\n")
+}
+
+/// P38：`tcp_check_http_method` 白名单（等价 dae `common.IsValidHttpMethod`，大写敏感）。
+pub fn is_valid_http_method(m: &str) -> bool {
+    matches!(
+        m,
+        "GET"
+            | "POST"
+            | "PUT"
+            | "PATCH"
+            | "DELETE"
+            | "COPY"
+            | "HEAD"
+            | "OPTIONS"
+            | "LINK"
+            | "UNLINK"
+            | "PURGE"
+            | "LOCK"
+            | "UNLOCK"
+            | "PROPFIND"
+            | "CONNECT"
+            | "TRACE"
+    )
 }
 
 /// 最小 DNS A 查询（ID 固定；健康探测只需任意应答）。
