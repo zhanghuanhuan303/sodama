@@ -1944,6 +1944,8 @@ fn usage() -> ! {
            sodama sub-parse <url|path> [--tag <t>] [--json] [--limit <n>] [--timeout <s>] 只读：拉取订阅解析预览\n\
            sodama sysdump [--socket <path>] [--out <file>] P6：状态+规则+系统网络信息归档\n\
            sodama trace [--seconds N]           P6：过滤 sodama 的 ftrace 输出（需 root）\n\
+           sodama completion [bash|zsh|fish]   P38：输出 shell 补全脚本（对照 dae completion；\n\
+                                 预生成副本在 install/shell-completion/）\n\
          \n\
          运行中收到 SIGHUP 会重读 --rules/--config 并热重载（非活跃槽 → 切换 active），
          同时清除 suspend 状态并 reopen --log-file（对照 dae reload）；SIGUSR2 = suspend。
@@ -6384,6 +6386,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 | "sub-parse"
                 | "sysdump"
                 | "trace"
+                | "completion"
         )
     {
         return run_subcommand(&argv);
@@ -8829,7 +8832,182 @@ fn run_subcommand(argv: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             Ok(())
         }
         "dns-bench" => run_dns_bench(argv),
+        "completion" => run_completion(argv),
         _ => unreachable!(),
+    }
+}
+
+/// P38：补全用的子命令清单（与 `main()` 的分派表保持一致）。
+const COMPLETION_SUBCOMMANDS: &[&str] = &[
+    "validate",
+    "export-config",
+    "extract-routing",
+    "status",
+    "reload",
+    "suspend",
+    "resume",
+    "metrics",
+    "sub-parse",
+    "sysdump",
+    "trace",
+    "dns-bench",
+    "completion",
+];
+
+/// P38：补全用的顶层参数清单（与 `parse_args()` 的 match 保持一致）。
+const COMPLETION_FLAGS: &[&str] = &[
+    "--ebpf",
+    "--lan",
+    "--wan",
+    "--dual",
+    "--dae0",
+    "--dae0peer",
+    "--daens",
+    "--tproxy-port",
+    "--rules",
+    "--config",
+    "--strict-config",
+    "--status-socket",
+    "--log-file",
+    "--watch-config",
+    "--dialer",
+    "--relay-idle-timeout",
+    "--dial-timeout",
+    "--dial-mode",
+    "--sniffing-timeout-ms",
+    "--sniff-punt",
+    "--disable-timestamp",
+    "--disable-pidfile",
+    "--subscribe",
+    "--geodata-dir",
+    "--group",
+    "--listen-socks",
+    "--udp-idle-timeout",
+    "--forward",
+    "--offload",
+    "--link-hdr",
+    "--xdp",
+    "--no-splice",
+    "--ebpf-debug",
+    "--ktls",
+    "--max-conns",
+    "--dns-upstream",
+    "--dump",
+    "--compile-dump",
+    "--proxy",
+    "--help",
+];
+
+const COMPLETION_BASH: &str = r##"# sodama bash completion（由 `sodama completion bash` 生成）
+_sodama() {
+    local cur prev
+    cur="${COMP_WORDS[COMP_CWORD]}"
+    prev="${COMP_WORDS[COMP_CWORD-1]}"
+    local subcmds="@SUBCMDS@"
+    local flags="@FLAGS@"
+    case "$prev" in
+        --config|--rules|--ebpf|--log-file|--status-socket|--compile-dump|--listen-socks)
+            COMPREPLY=( $(compgen -f -- "$cur") ); return ;;
+        --dial-mode) COMPREPLY=( $(compgen -W "ip domain domain+ domain++" -- "$cur") ); return ;;
+        --link-hdr) COMPREPLY=( $(compgen -W "auto l2 l3" -- "$cur") ); return ;;
+        --lan|--wan|--dual|--xdp|--dae0|--dae0peer)
+            COMPREPLY=( $(compgen -W "$(ls /sys/class/net 2>/dev/null)" -- "$cur") ); return ;;
+    esac
+    if [[ "$cur" == -* ]]; then
+        COMPREPLY=( $(compgen -W "$flags" -- "$cur") ); return
+    fi
+    if [[ $COMP_CWORD -eq 1 ]]; then
+        COMPREPLY=( $(compgen -W "$subcmds" -- "$cur") ); return
+    fi
+    case "${COMP_WORDS[1]}" in
+        completion) COMPREPLY=( $(compgen -W "bash zsh fish" -- "$cur") ) ;;
+        status) COMPREPLY=( $(compgen -W "--socket --cmd --json" -- "$cur") ) ;;
+        reload|suspend|resume|metrics) COMPREPLY=( $(compgen -W "--socket" -- "$cur") ) ;;
+        sysdump) COMPREPLY=( $(compgen -W "--socket --out" -- "$cur") ) ;;
+        sub-parse) COMPREPLY=( $(compgen -W "--tag --timeout --limit --json" -- "$cur") ) ;;
+        trace) COMPREPLY=( $(compgen -W "--seconds" -- "$cur") ) ;;
+        dns-bench) COMPREPLY=( $(compgen -W "--config --names --tags --runs --rounds --concurrency --client" -- "$cur") ) ;;
+        validate|export-config|extract-routing) COMPREPLY=( $(compgen -f -- "$cur") ) ;;
+    esac
+}
+complete -F _sodama sodama
+"##;
+
+const COMPLETION_ZSH: &str = r##"#compdef sodama
+# sodama zsh completion（由 `sodama completion zsh` 生成）
+_sodama() {
+    local -a subcmds flags
+    subcmds=(@SUBCMDS@)
+    flags=(@FLAGS@)
+    if (( CURRENT == 2 )); then
+        _describe -t commands "子命令" subcmds
+        _describe -t options "参数" flags
+        return
+    fi
+    case "${words[2]}" in
+        completion) _values "shell" bash zsh fish ;;
+        status) _values "参数" --socket --cmd --json ;;
+        reload|suspend|resume|metrics) _values "参数" --socket ;;
+        sysdump) _values "参数" --socket --out ;;
+        sub-parse) _values "参数" --tag --timeout --limit --json ;;
+        trace) _values "参数" --seconds ;;
+        dns-bench) _values "参数" --config --names --tags --runs --rounds --concurrency --client ;;
+        validate|export-config|extract-routing) _files ;;
+        *)
+            case "${words[CURRENT]}" in
+                -*) _describe -t options "参数" flags ;;
+                *) _files ;;
+            esac ;;
+    esac
+}
+_sodama "$@"
+"##;
+
+/// 生成指定 shell 的补全脚本（对照 dae `completion [bash|zsh|fish]`；输出到 stdout）。
+fn completion_script(shell: &str) -> Option<String> {
+    let subcmds = COMPLETION_SUBCOMMANDS.join(" ");
+    let flags = COMPLETION_FLAGS.join(" ");
+    match shell {
+        "bash" => Some(
+            COMPLETION_BASH
+                .replace("@SUBCMDS@", &subcmds)
+                .replace("@FLAGS@", &flags),
+        ),
+        "zsh" => Some(
+            COMPLETION_ZSH
+                .replace("@SUBCMDS@", &subcmds)
+                .replace("@FLAGS@", &flags),
+        ),
+        "fish" => {
+            let mut s = String::from(
+                "# sodama fish completion（由 `sodama completion fish` 生成）\ncomplete -c sodama -f\n",
+            );
+            s.push_str(&format!(
+                "complete -c sodama -n __fish_use_subcommand -a \"{subcmds}\"\n"
+            ));
+            for f in COMPLETION_FLAGS {
+                if *f == "--help" {
+                    s.push_str("complete -c sodama -s h -l help -d \"显示帮助\"\n");
+                    continue;
+                }
+                let name = f.trim_start_matches('-');
+                s.push_str(&format!("complete -c sodama -l {name}\n"));
+            }
+            Some(s)
+        }
+        _ => None,
+    }
+}
+
+/// P38：`sodama completion [bash|zsh|fish]`（对照 dae completion 子命令）。
+fn run_completion(argv: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let shell = argv.get(2).map(|s| s.as_str()).unwrap_or("");
+    match completion_script(shell) {
+        Some(s) => {
+            print!("{s}");
+            Ok(())
+        }
+        None => Err("用法: sodama completion [bash|zsh|fish]".into()),
     }
 }
 
@@ -10053,6 +10231,49 @@ mod tests {
             "[sodama] 2026-10-16 12:00:00 hello"
         );
         assert_eq!(log_line(true, "2026-10-16 12:00:00", "hello"), "[sodama] hello");
+    }
+
+    #[test]
+    fn completion_scripts_cover_subcommands_and_flags() {
+        let bash = completion_script("bash").unwrap();
+        assert!(bash.contains("complete -F _sodama sodama"));
+        assert!(bash.contains("--dialer"));
+        assert!(bash.contains("bash zsh fish"));
+        let zsh = completion_script("zsh").unwrap();
+        assert!(zsh.starts_with("#compdef sodama"));
+        assert!(zsh.contains("--compile-dump"));
+        let fish = completion_script("fish").unwrap();
+        assert!(fish.contains("__fish_use_subcommand"));
+        assert!(fish.contains("-l dialer"));
+        for sub in COMPLETION_SUBCOMMANDS {
+            assert!(bash.contains(sub), "bash 缺少子命令 {sub}");
+            assert!(zsh.contains(sub), "zsh 缺少子命令 {sub}");
+            assert!(fish.contains(sub), "fish 缺少子命令 {sub}");
+        }
+        assert!(completion_script("powershell").is_none());
+    }
+
+    #[test]
+    fn completion_artifacts_in_sync() {
+        // 预生成副本（install/shell-completion/）必须与生成器一致——防止 drift。
+        // 裁剪源码树（如打包后）无该目录时跳过。
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../install/shell-completion");
+        if !base.exists() {
+            return;
+        }
+        for (shell, file) in [
+            ("bash", "sodama.bash"),
+            ("zsh", "sodama.zsh"),
+            ("fish", "sodama.fish"),
+        ] {
+            let want = completion_script(shell).unwrap();
+            let got = std::fs::read_to_string(base.join(file)).unwrap_or_default();
+            assert_eq!(
+                got, want,
+                "{file} 与 `sodama completion {shell}` 不一致（重新生成即可）"
+            );
+        }
     }
 
     #[test]

@@ -15,6 +15,9 @@
 #   /etc/systemd/system/sodama.service        systemd 单元
 #   /etc/sodama/config.dae                    仅当不存在时从 sodama/lab/gateway.dae 拷贝
 #   /etc/sodama/blocklist.txt                 同上（gateway.dae 的 qname(file:) 相对配置目录解析）
+#   shell 补全：bash → /usr/share/bash-completion/completions/sodama
+#              zsh  → /usr/share/zsh/site-functions/_sodama
+#              fish → /usr/share/fish/vendor_completions.d/sodama.fish
 #
 # 重要：sodama.service 的 ExecStart 只是骨架，启动前必须补齐节点/订阅与数据面前置；
 # 见 docs/deploy.md（脚本结束时会打印同样的提示）。
@@ -30,10 +33,14 @@ OBJ_SRC="$MINI/ebpf-rs/target/bpfel-unknown-none/release/sodama-ebpf"
 CONFIG_SAMPLE="$MINI/lab/gateway.dae"
 BLOCKLIST_SAMPLE="$MINI/lab/blocklist.txt"
 SERVICE_SRC="$HERE/sodama.service"
+COMPLETION_SRC="$HERE/shell-completion"
 
 BIN_DST="/usr/local/bin/sodama"
 OBJ_DST="/usr/lib/sodama/sodama-ebpf"
 SERVICE_DST="/etc/systemd/system/sodama.service"
+BASH_COMP_DST="/usr/share/bash-completion/completions/sodama"
+ZSH_COMP_DST="/usr/share/zsh/site-functions/_sodama"
+FISH_COMP_DST="/usr/share/fish/vendor_completions.d/sodama.fish"
 CONFIG_DIR="/etc/sodama"
 CONFIG_DST="$CONFIG_DIR/config.dae"
 BLOCKLIST_DST="$CONFIG_DIR/blocklist.txt"
@@ -141,6 +148,16 @@ install_all() {
   run install -Dm644 "$OBJ_SRC" "$OBJ_DST"
   run install -Dm644 "$SERVICE_SRC" "$SERVICE_DST"
 
+  # P38：shell 补全（预生成副本；缺失则跳过——如裁剪源码树/发行包不含 install/）。
+  if [ -f "$COMPLETION_SRC/sodama.bash" ]; then
+    info "shell 补全（bash/zsh/fish）"
+    run install -Dm644 "$COMPLETION_SRC/sodama.bash" "$BASH_COMP_DST"
+    run install -Dm644 "$COMPLETION_SRC/sodama.zsh" "$ZSH_COMP_DST"
+    run install -Dm644 "$COMPLETION_SRC/sodama.fish" "$FISH_COMP_DST"
+  else
+    echo "   未找到 $COMPLETION_SRC（跳过；可用 sodama completion bash|zsh|fish 现拉）" >&2
+  fi
+
   info "配置样例（$CONFIG_DIR）"
   if [ -e "$CONFIG_DST" ]; then
     echo "   已存在 $CONFIG_DST：保留不覆盖"
@@ -185,6 +202,7 @@ uninstall_all() {
     run systemctl disable --now sodama.service || true
   fi
   run rm -f "$BIN_DST" "$OBJ_DST" "$SERVICE_DST"
+  run rm -f "$BASH_COMP_DST" "$ZSH_COMP_DST" "$FISH_COMP_DST"
   if [ "$DRY_RUN" -eq 0 ]; then
     rmdir /usr/lib/sodama 2>/dev/null || true
   fi
