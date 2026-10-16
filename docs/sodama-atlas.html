@@ -278,6 +278,8 @@ ol.endnotes li{margin-bottom:.5rem}
     <tr><td>11</td><td>部署自动化</td><td class="num">≈74%</td><td>systemd（<code>Type=notify</code> + <code>sd_notify</code> + 启动门禁/熔断/OOM 保护）、OpenWrt musl 交叉 + ipk + 内核 fragment + QEMU 冒烟、shell 补全；余：Docker/发行包/发行 CI</td></tr>
     <tr><td>12</td><td>运维面</td><td class="num">≈95%</td><td>状态 socket + Prometheus + CLI 取证五件套（<code>--version</code>/<code>export outline</code>/<code>trace</code>/<code>sysdump</code>/日志轮转）+ 1h 流量历史 + 告警节流 + <code>pprof_port</code> + <b>自研控制面板 v2.0</b></td></tr>
     <tr><td>13</td><td>质量工程</td><td class="num">≈87%</td><td>351 单测 + 跨实现逐字节 + QEMU 双内核矩阵 + 确定性 fuzz + fmt/clippy 门禁；余：CI 缺特权内核加载类测试</td></tr>
+    <tr><td>14</td><td>性能</td><td class="num">≈85%</td><td>同机四方（吞吐/并发/内存/UDP/codec）+ 真实 CF 节点公网轮 + 四层内存与 50k 连接；余：kTLS 异机复测、长稳 CI</td></tr>
+    <tr><td>15</td><td>真实订阅生态</td><td class="num">≈85%</td><td>订阅 #1（50×VLESS-ws）· 订阅 #2（anytls / <b>REALITY+Vision 自实现 TLS 1.3</b>）；边界外协议桥接过渡</td></tr>
     </tbody>
 </table>
 <p>面板（域 12 的落地形态）v2.0：<b>55 项</b>内核参数可视化、数据面卡片（UDP NAT/GSO、卸载记账、错误面）、
@@ -686,6 +688,7 @@ AF-XDP 否决（0058 及专文）· ECH 边界（0056）· 数据面对标（006
 
 <h3>9.3 · 数据源索引</h3>
 <table class="tight">
+  <caption>表 8 · 数据源索引（各节数字出处）</caption>
   <thead><tr><th>工件</th><th>内容</th></tr></thead>
   <tbody>
     <tr><td><code>docs/benchmark-report-v4.html</code> v4.1</td><td>本机全量强度轮 + 真实 CF 节点公网轮（§11）+ 四专题（R11/GSO/ss/offload 二分）+ ws/musl 收口修复；本图集 §4 的全部数字出处</td></tr>
