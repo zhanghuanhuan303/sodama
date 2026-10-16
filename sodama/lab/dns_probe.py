@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""DNS 客户端探针（P3a/P3b-1）：向 <server>:53 查询 <name>，打印解析结果。
+"""DNS 客户端探针（P3a/P3b-1）：向 <server>:<port> 查询 <name>，打印解析结果。
 
-用法： dns_probe.py [--tcp] [--edns <size>] <server> <name> [qtype]
+用法： dns_probe.py [--tcp] [--edns <size>] [--port <n>] <server> <name> [qtype]
+（`--port` 缺省 53；P38：`dns.bind` 用例查询 127.0.0.1:15353）
 
 输出（每行一条）：
   rcode=<n>
@@ -19,6 +20,7 @@ import sys
 argv = sys.argv[1:]
 use_tcp = False
 edns_size = 0
+port = 53
 pos = []
 i = 0
 while i < len(argv):
@@ -27,6 +29,9 @@ while i < len(argv):
     elif argv[i] == "--edns":
         i += 1
         edns_size = int(argv[i])
+    elif argv[i] == "--port":
+        i += 1
+        port = int(argv[i])
     else:
         pos.append(argv[i])
     i += 1
@@ -60,7 +65,7 @@ s = socket.socket(
 s.settimeout(5)
 try:
     if use_tcp:
-        s.connect((server, 53))
+        s.connect((server, port))
         s.sendall(struct.pack("!H", len(q)) + q)
         hdr = recv_exact(s, 2)
         if hdr is None:
@@ -68,7 +73,7 @@ try:
             sys.exit(1)
         resp = recv_exact(s, struct.unpack("!H", hdr)[0])
     else:
-        s.sendto(q, (server, 53))
+        s.sendto(q, (server, port))
         resp, peer = s.recvfrom(4096)
 except socket.timeout:
     print("timeout: no answer")

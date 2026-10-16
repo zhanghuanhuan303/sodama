@@ -7,7 +7,8 @@
   8082  TCP 纯回显（P4 relay 大流量完整性用例）
   8083  TCP 首包应答后立即关闭（半关闭回归：上游先关，客户端保持）
   9998  UDP 回显（P4 UDP NAT 用例，回复 "udp-echo-ok data=..."；P22 起 v4/v6 双栈）
-  9997  UDP 回显（P38 full-cone 用例：同一客户端 socket 向 9998+9997 双目标）
+  9997  UDP 回显（直连路径对照用；P38）
+  9996  UDP 回显（P38 full-cone 用例：同一客户端 socket 向 9998+9996 双目标）
 """
 import socket
 import threading
@@ -89,4 +90,5 @@ threading.Thread(target=serve, args=(8082, False), daemon=True).start()
 threading.Thread(target=serve, args=(8083, True, True), daemon=True).start()
 threading.Thread(target=serve_udp, args=(9998,), daemon=True).start()
 threading.Thread(target=serve_udp, args=(9997,), daemon=True).start()
+threading.Thread(target=serve_udp, args=(9996,), daemon=True).start()
 threading.Event().wait()

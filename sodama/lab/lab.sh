@@ -2226,7 +2226,11 @@ test_udp_relay() {
   "$LOADER" status --socket "$STATUS_SOCK" --json >/tmp/sodama-status-before.json
   out="$(ip netns exec "$CLIENT_NS" timeout 10 python3 "$HERE/udp_probe.py" 2.2.2.2 9998 3 0.2 2>&1 || true)"
   echo "$out"
-  echo "$out" | grep -q "reply=udp-echo-ok data=ping0 from=2.2.2.2:9998" || { echo "FAIL: UDP 未转发到真实目标/回包源地址不对"; exit 1; }
+  # P38：回包源断言更新为 10.9.9.2（wanpeer 主地址）。旧断言 2.2.2.2 是过时的：
+  # echo 夹具是通配绑定（0.0.0.0），内核按出接口主地址选回包源（2.2.2.2 只是 /32 别名）；
+  # full-cone 端点按上游**真实来源**注入回包（对照 dae Anyfrom 按上游 peer 地址缓存的语义），
+  # 而旧的 affine 路径注入的是 orig_dst（2.2.2.2）——两者都能被客户端接受，当前语义更贴真实。
+  echo "$out" | grep -q "reply=udp-echo-ok data=ping0 from=10.9.9.2:9998" || { echo "FAIL: UDP 未转发到真实目标/回包源地址不对"; exit 1; }
   echo "$out" | grep -q "^summary=3/3" || { echo "FAIL: UDP 报文丢失"; exit 1; }
   sleep 0.3
   "$LOADER" status --socket "$STATUS_SOCK" --json >/tmp/sodama-status.json
@@ -2469,11 +2473,13 @@ test_udp_cone() {
   echo "== 测试 UDP full-cone（同一客户端 src 向双目标 → 复用 1 个出口端点）=="
   local out before after
   "$LOADER" status --socket "$STATUS_SOCK" --json >/tmp/sodama-cone-before.json
-  out="$(ip netns exec "$CLIENT_NS" timeout 10 python3 "$HERE/udp_cone_probe.py" 2.2.2.2 9998 9997 2 2>&1 || true)"
+  # 双目标 = 9998/9996（都在 rules.udp.dae 里路由到 proxy → 走同一 full-cone 出口）；
+  # 回包源 = echo 夹具的出接口主地址 10.9.9.2（通配绑定；full-cone 按上游真实来源注入）。
+  out="$(ip netns exec "$CLIENT_NS" timeout 10 python3 "$HERE/udp_cone_probe.py" 2.2.2.2 9998 9996 2 2>&1 || true)"
   echo "$out"
   echo "$out" | grep -q "^summary=4/4" || { echo "FAIL: 双目标 UDP 未全部回显"; exit 1; }
-  echo "$out" | grep -q "from=2.2.2.2:9998" || { echo "FAIL: 缺 9998 的回包源"; exit 1; }
-  echo "$out" | grep -q "from=2.2.2.2:9997" || { echo "FAIL: 缺 9997 的回包源"; exit 1; }
+  echo "$out" | grep -q "from=10.9.9.2:9998" || { echo "FAIL: 缺 9998 的回包"; exit 1; }
+  echo "$out" | grep -q "from=10.9.9.2:9996" || { echo "FAIL: 缺 9996 的回包"; exit 1; }
   sleep 0.3
   "$LOADER" status --socket "$STATUS_SOCK" --json >/tmp/sodama-cone-after.json
   before=/tmp/sodama-cone-before.json
@@ -2490,6 +2496,26 @@ assert a["errors"] == b["errors"], (b, a)
 print("udp full-cone: +1 endpoint（cone=%d active=%d）" % (a["cone_sessions"], a["sessions_active"]))
 PY
   echo "PASS: UDP full-cone（双目标 4 报文复用 1 端点、回包源各异）"
+}
+
+test_dns_bind() {
+  require_root
+  echo "== 测试 dns.bind（明文 UDP 监听复用透明 DNS 全链路）=="
+  local out
+  # 监听见 root ns 的 127.0.0.1:15353（非 53 端口）——从 root ns 查询（与真实“本机 AdGuard 指上游”同形）。
+  out="$(timeout 8 python3 "$HERE/dns_probe.py" --port 15353 127.0.0.1 proxy.test 2>&1 || true)"
+  echo "$out"
+  printf '%s\n' "$out" | grep -q '^answer=10.9.10.3' || { echo "FAIL: dns.bind 未应答 proxy.test"; exit 1; }
+  # dns_probe 的输出行形如 `ancount=1 from=127.0.0.1:15353`（from 不在行首，不能锚 `^from=`）
+  printf '%s\n' "$out" | grep -q ' from=127.0.0.1:15353$' || { echo "FAIL: 回包源不是监听地址"; exit 1; }
+  grep -q '^QUERY proxy.test' "$FAKE_DNS_LOG" || { echo "FAIL: dns.bind 未走上游链路（假上游无记录）"; exit 1; }
+  "$LOADER" status --socket "$STATUS_SOCK" --json | python3 -c 'import json,sys;v=json.load(sys.stdin);d=v["dns"];assert d["bind"]=="udp://127.0.0.1:15353",d;assert d["bind_queries"]>=1,d;print("dns.bind: %s queries=%d" % (d["bind"], d["bind_queries"]))'
+  # 缓存/链路同源：第二次查询命中缓存 → 假上游只有 1 条记录
+  out="$(timeout 8 python3 "$HERE/dns_probe.py" --port 15353 127.0.0.1 proxy.test 2>&1 || true)"
+  printf '%s\n' "$out" | grep -q '^answer=10.9.10.3' || { echo "FAIL: 第二次查询失败"; exit 1; }
+  hits="$(grep -c '^QUERY proxy.test' "$FAKE_DNS_LOG" || true)"
+  [ "$hits" = "1" ] || { echo "FAIL: proxy.test 上行了 $hits 次（应 1 次；dns.bind 未共用缓存）"; exit 1; }
+  echo "PASS: dns.bind（明文监听 → routing/上游/缓存 同一链路）"
 }
 
 # P16：IPv6 全链（tproxy v6 → relay → ss v6 目标；v6 direct 内核转发对照）。
@@ -4602,6 +4628,7 @@ case "${1:-}" in
   test-pname) test_pname ;;
   forward-up) USE_FORWARD="socks5://127.0.0.1:$SOCKS5_PORT" up ;;
   dns-up) USE_RULES="$HERE/rules.dns.dae" USE_DNS_UPSTREAM="127.0.0.1:$FAKE_DNS_PORT" USE_FAKE_DNS=1 up ;;
+  dnsbind-up) USE_CONFIG="$HERE/dnsbind.dae" USE_FAKE_DNS=1 up ;;  # P38：dns.bind 明文监听
   dot-up) USE_RULES="$HERE/rules.dns.dae" USE_FAKE_DNS=1 USE_DNS_TRANSPORT=tls \
     USE_DNS_UPSTREAM="tls://127.0.0.1:$DOT_PORT?sni=localhost&insecure=1" up ;;
   test-dot) test_dot ;;
@@ -4749,6 +4776,7 @@ test-dns-udp) test_dns_udp ;;  # 显式 udp:// 上游（仅 UDP）
   test-sniff-punt) test_sniff_punt ;;  # P21：嗅探重判（direct/block/组重选）
   test-udp-idle) test_udp_idle ;;
   test-udp-cone) test_udp_cone ;;  # P38：full-cone（单客户端 src 多目标复用 1 个出口端点）
+  test-dns-bind) test_dns_bind ;;  # P38：dns.bind（明文监听复用透明 DNS 全链路）
   test-relay-offload) test_relay_offload ;;
   test-offload-lifecycle) test_offload_lifecycle ;;
   test-ss) test_ss ;;

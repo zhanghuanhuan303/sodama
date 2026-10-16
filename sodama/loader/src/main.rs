@@ -564,12 +564,23 @@ static OFFLOAD_PAUSE: OnceLock<Mutex<HashMap<MapData, SodaTuple, u8>>> = OnceLoc
 /// 出口连通性投影句柄（Array；每 2s 由 `connectivity_loop` 从组健康刷新）。
 /// 对照 dae `outbound_connectivity_map` + `resumeOutboundConnectivityUpdates`。
 static OUTBOUND_CONNECTIVITY: OnceLock<Mutex<Array<MapData, u32>>> = OnceLock::new();
+/// `outbound_connectivity_map` 项数（256 出口 × 3 domain × 2 IP 版本）。
+/// 与 `ebpf-rs/src/common.rs` 的 `SODAMA_CONNECTIVITY_MAP_SIZE` 保持一致。
+const CONNECTIVITY_MAP_SIZE: u32 = 1536;
 /// 上次投影的 dead 组数（status 用；0 = 全部存活）。
 static CONNECTIVITY_DEAD_GROUPS: AtomicU64 = AtomicU64::new(0);
 
 /// 出口连通性投影（对照 dae `control/connectivity.go:135-186`）：
 /// 仅 `dial_mode=ip` 且策略非 random/fixed 时把真实健康写入数据面；否则恒写 1
 /// （保留用户态选择/回退）。键域：outbound*6 + domain*2 + ipver（3 domain × 2 版本）。
+///
+/// P38 修复（实测）：**全键域投影**（`GROUP_INDEX_BASE..OUTBOUND_MUST_RULES`），
+/// 未被组覆盖的索引写 1。旧实现只遍历组，而 map 是零初始化 Array（0 = dead）——
+/// 「无 group 段」的配置里路由给隐式 proxy 索引（即 `GROUP_INDEX_BASE`），该索引
+/// 永远不被组覆盖 → 恒为 0 → 新流**首包**被 `flow.rs::outbound_is_alive` 门禁 SHOT
+/// （debug 实测：`route outbound=0x2` 打出后 `udp_nat.sessions_total` 不增长）。
+/// 每 tick 全量写（250 索引 × 6 = 1500 次 map set，µs 级）同时覆盖 reload 后
+/// 组集缩小留下的陈旧槽（旧代某组标死 → 新代无该组 → 槽位滞留 0 的隐患）。
 fn publish_outbound_connectivity() {
     let Some(gs_lock) = GROUP_SET.get() else {
         return;
@@ -586,28 +597,26 @@ fn publish_outbound_connectivity() {
         return;
     };
     let mut dead = 0u64;
-    for (i, g) in gs.groups.iter().enumerate() {
-        let outbound = (rules::GROUP_INDEX_BASE as usize + i) as u8;
-        if outbound >= rules::OUTBOUND_MUST_RULES {
-            break;
-        }
-        let policy = g.policy();
-        // 空组（无节点，dialer 兑底直连）不投影真实健康：sodama 特有形态，
-        // 投影 0 会把兑底流量全部阻断（dae 的组总有成员，无此形态）。
-        let publish_health = mode == 0
-            && g.member_count() > 0
-            && !matches!(
-                &*policy,
-                group::Policy::Random | group::Policy::Fixed(_) | group::Policy::FixedName(_)
-            );
-        let alive: u32 = if publish_health {
-            if g.snapshot().iter().any(|n| n.alive) {
-                1
-            } else {
-                0
+    for outbound in rules::GROUP_INDEX_BASE..rules::OUTBOUND_MUST_RULES {
+        let g = gs.groups.get((outbound - rules::GROUP_INDEX_BASE) as usize);
+        let alive: u32 = match g {
+            // 无组覆盖（无 group 段 / 组数少于索引）→ 乐观默认为存活。
+            None => 1,
+            Some(g) => {
+                let publish_health = mode == 0
+                    && g.member_count() > 0
+                    && !matches!(
+                        &*g.policy(),
+                        group::Policy::Random
+                            | group::Policy::Fixed(_)
+                            | group::Policy::FixedName(_)
+                    );
+                if publish_health && !g.snapshot().iter().any(|n| n.alive) {
+                    0
+                } else {
+                    1
+                }
             }
-        } else {
-            1
         };
         if alive == 0 {
             dead += 1;
@@ -622,12 +631,19 @@ fn publish_outbound_connectivity() {
     CONNECTIVITY_DEAD_GROUPS.store(dead, Ordering::Relaxed);
 }
 
-/// 投影循环（2s tick；幂等写，开销 = 组数 × 6 次 map set）。
-/// 首次启动晚于组构建：循环内部容忍 GROUP_SET/句柄未就绪（early return）。
+/// 投影循环（2s tick；幂等写，开销 = 250 索引 × 6 次 map set）。
+/// 首次启动晚于组构建：循环内部容忍 GROUP_SET/句柄未就绪（early return；
+/// 该窗口内 map 的乐观初值由 main 取图时的一次性全量置 1 保底）。
+///
+/// P38 修复（实测）：旧行为是「先 sleep 2s 再首次投影」，而 `outbound_connectivity_map`
+/// 是零初始化 Array——在首次投影前所有出口都是 0（dead），新流的**首包**会被
+/// `flow.rs::outbound_is_alive` 门禁 SHOT。实测现象：启动后第一个 UDP 报文/第一个 TCP
+/// 首连必失败（曾被记为「QEMU 首连抖动」，devlog §19）。改为**先投影再睡眠**，
+/// 并在启动首次下发规则后立即再投影一次（见 main 主流程）。
 fn connectivity_loop() {
     loop {
-        std::thread::sleep(Duration::from_secs(2));
         publish_outbound_connectivity();
+        std::thread::sleep(Duration::from_secs(2));
     }
 }
 
@@ -5158,6 +5174,9 @@ fn do_reload(args: &Args, ebpf: &mut Ebpf, startup: bool, fast: bool) -> ReloadO
             }
             // I6：热重载会重新编译规则/重建投影，同样回收一次分配器空闲页。
             trim_allocator();
+            // P38：规则换代后立即刷新出口连通性投影——新组索引在首次 2s tick 前
+            // 仍是全 0（dead），会把新流首包误杀（同启动期冷启动问题）。
+            publish_outbound_connectivity();
             ReloadOutcome {
                 ok: true,
                 match_sets: n,
@@ -6822,8 +6841,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     // 出口连通性投影 map：交给 2s 投影循环持有（take 后 ebpf 不再持有）。
+    // P38：取图后立即全量置 1（乐观初值）——map 零初始化 = 所有出口「死」，而
+    // GROUP_SET 的就绪晚于本处（投影循环首轮可能 early return）：该窗口内新流首包
+    // 会被门禁 SHOT（实测缺陷，见 `publish_outbound_connectivity` 注释）。
     if let Some(s) = ebpf.take_map("outbound_connectivity_map") {
-        if let Ok(arr) = Array::<MapData, u32>::try_from(s) {
+        if let Ok(mut arr) = Array::<MapData, u32>::try_from(s) {
+            for key in 0..CONNECTIVITY_MAP_SIZE {
+                let _ = arr.set(key, 1, 0);
+            }
             let _ = OUTBOUND_CONNECTIVITY.set(Mutex::new(arr));
             if let Err(e) = std::thread::Builder::new()
                 .name("connectivity".into())

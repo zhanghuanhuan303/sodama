@@ -1,0 +1,22 @@
+# P38：dns.bind 明文 DNS 监听（对照 dae `Dns.Bind`）——供 AdGuardHome/mosdns 等外部 DNS
+# 把 sodama 当上游（routing/上游/缓存与透明 DNS 完全同一链路）。
+#
+# 纯 `ip:port` = 仅 UDP；`udp+tcp://ip:port` = 同时开 TCP（RFC 1035 §4.2.2 长度前缀）。
+# 监听在 root/host ns 的 loopback（本用例仅本地可达，与真实部署“给本机 AdGuard 指上游”同形）。
+global {
+    dial_mode: 'ip'
+}
+
+dns {
+    bind: '127.0.0.1:15353'
+    upstream {
+        default: 'udp://127.0.0.1:5353'
+    }
+}
+
+routing {
+    # 启动要求 routing 段至少一条可编译规则（防空表 fail-open）；本用例只用
+    # dns.bind 明文监听（不依赖透明 DNS 抑持），给一条不会命中的 direct 规则即可。
+    dip(2.2.2.2) -> direct
+    fallback: direct
+}
