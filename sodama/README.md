@@ -74,7 +74,9 @@ P6（suspend/reload/metrics/sysdump/日志轮转/整配置热重载）已完成*
 - **P13 真网关模式（host gateway）**：`--lan none` + `lab/gateway.sh`——物理网卡不移动，
   只挂 wan egress/ingress 钩子接管**宿主自身流量**（浏览器零配置）；规则纪律：
   DNS `direct(must)` 置顶、禁用任何 `sip()`（宿主机源地址即私网）、QUIC 阻断回落 TCP；
-  一键 up/down/status/test，一键回滚无残留（ADR-0029、NOTES §11.20）
+  一键 up/down/status/test，一键回滚无残留（ADR-0029、NOTES §11.20）；
+  **接口选择（ADR-0066）**：`--lan`/`--wan` 支持 glob pattern与 `auto`（= 默认路由接口），配置键
+  `lan_interface`/`wan_interface` 同语义（CLI 优先）；懒绑定——启动无匹配不报错，接口出现后 1s 内自动补挂、消失后清理
 - **P14 用户态嗅探 + dial_mode（远端域名解析）**：TLS ClientHello SNI / HTTP/1.x Host/CONNECT
   嗅探（`MSG_PEEK` 只读采集不消费，超时默认 100ms 回退 IP）；`--dial-mode ip|domain|domain+`
   命中即交域名给节点远端解析（绕 DNS 污染）；目标地址类型化（vless/vmess 0x02、tuic 0x00、
@@ -82,7 +84,8 @@ P6（suspend/reload/metrics/sysdump/日志轮转/整配置热重载）已完成*
   状态面 `sniffing` 计数（ADR-0030、NOTES §11.21）
 - **P15 订阅 / 节点组 / 健康检查（多节点选路）**：`--subscribe <url>`（可重复）/`--group <name>`，
   config `subscription/node/group` 生效；极小 HTTP(S) 订阅拉取（3 跳重定向/chunked/webpki/
-  **优先 IPv4**/marked socket）+ base64/明文解码 + 逐行容错；filter（name 精确/keyword:/regex:/
+  **优先 IPv4**/marked socket、**`http-file://`/`https-file://` = 拉取+磁盘回退，dae 风格**）
+  + base64/明文解码 + 逐行容错；filter（name 精确/keyword:/regex:/
   subtag/`!`，行内 AND / 行间 OR）；policy（min/min_moving_avg/min_avg10/random/fixed(i)/
   `fixed('节点名')`——**名字点名**：订阅刷新重排成员索引后仍指向同一节点，
   改名/下线则自动兑底；reload 时 policy 与成员/filter 一起热应用）；
@@ -270,7 +273,8 @@ P6（suspend/reload/metrics/sysdump/日志轮转/整配置热重载）已完成*
   aya-ebpf（BTF maps，含 map-in-map 的 LPM 内层模板），**8 程序/14 map 单对象**，与 C 同名同型，
   loader 零分支；全量回归（verify/DNS/协议梯/运维/soak）在 Rust 数据面上通过；唯一路线调整：
   `bpf_loop` 因 aya-obj 的 PSEUDO_FUNC relocation 缺口改用有界循环（规则 ≤64，语义等价）
-  （见 ADR-0024、NOTES §11.14）
+  （见 ADR-0024、NOTES §11.14；**2026-10-16 已改回 `bpf_loop`**——aya-obj 0.3.0 已支持
+  PSEUDO_FUNC 重定位，规则容量对齐 dae 1024，见下「能力缺口批次」与 ADR-0066）
 - **P9+ 移除 C 数据面（完成）**：删 `ebpf/sodama.c` 与全部 `USE_EBPF_*` 回退分支
   （loader 去掉 `--ebpf-offload`；lab/bench 删 `offload-rs`/`rs-up`/`rs-dual-up` 入口）；
   `lab/lab.sh build` 只构建 Rust 对象；复跑：标准/单臂 verify 均 9/9、DNS/转发面/协议栈抽查、
@@ -293,6 +297,23 @@ P6（suspend/reload/metrics/sysdump/日志轮转/整配置热重载）已完成*
   **未过/待办**：offload 用例的 QEMU 既有抖动（随宿主状态大幅波动，基线同环境亦失败，待查注册交接竞态）、
   生产 6.12 回验（见 ADR-0065、devlog §19）
   （数据面调试开关：`SODAMA_NO_OFFLOAD_ACCOUNT=1` 跳过记账探针挂载，供 A/B 与隔离排障）
+- **能力缺口批次 #1–#4（完成，2026-10-16）**：按 `docs/capability-gap-review.md`「日常网关影响」
+  top 4 逐项落地（ADR-0066、devlog §20）——
+  **① `must_<组名>` 糖**（≡ `<组名>(must)`，含 fallback 展开；顺带修 `--config` 路径
+  丢 `(must)`/`(mark: 0x…)` 参数的静默丢语义；投递侧成套：`conn_save` 只在非 UDP-53
+  或 must 时存，TCP-53/`dns_loop` 交付分支按 conn_state 的 must 位分流——must 的 DNS
+  走普通代理流，不劫持）；
+  **② 订阅 `http(s)-file://`**（dae 风格 scheme；磁盘回退沿用 `sub-cache/<tag>.bin`，
+  与 dae `persist.d` 同口径：先解析成功再落盘，失败回退）；
+  **③ 接口懒绑定/热插拔**（`loader/src/ifwatch.rs`：`path.Match` 风格 glob +
+  `wan_interface: auto`→默认路由接口 + 1s 轮询；启动按 pattern 挂载，运行中自动补挂/清理，含 L3 记账；
+  偏离 dae 的 netlink 订阅）；
+  **④ `match_set` 容量 64 → 1024**（= dae 默认；有界循环实测上限仅 ~217，改内核 `bpf_loop`；
+  domain 位图 word/bit 改 loader 预计算写进 `match_set.value[0..2]`，跨规则拼接处重定位）。
+  实测：`cargo test` **308/308**；内核级 QEMU 7.2.8 **`verify` 12/12 + 新增 cap 阶段 5/5**
+  （`test-must` / `test-sub-file` / `test-hotplug` / `test-rules-cap`（71 match_set + 高位命中）/
+  `test-domain`），汇总行 `verify=PASS cap=PASS`（lab 另修一个 VM 环境缺口：最小 initramfs 根 ns
+  `lo` 默认 down → `lab.sh up()` 幂等拉起 + 假上游存活检查）
 
 原理与 dae 源码对照见 [NOTES.md](./NOTES.md)。
 
@@ -303,12 +324,14 @@ ebpf-rs/src/         Rust/aya-ebpf 数据面（唯一）：12 个 TC 程序（6 
                      （P17b pname 采集）+ sk_skb offload + fentry/kprobe 记账 + xdp 计量
                      + 规则 VM + conn_state + 单写者；BTF maps（含 map-in-map）
 loader/src/main.rs   Rust + aya：加载、挂钩子、setns、tproxy/UDP socket、规则下发/热重载、
-                     relay/Dialer、UDP NAT、offload 注册、janitor、只读状态面、DNS 线程
-loader/src/rules.rs  迷你规则解析 + 编译（match_set 编码 + LPM trie + regex 编译 + dump/对拍；P19 组名→outbound 索引）
+                     relay/Dialer、UDP NAT、offload 注册、janitor、只读状态面、DNS 线程、
+                     接口懒绑定/热插拔（启动 specs → `IfWatch` → 主循环每 1s 补挂/清理）
+loader/src/rules.rs  迷你规则解析 + 编译（match_set 编码 + LPM trie + regex 编译 + dump/对拍；P19 组名→outbound 索引；容量 1024；domain 位下标预计算进 value[0..2]）
 loader/src/target.rs P14：拨号目标类型（IPv4/IPv6/域名）+ 逐协议编码（vless/vmess/tuic/RFC1928/字符串；v6 形式见 P16）
 loader/src/quicsniff.rs P20：QUIC Initial SNI 嗅探（RFC 9001 解密：固定盐 HKDF + 头部保护 + AES-128-GCM + CRYPTO→ClientHello）
 loader/src/sniffer.rs P14/P18e/P20：TLS SNI / HTTP Host / h2c（preface + 最小 HPACK :authority）嗅探（纯解析函数 + MSG_PEEK 采集循环；P20 起 ClientHello 解析与 QUIC 共用）
-loader/src/subscribe.rs P15：订阅拉取（HTTP(S)/file、重定向/chunked/base64）+ 链接解析
+loader/src/subscribe.rs P15：订阅拉取（HTTP(S)/file、**`http(s)-file://`（dae 风格 scheme，ADR-0066）**、重定向/chunked/base64）+ 链接解析 + 磁盘缓存/回退（`sub-cache/<tag>.bin`）
+loader/src/ifwatch.rs 接口懒绑定/热插拔（ADR-0066）：`path.Match` 风格 glob + `auto`→默认路由接口 + 1s 轮询（/sys/class/net）+ 启动/运行中挂载去重
 loader/src/group.rs   P15/P18e：节点组 filter/policy/健康探测/失败切换（GroupRuntime）；P18e 成员热替换（replace_members 健康继承）+ udp_check_dns
 loader/src/geodata.rs P17a：v2ray .dat 读取（手写 protobuf）+ geoip/geosite 展开/搜索目录（含 XDG）/缓存
 loader/src/config.rs 全量 .dae 解析（词法/语法、include 合并、schema 校验、deferred 提取；P19 已定义组名在 routing 提取中直通）
@@ -390,7 +413,7 @@ lab/matrix/SUMMARY.md 矩阵执行结果与未覆盖项
 
 ## 依赖
 
-- Linux 内核 ≥ 5.17（有界循环；aya 在内核 ≥ 6.6 时走 TCX）
+- Linux 内核 ≥ 5.17（`bpf_loop` 路由扫描；aya 在内核 ≥ 6.6 时走 TCX）
 - Rust（cargo）与 nightly + rust-src + `bpf-linker`（编 eBPF 数据面，`lab/build-ebpf-rs.sh`）；
   libbpf 头文件（`/usr/include/bpf`）、`ip`/`tc`/`bpftool`、python3、gcc（仅 P7 基准端点 `bench_io.c`）
 - root 权限（加载 eBPF、建 netns）；对拍与矩阵的 VM 无需 root
@@ -663,7 +686,8 @@ fallback -> direct
 - `domain` 支持 `suffix:` / `full:` / `keyword:` / `regex:` 四种 key，带 key 参数需与 DNS 接管配合（P3a）
 - `regex:` 在规则编译期编译（非法正则硬失败）；匹配小写化 qname、模式保持原大小写（与 dae 一致）
 - 运算符：`!`（取反）、`&&`（连接函数）；函数内逗号 = OR
-- outbound：`direct / block / proxy / must_rules`，参数 `mark: 0xNNN`、`must`
+- outbound：`direct / block / proxy / must_rules`，参数 `mark: 0xNNN`、`must`；
+  **`must_<组名>` 前缀糖 ≡ `<组名>(must)`**（dae 同形；未定义组仍回退 proxy 但 must 语义不丢，ADR-0066）
 - 未支持：无（dae 现有 routing 函数全覆盖）；`geoip` 的 `inverse_match` 是硬错误（dae 同）；
   pname 用 comm 而非 argv basename（见 ADR-0033）
 

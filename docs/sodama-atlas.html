@@ -186,7 +186,7 @@ ol.endnotes li{margin-bottom:.5rem}
 <div class="classbar">
   <span class="cls">密级 · 最高</span>
   <span>SODAMA ATLAS · 内部研究档案 · 未经许可不得外传</span>
-  <span class="push">v1.4 · 2026-10-16 · main@2026-10-16 数据面对标批次收口后</span>
+  <span class="push">v1.5 · 2026-10-16 · main@2026-10-16 能力缺口批次 #1–#4 入库后</span>
 </div>
 
 <div class="page">
@@ -234,7 +234,7 @@ ol.endnotes li{margin-bottom:.5rem}
   <p><strong>一句话结论。</strong>sodama 以个位数到两位数 MB 的<em class="term">用户态</em>内存与恒定线程数承载高并发连接；真实上限由<strong>内核内存</strong>与<strong>加密协议 CPU</strong>决定，而不是线程或用户态分配器。<span class="sn">这是全篇最重要的口径纪律：<b>用户态优势 ≠ 系统优势</b>。20 000 连接时 sodama 的用户态仅占系统总增量的约 2.5%，其余在内核对象（socket、inode、pipe、dentry）。只报 RSS 是<strong>不完整</strong>的。</span></p>
 </div>
 
-<p>以上为第一阶段收口口径。<strong>v1.1 新增 <a href="#s8">§8 · 第二阶段 · 生产实战轮</a></strong>——真实软路由上的四轮侦查/修复与稳态观测。<strong>v1.2 增量</strong>：探测/订阅治理（CF 额度事故 → 6× 超速归零，ADR-0064）、AF-XDP 预研的条件性否决、<strong>内存安全审计（unsafe 专项）</strong>及其修复批上线——2d5h39m 生产数据比对把「拨号看门狗未解除」实锤为 DoH 连接 3 s 生命周期并已修复、把「退出残留」预测证伪降级；新一轮 72h 生产测试进行中（§8.4–§8.6 与 <code>docs/memory-safety-audit.html</code>）。<strong>v1.3 增量</strong>：<strong>数据面对标批次</strong>——L3 链路头变体（TC 程序 7 → 12）、ringbuf 事件通道、<code>skb_send_sock</code> 记账（fentry/kprobe，用户态 BTF 解析替代 CO-RE）、XDP 计量探针；合计 22 程序 / 22 map，eBPF 数据面覆盖度 ≈65% → <strong>≈85%</strong>（§8.7 与 <code>docs/adr/ADR-0065-l3-link-hdr-ringbuf-events-fentry-accounting-xdp.md</code>）。<strong>v1.4 增量</strong>：<strong>数据面对标批次收口</strong>——L3 端到端过关并入 <code>verify</code> 门禁（12/12，ipip 隧道 512KB 逐字节回显）；回程改为「只 redirect、不剥头」（实测修正多剥 14 B 的缺陷）；同批修掉两处 lab 工具缺陷（回显夹具 8 次读上限→大流误 RST；<code>net_offload.py</code> 指针段错误）与一处探针版本字节误读（§8.7）。</p>
+<p>以上为第一阶段收口口径。<strong>v1.1 新增 <a href="#s8">§8 · 第二阶段 · 生产实战轮</a></strong>——真实软路由上的四轮侦查/修复与稳态观测。<strong>v1.2 增量</strong>：探测/订阅治理（CF 额度事故 → 6× 超速归零，ADR-0064）、AF-XDP 预研的条件性否决、<strong>内存安全审计（unsafe 专项）</strong>及其修复批上线——2d5h39m 生产数据比对把「拨号看门狗未解除」实锤为 DoH 连接 3 s 生命周期并已修复、把「退出残留」预测证伪降级；新一轮 72h 生产测试进行中（§8.4–§8.6 与 <code>docs/memory-safety-audit.html</code>）。<strong>v1.3 增量</strong>：<strong>数据面对标批次</strong>——L3 链路头变体（TC 程序 7 → 12）、ringbuf 事件通道、<code>skb_send_sock</code> 记账（fentry/kprobe，用户态 BTF 解析替代 CO-RE）、XDP 计量探针；合计 22 程序 / 22 map，eBPF 数据面覆盖度 ≈65% → <strong>≈85%</strong>（§8.7 与 <code>docs/adr/ADR-0065-l3-link-hdr-ringbuf-events-fentry-accounting-xdp.md</code>）。<strong>v1.4 增量</strong>：<strong>数据面对标批次收口</strong>——L3 端到端过关并入 <code>verify</code> 门禁（12/12，ipip 隧道 512KB 逐字节回显）；回程改为「只 redirect、不剥头」（实测修正多剥 14 B 的缺陷）；同批修掉两处 lab 工具缺陷（回显夹具 8 次读上限→大流误 RST；<code>net_offload.py</code> 指针段错误）与一处探针版本字节误读（§8.7）。<strong>v1.5 增量</strong>：<strong>能力缺口批次 #1–#4</strong>（§8.8 与 <code>docs/adr/ADR-0066-capability-gap-batch-1-4.md</code>）——<code>must_&lt;组名&gt;</code> 糖（+ must 投递侧语义，不再静默变 proxy）、订阅 <code>http(s)-file://</code>（+ 磁盘回退口径）、接口懒绑定/热插拔（<code>ifwatch</code> 1 s 轮询 + glob + <code>auto</code>）、规则容量 64 → <strong>1024</strong>（<code>bpf_loop</code>，domain 位下标改 loader 预计算）；内核级 <code>verify 12/12</code> + 新增 <code>cap 5/5</code>（§8.8）。</p>
 </section>
 
 <nav class="toc">
@@ -982,9 +982,9 @@ ol.endnotes li{margin-bottom:.5rem}
 <p><strong><code>skb_send_sock</code> 记账。</strong>fentry 优先、kprobe 回退挂同一函数（共用 <code>account()</code> 主体）；aya 无 CO-RE 字段访问，替代物是 loader 侧 <code>btfoff.rs</code> 的最小 BTF 解析器（纯 std，从 <code>/sys/kernel/btf/vmlinux</code> 解出 <code>sk_buff</code> 字段偏移写 <code>trace_param_map</code>，数据面用 <code>bpf_probe_read_kernel</code> 读）——真机 6.18 解得 <code>network_header=184 / transport_header=182 / tail=188 / head=200</code>，与 <code>pahole</code> 逐项一致。先查 <code>offload_guard</code> 过滤（只记本进程注册的 offload 键），再 per-CPU 累加 <code>offload_sent</code>；键摘除时回收进 <code>status.offload_sent.{reclaimed_bytes, kernel_bytes, account_drops}</code>。<strong>边界</strong>：只做计量，未做 dae 的 per-key 背压 fuse（登记为余项）。</p>
 <p><strong>XDP 计量探针。</strong><code>sodama_xdp_observe</code> 恒返回 <code>XDP_PASS</code>、只计数（包 / 字节 / IPv4 / IPv6 / 其它），<code>--xdp &lt;iface&gt;</code> 可选挂载、失败仅告警；<code>status.xdp</code> 区分「0 包」与「没有探针」。定位是 C4 的<strong>最小计量探针</strong>——数据面搬 XDP 仍维持 §8.3 的否决。</p>
 <p><strong>实测口径。</strong>本机构建 + section/符号/map 容量核对（<code>event_ringbuf</code>=262144、<code>event_rate_map</code>=259、<code>l3_ifindex_map</code>=64、<code>offload_sent</code>=8192、<code>xdp_stats_map</code>=8、<code>sodama_stats_map</code>=16；<code>SodaEvent</code>=72 B）；<code>cargo test</code> <strong>302/302</strong>；musl x86_64 交叉构建 <code>sodama 7.7M · sodama-ebpf 772K</code>（eBPF 对象 496K → 772K）；clippy 无新增 error。<strong>内核级</strong>：QEMU 内核矩阵（7.2.8）<code>verify</code> <strong>12/12 PASS</strong>（含 <code>l3</code> 端到端）、fentry 挂载与记账计数实测、xdp 计数实测；并借此抓到并修掉四处真实缺陷：探针版本字节误读（<code>head+0</code> → <code>head+nh</code>，<code>parse_fail</code> 由 100% 归零）、L3 回程多剥 14 B（改为只 redirect）、回显夹具 8 次读上限（>32KB 必 RST，曾误诊为 MTU 问题）、<code>net_offload.py</code> 指针段错误（<code>id(buf)</code> 当内核指针）。本批先入库、暂未部署：生产部署会切断当前 72h 窗口（§8.6 世代）并重置计数，时机由用户决定（devlog §19）。</p>
-</section>
-
-<section id="s9">
+<h3>8.8 · 能力缺口批次 #1–#4：must 糖 · 订阅 -file · 接口热插拔 · 规则容量 1024（§20，ADR-0066）</h3>
+<p>同日清点文档 <code>docs/capability-gap-review.md</code>（110 行判定）排出「日常网关影响」前四缺口，本批逐一落地。<strong>#1 <code>must_&lt;组名&gt;</code> 糖</strong>：此前只特判 <code>must_direct</code>，其余 <code>must_&lt;名&gt;</code> <strong>静默变 proxy</strong>（DNS 会被劫持，正是 must 想避免的）；现等价于 <code>&lt;名&gt;(must)</code>（含 fallback 展开），并顺带修掉 <code>--config</code> 路径丢 <code>(must)</code>/<code>(mark: 0x…)</code> 参数的静默丢语义。must 的<strong>投递侧</strong>成套落地：数据面只在「非 UDP-53 或 must」时存 <code>conn_state</code>，控制面 TCP-53/<code>dns_loop</code> 两个交付分支按回读的 must 位分流（must 的 DNS 走普通代理流，不劫持）。<strong>#2 订阅 <code>http(s)-file://</code></strong>：dae 风格 scheme 映射到普通 <code>http(s)://</code>（<code>normalize_url</code>），磁盘回退沿用既有 <code>sub-cache/&lt;tag&gt;.bin</code>（与 dae <code>persist.d</code> 同口径：先解析成功再落盘，失败回退）。<strong>#3 接口懒绑定/热插拔</strong>：新模块 <code>ifwatch.rs</code>（<code>path.Match</code> 风格 glob + <code>wan_interface: auto</code> → 默认路由接口 + 1 s 轮询），启动按 pattern 挂载、运行中自动补挂/清理（含 L3 接口记账）——<strong>偏离</strong> dae 的 netlink 订阅。</p>
+<p><strong>#4 <code>match_set</code> 容量 64 → 1024</strong>（= dae 默认，ADR-0066）：有界循环路线经实测不可行（verifier 成本 ≈4600 processed insn/迭代，上限仅 ~217），改用内核 <code>bpf_loop</code>（aya-obj 0.3.0 已支持 <code>BPF_PSEUDO_FUNC</code> 重定位，P9 时代的缺口已消失；成本与迭代数无关，<code>verification time</code> 仅 ~13–18 ms）。三个坑：回调须经 <code>BPF_PSEUDO_FUNC</code>；<code>callback_ctx</code> 只能传栈指针或 NULL；回调的 u32 参数不可参与数组下标——因此 <strong>domain 位图的 word/bit 改为 loader 预计算</strong>写进 <code>match_set.value[0..2]</code>（跨规则拼接处必须重定位，此处单测抳到并修掉一处真实缺陷）。<span class="sn">内核级验收（QEMU 7.2.8）：<code>verify</code> <strong>12/12</strong> 不回退；新增 <b>cap 阶段 5/5 全绿</b>（<code>test-must</code> / <code>test-sub-file</code> / <code>test-hotplug</code> / <code>test-rules-cap</code>（71 match_set + 高位规则命中）/ <code>test-domain</code>（域位图端到端回归）），汇总行 <code>verify=PASS cap=PASS</code>；单测 302 → <strong>308/308</strong>。期间排掉一个 VM 环境缺口：最小 initramfs 里根 ns <code>lo</code> 默认 down，依赖 <code>127.0.0.1</code> 的夹具（ss 后端/假上游）会得到误导性失败—— <code>lab.sh up()</code> 现幂等拉起 <code>lo</code>，假上游加存活检查（devlog §20）。</span>本批先入库、暂未部署：上线会切断当前 72h 窗口，时机由用户决定。</p>
 <h2><span class="num">§9</span>复现与索引 · 命令、ADR、数据源</h2>
 
 <h3>9.1 · 复现命令</h3>
@@ -1009,7 +1009,7 @@ sudo lab/perf/soak-curve.sh run 3600
 # OpenWrt 交叉构建（musl 静态）
 lab/build-openwrt.sh --arch x86_64</code></pre>
 
-<h3>9.2 · ADR 索引（65 篇）</h3>
+<h3>9.2 · ADR 索引（66 篇）</h3>
 <p>ADR 记录「<em>为什么这么做</em>」，<code>parity-status.md</code> 记录「<em>做到了哪里</em>」；两处不一致时以 ADR + NOTES 实测为准。</p>
 
 <table class="tight">
@@ -1024,7 +1024,7 @@ lab/build-openwrt.sh --arch x86_64</code></pre>
     <tr><td>DNS 深化</td><td>0034–0040</td><td>DoT/DoH · DoQ · dns.routing · 名单文件 · ECS 与 sip · 应答侧 sip 与 bench · pname 与并发</td></tr>
     <tr><td>协议细节与扩展</td><td>0041–0056</td><td>REALITY+Vision · 批量收尾 · 多组分派 · QUIC SNI · sniff-punt · UDP v6 · sticky/H2/bootstrap · 指纹对齐 · naive · HTTP/3 · juicity · ecs_cache · optimistic refresh · SSR · shadow-tls · <b>ECH 边界</b></td></tr>
     <tr><td>性能与配置阶段</td><td>0057–0063</td><td>M3 Vision over TLS · <b>M4 Reactor</b> · I6 零线程握手 · P33 运行参数热更新 · P34 订阅顺序与默认配置 · P35 inotify 与唯一事实来源 · P36 规则集与用户名单</td></tr>
-    <tr><td>生产治理与数据面对标</td><td>0064–0065</td><td>P37 探测活跃信号与订阅拉取模式 · 数据面对标批次：L3 链路头 · ringbuf 事件 · fentry/kprobe 记账 · XDP 计量</td></tr>
+    <tr><td>生产治理与数据面对标</td><td>0064–0066</td><td>P37 探测活跃信号与订阅拉取模式 · 数据面对标批次：L3 链路头 · ringbuf 事件 · fentry/kprobe 记账 · XDP 计量 · 能力缺口批次 #1–#4：must 糖 · 订阅 -file · 接口热插拔 · 规则容量 1024</td></tr>
   </tbody>
 </table>
 
@@ -1067,13 +1067,13 @@ lab/build-openwrt.sh --arch x86_64</code></pre>
   <li id="fn7"><code>docs/adr/ADR-0058-m4-reactor.md</code>——epoll worker 池、stage 1/2 划分、io_uring A/B 结论与关闭开关。</li>
   <li id="fn8"><code>docs/adr/ADR-0025-remove-c-datapath.md</code>——C 数据面退役；配合 ADR-0023/0024 的两阶段迁移。</li>
   <li id="fn9"><code>docs/adr/ADR-0062-p35-inotify-fast-reload-config-source-of-truth.md</code>——配置文件作为唯一事实来源与 inotify 毫秒级热驱动；配合 ADR-0061/0063。</li>
-  <li id="fn10"><code>docs/phase2-devlog.md</code>（§1–§19，2026-10-08 起）——第二阶段 · 生产实战轮：四轮侦查/修复/验收的完整证据、P37/P37b 治理、审计修复批上线回验与两轮 72h 生产测试记分板、数据面对标批次与其未实测边界（§19）、附 A/B 台账。</li>
+  <li id="fn10"><code>docs/phase2-devlog.md</code>（§1–§20，2026-10-08 起）——第二阶段 · 生产实战轮：四轮侦查/修复/验收的完整证据、P37/P37b 治理、审计修复批上线回验与两轮 72h 生产测试记分板、数据面对标批次（§19）与能力缺口批次 #1–#4（§20）、附 A/B 台账。</li>
 </ol>
 </section>
 
 <div class="colophon">
-  <p><strong>SODAMA ATLAS</strong> · 全 Rust 代理数据面开发研究图集 · v1.4 · 2026-10-16 · 对应代码 <code>main@2026-10-16 数据面对标批次收口后</code>（内存安全审计修复批上线后 + 本批次入库）。</p>
-  <p>v1.1 增量：<a href="#s8">§8 · 第二阶段 · 生产实战轮</a>——四轮生产侦查/修复的收口结论与修复后稳态；原始证据见 <code>docs/phase2-devlog.md</code>。<br>v1.2 增量：§8.4–§8.6——P37/P37b 探测与订阅治理（ADR-0064）、AF-XDP 预研否决、内存安全审计（unsafe 专项）与修复批上线回验、新一轮 72h 生产测试进行中。<br>v1.3 增量：§8.7——数据面对标批次：L3 链路头变体（TC 7 → 12）、ringbuf 事件通道、<code>skb_send_sock</code> fentry/kprobe 记账、XDP 计量探针（ADR-0065、devlog §19）——合计 22 程序 / 22 map，eBPF 数据面覆盖度 ≈65% → ≈85%（带未实测边界）。<br>v1.4 增量：§8.7 收口——L3 端到端过关并入 <code>verify</code> 门禁（12/12，ipip 隧道 512KB 逐字节回显）、回程改为「只 redirect、不剥头」（修正多剥 14 B）；同批修掉回显夹具 8 次读上限与 <code>net_offload.py</code> 指针段错误两处缺陷。</p>
+  <p><strong>SODAMA ATLAS</strong> · 全 Rust 代理数据面开发研究图集 · v1.5 · 2026-10-16 · 对应代码 <code>main@2026-10-16 能力缺口批次 #1–#4 入库后</code>（内存安全审计修复批上线 + 数据面对标批次 + 本批次）。</p>
+  <p>v1.1 增量：<a href="#s8">§8 · 第二阶段 · 生产实战轮</a>——四轮生产侦查/修复的收口结论与修复后稳态；原始证据见 <code>docs/phase2-devlog.md</code>。<br>v1.2 增量：§8.4–§8.6——P37/P37b 探测与订阅治理（ADR-0064）、AF-XDP 预研否决、内存安全审计（unsafe 专项）与修复批上线回验、新一轮 72h 生产测试进行中。<br>v1.3 增量：§8.7——数据面对标批次：L3 链路头变体（TC 7 → 12）、ringbuf 事件通道、<code>skb_send_sock</code> fentry/kprobe 记账、XDP 计量探针（ADR-0065、devlog §19）——合计 22 程序 / 22 map，eBPF 数据面覆盖度 ≈65% → ≈85%（带未实测边界）。<br>v1.4 增量：§8.7 收口——L3 端到端过关并入 <code>verify</code> 门禁（12/12，ipip 隧道 512KB 逐字节回显）、回程改为「只 redirect、不剥头」（修正多剥 14 B）；同批修掉回显夹具 8 次读上限与 <code>net_offload.py</code> 指针段错误两处缺陷。<br>v1.5 增量：§8.8——能力缺口批次 #1–#4：<code>must_&lt;组名&gt;</code> 糖 + must 投递侧语义、订阅 <code>http(s)-file://</code> + 磁盘回退、接口懒绑定/热插拔（<code>ifwatch</code>）、<code>match_set</code> 容量 64 → 1024（<code>bpf_loop</code>；ADR-0066、devlog §20）——内核级 <code>verify 12/12</code> + 新增 <code>cap 5/5</code>，单测 302 → 308。</p>
   <p>本图集为单文件 HTML，样式与图表全部内联（SVG），无外部依赖。排版遵循 Tufte 式书卷原则：正文窄栏、边注旁置、数据优先、表格无竖线、图表与正文同宽、克制用色。</p>
   <p>所有数字均为本机或真实环境实测，未做外推；所有「未做」项均显式登记。口径与边界见 §5.3。项目以 AGPL-3.0 授权（许可证头一致性审计待办，见 §7 A8）。</p>
 </div>
@@ -1084,7 +1084,7 @@ lab/build-openwrt.sh --arch x86_64</code></pre>
 <div class="classbar bottom">
   <span class="cls">密级 · 最高</span>
   <span>SODAMA ATLAS · 内部研究档案 · 未经许可不得外传</span>
-  <span class="push">v1.4 · 2026-10-16</span>
+  <span class="push">v1.5 · 2026-10-16</span>
 </div>
 
 </body>

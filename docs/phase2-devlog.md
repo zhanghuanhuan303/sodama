@@ -1224,6 +1224,122 @@ worker 停摆现象加诊断日志后未再复现；全链路日志（“后台�
 
 ---
 
+## 20 · 能力缺口批次 #1–#4：must 糖 · 订阅 -file scheme · 接口热插拔 · match_set 容量 1024（2026-10-16）
+
+对应 `docs/capability-gap-review.md`「top 10 缺口」的 #1–#4（用户指令「先做到 1-4」）；
+决策与偏离清单见 ADR-0066。
+
+### 侦查（源码实测，均有行号）
+
+1. **dae 的 `must_<组名>` 糖**：`dae/config/patch.go:71-95`（`patchMustOutbound`：`must_<name>` →
+   `<name>(must)`，fallback 的 `must_x` 同样展开）+ `dae/docs/zh/configuration/routing.md:14`
+   （文档明示 `must_groupname` ≡ `groupname(must)`，语义是「不劫持/处理 DNS」）。
+2. **dae 的订阅 `-file` scheme**：`dae/common/subscription/subscription.go:171-179`（`http-file`/
+   `https-file` 识别）、`:213-241`（**先解析成功再落盘** `persist.d/<tag>.sub`，失败回退磁盘）。
+3. **dae 的接口热插拔**：`dae/component/interface_manager.go:38-50`（netlink 订阅 + `path.Match` +
+   up/down 去重）、`dae/cmd/run_config.go:144-157`（`wan_interface: auto` → `GetDefaultIfnames`）、
+   `dae/control/control_plane_core_bind.go:487+`（接口出现时补挂）。
+4. **dae 的容量口径**：`dae/Makefile:14`（`MAX_MATCH_SET_LEN ?= 1024`）、
+   `dae/control/kern/tproxy.c:359/380`（`routing_map` 2×1024、`lpm_array_map` 同量级）——sodama 此前
+   64（P9 有界循环路线，ADR-0024）。
+
+### 实施
+
+- **#1 must 糖 + must 投递侧（`config.rs`/`flow.rs`/`main.rs`）**：`map_outbound` 重写
+  （`config.rs:1710`，`must_<名>` → `<名>(must)`，`must_rules` 保留；未定义组仍 K3 兼容回退 proxy
+  但 `(must)` 不丢）；新增 `apply_outbound_params`/`split_outbound_params`（`:1765/:1797`），
+  **修掉 `--config` 路径静默丢 `(must)`/`(mark: 0x…)` 参数**（`extract_routing` 此前只取 `.name`）。
+  数据面 `conn_save` 条件改为「非 UDP-53 **或** must」（`flow.rs:326`）；交付侧新增
+  `lookup_conn_state`（`main.rs:3097`），TCP-53 劫持分支加 `must == 0`（`:2514-2529`），UDP 监听器
+  `dns_loop` 的 53 分支按 conn_state 的 must 位走 NAT（`:7279-7285`）。
+- **#2 订阅 scheme（`subscribe.rs`）**：`normalize_url`（`:33`）映射 `https-file://`→`https://`、
+  `http-file://`→`http://`，接入 `fetch`/`fetch_lenient`/`fetch_once`、URL 文件间接路径
+  （`url_file_target` 改返回 `Option<String>`）与 `main.rs::resolve_sub_url`（缓存键一致性）。
+  磁盘落盘/回退机制本就存在（`subscribe.rs:639-680`，`sub-cache/<tag>.bin`），本批只补 scheme。
+- **#3 接口懒绑定/热插拔（新模块 `ifwatch.rs`）**：`pattern_matches`（`path.Match` 风格 glob 含
+  `[...]`/`[!...]`，`:46`）、`list_interfaces`（读 `/sys/class/net`，`:138`）、`parse_default_v4/v6` +
+  `default_route_ifaces`（`:151/:163/:181`）、`expand_auto`（`:203`）、`IfWatch::{poll,initial,roles_for}`
+  （`:228-285`）。`main.rs`：`Args.lan_given/wan_given`（`:1386`）、`split_iface_list`（`:2192`）、
+  `attach_role`（`:2140`，启动/watcher 共用；`register_l3_ifindex` 改 `Option<u32>` +
+  `unregister_l3_ifindex` `:2128`）；启动挂载改 specs → `IfWatch` → `initial` → `attach_role`
+  （`:6039-6044`），主循环每 1s `poll()` 补挂/清理（`:6352-6374`，含 `HOOKS`/`l3_mounts` 记账）；
+  config 的 `lan_interface`/`wan_interface` 回填（CLI 优先）。**偏离 dae**：1s 轮询替代 netlink 订阅。
+- **#4 容量 1024（`common.rs`/`maps.rs`/`rules.rs`/`route.rs`）**：`SODAMA_MAX_MATCH_SET_LEN = 1024`
+  （`common.rs:14`）、`SodaDomainRouting.bitmap` → `[u32; MAX/32]`（`:311`）、`routing_map` =
+  `Array<SodaMatchSet, 2*MAX>`（`maps.rs:24`）、`lpm_array_map` = `ArrayOfMaps<_, 2*MAX+8>`（`:18`）。
+  **扫描改内核 `bpf_loop`**（`route.rs:253-260`；aya-obj 0.3.0 已支持 `BPF_PSEUDO_FUNC` 重定位——
+  ADR-0024 时代的缺口已修）；回调 `route_bpf_loop_cb`（`:275`，`extern "C" fn(u32, *mut c_void) -> i64`），
+  `ctx` 传 NULL，上下文从 `route_ctx_scratch_map` 取回。**domain 位下标改 loader 预计算**：
+  word/bit 写进 `match_set.value[0..2]`（`rules.rs:1035-1039`；跨规则拼接处的重定位 `:1136-1137`），
+  数据面 `route_match_domain_set`（`route.rs:48`）从 value 读 + 单边界检查。
+- **lab 编排**：新夹具 `lab/must.dae`；`lab.sh` 新增 8 个目标（`must-up/test-must`、
+  `subfile-up/test-sub-file`、`hotplug-up/test-hotplug`、`rulecap-up/test-rules-cap`，`:3295-3490`）；
+  `vm-init.sh` 增 cap 阶段（5 对用例，输出 `cap=` 汇总项）。
+
+### `bpf_loop` 路线的实测数据与三个坑（#4 的决策依据）
+
+有界循环路线**不可行**：verifier 复杂度随上界线性增长，子程序形态实测 **≈4600 processed insn/迭代**
+（1024/768/640/512/448/320/160 全部撞 1M processed insn 墙或 8193 jump 序列墙，死在 ~217/~342 次
+迭代）；`#[inline(always)]` 更差（会话爆 ≈8900/迭代，上限 ≈112）。`bpf_loop` 成本与迭代数无关
+（`verification time` 仅 ~13–18ms）。三个坑（都已解）：
+
+1. 回调必须经 `BPF_PSEUDO_FUNC` relocation（aya-obj 0.3.0 起支持，旧版报
+   `callback function not static`）；
+2. `callback_ctx` 只能传栈指针或 NULL——传 map value 报 `R3 type=map_value expected=fp`；
+3. 回调的 `u32` 参数不可参与数组下标：LLVM 会二次物化参数、verifier 无法把上界传下去
+   （`bitmap[(index>>5)]` 报越界可能）——**domain 位下标因此改为 loader 预计算**（见上）。
+
+同类陷阱：`nrv = min(MAX-1)` 钳制与 `& (MAX-1)` 掩码都会被 LLVM 折叠（无效）；两个同形边界检查
+写成 `a >= X \|\| b >= Y` 会被合并成 OR 测试、verifier 无法回推单边上界（`route.rs:55-57` 注释）。
+
+### 单测抓到并已修的真实缺陷
+
+**跨规则拼接时的 domain 位下标重定位遗漏**：`parse_and_compile_full` 合并多段规则时此前只重定位
+LPM 的 `value[0..4]`，`base` 偏移下的 domain word/bit 下标错位（会静默指到错误位图字）——
+单测 `domain_rules_compile_to_bitmap_sets` 抓到，修于 `rules.rs:1136-1137`。这正是 #4 的
+`test-domain`（cap 阶段）守的回归面。
+
+### 验收（本机已实测）
+
+| 项 | 结果 |
+|---|---|
+| 单测 | `cargo test --release` **308/308**（新增 must 糖/参数保留/`normalize_url`/`ifwatch` 3 项/domain 位下标 3 处断言） |
+| 离线规则核对 | `--compile-dump lab/rules.dns.dae`：`direct(must)` → `must=1`；DomainSet 槽 `outbound=0xff`（AND 中间条件，不结算）；6 槽序与预期一致 |
+| eBPF 对象 | `cargo +nightly build --release`（bpfel）通过；1024 上界的 `bpf_loop` 形态 verifier 接受（VM 内实测） |
+
+### 内核级验收（QEMU 内核矩阵，内核 7.2.8-arch1-2，已实测）
+
+`MATRIX-RESULT kernel=7.2.8-arch1-2 verify=PASS offload=FAIL cap=PASS`：
+
+| 项 | 结果 | 证据 |
+|---|---|---|
+| 回归门禁 | `verify=PASS` 12/12（原门禁不回退） | `lab/matrix/out/vm-kernel-7.2.8-arch1-2.log` |
+| #1 must 投递 | ✅ `cap/test-must` | `must.dae`（`l4proto(udp) && dport(53) -> must_proxy`）下 DNS 查询不被劫持（`queries` 不增长）、代理交付正常 |
+| #2 订阅 -file | ✅ `cap/test-sub-file` | `订阅 lab: 拉取成功，2 个节点` + `sub-cache/lab.bin` 落盘 + 源掉线 SIGHUP 回退磁盘缓存后拨号成功 |
+| #3 热插拔 | ✅ `cap/test-hotplug` | 启动日志 `iface: lan 模式 "hplug*" 当前无匹配接口（懒绑定：出现后自动挂载）`；创建 → 补挂 → 分流、删除 → 清理、重加 → 再挂 |
+| #4 容量/高位 | ✅ `cap/test-rules-cap` | `rules: 71 match_sets` + `PASS: 高位规则命中`（index≥64 的 match_set 生效） |
+| domain 回归 | ✅ `cap/test-domain` | dns_probe `answer=10.9.10.3` + 状态面 `bitmap_matched=1`/`domain_routing=1`；假上游日志 `QUERY proxy.test` |
+| offload | ❌ 信息项（既有环境抖动，与 §19 同因，非本批引入） | 与基线同环境同样失败 |
+
+### 环境缺口与 lab 加固（本轮踩到）
+
+QEMU 最小 initramfs 里**根 ns 的 `lo` 默认是 down**（veth/netns 内的 lo 由 lab 显式拉起，根 ns 没有）：
+凡依赖 `127.0.0.1` 的夹具（ss 等后端、假上游 DNS）全部得到误导性失败（`Cannot assign requested
+address` / `Network is unreachable`），而默认 `up`（verify 阶段）恰好不依赖 127.0.0.1 —— 因此直到
+cap 阶段才暴露。修复（`lab/lab.sh`）：
+
+1. `up()` 开头幂等 `ip link set lo up`（`:528`）；
+2. 假上游加存活检查（`:855`，失败即 die 并打印 stdout）——此前该夹具静默失败，把 DNS 用例的超时
+   归因引向了错误方向（loader 日志里的 `Network is unreachable` 才是真因）。
+
+### 未通过 / 待办（诚实边界）
+
+1. **offload 仍为信息项**（同 §19：QEMU 环境抖动，非本批引入）；
+2. 热插拔是 1s 轮询（非 netlink），接管时延未做量化（记录为偏离 #1）；接口移除不主动清理已建连接；
+3. `wan_interface: auto` 只取默认路由接口（dae `GetDefaultIfnames` 的全量语义未逐条对齐）；
+4. domain 位图的 `value[0..2]` 是 loader↔数据面的载荷契约，**两侧必须同批升级**（旧 loader + 新对象
+   的域分流必然错配——本轮就因 loader 二进制未重建而误诊过一轮，教训：改 eBPF 后必须重建 loader）。
+
 ---
 
 ## 附 A · 路由器侧工具清单（**不入库**，仅存在于软路由）
