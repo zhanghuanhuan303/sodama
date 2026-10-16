@@ -1171,15 +1171,13 @@ worker 停摆现象加诊断日志后未再复现；全链路日志（“后台�
   `attach_offload_accounting`（BTF → `trace_param_map` → fentry→kprobe 回退）、
   事件消费线程（poll+排空、1 条/秒/类型日志限速）、`offload_sent_reclaim`（键摘除时汇总）、
   status 新增 `events`/`offload_sent`/`xdp` 三块 + 9 个 metrics 计数。
-
-### 验收（本机已实测）
-
-| 项 | 结果 |
-|---|---|
-| 数据面构建 | `cargo +nightly build --release` 通过；section `fentry/skb_send_sock`/`kprobe/skb_send_sock`/`xdp` 均在（`llvm-readelf`）；5 个 `*_l3` 符号在（`llvm-nm`） |
-| map 容量与结构 | `bpftool btf dump`：`event_ringbuf`=262144、`event_rate_map`=259、`l3_ifindex_map`=64、`offload_sent`=8192、`xdp_stats_map`=8、`sodama_stats_map`=16；`SodaEvent`=72B、`SodaTraceParam`=16B |
-| BTF 解析 | 302 tests passed（含 `btfoff` 14 项）；真机 `/sys/kernel/btf/vmlinux` 解出 `network_header=184, transport_header=182, tail=188, head=200`，与 `pahole` 逐项一致 |
-| 构建与 CLI | musl 交叉（x86_64）通过：`sodama 7.7M · sodama-ebpf 772K`；`--help`/`--link-hdr bogus` 行为正确；clippy 无新增 error |
+- **回显夹具（loader `handle_tproxy_conn`）**：移除「最多读 8 次（≈32KB）」上限，改为读到对端关闭。
+  旧上限对 >32KB 的流 shutdown(Both) → 残余数据触发 RST，现象酷似「大流被中间设备 reset」
+  （曾把 L3 排障引向 MTU/隧道方向）；夹具只服务无 dialer 的 lab 会话，生产必有 dialer。
+- **lab 工具链**：新增 `lab/net_offload.py`（SIOCETHTOOL 关 csum/tso/gso/gro，免 ethtool；
+  解决「veth+隧道 内层校验和 PARTIAL → 对端静默丢包」；含设后回读证据）、
+  `lab/tproxy_stream_probe.py`（banner 容忍的大流探针：无 dialer 会话回显夹 banner，
+  用「期望载荷=已发字节」消歧剥掉 banner 后逐字节比对）。
 
 ### 验收（本机已实测）
 
@@ -1197,25 +1195,32 @@ worker 停摆现象加诊断日志后未再复现；全链路日志（“后台�
 
 | 项 | 结果 | 证据 |
 |---|---|---|
-| 回归门禁 | **verify=PASS：11 项全绿**（原 9 项 + 新增 `l3-attach` + `xdp`） | `lab/matrix/out/vm-kernel-7.2.8-arch1-2.log` 的 `MATRIX-RESULT` |
+| 回归门禁 | **verify=PASS：12 项全绿**（原 9 项 + `l3-attach` + `l3` + `xdp`） | `lab/matrix/out/vm-kernel-7.2.8-arch1-2.log` 的 `MATRIX-RESULT`、逐项 PASS 行 |
 | L3 变体选择/挂载 | ✅ 自动判定 + 挂载成功 | 日志 `link-hdr: landae3 登记为 L3（ifindex=5）`、`attached sodama_lan_ingress_l3 to landae3`，`bpftool net show` 显示 `landae3 tcx/ingress sodama_lan_ingress_l3` |
+| L3 端到端 | ✅ **已过并入门禁**：`test-l3` —— 小连接（`orig_dst=1.1.1.1:8080` 证明经隧道进 tproxy）+ 512KB 逐字节一致回显（双向经 ipip 隧道），`verify` 的 `l3 : PASS` | `lab/matrix/out/vm-l3only-7.2.8-arch1-2.log`：`stream-ok bytes=524288`；`MATRIX-RESULT l3_attach=0 l3=0` |
 | fentry 探针 | ✅ 挂载成功；偏移由运行内核 BTF 解出（7.2.8 与 6.18 同值 184/182/188/200）；`probe_calls` 随流量增长 | 日志 `offload 记账: fentry/skb_send_sock 已挂载`、`status.offload_sent.probe_calls` |
 | 记账链路 | ✅ `kernel_bytes`/`reclaimed_bytes` 均随 offload 会话增长并释出：实测单轮 `kernel_bytes=1050069` 且 `reclaimed_bytes=1050069`；6 轮累计 `kernel_bytes=5289555`、`probe_parse_fail=0` | `status.offload_sent`（debug3 运行记录） |
 | XDP 计量 | ✅ 挂载并计数：`packets=6 bytes=488 ipv4=4 ipv6=1 other=1`（quiet 时）→ 验证运行中 `packets>0 && ipv4>0` 均过 | `status.xdp`；`test-xdp` 用例 |
-| L3 补头/剥头 helper | ✅ 内核里逐次成功：`L3 push eth change_head=0 proto=0x8`、`L3 reply pop adjust_room=0 ifindex=5`（M1 `--ebpf-debug` 采样） | trace_pipe 采样（VM） |
+| L3 前向补头 helper | ✅ 内核里逐次成功：`L3 push eth change_head=0 proto=0x8`（M1 `--ebpf-debug` 采样） | trace_pipe 采样（VM） |
 | `head+nh` 缺陷 | ✅ **测试抓到并已修**：探针误读 `head+0` 当版本字节（采到 `v=0x0/0x52` 即以太目的 MAC 首字节）→ 100% 解析失败；改为 `head+nh` 后 `parse_fail=0` | debug2/debug4 采样对照；`trace.rs` 注释 |
+| 回程「多剥 14B」缺陷 | ✅ **抓包十六进制抓到并已修**：redirect 到 L3 设备时内核自己会去 L2 头，再 `adjust_room(-14)` 会多剥——外层 `total_length=66`（应为 80）且载荷从内层 IP 头第 14 字节起；改为「只 redirect、不手工剥头」后 512KB 回显逐字节一致 | `progs.rs::dae0_ingress_l3_reply` 注释；`vm-l3rst` 抓包（已删，结论入库） |
+| 隧道 MTU/校验和治理 | ✅ 三层修复后大流稳定：ipip MTU 1466（封装 34B → 外层 ≤1500）+ 专用 underlay veth（10.30.0.0/24）+ 两端关 offload（`lab/net_offload.py`） | `lab.sh` L3 段注释；net_offload 回读行（`rx-csum=off tx-csum=off tso=off gso=off gro=off`） |
+| 回显夹具上限缺陷 | ✅ **定位并已修**：`handle_tproxy_conn` 限读 8 次（≈32KB）→ 之后 shutdown 使残余数据变 RST，曾误诊为「MTU/隧道问题」；改为读至对端关闭 + 新增 banner 容忍探针 `tproxy_stream_probe.py` | `loader/src/main.rs`；本地仿真 3 场景（正常/分开发/中途关）5+1+1 次全过 |
+| `net_offload.py` 段错误缺陷 | ✅ **修**：`id(buf)` 当 `ifr_data` 指针指向 CPython 对象头，内核写回直接写坏解释器堆（VM 内 4 处调用全 SIGSEGV，被 `|| true` 掩盖）；改 ctypes 取地址 + `struct.pack_into` | `net_offload.py` 头注；宿主 GET/SET 路径验证（EPERM 而非 EFAULT/段错） |
 
 ### 未通过 / 待办（诚实边界）
 
-1. **L3 端到端（`test-l3`）未过**：本批的 ipip 隧道拓扑（10.20.0.0/24 + 两侧 netns）回程腿在 VM 里
-   仍未通——**对照实验（TOPO_ONLY，不经 sodama）同样超时**，说明是 lab 拓扑问题而非数据面；
-   数据面自身的补头/剥头/重定向已逐个实测（上表）。该用例**不入 verify 门禁**（`l3_e2e=` 信息项），
-   待真机（生产路由器 6.12 + 真 tun/ppp）或拓扑补完后验收。
-2. **offload 用例在 QEMU 环境有既有抖动**（首连超时）：基线构建（97ebe9f）复现，且
-   `SODAMA_NO_OFFLOAD_ACCOUNT=1` 关掉记账探针也复现（同 VM 内 A/B：记账开 4/6、记账关 5/6 通过）——
-   非本批引入；故 `offload=` 也列为信息项。
-3. **仍属推断**：verifier 在 6.12（生产内核）上的行为、kprobe 回退路径（VM 上 fentry 直接成功，未触发回退）、
-   以及 L3 在生产 tun/ppp 接口上的实际表现。
+1. **offload 用例在本 QEMU 环境有既有抖动，今日显著加剧**：2026-10-16 重启后同机实测——
+   全矩阵一轮 3 次尝试全挂（失败点：第二连 `stream_probe` 前缀读超时），
+   随即做四组对照（`l3` 全配 / `NO_L3=1` / `SKIP_NET_OFFLOAD=1` / **基线 5092723 stash 后重编译**）：
+   **全部 9/9 失败**（基线失败更早：首连即不通）。⇒ 与本批改动（关 offload/MTU/夹具）**无关**，
+   是宿主重启后的环境因素；基线前期（会话内）记录为「记账开 4/6、记账关 5/6 通过」，
+   可见通过率随宿主状态大幅波动。`offload=` 仍为信息项（不计入 PASS/FAIL 判定），
+   但**下一批应把 offload 路径的「drain→注册」交接竞态列入调查**：本轮拿到两种签名——
+   ①首/次连问候超时（疑似交接期丢段或核内管道未流动）；②`offload_failures=1` +
+   `offloaded_total=1`（首连降级用户态泵，转发无感但背离「两连接都内核拼接」的断言）。
+2. **仍属推断**：verifier 在 6.12（生产内核）上的行为、kprobe 回退路径（VM 上 fentry 直接成功，未触发回退）、
+   以及 L3 在生产 tun/ppp 接口上的实际表现（lab 侧 ipip 已端到端过关）。
 
 ---
 

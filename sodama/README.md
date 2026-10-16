@@ -278,17 +278,19 @@ P6（suspend/reload/metrics/sysdump/日志轮转/整配置热重载）已完成*
 - **数据面对标批次（完成，2026-10-16）**：补齐 `docs/backlog.md` C1/C3/C4——
   **L3 链路头变体**（5 个 `*_l3` 程序 + `--link-hdr auto|l2|l3`，按 `/sys/class/net/<if>/type`
   自动判定，对照 dae `linkHdrLen()`；L3 送控制面 `bpf_skb_change_head(+14)` 补以太头，
-  回程按 `l3_ifindex_map` 用 `bpf_skb_adjust_room(-14)` 剥头）；
+  回程按 `l3_ifindex_map` **不写 MAC、不手工剥头，直接 `bpf_redirect` 回原接口**——
+  实测手工 `adjust_room(-14)` 会多剥 14B，与 dae 多留 14B 一样是错形态，两条都避开）；
   **ringbuf 事件通道**（`event_ringbuf` + `SodaEvent` 72B + 5 类事件 + 1s/键限速 + 丢弃计数，
   替代热路径 printk；`status.events` + 事件日志限速 1 条/秒/类型）；
   **`skb_send_sock` 记账**（fentry→kprobe 回退；用户态 BTF 解析（`loader/src/btfoff.rs`）
   写 `sk_buff` 字段偏移替代 CO-RE；`offload_guard` 过滤 + `offload_sent` 累加 + 键摘除时回收）；
   **XDP 计量探针**（`--xdp <iface>` 可选，恒 `XDP_PASS`、只计数不干预）。
   实测：22 程序/22 map、`cargo test` 302/302、musl x86_64 交叉构建通过（`sodama 7.7M · sodama-ebpf 772K`）；
-  **内核级已实测**（QEMU 内核矩阵 `lab/matrix.sh vm`，内核 7.2.8，宿主用户即可）：`verify` **11/11 全绿**
-  （原 9 项 + `l3-attach` + `xdp`）、fentry 挂载成功（偏移由运行内核 BTF 解出）、记账
-  `kernel_bytes`/`reclaimed_bytes` 实测增长与释出、L3 补头/剥头 helper 逐次返回 0；
-  **未过/待办**：L3 端到端（lab ipip 拓扑回程腿；对照实验证明非数据面）、offload 用例的 QEMU 首连抖动、
+  **内核级已实测**（QEMU 内核矩阵 `lab/matrix.sh vm`，内核 7.2.8，宿主用户即可）：`verify` **12/12 全绿**
+  （原 9 项 + `l3-attach` + `l3` + `xdp`）、fentry 挂载成功（偏移由运行内核 BTF 解出）、记账
+  `kernel_bytes`/`reclaimed_bytes` 实测增长与释出、**L3 端到端过关**（ipip 隧道：小连接分流 + 512KB 逐字节回显；
+  同批修掉回程多剥 14B、回显夹具 8 次读上限、`net_offload.py` 指针段错误三处缺陷）；
+  **未过/待办**：offload 用例的 QEMU 既有抖动（随宿主状态大幅波动，基线同环境亦失败，待查注册交接竞态）、
   生产 6.12 回验（见 ADR-0065、devlog §19）
   （数据面调试开关：`SODAMA_NO_OFFLOAD_ACCOUNT=1` 跳过记账探针挂载，供 A/B 与隔离排障）
 

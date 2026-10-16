@@ -47,9 +47,10 @@
   `h_proto = skb->protocol`、`h_source = 0`、`h_dest = dae0peer_mac`（同 dae
   `rewrite_packet_for_control_plane:2253-2279`，因为 `dae0peer` 是 veth、需要以太帧）。
 - 回程路径：loader 把 L3 接口 ifindex 写进新 map `l3_ifindex_map`；`sodama0_ingress` 命中则
-  `bpf_skb_adjust_room(-14, BPF_ADJ_ROOM_MAC, 0)` 剥掉控制面侧 veth 的以太头后再
-  `bpf_redirect` 回原接口，并对 L3 流按「有回程 = 流仍活跃」续租
-  （dae 在此形态下 MAC 比对恒失败、不续租，见「偏离清单」）。
+  **不写 MAC、不手工剥头**，直接 `bpf_redirect(ifindex, BPF_F_INGRESS)` 回原接口——
+  L2 头的去除由 redirect 语义完成（实测：手工 `adjust_room(-14)` 会多剥 14B，见「偏离清单」#1）；
+  并对 L3 流按「有回程 = 流仍活跃」续租
+  （dae 在此形态下 MAC 比对恒失败、不续租，见「偏离清单」#2）。
 
 ### 2. C3：ringbuf 事件通道
 
@@ -123,13 +124,15 @@
 - 事件限速的「本秒抑制 N 条」实际统计的是「距上次输出以来」的抑制数（静默期拉长时会覆盖整个
   间隔），非严格 1s 滚动窗口。
 - `offload_sent` 的「读 → 删」之间数据面仍可能继续累加，尾账随删除丢弃（接受的小误差）。
-- L3 回程剥头是本批次新增路径，本机无法加载 eBPF（无 CAP_BPF），**未做 verifier/运行时实测**。
+- L3 回程改为「只 redirect、不手工剥头」（见「偏离清单」#1）：语义依赖内核 redirect 到
+  无链路头设备时自行去 L2 头；已在 QEMU（7.2.8）端到端实测，但生产 6.12 + 真 tun/ppp
+  仍待回验。
 
 ## 偏离清单（与 dae 的显式差异）
 
 | # | 项 | dae | sodama | 理由 |
 |---|---|---|---|---|
-| 1 | L3 回程报文形态 | `tproxy_dae0_ingress` 一律按以太处理：写 MAC + `bpf_redirect`（原接口是 tun/ppp 时包上会多 14B） | 按 `l3_ifindex_map` 判定，L3 目标 `bpf_skb_adjust_room(-14, BPF_ADJ_ROOM_MAC)` 剥头 | 修正 dae 在无链路头接口上的形态缺陷（详 `sodama/NOTES.md`） |
+| 1 | L3 回程报文形态 | `tproxy_dae0_ingress` 一律按以太处理：写 MAC + `bpf_redirect`（原接口是 tun/ppp 时包上会多 14B） | 按 `l3_ifindex_map` 判定，L3 目标**跳过 MAC 改写、直接 redirect**（不手工剥头） | 修正 dae 在无链路头接口上的形态缺陷（详 `sodama/NOTES.md`）；手工 `adjust_room(-14)` 实测会多剥 14B——redirect 到 L3 设备时内核自己会去 L2 头（十六进制取证：外层 `total_length=66` 应为 80，载荷从内层 IP 头第 14 字节起） |
 | 2 | L3 回程续租 | MAC 比对（`reply_publisher_matches`）对 L3 条目恒失败 → 不续租 → 反向活跃、正向静默的流会被 janitor 过期 | L3 流按「有回程 = 流仍活跃」续租 | 同上；L3 无 L2 发布者可比，权衡后选可用性 |
 | 3 | 事件限速严格性 | 全局 ARRAY + `__sync_val_compare_and_swap` 严格 1 条/秒/键 | per-CPU ARRAY，上界 = CPU 数/秒/键 | bpf 目标无 64 位原子 RMW：`rustc +nightly --print cfg --target bpfel-unknown-none` 只给 `target_has_atomic_load_store`（实测），Rust 侧无 `AtomicU64::compare_exchange` |
 | 4 | 记账过滤 | 无条件建键/累加（任何 `skb_send_sock` 调用方都会进表） | 先查 `offload_guard`（只记 offload 注册键） | 避免无关流量（kTLS 等）污染与撑表 |
@@ -141,9 +144,15 @@
 
 **已实测（内核级，QEMU 内核矩阵 7.2.8-arch1-2，2026-10-16）**：
 
-- 回归门禁 `lab/matrix.sh vm` 的 `lab.sh up && verify`：**11 项全绿**（原 9 项 + 新增 `l3-attach`/`xdp`），
+- 回归门禁 `lab/matrix.sh vm` 的 `lab.sh up && verify`：**12 项全绿**（原 9 项 + 新增 `l3-attach`/`l3`/`xdp`），
   证明改动后的数据面（含新 map/新程序/parse 与 flow 重构）在新内核上**通过 verifier 且无回归**；
 - `_l3` 变体选择与挂载（`landae3` arphrd=768 → `sodama_lan_ingress_l3`，见 `bpftool net show`）；
+- **L3 端到端已过（本次收口）**：`test-l3` 经 ipip 隧道——小连接拿到
+  `orig_dst=1.1.1.1:8080`（证明分流进 tproxy）+ 512KB 回显逐字节一致（双向经隧道，
+  `stream-ok bytes=524288`）；配套修复三件事：①回程只 redirect 不剥头（同上「偏离清单」#1）；
+  ②隧道 MTU 1466 + 专用 underlay veth + 两端关 offload（新增 `lab/net_offload.py`，免 ethtool）；
+  ③loader 回显夹具去除 8 次读上限（>32KB 会被 RST，曾误诊为 MTU 问题）。`test_l3` 已入
+  `verify` 门禁（SKIP 条件：无 ipip/无法建隧道）；
 - fentry `skb_send_sock` **挂载成功**（偏移由运行内核 BTF 解出：7.2.8 上亦为
   `nh=184 th=182 tail=188 head=200`）；探针 `probe_calls` 随流量增长；
 - 记账链路端到端：`kernel_bytes=1050069` 且 `reclaimed_bytes=1050069`（单轮），6 轮累计
@@ -154,15 +163,14 @@
   当版本字节读（采到 `v=0x0/0x52` = 以太目的 MAC 首字节）导致 100% 解析失败，
   改为 dae 同口径的 `head+nh` 后 `parse_fail=0`。
 
-**未通过 / 仍属推断**（验收放到 lab 补完或生产）：
+**未通过 / 仍属推断**（验收放到生产）：
 
-- **L3 端到端**（`test-l3`，经 ipip 隧道的代理路径）在 QEMU 里未过：对照实验
-  （`TOPO_ONLY`，不经 sodama）同样超时 ⇒ 是 lab 拓扑（回程腿）问题而非数据面；
-  该用例不入 `verify` 门禁，留待真机（tun/ppp）或拓扑补完；
-- offload 用例在本 QEMU 环境有**既有抖动**（首连超时；基线 97ebe9f 与
-  `SODAMA_NO_OFFLOAD_ACCOUNT=1` 均复现）；
+- offload 用例在本 QEMU 环境有**既有抖动且随宿主状态大幅波动**：2026-10-16 重启后，
+  四组对照（全配 / `NO_L3=1` / `SKIP_NET_OFFLOAD=1` / 基线 5092723 重编译）**全部 9/9 失败**
+  ⇒ 与本批无关，环境因素；签名指向 offload 注册交接竞态（问候超时 / 首连降级），
+  已登记入 devlog §19 待下批调查；
 - verifier 在 6.12（生产内核）上的行为、kprobe 回退路径（VM 上 fentry 直接成功未触发回退）、
-  L3 在生产 tun/ppp 接口上的实际表现。
+  L3 在生产 tun/ppp 接口上的实际表现（lab ipip 已端到端过关）。
 
 **已实测（本机构建/单测，2026-10-16）**：
 
@@ -183,7 +191,7 @@
 1. 生产内核（6.12）上新增程序的 verifier 接受度与 fentry/kprobe 挂载结果（矩阵在 7.2.8 上已验证，
    见上一节；6.12 待生产回验）；
 2. kprobe 回退路径（需 fentry 因 EBUSY/无 DYNAMIC_FTRACE 失败的场景）；
-3. L3 在真实 tun/ppp 接口上的端到端（lab 拓扑未过关，见上一节）。
+3. L3 在真实 tun/ppp 接口上的端到端（lab 侧 ipip 隧道已过关，见上文）。
 
 **验收命令（staging/生产，需 root）**：
 `status` 看 `events.{consumed,suppressed,by_type,dropped_kernel}`、
