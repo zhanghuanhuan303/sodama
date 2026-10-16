@@ -1,6 +1,6 @@
 # sodama fish completion（由 `sodama completion fish` 生成）
 complete -c sodama -f
-complete -c sodama -n __fish_use_subcommand -a "validate export-config extract-routing status reload suspend resume metrics sub-parse sysdump trace dns-bench completion"
+complete -c sodama -n __fish_use_subcommand -a "validate export-config export extract-routing status reload suspend resume metrics sub-parse sysdump trace dns-bench completion"
 complete -c sodama -l ebpf
 complete -c sodama -l lan
 complete -c sodama -l wan

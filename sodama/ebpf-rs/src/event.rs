@@ -95,3 +95,38 @@ pub unsafe fn send_event_limited(
     send_event(type_, outbound, l4proto, tuple);
     true
 }
+
+/// A2 #3：发一条 trace 事件（判决编码在 `pad[0]`；不做限速——trace 是显式短时诊断）。
+/// 与 `send_event` 共用 `event_scratch_map`（不占栈）。
+#[inline(always)]
+pub unsafe fn send_trace_event(
+    verdict: u8,
+    outbound: u8,
+    l4proto: u8,
+    tuple: Option<&SodaTuple>,
+) {
+    let Some(ev) = event_scratch_map.get_ptr_mut(0) else {
+        return;
+    };
+    (*ev).timestamp = bpf_ktime_get_ns();
+    (*ev).type_ = SODAMA_EVENT_TRACE;
+    (*ev).pid = 0;
+    (*ev).pname = [0u8; 16];
+    (*ev).outbound = outbound;
+    (*ev).l4proto = l4proto;
+    (*ev).pad = [verdict, 0];
+    (*ev).sip = [0u8; 16];
+    (*ev).dip = [0u8; 16];
+    (*ev).sport = 0;
+    (*ev).dport = 0;
+    if let Some(t) = tuple {
+        (*ev).sip = t.sip;
+        (*ev).dip = t.dip;
+        (*ev).sport = t.sport;
+        (*ev).dport = t.dport;
+        (*ev).l4proto = t.l4proto;
+    }
+    if event_ringbuf.output(&*ev, 0).is_err() {
+        bump_stat(SODAMA_STAT_EVENT_DROPS);
+    }
+}

@@ -1184,7 +1184,7 @@ pub const GROUP_KEYS: &[&str] = &[
     "check_tolerance",
 ];
 
-const KNOWN_SECTIONS: &[&str] = &[
+pub const KNOWN_SECTIONS: &[&str] = &[
     "include",
     "global",
     "subscription",
@@ -2373,7 +2373,7 @@ pub fn key_docs() -> Vec<KeyDoc> {
         g("tproxy_port", "tproxy 监听端口（实际仅 CLI `--tproxy-port` 生效）", "12345", false),
         g("tproxy_port_protect", "保护 tproxy 端口的防火墙标记（dae 与本实现两端均为空置字段）", "0x8000000", false),
         g("so_mark_from_dae", "控制面 socket 标记（数据面硬编码 0x233）", "0x233", false),
-        g("log_level", "日志级别", "info", false),
+        g("log_level", "日志级别（off/error/warning/info/debug；默认 info）", "info", true),
         g("tcp_check_url", "组健康检查目标（tcp）", "http://cp.cloudflare.com", true),
         g("tcp_check_http_method", "探测 HTTP 方法（大写白名单；非法回退 CONNECT）", "HEAD", true),
         g("udp_check_dns", "组健康检查目标（udp DNS）", "dns.google:53, 8.8.8.8:53", true),

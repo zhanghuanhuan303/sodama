@@ -56,6 +56,7 @@ mod config;
 mod dns;
 mod dnsroute;
 mod dnsup;
+mod dump;
 #[cfg(test)]
 mod fuzz_smoke;
 mod geodata;
@@ -135,6 +136,14 @@ struct ReloadOutcome {
 /// P6：`--log-file`（轮转友好：SIGHUP reload 时 reopen）。
 static LOG_PATH: OnceLock<String> = OnceLock::new();
 static LOG_SINK: Mutex<Option<std::fs::File>> = Mutex::new(None);
+/// A2 #2：内建日志轮转参数（MB / 保留份数；0 = 关轮转 / 不保留，对照 dae lumberjack 的
+/// `--logfile-maxsize`/`--logfile-maxbackups`）。
+static LOG_MAX_SIZE_MB: AtomicU64 = AtomicU64::new(0);
+static LOG_MAX_BACKUPS: AtomicU64 = AtomicU64::new(3);
+/// 当前日志文件已写入字节数（轮转判定用；开文件时以文件大小为初值）。
+static LOG_WRITTEN: AtomicU64 = AtomicU64::new(0);
+/// A2 #6：日志级别（0=off 1=error 2=warn 3=info 4=debug；默认 info）。
+static LOG_LEVEL: AtomicU32 = AtomicU32::new(3);
 /// CLI 子命令：日志改走 stderr，保持 stdout 只有机器可读输出（JSON/文本）。
 static LOG_STDERR: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// 只读状态面：进程启动时间 / 监听端口 / 钩子列表 / 最近编译结果 / 配置解析结果
@@ -1157,11 +1166,11 @@ fn migrate_pinned_conn_state(ebpf: &mut Ebpf, capacity: u32) {
         Ok(()) => {
             if let Some(aya::maps::Map::HashMap(md)) = ebpf.map("conn_state_map") {
                 if let Err(e) = md.pin(&path) {
-                    log(&format!("conn_state pin: 失败（{e}），重启后状态不保留"));
+                    log_warn(&format!("conn_state pin: 失败（{e}），重启后状态不保留"));
                 }
             }
         }
-        Err(e) => log(&format!(
+        Err(e) => log_warn(&format!(
             "conn_state pin: 目录不可用（{e}），重启后状态不保留"
         )),
     }
@@ -1258,6 +1267,12 @@ const EV_REDIRECT_REBIND_REJECTED: u32 = 4;
 const EV_SYN_REBIND_REJECTED: u32 = 5;
 const EV_REDIRECT_UPDATE_FAILED: u32 = 8;
 const EV_SYN_REBIND_REROUTED: u32 = 9;
+/// A2 #3：trace 事件（sodama 自有；判决在 `SodaEvent.pad[0]`）。
+const EV_TRACE: u32 = 10;
+/// trace 判决编码（与 ebpf-rs/src/common.rs 的 `SODAMA_VERDICT_*` 对齐）。
+const VERDICT_OK: u8 = 0;
+const VERDICT_SHOT: u8 = 1;
+const VERDICT_REDIR: u8 = 2;
 
 /// 事件类型名（日志/status 用；未实现的编号保留为 unknown）。
 fn event_type_name(t: u32) -> &'static str {
@@ -1270,6 +1285,7 @@ fn event_type_name(t: u32) -> &'static str {
         EV_SYN_REBIND_REJECTED => "syn_rebind_rejected",
         EV_REDIRECT_UPDATE_FAILED => "redirect_update_failed",
         EV_SYN_REBIND_REROUTED => "syn_rebind_rerouted",
+        EV_TRACE => "trace",
         _ => "unknown",
     }
 }
@@ -1418,10 +1434,178 @@ fn log_soda_event(ev: &SodaEvent) {
     log(&msg);
 }
 
+// ---------------------------------------------------------------- A2 #3：trace
+/// 与 ebpf-rs/src/common.rs 的 `SodaTraceFilter` 同位（20 字节）。
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct SodaTraceFilter {
+    enabled: u32,
+    l4proto: u32,
+    port: u32,
+    ipver: u32,
+    drop_only: u32,
+}
+unsafe impl aya::Pod for SodaTraceFilter {}
+
+/// trace 会话截止时刻（单调 ns；0 = 未激活）。
+static TRACE_UNTIL_NS: AtomicU64 = AtomicU64::new(0);
+/// trace 会话代次（每次 `trace` 命令 +1；事件线程据此新建/截断文件）。
+static TRACE_GEN: AtomicU64 = AtomicU64::new(0);
+/// trace 输出文件（daemon 写、CLI 读；`/run` 不可写时退 `/tmp`）。
+static TRACE_PATH: OnceLock<std::path::PathBuf> = OnceLock::new();
+/// 本次会话收到的 trace 事件数。
+static TRACE_EVENTS: AtomicU64 = AtomicU64::new(0);
+/// trace 写盘失败数（磁盘满/权限）。
+static TRACE_WRITE_ERRS: AtomicU64 = AtomicU64::new(0);
+
+/// trace 文件路径（首次调用时探测：优先 `/run/sodama-trace.log`，否则 `/tmp/sodama-trace.log`）。
+fn trace_path() -> &'static std::path::Path {
+    TRACE_PATH.get_or_init(|| {
+        let run = std::path::PathBuf::from("/run/sodama-trace.log");
+        let chosen = if std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&run)
+            .is_ok()
+        {
+            run
+        } else {
+            std::path::PathBuf::from("/tmp/sodama-trace.log")
+        };
+        chosen
+    })
+}
+
+/// 开启一次 trace 会话（对照 dae `trace` 子命令的过滤参数：IPv4/IPv6、L4 协议、端口、drop-only）。
+/// 返回 (seconds, 文件路径)；由状态命令调用，过滤器同步写入数据面（内核侧过滤）。
+fn arm_trace(
+    ebpf: &mut Ebpf,
+    seconds: u64,
+    l4: Option<u32>,
+    port: Option<u32>,
+    ipver: u32,
+    drop_only: bool,
+) -> Result<(u64, String), String> {
+    let seconds = seconds.clamp(1, 3600);
+    let filter = SodaTraceFilter {
+        enabled: 1,
+        l4proto: l4.unwrap_or(0),
+        port: port.unwrap_or(0),
+        ipver,
+        drop_only: u32::from(drop_only),
+    };
+    let map = ebpf
+        .map_mut("trace_filter_map")
+        .ok_or("对象不含 trace_filter_map（旧 eBPF 对象？请重建数据面）")?;
+    let mut arr: Array<_, SodaTraceFilter> = Array::try_from(map).map_err(|e| e.to_string())?;
+    arr.set(0, filter, 0).map_err(|e| e.to_string())?;
+    TRACE_EVENTS.store(0, Ordering::Relaxed);
+    TRACE_WRITE_ERRS.store(0, Ordering::Relaxed);
+    TRACE_GEN.fetch_add(1, Ordering::Relaxed);
+    TRACE_UNTIL_NS.store(
+        monotonic_now_ns() + seconds.saturating_mul(1_000_000_000),
+        Ordering::Relaxed,
+    );
+    let path = trace_path().display().to_string();
+    log(&format!(
+        "trace: 会话开始（{seconds}s；l4={:?} port={:?} ipver={ipver} drop_only={drop_only}）→ {path}",
+        l4, port
+    ));
+    Ok((seconds, path))
+}
+
+/// 会话到期清位（主循环 tick 调用）；未激活时是单次原子读。
+fn trace_maybe_expired(ebpf: &mut Ebpf) {
+    let until = TRACE_UNTIL_NS.load(Ordering::Relaxed);
+    if until == 0 || monotonic_now_ns() < until {
+        return;
+    }
+    TRACE_UNTIL_NS.store(0, Ordering::Relaxed);
+    if let Some(map) = ebpf.map_mut("trace_filter_map") {
+        if let Ok(mut arr) = Array::<_, SodaTraceFilter>::try_from(map) {
+            let _ = arr.set(0, SodaTraceFilter::default(), 0);
+        }
+    }
+    log(&format!(
+        "trace: 会话结束（{} 事件，{} 写失败）",
+        TRACE_EVENTS.load(Ordering::Relaxed),
+        TRACE_WRITE_ERRS.load(Ordering::Relaxed)
+    ));
+}
+
+/// trace 行格式（CLI 按此解析过滤后展示）：一行一事件，键值对自描述。
+/// 端口转 host 序（tuple 里是网络序原始值；对照 `pkt.h_sport/h_dport`）。
+fn format_trace_line(ev: &SodaEvent) -> String {
+    let v6 = !(ev.sip[..10].iter().all(|b| *b == 0) && ev.sip[10] == 0xff && ev.sip[11] == 0xff);
+    let l4 = match ev.l4proto {
+        6 => "tcp",
+        17 => "udp",
+        _ => "?",
+    };
+    let act = match ev.pad[0] {
+        VERDICT_OK => "ok",
+        VERDICT_SHOT => "shot",
+        VERDICT_REDIR => "redir",
+        _ => "?",
+    };
+    format!(
+        "{} v={} l4={} sip={} sport={} dip={} dport={} outbound=0x{:x} act={}\n",
+        now_hms(),
+        if v6 { 6 } else { 4 },
+        l4,
+        format_event_addr(&ev.sip),
+        u16::from_be(ev.sport),
+        format_event_addr(&ev.dip),
+        u16::from_be(ev.dport),
+        ev.outbound,
+        act
+    )
+}
+
+/// A2 #3：收一条 trace 事件——写盘（按代次截断开新文件），超期/未激活不写。
+/// 返回 `true` = 本次为 trace 事件（消费循环据此跳过普通事件日志）。
+fn trace_sink_write(ev: &SodaEvent, sink: &mut Option<(u64, std::fs::File)>) -> bool {
+    if ev.type_ != EV_TRACE {
+        return false;
+    }
+    TRACE_EVENTS.fetch_add(1, Ordering::Relaxed);
+    let until = TRACE_UNTIL_NS.load(Ordering::Relaxed);
+    if until == 0 || monotonic_now_ns() >= until {
+        // 到期与主循环清位之间的窗口：事件仍会到（数据面旗标未清），直接丢。
+        return true;
+    }
+    let gen = TRACE_GEN.load(Ordering::Relaxed);
+    if sink.as_ref().map(|(g, _)| *g) != Some(gen) {
+        match std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(trace_path())
+        {
+            Ok(f) => *sink = Some((gen, f)),
+            Err(_) => {
+                TRACE_WRITE_ERRS.fetch_add(1, Ordering::Relaxed);
+                return true;
+            }
+        }
+    }
+    if let Some((_, f)) = sink.as_mut() {
+        use std::io::Write as _;
+        if f.write_all(format_trace_line(ev).as_bytes()).is_err() {
+            TRACE_WRITE_ERRS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    true
+}
+
 /// C3：`event_ringbuf` 常驻消费者（专用线程；对照 dae `control/event_ringbuf.go`
 /// 的消费循环）。逐事件只做计数与限速日志，不做任何阻塞/逐包输出。
+/// A2 #3：trace 事件（`EV_TRACE`）单独走落盘路径（不限速；筛选已在数据面完成）。
 fn ebpf_event_loop(mut rb: RingBuf<MapData>) -> ! {
     const POLL_TIMEOUT_MS: libc::c_int = 500;
+    // trace 落盘 sink（单线程持有；代次变化时截断开新文件）。
+    let mut trace_sink: Option<(u64, std::fs::File)> = None;
     loop {
         let mut pfd = libc::pollfd {
             fd: rb.as_raw_fd(),
@@ -1446,6 +1630,10 @@ fn ebpf_event_loop(mut rb: RingBuf<MapData>) -> ! {
             // 故 unaligned 读安全（与 aya Pod 的字节视图语义一致）。
             let ev = unsafe { core::ptr::read_unaligned(bytes.as_ptr() as *const SodaEvent) };
             EVENTS_TOTAL.fetch_add(1, Ordering::Relaxed);
+            // A2 #3：trace 事件（落盘，不参与普通事件的计数槽/限速日志）。
+            if trace_sink_write(&ev, &mut trace_sink) {
+                continue;
+            }
             match event_type_slot(ev.type_) {
                 Some(i) => {
                     EVENT_COUNTS[i].fetch_add(1, Ordering::Relaxed);
@@ -1779,6 +1967,10 @@ struct Args {
     disable_timestamp: bool,
     /// P38：不写 pid 文件（对照 dae `--disable-pidfile`；默认写 /var/run/sodama.pid）
     disable_pidfile: bool,
+    /// A2 #2：日志轮转——单文件上限 MB（0/缺省 = 不轮转；对照 dae `--logfile-maxsize`）。
+    logfile_maxsize: Option<u64>,
+    /// A2 #2：保留旧日志份数（缺省 3；0 = 不保留；对照 dae `--logfile-maxbackups`）。
+    logfile_maxbackups: Option<u64>,
 }
 
 /// 本地时间戳 `YYYY-MM-DD HH:MM:SS`。
@@ -1892,6 +2084,38 @@ fn epoch_to_civil(secs: i64) -> (i64, u32, u32, i64, i64, i64) {
 }
 
 fn log(msg: &str) {
+    log_at(3, msg);
+}
+
+/// A2 #6：warn 级（`log_level: warning` 仍可见）。
+fn log_warn(msg: &str) {
+    log_at(2, msg);
+}
+
+/// A2 #6：debug 级（仅 `log_level: debug` 可见；对照 dae logrus Debug 行）。
+fn log_debug(msg: &str) {
+    log_at(4, msg);
+}
+
+/// A2 #6：`log_level` 取值 → 内部级别（对照 dae logrus：panic/fatal/error/warn/info/debug/trace）。
+fn parse_log_level(s: &str) -> Option<u32> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "off" | "none" => Some(0),
+        "panic" | "fatal" | "error" => Some(1),
+        "warn" | "warning" => Some(2),
+        "info" => Some(3),
+        "debug" | "trace" => Some(4),
+        _ => None,
+    }
+}
+
+/// A2 #6 + #2：带级别的日志出口（过滤 + 轮转判定）。
+/// 级别映射是 best-effort：既有调用大多按 info 归类；逐行分级可后续渐进补充
+/// （不在本批把 250+ 行全部重标——那是行为面上无收益的大 diff，如实登记为边界）。
+fn log_at(level: u32, msg: &str) {
+    if level > LOG_LEVEL.load(Ordering::Relaxed) {
+        return;
+    }
     // P38：`--disable-timestamp` 关闭时间戳前缀（对照 dae `--disable-timestamp`）。
     let line = log_line(
         LOG_TS_OFF.load(std::sync::atomic::Ordering::Relaxed),
@@ -1899,11 +2123,20 @@ fn log(msg: &str) {
         msg,
     );
     let mut done = false;
+    let mut rotate_due = false;
     if let Ok(mut g) = LOG_SINK.lock() {
         if let Some(f) = g.as_mut() {
             use std::io::Write as _;
             if writeln!(f, "{line}").and_then(|_| f.flush()).is_ok() {
                 done = true;
+                // A2 #2：轮转判定（只在文件 sink 下有意义）。
+                let n = LOG_WRITTEN.fetch_add(line.len() as u64 + 1, Ordering::Relaxed)
+                    + line.len() as u64
+                    + 1;
+                let max = LOG_MAX_SIZE_MB.load(Ordering::Relaxed);
+                if max > 0 && n >= max * 1024 * 1024 {
+                    rotate_due = true;
+                }
             }
         }
     }
@@ -1916,6 +2149,41 @@ fn log(msg: &str) {
             let _ = std::io::stdout().flush();
         }
     }
+    if rotate_due {
+        rotate_log_now();
+    }
+}
+
+/// A2 #2：按大小轮转——`<log>` → `<log>.1.gz`（stored gzip，与 sysdump 同一实现），
+/// 旧份依次后移，超过 `maxbackups` 的删除（0 = 不保留）；随后重开当前文件。
+/// 对照 dae lumberjack（MaxSize/MaxBackups/Compress=true）；差异：份名用 `.N.gz` 序号
+/// 而非时间戳（可预测、无时钟依赖）。
+fn rotate_log_now() {
+    let Some(path) = LOG_PATH.get() else {
+        return;
+    };
+    let backups = LOG_MAX_BACKUPS.load(Ordering::Relaxed) as usize;
+    // 关闭 sink → 移动/压缩 → 重开（失败不阻断日志：下次写入仍走旧/新句柄）。
+    if let Ok(mut g) = LOG_SINK.lock() {
+        *g = None;
+    }
+    // 旧份后移（从最老开始，避免覆盖）。
+    for i in (1..backups).rev() {
+        let from = format!("{path}.{i}.gz");
+        let to = format!("{path}.{}.gz", i + 1);
+        let _ = std::fs::rename(&from, &to);
+    }
+    if let Ok(data) = std::fs::read(path) {
+        let gz = dump::gzip_store(&data);
+        let _ = std::fs::write(format!("{path}.1.gz"), &gz);
+    }
+    // 清空当前文件（truncate 而非 rename：SIGHUP 外部 logrotate 衔接时行为一致）。
+    let _ = std::fs::write(path, b"");
+    LOG_WRITTEN.store(0, Ordering::Relaxed);
+    let _ = open_log_file(path);
+    log(&format!(
+        "日志轮转：{path} -> {path}.1.gz（保留 {backups} 份）"
+    ));
 }
 
 /// P38：日志行组装（时间戳开关拆成纯函数，便于单测；对照 dae `DisableTimestamp`）。
@@ -1928,6 +2196,7 @@ fn log_line(ts_off: bool, hms: &str, msg: &str) -> String {
 }
 
 /// P6：打开（或 SIGHUP 后重开）日志文件；best-effort，失败保留原输出。
+/// A2 #2：以当前文件大小为轮转计数初值（重启不重置）。
 fn open_log_file(path: &str) -> bool {
     match std::fs::OpenOptions::new()
         .create(true)
@@ -1935,6 +2204,8 @@ fn open_log_file(path: &str) -> bool {
         .open(path)
     {
         Ok(f) => {
+            let sz = f.metadata().map(|m| m.len()).unwrap_or(0);
+            LOG_WRITTEN.store(sz, Ordering::Relaxed);
             if let Ok(mut g) = LOG_SINK.lock() {
                 *g = Some(f);
             }
@@ -1959,6 +2230,7 @@ fn usage() -> ! {
         "usage: sodama [options]\n\
          \n\
          options:\n\
+           --version              A2：版本信息（版本+git sha / 构建 profile / 平台 / 许可；等同 `sodama version`，不需 root）\n\
            --ebpf <path>         eBPF object（默认 ebpf-rs/target/bpfel-unknown-none/release/sodama-ebpf）\n\
            --lan <ifname>        LAN 侧接口，可重复（默认 landae；`--lan none` = 不挂 LAN 钩子，本机网关模式）\n\
            --wan <ifname>        WAN 侧接口，可重复（默认 wan）\n\
@@ -2005,7 +2277,9 @@ fn usage() -> ! {
                                  且订阅节点走缓存（sub_cache_ttl，默认 1800s；失败源负缓存
                                  sub_fail_ttl 默认 600s）秒级生效——未变源不打订阅服务器
            --log-file <path>     P6/P35：日志写文件（默认 stdout；SIGHUP 时 reopen，轮转友好；
-                                 可用 config global.log_file 代替）
+                                 可用 config global.log_file 代替；`--logfile` 同义）
+           --logfile-maxsize <MB>   A2：内建轮转单文件上限（默认 0=不轮转；对照 dae lumberjack）
+           --logfile-maxbackups <N> A2：轮转保留份数（默认 3；0=不保留；产物 <log>.<N>.gz）
            --dump                打印编译出的 match_set / LPM 内容\n\
            --compile-dump <path> 只编译规则并按对拍格式打印（不加载 eBPF，不需要 root）\n\
            --proxy <ipv4>        无 --rules 时加入「走代理」的目的 IP，可重复\n\
@@ -2013,6 +2287,7 @@ fn usage() -> ! {
          子命令（不加载 eBPF、不需 root）：\n\
            sodama validate <config.dae>       解析 + schema 校验 + routing 可编译性报告\n\
            sodama export-config <config.dae>  合并后的配置导出为 JSON\n\
+           sodama export outline              A2：配置 schema（机器可读，供 UI/面板开发者；与 config-doc 同源登记表）\n\
            sodama extract-routing <config.dae> 输出可编译规则（deferred 到 stderr）\n\
            sodama status [--socket <path>] [--json]  查询状态面\n\
            sodama reload [--socket <path>] [--abort] P6/P38：热重载（等价 kill -HUP，同步等结果；\n\
@@ -2022,7 +2297,8 @@ fn usage() -> ! {
            sodama metrics [--socket <path>]     P6：Prometheus 文本格式统计导出\n\
            sodama sub-parse <url|path> [--tag <t>] [--json] [--limit <n>] [--timeout <s>] 只读：拉取订阅解析预览\n\
            sodama sysdump [--socket <path>] [--out <file>] P6：状态+规则+系统网络信息归档\n\
-           sodama trace [--seconds N]           P6：过滤 sodama 的 ftrace 输出（需 root）\n\
+           sodama trace [--seconds N] [-4|-6] [--l4-proto tcp|udp] [--port N]
+\n\
            sodama completion [bash|zsh|fish]   P38：输出 shell 补全脚本（对照 dae completion；\n\
                                  预生成副本在 install/shell-completion/）\n\
            sodama config-doc [--format md|json] [--out <file>] P38：输出配置参考（docs/config-reference.md 由此生成）\n\
@@ -2084,6 +2360,8 @@ fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
         auto_config: false,
         disable_timestamp: false,
         disable_pidfile: false,
+        logfile_maxsize: None,
+        logfile_maxbackups: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
@@ -2124,6 +2402,9 @@ fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
             "--sniff-punt" => args.sniff_punt = true,
             "--disable-timestamp" => args.disable_timestamp = true,
             "--disable-pidfile" => args.disable_pidfile = true,
+            "--logfile" => args.log_file = Some(next()?),
+            "--logfile-maxsize" => args.logfile_maxsize = Some(next()?.parse()?),
+            "--logfile-maxbackups" => args.logfile_maxbackups = Some(next()?.parse()?),
             "--subscribe" => args.subscribe.push(next()?),
             "--geodata-dir" => args.geodata_dir.push(next()?),
             "--group" => args.group = Some(next()?),
@@ -4266,7 +4547,7 @@ fn handle_relay_conn(mut client: TcpStream) {
         match sniffer::sniff_domain(&client, timeout) {
             Some(name) => {
                 SNIFF_STATS.hits.fetch_add(1, Ordering::Relaxed);
-                log(&format!("sniff {orig} → {name}（域名交节点远端解析）"));
+                log_debug(&format!("sniff {orig} → {name}（域名交节点远端解析）"));
                 // P21：嗅探重判——用 (域名, 五元组) 在用户态重放规则（与数据面同语义）；
                 // 命中 direct/block/用户组时在 relay 侧重选出口。
                 if SNIFF_PUNT.load(Ordering::Relaxed) {
@@ -6481,13 +6762,20 @@ fn config_watch_loop(extra: Vec<std::path::PathBuf>, tx: std::sync::mpsc::Sender
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // K3 子命令（不加载 eBPF、不需要 root）
+    // A2 #1：`--version`（对照 dae rootCmd.Version：版本 + 运行时/平台 + 许可三行；
+    // 在任何加载之前处理，无需 root/配置）。git sha 由 build.rs 注入（尽力而为）。
     let argv: Vec<String> = std::env::args().collect();
+    if argv.len() >= 2 && matches!(argv[1].as_str(), "--version" | "-V" | "version") {
+        print_version();
+        return Ok(());
+    }
+    // K3 子命令（不加载 eBPF、不需要 root）
     if argv.len() >= 2
         && matches!(
             argv[1].as_str(),
             "validate"
                 | "export-config"
+                | "export"
                 | "extract-routing"
                 | "dns-bench"
                 | "status"
@@ -6558,6 +6846,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 args.wan = list;
             }
         }
+    }
+    // A2 #6：日志级别（config global.log_level；非法值回落 info——对照 dae `logrus.ParseLevel`
+    // 失败回落 InfoLevel）。分级为 best-effort：既有调用大多按 info 归类（见 ADR-0069 偏离）。
+    if let Some(v) = cfg_boot_val("log_level") {
+        match parse_log_level(&v) {
+            Some(l) => LOG_LEVEL.store(l, Ordering::Relaxed),
+            None => {
+                LOG_LEVEL.store(3, Ordering::Relaxed);
+                log(&format!(
+                    "log_level '{v}' 非法，回落 info（off/error/warning/info/debug）"
+                ));
+            }
+        }
+    }
+    // A2 #2：内建日志轮转参数（CLI；对照 dae `--logfile-maxsize`/`--logfile-maxbackups`）。
+    if let Some(mb) = args.logfile_maxsize {
+        LOG_MAX_SIZE_MB.store(mb, Ordering::Relaxed);
+    }
+    if let Some(n) = args.logfile_maxbackups {
+        LOG_MAX_BACKUPS.store(n, Ordering::Relaxed);
     }
     if let Some(path) = &args.log_file {
         if open_log_file(path) {
@@ -7220,6 +7528,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             reopen_log();
             do_reload(&args, &mut ebpf, false, false);
         }
+        // A2 #3：trace 会话到期（清数据面过滤器位；未激活时是一次原子读）。
+        trace_maybe_expired(&mut ebpf);
         ticks += 1;
         if ticks.is_multiple_of(janitor_ticks) {
             match sweep_conn_state(&mut ebpf) {
@@ -8018,7 +8328,7 @@ fn resolve_dns(
                 Ok(r) => return Some(serve_response(query, r, proto)),
                 Err(e) => {
                     DNS_STATS.upstream_errors.fetch_add(1, Ordering::Relaxed);
-                    log(&format!("dns 上游 {} 查询失败: {e}", u.url));
+                    log_warn(&format!("dns 上游 {} 查询失败: {e}", u.url));
                     return None;
                 }
             }
@@ -8104,7 +8414,7 @@ fn resolve_dns(
         Ok(r) => r,
         Err(e) => {
             DNS_STATS.upstream_errors.fetch_add(1, Ordering::Relaxed);
-            log(&format!("dns 上游 {} 查询失败: {e}", up.url));
+            log_warn(&format!("dns 上游 {} 查询失败: {e}", up.url));
             return None;
         }
     };
@@ -8925,7 +9235,7 @@ fn udp_nat_session(
         SNIFF_STATS.quic_initial.fetch_add(1, Ordering::Relaxed);
         if let quicsniff::QuicSniff::Found(name) = quicsniff::sniff(probe) {
             SNIFF_STATS.quic_sni.fetch_add(1, Ordering::Relaxed);
-            log(&format!(
+            log_debug(&format!(
                 "quic sniff {client} → {name}（SNI，Initial 解密）"
             ));
         }
@@ -9270,6 +9580,19 @@ fn run_subcommand(argv: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     // 子命令的 stdout 留给数据（JSON/文本），诊断信息一律 stderr。
     LOG_STDERR.store(true, std::sync::atomic::Ordering::Relaxed);
     match argv[1].as_str() {
+        // A2 #5：`export outline`（对照 dae `config.ExportOutlineJson`）——机器可读的
+        // 配置 schema（供 UI/面板开发者），与 `config-doc` 同源（`key_docs()` 登记表）。
+        "export" => match argv.get(2).map(|s| s.as_str()) {
+            Some("outline") => {
+                println!("{}", serde_json::to_string_pretty(&export_outline_json())?);
+                Ok(())
+            }
+            other => Err(format!(
+                "用法: sodama export outline（未知子命令 {}；dae 仅有 outline）",
+                other.unwrap_or("<无>")
+            )
+            .into()),
+        },
         "validate" | "export-config" | "extract-routing" => {
             let path = argv
                 .get(2)
@@ -9518,60 +9841,180 @@ fn run_subcommand(argv: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             Ok(())
         }
         "sysdump" => {
-            let (sock, out) = parse_socket_args(argv, 2)?;
-            let mut dump = serde_json::Map::new();
-            dump.insert("generated_at_sec".into(), json!(unix_now_sec()));
+            // A2 #4：现场归档（对照 dae `dae sysdump`）——状态面 JSON + 系统网络现场
+            // （路由/网卡/sysctl/nft/iptables/邻居）打包为 `.tar.gz`。
+            // `--json` 保留旧行为（单份 JSON，便于管道消费）。
+            let mut sock = "/tmp/sodama-status.sock".to_string();
+            let mut out: Option<String> = None;
+            let mut json_only = false;
+            let mut it = argv.iter().skip(2);
+            while let Some(a) = it.next() {
+                match a.as_str() {
+                    "--socket" => sock = it.next().ok_or("--socket 需要值")?.clone(),
+                    "--out" => out = Some(it.next().ok_or("--out 需要值")?.clone()),
+                    "--json" => json_only = true,
+                    other => return Err(format!("未知参数 {other}").into()),
+                }
+            }
+            let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
             for key in ["status", "rules", "config", "maps"] {
                 let val = match status::client(Path::new(&sock), key) {
-                    Ok(resp) => serde_json::from_str(&resp).unwrap_or_else(|_| json!(resp)),
+                    Ok(resp) => serde_json::from_str::<serde_json::Value>(&resp)
+                        .unwrap_or_else(|_| json!(resp)),
                     Err(e) => json!({"error": e.to_string()}),
                 };
-                dump.insert(key.into(), val);
+                entries.push((format!("{key}.json"), serde_json::to_vec_pretty(&val)?));
             }
-            dump.insert("system".into(), system_info_json());
-            let text = serde_json::to_string_pretty(&serde_json::Value::Object(dump))?;
-            match out {
-                Some(path) => {
-                    std::fs::write(&path, &text)?;
-                    eprintln!("sysdump -> {path}");
+            entries.push((
+                "system.json".into(),
+                serde_json::to_vec_pretty(&system_info_json())?,
+            ));
+            if json_only {
+                let mut map = serde_json::Map::new();
+                map.insert("generated_at_sec".into(), json!(unix_now_sec()));
+                for (name, data) in &entries {
+                    let key = name.trim_end_matches(".json").to_string();
+                    map.insert(key, serde_json::from_slice(data).unwrap_or(json!(null)));
                 }
-                None => println!("{text}"),
+                let text = serde_json::to_string_pretty(&serde_json::Value::Object(map))?;
+                match out {
+                    Some(path) => {
+                        std::fs::write(&path, &text)?;
+                        eprintln!("sysdump -> {path}（JSON）");
+                    }
+                    None => println!("{text}"),
+                }
+                return Ok(());
             }
+            // 系统网络现场（外部命令缺失/失败均如实记录，不中断归档）。
+            for (name, prog, cargs) in [
+                (
+                    "net/routes.txt",
+                    "ip",
+                    &["-o", "route", "show", "table", "all"][..],
+                ),
+                ("net/addresses.txt", "ip", &["-o", "addr", "show"][..]),
+                ("net/links.txt", "ip", &["-o", "-s", "link", "show"][..]),
+                ("net/neigh.txt", "ip", &["-o", "neigh", "show"][..]),
+                ("net/netfilter-nft.txt", "nft", &["list", "ruleset"][..]),
+                ("net/iptables-save.txt", "iptables-save", &[][..]),
+                ("net/ip6tables-save.txt", "ip6tables-save", &[][..]),
+            ] {
+                entries.push((name.into(), sysdump_cmd(prog, cargs).into_bytes()));
+            }
+            entries.push(("net/sysctl-net.txt".into(), sysdump_sysctl_net()));
+            entries.push(("version.txt".into(), version_text().into_bytes()));
+            entries.push((
+                "README.txt".into(),
+                "sodama sysdump：status/rules/config/maps + system + 现场（ip/nft/iptables/sysctl）。\n"
+                    .as_bytes()
+                    .to_vec(),
+            ));
+            let now = unix_now_sec();
+            let mut tar = dump::TarWriter::new();
+            for (name, data) in &entries {
+                tar.add(name, data, now);
+            }
+            let gz = dump::gzip_store(&tar.finish());
+            let path = out.unwrap_or_else(|| format!("sodama-sysdump.{now}.tar.gz"));
+            std::fs::write(&path, &gz)?;
+            println!(
+                "sysdump -> {path}（{} 文件，{} 字节；`tar xzf` 查看）",
+                entries.len(),
+                gz.len()
+            );
             Ok(())
         }
         "trace" => {
+            // A2 #3：`trace`——向守护进程开一个短时 trace 会话（数据面已在判决策做
+            // 内核侧筛选），随后读守护进程写的 trace 文件并做展示层过滤。
+            // 对照 dae `trace -4/-6 -p tcp|udp -P <port> --drop-only -o <file>`。
             let mut secs = 5u64;
+            let mut v4 = false;
+            let mut v6 = false;
+            let mut l4: Option<String> = None;
+            let mut port: Option<u16> = None;
+            let mut drop_only = false;
+            let mut out: Option<String> = None;
+            let mut sock = "/tmp/sodama-status.sock".to_string();
             let mut it = argv.iter().skip(2);
             while let Some(a) = it.next() {
                 match a.as_str() {
                     "--seconds" => secs = it.next().ok_or("--seconds 需要值")?.parse()?,
+                    "-4" | "--ipv4" => v4 = true,
+                    "-6" | "--ipv6" => v6 = true,
+                    "-p" | "--l4-proto" => {
+                        let v = it.next().ok_or("--l4-proto 需要值（tcp|udp）")?;
+                        match v.as_str() {
+                            "tcp" | "udp" => l4 = Some(v.clone()),
+                            other => return Err(format!("未知 L4 协议 {other}（tcp|udp）").into()),
+                        }
+                    }
+                    "-P" | "--port" => port = Some(it.next().ok_or("--port 需要值")?.parse()?),
+                    "--drop-only" => drop_only = true,
+                    "-o" | "--output" => out = Some(it.next().ok_or("-o 需要值")?.clone()),
+                    "--socket" => sock = it.next().ok_or("--socket 需要值")?.clone(),
                     other => return Err(format!("未知参数 {other}").into()),
                 }
             }
-            let path = if Path::new("/sys/kernel/tracing/trace_pipe").exists() {
-                "/sys/kernel/tracing/trace_pipe"
+            if v4 && v6 {
+                return Err("--ipv4 与 --ipv6 不能同时指定（对照 dae trace）".into());
+            }
+            let ipver = if v6 {
+                2
+            } else if v4 {
+                1
             } else {
-                "/sys/kernel/debug/tracing/trace_pipe"
+                0
             };
-            let f = std::fs::File::open(path)
-                .map_err(|e| format!("打开 {path} 失败（需要 root）: {e}"))?;
-            let (tx, rx) = std::sync::mpsc::channel::<String>();
-            std::thread::spawn(move || {
-                use std::io::BufRead as _;
-                for line in std::io::BufReader::new(f).lines().map_while(Result::ok) {
-                    if tx.send(line).is_err() {
-                        return;
-                    }
-                }
-            });
-            let deadline = Instant::now() + Duration::from_secs(secs);
-            while Instant::now() < deadline {
-                match rx.recv_timeout(Duration::from_millis(200)) {
-                    Ok(line) if line.contains("sodama") => println!("{line}"),
-                    Ok(_) => {}
-                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-                    Err(_) => break,
-                }
+            let l4no = match l4.as_deref() {
+                Some("tcp") => 6u32,
+                Some("udp") => 17u32,
+                _ => 0u32,
+            };
+            let mut cmd = format!("trace secs={secs} ipver={ipver}");
+            if l4no != 0 {
+                cmd.push_str(&format!(" l4={l4no}"));
+            }
+            if let Some(p) = port {
+                cmd.push_str(&format!(" port={p}"));
+            }
+            if drop_only {
+                cmd.push_str(" drop_only=1");
+            }
+            let resp = status::client(Path::new(&sock), &cmd)
+                .map_err(|e| format!("无法连接守护进程（{sock}）：{e}"))?;
+            let v: serde_json::Value = serde_json::from_str(&resp).unwrap_or(json!({}));
+            if v.get("ok").and_then(|b| b.as_bool()) != Some(true) {
+                return Err(format!(
+                    "守护进程拒绝 trace：{}",
+                    v.get("error").and_then(|s| s.as_str()).unwrap_or(&resp)
+                )
+                .into());
+            }
+            let secs = v.get("seconds").and_then(|x| x.as_u64()).unwrap_or(secs);
+            let file = v
+                .get("file")
+                .and_then(|x| x.as_str())
+                .ok_or("回执缺 file 字段（旧守护进程？）")?
+                .to_string();
+            let filters = TraceFilters {
+                v4_only: v4,
+                v6_only: v6,
+                l4: l4.clone(),
+                port,
+                drop_only,
+            };
+            let mut writer: Box<dyn std::io::Write> = match &out {
+                Some(p) => Box::new(std::fs::File::create(p)?),
+                None => Box::new(std::io::stdout()),
+            };
+            let shown =
+                stream_trace_lines(&file, Duration::from_secs(secs), &filters, &mut writer)?;
+            if let Some(p) = &out {
+                eprintln!("trace -> {p}（{shown} 行）");
+            } else {
+                eprintln!("trace: 会话结束（{shown} 行；产出于 {file}）");
             }
             Ok(())
         }
@@ -9586,6 +10029,7 @@ fn run_subcommand(argv: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 const COMPLETION_SUBCOMMANDS: &[&str] = &[
     "validate",
     "export-config",
+    "export",
     "extract-routing",
     "status",
     "reload",
@@ -9741,6 +10185,332 @@ fn completion_script(shell: &str) -> Option<String> {
             Some(s)
         }
         _ => None,
+    }
+}
+
+/// A2 #1：版本信息文本（`--version` / sysdump 的 version.txt 共用）。
+/// git sha / 构建 profile 由 `build.rs` 尽力注入（无 git 时为 unknown）。
+fn version_text() -> String {
+    format!(
+        "{}\nrust {} {}/{}\nCopyright (c) 2026 sodama project\nLicense GNU AGPLv3 <https://www.gnu.org/licenses/agpl-3.0.html>\n",
+        env!("SODAMA_VERSION_FULL", "sodama unknown"),
+        env!("SODAMA_BUILD_PROFILE", "unknown"),
+        std::env::consts::OS,
+        std::env::consts::ARCH
+    )
+}
+
+/// A2 #1：`--version` 输出（对照 dae rootCmd.Version 的多行格式：版本 + 运行时/平台 + 许可）。
+fn print_version() {
+    print!("{}", version_text());
+}
+
+/// A2 #4：跑一条取证命令（挂起最多 5s；缺失/失败如实记录）。
+fn sysdump_cmd(prog: &str, args: &[&str]) -> String {
+    use std::process::{Command, Stdio};
+    let mut child = match Command::new(prog)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => return format!("（{prog} 不可用: {e}）\n"),
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            _ => {
+                let _ = child.kill();
+                return format!("（{prog} 超时 5s，已终止）\n");
+            }
+        }
+    }
+    match child.wait_with_output() {
+        Ok(o) => {
+            let mut s = String::from_utf8_lossy(&o.stdout).to_string();
+            if !o.stderr.is_empty() {
+                s.push_str("\n# stderr:\n");
+                s.push_str(&String::from_utf8_lossy(&o.stderr));
+            }
+            if !o.status.success() {
+                s.push_str(&format!("\n# 退出码: {:?}\n", o.status.code()));
+            }
+            s
+        }
+        Err(e) => format!("（{prog} 读取输出失败: {e}）\n"),
+    }
+}
+
+/// A2 #4：遍历 `/proc/sys/net`（全部 net sysctl，路径 = `net/...`）。
+/// 读不到的条目跳过（procfs 条目可能瞬态消失）。
+fn sysdump_sysctl_net() -> Vec<u8> {
+    fn walk(dir: &std::path::Path, base: &std::path::Path, out: &mut String) {
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for e in rd.flatten() {
+            let p = e.path();
+            let Ok(ft) = e.file_type() else { continue };
+            if ft.is_dir() {
+                walk(&p, base, out);
+            } else if let Ok(txt) = std::fs::read_to_string(&p) {
+                let rel = p.strip_prefix(base).unwrap_or(&p).display().to_string();
+                out.push_str(&format!("{rel} = {}\n", txt.trim()));
+            }
+        }
+    }
+    let base = std::path::Path::new("/proc/sys/net");
+    let mut out = String::new();
+    walk(base, base, &mut out);
+    out.into_bytes()
+}
+
+/// A2 #5：`export outline`——配置 schema（机器可读，供 UI/面板开发者）。
+/// 与 `config-doc --format json` 同源（`config::key_docs()` 登记表）；
+/// 额外带上版本与生成器标识，字段结构与 dae `ExportOutlineJson` 同一用途（用途同、字段名可不同）。
+fn export_outline_json() -> serde_json::Value {
+    let mut sections: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
+    for k in config::key_docs() {
+        let sec = sections
+            .entry(k.section.to_string())
+            .or_insert_with(|| json!({}));
+        if let Some(m) = sec.as_object_mut() {
+            m.insert(
+                k.key.to_string(),
+                json!({
+                    "desc": k.desc,
+                    "default": k.default,
+                    "consumed": k.consumed,
+                }),
+            );
+        }
+    }
+    // 段清单（与 config.rs 的 KNOWN_SECTIONS 同源，保证 UI 能列全所有段）。
+    let known: Vec<&str> = config::KNOWN_SECTIONS.to_vec();
+    json!({
+        "outline": "sodama-config",
+        "version": env!("SODAMA_VERSION_FULL", env!("CARGO_PKG_VERSION")),
+        "generator": "sodama export outline（schema 登记表：loader/src/config.rs key_docs()）",
+        "sections": sections,
+        "known_sections": known,
+    })
+}
+
+/// A2 #3：trace 展示层过滤器（内核侧已按同一条件筛过；此处为用户终态过滤 +
+/// `-o` 重定向服务，两侧一致由单测锁定）。
+#[derive(Debug, Default, Clone)]
+struct TraceFilters {
+    v4_only: bool,
+    v6_only: bool,
+    l4: Option<String>,
+    port: Option<u16>,
+    drop_only: bool,
+}
+
+/// 一行 trace 的解析结果（只取过滤需要的字段；其余保留原文打印）。
+#[derive(Debug, PartialEq, Eq)]
+struct TraceLine {
+    v: u8,
+    l4: String,
+    sport: u16,
+    dport: u16,
+    act: String,
+}
+
+/// 解析 `format_trace_line` 产出的行（键值对自描述；未知/损坏行 → None 不打印）。
+fn parse_trace_line(line: &str) -> Option<TraceLine> {
+    let mut v = None;
+    let mut l4 = None;
+    let mut sport = None;
+    let mut dport = None;
+    let mut act = None;
+    for kv in line.split_whitespace() {
+        // 首列是时间戳（无 `=`）——跳过而非报错；必填字段在末尾统一验证。
+        let Some((k, val)) = kv.split_once('=') else {
+            continue;
+        };
+        match k {
+            "v" => v = val.parse::<u8>().ok(),
+            "l4" => l4 = Some(val.to_string()),
+            "sport" => sport = val.parse::<u16>().ok(),
+            "dport" => dport = val.parse::<u16>().ok(),
+            "act" => act = Some(val.to_string()),
+            _ => {}
+        }
+    }
+    Some(TraceLine {
+        v: v?,
+        l4: l4?,
+        sport: sport?,
+        dport: dport?,
+        act: act?,
+    })
+}
+
+/// 展示层过滤（与数据面 `trace_filter_map` 同语义）。
+fn trace_line_matches(tl: &TraceLine, f: &TraceFilters) -> bool {
+    if f.v4_only && tl.v != 4 {
+        return false;
+    }
+    if f.v6_only && tl.v != 6 {
+        return false;
+    }
+    if let Some(l4) = &f.l4 {
+        if &tl.l4 != l4 {
+            return false;
+        }
+    }
+    if let Some(p) = f.port {
+        if tl.sport != p && tl.dport != p {
+            return false;
+        }
+    }
+    if f.drop_only && tl.act != "shot" {
+        return false;
+    }
+    true
+}
+
+/// 读 trace 文件并过滤打印（轮询读；截止后把剩余读完）。返回匹配行数。
+fn stream_trace_lines(
+    file: &str,
+    window: Duration,
+    filters: &TraceFilters,
+    out: &mut dyn std::io::Write,
+) -> Result<u64, Box<dyn std::error::Error>> {
+    use std::io::Read as _;
+    // 守护进程在会话开始时截断/新建文件：等它出现（最多 2s）。
+    let mut f = {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match std::fs::File::open(file) {
+                Ok(f) => break f,
+                Err(e) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(100));
+                    let _ = e;
+                }
+                Err(e) => return Err(format!("打开 trace 文件 {file} 失败: {e}").into()),
+            }
+        }
+    };
+    let deadline = Instant::now() + window + Duration::from_millis(300);
+    let mut pending = String::new();
+    let mut buf = [0u8; 16 * 1024];
+    let mut shown = 0u64;
+    loop {
+        let n = f.read(&mut buf)?;
+        if n > 0 {
+            pending.push_str(&String::from_utf8_lossy(&buf[..n]));
+            while let Some(pos) = pending.find('\n') {
+                let line = pending[..pos].to_string();
+                pending.drain(..=pos);
+                if let Some(tl) = parse_trace_line(&line) {
+                    if trace_line_matches(&tl, filters) {
+                        writeln!(out, "{line}")?;
+                        shown += 1;
+                    }
+                }
+            }
+            continue;
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    Ok(shown)
+}
+
+/// A2 #3：trace 解析/过滤单测（展示层与数据面同语义；行格式由 `format_trace_line` 锁定）。
+#[cfg(test)]
+mod trace_tests {
+    use super::*;
+
+    #[test]
+    fn parse_and_filter_trace_line() {
+        let line = "18:31:02 v=4 l4=tcp sip=10.0.0.2 sport=41000 dip=1.1.1.1 dport=443 outbound=0x2 act=redir";
+        let tl = parse_trace_line(line).expect("应可解析");
+        assert_eq!(tl.v, 4);
+        assert_eq!(tl.l4, "tcp");
+        assert_eq!(tl.sport, 41000);
+        assert_eq!(tl.dport, 443);
+        assert_eq!(tl.act, "redir");
+        // 空过滤：全过
+        assert!(trace_line_matches(&tl, &TraceFilters::default()));
+        // -4 且是 v4 → 过；-6 → 不过
+        assert!(trace_line_matches(
+            &tl,
+            &TraceFilters {
+                v4_only: true,
+                ..Default::default()
+            }
+        ));
+        assert!(!trace_line_matches(
+            &tl,
+            &TraceFilters {
+                v6_only: true,
+                ..Default::default()
+            }
+        ));
+        // 端口：sport 或 dport 任一命中
+        assert!(trace_line_matches(
+            &tl,
+            &TraceFilters {
+                port: Some(443),
+                ..Default::default()
+            }
+        ));
+        assert!(!trace_line_matches(
+            &tl,
+            &TraceFilters {
+                port: Some(80),
+                ..Default::default()
+            }
+        ));
+        // drop-only：redir 不过
+        assert!(!trace_line_matches(
+            &tl,
+            &TraceFilters {
+                drop_only: true,
+                ..Default::default()
+            }
+        ));
+        // 损坏行（缺字段）→ None（不打印）；非键值行（分隔线）同理
+        assert!(parse_trace_line("v=4 l4=tcp sip=1.1.1.1").is_none());
+        assert!(parse_trace_line("kernel: something").is_none());
+    }
+
+    #[test]
+    fn trace_line_stream_filter() {
+        let dir = std::env::temp_dir().join(format!("sodama-trace-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("trace.log");
+        std::fs::write(
+            &path,
+            "18:31:02 v=4 l4=tcp sip=10.0.0.2 sport=41000 dip=1.1.1.1 dport=443 outbound=0x2 act=redir\n\
+             18:31:03 v=6 l4=udp sip=2001:db8::1 sport=5353 dip=2001:db8::2 dport=53 outbound=0x1 act=shot\n",
+        )
+        .unwrap();
+        let mut out: Vec<u8> = Vec::new();
+        let n = stream_trace_lines(
+            path.to_str().unwrap(),
+            Duration::from_millis(0),
+            &TraceFilters {
+                drop_only: true,
+                ..Default::default()
+            },
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(n, 1);
+        let s = String::from_utf8(out).unwrap();
+        assert!(s.contains("act=shot") && !s.contains("act=redir"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
@@ -10567,6 +11337,12 @@ fn status_json(ebpf: &mut Ebpf) -> serde_json::Value {
             "event_drops": stats.event_drops,
         },
         "events": events_json(&stats),
+        "trace": {
+            "active": TRACE_UNTIL_NS.load(Ordering::Relaxed) > monotonic_now_ns(),
+            "file": TRACE_PATH.get().map(|p| p.display().to_string()),
+            "events": TRACE_EVENTS.load(Ordering::Relaxed),
+            "write_errors": TRACE_WRITE_ERRS.load(Ordering::Relaxed),
+        },
         "offload_sent": {
             "reclaimed_bytes": RELAY_STATS.offload_sent_bytes.load(Ordering::Relaxed),
             "kernel_bytes": stats.offload_sent_bytes,
@@ -11022,6 +11798,42 @@ fn handle_status_query(cmd: &str, ebpf: &mut Ebpf, args: &Args) -> String {
             Err(e) => json!({"ok": false, "error": e.to_string()}).to_string(),
         },
         "metrics" => metrics_text(&status_json(ebpf)),
+        cmd if cmd == "trace" || cmd.starts_with("trace ") => {
+            // A2 #3：`trace secs=<n> [l4=<6|17>] [port=<n>] [ipver=<0|1|2>] [drop_only=1]`
+            // ——写数据面过滤器（内核侧筛选）+ 开会话；事件由常驻消费线程落盘，
+            // CLI 读同一文件做展示层过滤（文件路径随回执返回）。
+            let mut seconds = 5u64;
+            let mut l4 = None;
+            let mut port = None;
+            let mut ipver = 0u32;
+            let mut drop_only = false;
+            for part in cmd.split_whitespace().skip(1) {
+                if let Some(v) = part.strip_prefix("secs=") {
+                    seconds = v.parse().unwrap_or(5);
+                } else if let Some(v) = part.strip_prefix("l4=") {
+                    l4 = v.parse::<u32>().ok();
+                } else if let Some(v) = part.strip_prefix("port=") {
+                    port = v.parse::<u32>().ok();
+                } else if let Some(v) = part.strip_prefix("ipver=") {
+                    ipver = v.parse().unwrap_or(0);
+                } else if let Some(v) = part.strip_prefix("drop_only=") {
+                    drop_only = v == "1";
+                }
+            }
+            match arm_trace(ebpf, seconds, l4, port, ipver, drop_only) {
+                Ok((secs, file)) => json!({
+                    "ok": true,
+                    "seconds": secs,
+                    "file": file,
+                    "l4": l4,
+                    "port": port,
+                    "ipver": ipver,
+                    "drop_only": drop_only,
+                })
+                .to_string(),
+                Err(e) => json!({"ok": false, "error": e}).to_string(),
+            }
+        }
         "rules" => {
             let rules_state = LAST_RULES.lock().ok().and_then(|g| g.clone());
             match rules_state {
@@ -11139,6 +11951,43 @@ mod tests {
         assert!(parse_dns_bind("udp://127.0.0.1").is_err());
         assert!(parse_dns_bind("127.0.0.1").is_err());
         assert!(parse_dns_bind("  ").is_err());
+    }
+
+    #[test]
+    fn log_rotation_creates_gz_backup() {
+        let dir = std::env::temp_dir().join(format!("sodama-logrot-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("sodama.log");
+        std::fs::write(&path, "line1\nline2\n").unwrap();
+        let _ = LOG_PATH.set(path.display().to_string());
+        assert!(open_log_file(path.to_str().unwrap()), "打开日志文件");
+        LOG_MAX_BACKUPS.store(2, Ordering::Relaxed);
+        rotate_log_now();
+        let gz_path = dir.join("sodama.log.1.gz");
+        assert!(gz_path.exists(), "轮转产物 {gz_path:?} 应存在");
+        let gz = std::fs::read(&gz_path).unwrap();
+        assert_eq!(crate::dump::gunzip_store(&gz), b"line1\nline2\n");
+        // 当前文件只剩「轮转」这一条日志（旧内容已压入 .1.gz）
+        let now_content = String::from_utf8(std::fs::read(&path).unwrap()).unwrap();
+        assert!(
+            now_content.contains("日志轮转"),
+            "当前文件应含轮转提示：{now_content:?}"
+        );
+        assert!(!now_content.contains("line1"), "旧内容不应留在当前文件");
+        assert!(LOG_SINK.lock().unwrap().is_some(), "轮转后应重开 sink");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parse_log_level_values() {
+        assert_eq!(parse_log_level("off"), Some(0));
+        assert_eq!(parse_log_level("ERROR"), Some(1));
+        assert_eq!(parse_log_level(" warning "), Some(2));
+        assert_eq!(parse_log_level("info"), Some(3));
+        assert_eq!(parse_log_level("debug"), Some(4));
+        assert_eq!(parse_log_level("trace"), Some(4));
+        assert_eq!(parse_log_level("verbose"), None);
     }
 
     #[test]

@@ -2,7 +2,7 @@
 # sodama zsh completion（由 `sodama completion zsh` 生成）
 _sodama() {
     local -a subcmds flags
-    subcmds=(validate export-config extract-routing status reload suspend resume metrics sub-parse sysdump trace dns-bench completion)
+    subcmds=(validate export-config export extract-routing status reload suspend resume metrics sub-parse sysdump trace dns-bench completion)
     flags=(--ebpf --lan --wan --dual --dae0 --dae0peer --daens --tproxy-port --rules --config --strict-config --status-socket --log-file --watch-config --dialer --relay-idle-timeout --dial-timeout --dial-mode --sniffing-timeout-ms --sniff-punt --disable-timestamp --disable-pidfile --subscribe --geodata-dir --group --listen-socks --udp-idle-timeout --forward --offload --link-hdr --xdp --no-splice --ebpf-debug --ktls --max-conns --dns-upstream --dump --compile-dump --proxy --help)
     if (( CURRENT == 2 )); then
         _describe -t commands "子命令" subcmds

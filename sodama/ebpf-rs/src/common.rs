@@ -55,6 +55,8 @@ pub const SODAMA_STATE_DNS_QUERY: u8 = 1 << 3;
 pub const SODAMA_FLAG_SUSPEND: u32 = 1;
 /// M1：热路径调试打印门控（默认关；loader `--ebpf-debug` 置位）。
 pub const SODAMA_FLAG_DEBUG: u32 = 2;
+/// A2 #3：trace 过滤器 map 的尺寸（单元素；loader 写，热路径读）。
+pub const SODAMA_TRACE_FILTER_SIZE: u32 = 1;
 
 pub const SODAMA_STAT_UDP_CONN_OVERFLOW: u32 = 0;
 pub const SODAMA_STAT_TCP_CONN_OVERFLOW: u32 = 1;
@@ -279,6 +281,28 @@ pub struct SodaDnsSenderPname {
     pub ts_ns: u64,
 }
 
+/// A2 #3：trace 过滤器（单元素结构；loader 的 `trace` 子命令写，热路径按字段匹配
+/// ——内核侧过滤，对照 dae trace 的过滤语义；洪泛时不会把无关报文灌进 ringbuf）。
+pub const SODAMA_TRACE_L4_ANY: u32 = 0;
+pub const SODAMA_TRACE_IPVER_ANY: u32 = 0;
+pub const SODAMA_TRACE_IPVER_V4: u32 = 1;
+pub const SODAMA_TRACE_IPVER_V6: u32 = 2;
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct SodaTraceFilter {
+    /// 0 = 关闭（默认）；非 0 = 开启。
+    pub enabled: u32,
+    /// 0 = 不限；否则要求 `l4proto` 匹配（6=TCP / 17=UDP）。
+    pub l4proto: u32,
+    /// 0 = 不限；否则要求 sport 或 dport 匹配（host 序）。
+    pub port: u32,
+    /// 0 = 不限；`SODAMA_TRACE_IPVER_*`。
+    pub ipver: u32,
+    /// 0 = 全部判决；非 0 = 仅 SHOT（drop-only，对照 dae `--drop-only`）。
+    pub drop_only: u32,
+}
+
 /// 事件类型（对照 dae `enum dae_event_type` 的编号）。
 pub const SODAMA_EVENT_BLOCKED: u32 = 0;
 pub const SODAMA_EVENT_UDP_CONN_OVERFLOW: u32 = 1;
@@ -293,6 +317,14 @@ pub const SODAMA_EVENT_SYN_REBIND_REJECTED: u32 = 5;
 pub const SODAMA_EVENT_REDIRECT_UPDATE_FAILED: u32 = 8;
 /// 纯 SYN 的缓存路由属旧代次：删条目重路由（对照 dae `DAE_EVENT_SYN_REBIND_REROUTED`）。
 pub const SODAMA_EVENT_SYN_REBIND_REROUTED: u32 = 9;
+/// A2 #3：trace 事件（sodama 自有，dae 无此事件——dae 的 trace 是独立 eBPF 程序）。
+/// 携带完整五元组 + 判决（判决编码在 `SodaEvent.pad[0]`，见 `SODAMA_VERDICT_*`），
+/// 由 loader 的 `trace` 子命令按秒开启，写 trace 文件供 CLI 过滤。
+pub const SODAMA_EVENT_TRACE: u32 = 10;
+/// trace 事件的判决编码（写入 `SodaEvent.pad[0]`）。
+pub const SODAMA_VERDICT_OK: u8 = 0;
+pub const SODAMA_VERDICT_SHOT: u8 = 1;
+pub const SODAMA_VERDICT_REDIR: u8 = 2;
 
 /// 事件限速键（0..=255 = per-outbound，供 BLOCKED_ALIVE 用；256+ 保留键域，
 /// 对照 dae `control/event_rate_contract.go`：256 blocked / 257 redirect_rebind /

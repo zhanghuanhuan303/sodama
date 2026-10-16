@@ -9,7 +9,7 @@ use aya_ebpf_bindings::{
 };
 
 use crate::common::*;
-use crate::event::{bump_stat, send_event_limited};
+use crate::event::{bump_stat, send_event_limited, send_trace_event};
 use crate::maps::*;
 use crate::route::sodama_route;
 
@@ -26,6 +26,37 @@ pub fn debug_log() -> bool {
         Some(v) => *v & SODAMA_FLAG_DEBUG != 0,
         None => false,
     }
+}
+
+/// A2 #3：trace 判决点——内核侧过滤（对照 dae trace 的过滤语义：dae 用独立 eBPF
+/// 程序 + 内核侧判定，sodama 用单元素过滤器 map + 热路径判定，见 ADR-0069）。
+/// `enabled=0` 时只多一次 map 读；不匹配则不产生任何事件。
+#[inline(always)]
+unsafe fn trace_verdict(verdict: u8, outbound: u8, pkt: &SodaParseResult) {
+    let Some(f) = trace_filter_map.get_ptr_mut(0) else {
+        return;
+    };
+    if (*f).enabled == 0 {
+        return;
+    }
+    if (*f).l4proto != SODAMA_TRACE_L4_ANY && (*f).l4proto != pkt.l4proto as u32 {
+        return;
+    }
+    if (*f).port != 0 && (*f).port != pkt.h_sport as u32 && (*f).port != pkt.h_dport as u32 {
+        return;
+    }
+    if (*f).ipver != SODAMA_TRACE_IPVER_ANY {
+        let v4 = pkt.is_v4 != 0;
+        if (v4 && (*f).ipver != SODAMA_TRACE_IPVER_V4)
+            || (!v4 && (*f).ipver != SODAMA_TRACE_IPVER_V6)
+        {
+            return;
+        }
+    }
+    if (*f).drop_only != 0 && verdict != SODAMA_VERDICT_SHOT {
+        return;
+    }
+    send_trace_event(verdict, outbound, pkt.l4proto, Some(&pkt.tuples));
 }
 
 unsafe fn conn_lookup(key: &SodaTuple, l4proto: u8) -> Option<*mut SodaConnState> {
@@ -498,9 +529,11 @@ pub unsafe fn split_flow(
             pkt.l4proto,
             Some(&pkt.tuples),
         );
+        trace_verdict(SODAMA_VERDICT_SHOT, outbound, pkt);
         return TC_ACT_SHOT as i32;
     }
     if outbound == SODAMA_OUTBOUND_DIRECT {
+        trace_verdict(SODAMA_VERDICT_OK, outbound, pkt);
         ctx.set_mark(mark);
         return TC_ACT_OK as i32;
     }
@@ -509,8 +542,10 @@ pub unsafe fn split_flow(
     // 限速键 = outbound 本身）。
     if cached.is_none() && !outbound_is_alive(outbound, pkt.l4proto, pkt.h_dport, pkt.is_v4) {
         send_blocked_alive_event(outbound, pkt.l4proto, &pkt.tuples);
+        trace_verdict(SODAMA_VERDICT_SHOT, outbound, pkt);
         return TC_ACT_SHOT as i32;
     }
+    trace_verdict(SODAMA_VERDICT_REDIR, outbound, pkt);
     redirect_to_control_plane(ctx, pkt, &cfg, is_wan, link_h_len)
 }
 

@@ -14,6 +14,10 @@ use crate::common::*;
 #[btf_map]
 pub static config_map: Array<SodaConfig, 1> = Array::new();
 
+/// A2 #3：trace 过滤器（单元素；loader 写，热路径 `trace_verdict` 读）。
+#[btf_map]
+pub static trace_filter_map: Array<SodaTraceFilter, 1> = Array::new();
+
 #[btf_map]
 pub static lpm_array_map: ArrayOfMaps<
     LpmTrie<[u8; 16], u32, 2_048_000>,
