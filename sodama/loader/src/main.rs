@@ -54,6 +54,7 @@ mod btfoff;
 mod bufpool;
 mod config;
 mod dns;
+mod dns_pref_wait;
 mod dnsroute;
 mod dnsup;
 mod dump;
@@ -5757,6 +5758,150 @@ fn monotonic_now_ns() -> u64 {
 
 /// conn_state 过期清扫（对照 dae control/conn_state_janitor.go；dae 在内核里也有
 /// 到期判定，这里保留内核判定 + 用户态兜底回收，避免地图无限增长）。
+// ---------------------------------------------------------------- A2 #13：流量历史
+/// 1h 流量历史（对照 dae `control/runtime_stats.go`：1h 上限 / 30min 默认窗口 /
+/// ≤180 点；dae 用 250ms 惰性桶，sodama 用 1s 采样线程——同一可观察形态，分辨率更粗）。
+#[derive(Clone, Copy)]
+struct TrafficPoint {
+    /// unix 秒。
+    t: u64,
+    /// 上行字节/秒。
+    up: u64,
+    /// 下行字节/秒。
+    down: u64,
+}
+
+/// 历史点数上限（1h）。
+const TRAFFIC_HIST_MAX: usize = 3600;
+/// 默认查询窗口（30min）与点数上限（180）——对照 dae `defaultRuntimeWindowSec`/`maxPoints`。
+const TRAFFIC_WINDOW_SEC: u64 = 1800;
+const TRAFFIC_MAX_POINTS: usize = 180;
+
+fn traffic_hist() -> &'static Mutex<std::collections::VecDeque<TrafficPoint>> {
+    static H: OnceLock<Mutex<std::collections::VecDeque<TrafficPoint>>> = OnceLock::new();
+    H.get_or_init(|| Mutex::new(std::collections::VecDeque::with_capacity(TRAFFIC_HIST_MAX)))
+}
+
+/// 最近一次采样的速率（status/metrics 用，避免每查询都加锁算）。
+static TRAFFIC_UP_RATE: AtomicU64 = AtomicU64::new(0);
+static TRAFFIC_DOWN_RATE: AtomicU64 = AtomicU64::new(0);
+
+/// 累计字节（TCP relay + UDP NAT；dae 在每次拷贝处记录，sodama 用累计计数采样）。
+fn traffic_bytes_total() -> (u64, u64) {
+    let up = RELAY_STATS.bytes_up.load(Ordering::Relaxed)
+        + UDP_NAT_STATS.bytes_up.load(Ordering::Relaxed);
+    let down = RELAY_STATS.bytes_down.load(Ordering::Relaxed)
+        + UDP_NAT_STATS.bytes_down.load(Ordering::Relaxed);
+    (up, down)
+}
+
+/// 1s 采样线程（对照 dae 的 runtime bucket 滚动；空转成本 = 两次原子读 + 一次 push）。
+fn traffic_history_loop() {
+    let mut last_mono = monotonic_now_ns();
+    let (mut last_up, mut last_down) = traffic_bytes_total();
+    loop {
+        std::thread::sleep(Duration::from_secs(1));
+        let now_mono = monotonic_now_ns();
+        let (up, down) = traffic_bytes_total();
+        let elapsed = now_mono.saturating_sub(last_mono).max(1);
+        let up_rate = up.saturating_sub(last_up) * 1_000_000_000 / elapsed;
+        let down_rate = down.saturating_sub(last_down) * 1_000_000_000 / elapsed;
+        last_mono = now_mono;
+        last_up = up;
+        last_down = down;
+        TRAFFIC_UP_RATE.store(up_rate, Ordering::Relaxed);
+        TRAFFIC_DOWN_RATE.store(down_rate, Ordering::Relaxed);
+        let t = unix_now_sec();
+        if let Ok(mut h) = traffic_hist().lock() {
+            if h.len() >= TRAFFIC_HIST_MAX {
+                h.pop_front();
+            }
+            h.push_back(TrafficPoint {
+                t,
+                up: up_rate,
+                down: down_rate,
+            });
+        }
+    }
+}
+
+/// status 面取样：窗口内降采样到 ≤`TRAFFIC_MAX_POINTS`（对照 dae `snapshot` 的
+/// `windowSec`/`maxPoints` 语义：窗口过滤 + 点数上限）。
+fn traffic_snapshot_json() -> serde_json::Value {
+    let (up_total, down_total) = traffic_bytes_total();
+    let now = unix_now_sec();
+    let start = now.saturating_sub(TRAFFIC_WINDOW_SEC);
+    let Ok(h) = traffic_hist().lock() else {
+        return json!({"error": "history busy"});
+    };
+    let window: Vec<&TrafficPoint> = h.iter().filter(|p| p.t >= start).collect();
+    let stride = window.len().div_ceil(TRAFFIC_MAX_POINTS).max(1);
+    let samples: Vec<serde_json::Value> = window
+        .iter()
+        .step_by(stride)
+        .map(|p| json!({"t": p.t, "up": p.up, "down": p.down}))
+        .collect();
+    json!({
+        "updated_at_sec": now,
+        "window_sec": TRAFFIC_WINDOW_SEC,
+        "points": samples.len(),
+        "samples_total": h.len(),
+        "upload_rate": TRAFFIC_UP_RATE.load(Ordering::Relaxed),
+        "download_rate": TRAFFIC_DOWN_RATE.load(Ordering::Relaxed),
+        "upload_total": up_total,
+        "download_total": down_total,
+        "active_conns": RELAY_STATS.conns_active.load(Ordering::Relaxed),
+        "udp_sessions": UDP_NAT_STATS
+            .sessions_total
+            .load(Ordering::Relaxed)
+            .saturating_sub(UDP_NAT_STATS.evicted.load(Ordering::Relaxed)),
+        "samples": samples,
+    })
+}
+
+// ---------------------------------------------------------------- A2 #14：告警节流
+/// 「持续条件」告警节流（对照 dae `control/alert_pacing.go` 的 `pacedAlert`）：
+/// 同一条件跨多次巡检持续为真时——首次必发、冷却期内只累计**观察次数**、冷却结束
+/// 后再次发出并把累计次数写进消息（「观察 N 次」）。与旧「固定步长单次」的区别：
+/// 观察次数让「条件从未解除」可读（步长法只能看到孤立的几条）。
+pub(crate) struct AlertPacer {
+    last_emit_ns: AtomicU64,
+    observations: AtomicU64,
+    cooldown_ns: u64,
+}
+
+impl AlertPacer {
+    pub(crate) const fn new(cooldown_ns: u64) -> Self {
+        Self {
+            last_emit_ns: AtomicU64::new(0),
+            observations: AtomicU64::new(0),
+            cooldown_ns,
+        }
+    }
+
+    /// 记一次观察；返回 `(累计观察次数, 是否应输出)`（首次必发；冷却后复发）。
+    pub(crate) fn observe(&self, now_ns: u64) -> (u64, bool) {
+        let n = self.observations.fetch_add(1, Ordering::Relaxed) + 1;
+        let last = self.last_emit_ns.load(Ordering::Relaxed);
+        if last != 0 && now_ns.saturating_sub(last) < self.cooldown_ns {
+            return (n, false);
+        }
+        if self
+            .last_emit_ns
+            .compare_exchange(last, now_ns, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+        {
+            return (n, false);
+        }
+        (n, true)
+    }
+}
+
+/// redirect_track 容量告警节流（对照 dae `mapCapacityAlertCooldown = 1min`）。
+static REDIRECT_CAPACITY_ALERT: AlertPacer = AlertPacer::new(60 * 1_000_000_000);
+/// conn_state 容量告警节流（sodama 扩展；同口径）。
+static CONN_STATE_CAPACITY_ALERT: AlertPacer = AlertPacer::new(60 * 1_000_000_000);
+
 fn sweep_conn_state(ebpf: &mut Ebpf) -> Result<usize, Box<dyn std::error::Error>> {
     const TCP_TIMEOUT_NS: u64 = 300 * 1_000_000_000;
     const UDP_TIMEOUT_NS: u64 = 60 * 1_000_000_000;
@@ -5766,7 +5911,9 @@ fn sweep_conn_state(ebpf: &mut Ebpf) -> Result<usize, Box<dyn std::error::Error>
     let mut conn_state: HashMap<_, SodaTuple, SodaConnState> = HashMap::try_from(map)?;
     let now = monotonic_now_ns();
     let mut dead: Vec<SodaTuple> = Vec::new();
+    let mut total: usize = 0;
     for (k, v) in conn_state.iter().flatten() {
+        total += 1;
         let timeout = if v.l4proto == 6 {
             TCP_TIMEOUT_NS
         } else {
@@ -5779,6 +5926,16 @@ fn sweep_conn_state(ebpf: &mut Ebpf) -> Result<usize, Box<dyn std::error::Error>
     let n = dead.len();
     for k in &dead {
         let _ = conn_state.remove(k);
+    }
+    // A2 #14：容量告警（持续条件 + 观察次数；90% 阈值同 redirect_track 口径）。
+    const CONN_STATE_CAPACITY: usize = 262144;
+    if total * 100 >= CONN_STATE_CAPACITY * 90 {
+        let (obs, emit) = CONN_STATE_CAPACITY_ALERT.observe(now);
+        if emit {
+            log_warn(&format!(
+                "conn_state_map 容量告警：{total}/{CONN_STATE_CAPACITY}（≥90%；本次观察 {obs} 次，60s 一条）"
+            ));
+        }
     }
     Ok(n)
 }
@@ -5793,8 +5950,6 @@ fn sweep_redirect_track(ebpf: &mut Ebpf) -> Result<(usize, usize), Box<dyn std::
     /// 对照 ebpf-rs/src/maps.rs 的 `redirect_track` max_entries。
     const REDIRECT_TRACK_CAPACITY: usize = 65536;
     const CAPACITY_ALERT_PCT: usize = 90;
-    const CAPACITY_ALERT_STEP_S: u64 = 60;
-    static LAST_CAPACITY_ALERT_S: AtomicU64 = AtomicU64::new(0);
 
     let map = ebpf
         .map_mut("redirect_track")
@@ -5813,14 +5968,12 @@ fn sweep_redirect_track(ebpf: &mut Ebpf) -> Result<(usize, usize), Box<dyn std::
     for k in &dead {
         let _ = track.remove(k);
     }
-    // 容量告警（对照上游 logMapCapacityAlert；60s 节流避免刷屏）。
+    // A2 #14：容量告警（对照上游 logMapCapacityAlert；持续条件 + 观察次数）。
     if total * 100 >= REDIRECT_TRACK_CAPACITY * CAPACITY_ALERT_PCT {
-        let now_s = now / 1_000_000_000;
-        let last = LAST_CAPACITY_ALERT_S.load(Ordering::Relaxed);
-        if now_s.saturating_sub(last) >= CAPACITY_ALERT_STEP_S {
-            LAST_CAPACITY_ALERT_S.store(now_s, Ordering::Relaxed);
-            log(&format!(
-                "redirect_track 容量告警：{total}/{REDIRECT_TRACK_CAPACITY}（≥{CAPACITY_ALERT_PCT}%），过期清理未跟上"
+        let (obs, emit) = REDIRECT_CAPACITY_ALERT.observe(now);
+        if emit {
+            log_warn(&format!(
+                "redirect_track 容量告警：{total}/{REDIRECT_TRACK_CAPACITY}（≥{CAPACITY_ALERT_PCT}%；本次观察 {obs} 次，60s 一条），过期清理未跟上"
             ));
         }
     }
@@ -7372,6 +7525,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
+    // A2 #13：1h 流量历史采样线程（1s 周期；dae 的 daed API 口径）。
+    if let Err(e) = std::thread::Builder::new()
+        .name("traffic-hist".into())
+        .spawn(traffic_history_loop)
+    {
+        log_warn(&format!("traffic: 历史采样线程创建失败（{e}）"));
+    }
     // 出口连通性投影 map：交给 2s 投影循环持有（take 后 ebpf 不再持有）。
     // P38：取图后立即全量置 1（乐观初值）——map 零初始化 = 所有出口「死」，而
     // GROUP_SET 的就绪晚于本处（投影循环首轮可能 early return）：该窗口内新流首包
@@ -7735,7 +7895,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             Ok(status::MainMsg::DnsPublish { updates }) => {
                 if let Err(e) = publish_domain_bits(&mut ebpf, &updates) {
-                    log(&format!("domain_routing_map 写入失败: {e}"));
+                    // A2 #11：入重试堆（对照 dae 的投影重试任务堆），主循环 tick 消费。
+                    log_warn(&format!("domain_routing_map 写入失败: {e}（已排入重试）"));
+                    publish_enqueue_retry(updates);
                 }
             }
             Err(_) => {}
@@ -7755,6 +7917,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         // A2 #3：trace 会话到期（清数据面过滤器位；未激活时是一次原子读）。
         trace_maybe_expired(&mut ebpf);
+        // A2 #11：投影重试堆消费（空队列时是一次加锁读）。
+        publish_retry_tick(&mut ebpf);
         ticks += 1;
         if ticks.is_multiple_of(janitor_ticks) {
             match sweep_conn_state(&mut ebpf) {
@@ -8617,6 +8781,12 @@ fn resolve_dns(
         if let Some(hit) = hit {
             DNS_STATS.responses.fetch_add(1, Ordering::Relaxed);
             publish_live(q, &hit.resp, tx, true);
+            // A2 #7/#12：首选族命中缓存也要唤醒等待者（带记录性由应答内容判定）。
+            let pref = dns_opts().ipversion_prefer;
+            if pref != 0 && q.qtype == dns_pref_wait::preferred_qtype(pref) {
+                let (a, aaaa) = dns::answer_a_and_aaaa_records(&hit.resp);
+                dns_pref_wait::notify(&q.qname, !a.is_empty() || !aaaa.is_empty());
+            }
             if hit.stale {
                 // P29：RFC 8767——已返回 stale，尝试单飞后台刷新（对照 dae 的
                 // refreshing CAS；失败保留旧条目，不影响本次应答）。
@@ -8633,6 +8803,17 @@ fn resolve_dns(
             return Some(serve_response(query, hit.resp, proto));
         }
     }
+    // A2 #7/#12：ipversion_prefer 的 50ms 偏好等待（RFC 8305；对照 dae
+    // `dns_preference_wait.go`）——**缓存未命中、即将上行**的非首选族查询登记等待
+    // （缓存命中不登记：命中即答，不留未消费登记）；首选族应答到达且带记录则抑制
+    // 本条应答（回空 NOERROR）；等待发生在应答就绪后（不占上游时间）。
+    let pref_wait: Option<(dns_pref_wait::Entry, String)> =
+        match (&parsed, dns_opts().ipversion_prefer) {
+            (Some(q), pref) if dns_pref_wait::needs_deferred(pref as u16, q.qtype) => {
+                Some((dns_pref_wait::register(&q.qname), q.qname.clone()))
+            }
+            _ => None,
+        };
     // 3) 上游 + 应答路由（对照 dae resolveDNSUpstream 的递归重查；深度上限 3）
     let router = dns_router();
     let mut resp = match up.exchange(query_send) {
@@ -8698,6 +8879,23 @@ fn resolve_dns(
         }
     }
     DNS_STATS.responses.fetch_add(1, Ordering::Relaxed);
+    // A2 #7/#12：首选族上游应答到达 → 唤醒同 qname 的等待者（带记录性按应答内容判）。
+    if let Some(q) = &parsed {
+        let pref = dns_opts().ipversion_prefer;
+        if pref != 0 && q.qtype == dns_pref_wait::preferred_qtype(pref) {
+            let (a, aaaa) = dns::answer_a_and_aaaa_records(&resp);
+            dns_pref_wait::notify(&q.qname, !a.is_empty() || !aaaa.is_empty());
+        }
+    }
+    if let Some((entry, qname)) = &pref_wait {
+        if dns_pref_wait::wait(entry, qname, dns_pref_wait::PREFERENCE_DELAY) {
+            DNS_STATS.ipversion_filtered.fetch_add(1, Ordering::Relaxed);
+            let empty = dns::empty_noerror(query);
+            if !empty.is_empty() {
+                return Some(serve_response(query, empty, proto));
+            }
+        }
+    }
     if let Some(q) = &parsed {
         publish_live(q, &resp, tx, false);
         // P23：fixed_domain_ttl——命中配置的域名用固定缓存寿命（0 = 立即过期，
@@ -9072,6 +9270,41 @@ fn dns_loop(listener: OwnedFd, tx: std::sync::mpsc::Sender<status::MainMsg>) {
             DNS_STATS.queries.fetch_add(1, Ordering::Relaxed);
             // P18c+：发送方进程名（WAN egress 新 UDP DNS 流由 eBPF 写入）
             let dns_pname = lookup_dns_pname(Some(client.ip()), client.port());
+            // A2 #7/#12：偏好等待需要「A/AAAA 并发在飞」，而本循环是串行的——
+            // 开启 `ipversion_prefer` 时把非首选族查询交给工作线程（默认关闭 → 零影响；
+            // 对照 dae 的每查询一 goroutine，见 `dns_pref_wait` 模块头说明）。
+            if dns_pref_wait::needs_deferred(
+                dns_opts().ipversion_prefer as u16,
+                dns::parse_query(data).map(|q| q.qtype).unwrap_or(0),
+            ) {
+                let data: Vec<u8> = data.to_vec();
+                let orig = orig_dst;
+                let pname = dns_pname.clone();
+                let tx2 = tx.clone();
+                let clip = client.ip();
+                std::thread::Builder::new()
+                    .name("dns-pref".into())
+                    .spawn(move || {
+                        let resolved =
+                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                resolve_dns(
+                                    &data,
+                                    ClientProto::Udp,
+                                    Some(clip),
+                                    pname.as_deref(),
+                                    Some(orig),
+                                    &tx2,
+                                )
+                            }));
+                        if let Ok(Some(resp)) = resolved {
+                            if let Err(e) = reply_send(orig, client, &[&resp]) {
+                                log(&format!("dns 回包 {client}: {e}"));
+                            }
+                        }
+                    })
+                    .ok();
+                continue;
+            }
             // panic 隔离：单次查询（含第三方 QUIC 栈）出 panic 不应杀死整个 DNS 线程
             let resolved = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 resolve_dns(
@@ -9168,6 +9401,95 @@ fn handle_tcp_dns_conn(mut stream: TcpStream, tx: std::sync::mpsc::Sender<status
         }
     }
     let _ = stream.shutdown(std::net::Shutdown::Both);
+}
+
+// ---------------------------------------------------------------- A2 #11：投影重试堆
+/// 投影重试队列（对照 dae `dns_controller_bpf.go:17-24` 的「更新任务堆 + 重试」）：
+/// `domain_routing_map` 写入失败（map 更新错误）时不再只记一条日志，而是把同一批
+/// updates 排进重试堆（指数退避；上限 `PUBLISH_MAX_ATTEMPTS` 次 / `PUBLISH_QUEUE_CAP`
+/// 批），主循环 tick 消费——失败路径的重试语义与 dae 对等（daemon 内部状态，无需落盘）。
+struct PublishRetry {
+    updates: Vec<status::DnsUpdate>,
+    attempts: u32,
+    due_ns: u64,
+}
+const PUBLISH_MAX_ATTEMPTS: u32 = 5;
+const PUBLISH_QUEUE_CAP: usize = 4096;
+
+fn publish_retry_queue() -> &'static Mutex<Vec<PublishRetry>> {
+    static Q: OnceLock<Mutex<Vec<PublishRetry>>> = OnceLock::new();
+    Q.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// 投影重试计数（status/metrics 可见）。
+static PUBLISH_RETRIES: AtomicU64 = AtomicU64::new(0);
+static PUBLISH_DROPPED: AtomicU64 = AtomicU64::new(0);
+
+/// 失败入队（退避 100ms → 1.6s；队列满则丢最旧并计数——不阻塞主循环）。
+fn publish_enqueue_retry(updates: Vec<status::DnsUpdate>) {
+    if updates.is_empty() {
+        return;
+    }
+    let backoff_ms = 100u64 << PUBLISH_RETRIES.load(Ordering::Relaxed).min(4);
+    let mut q = match publish_retry_queue().lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    if q.len() >= PUBLISH_QUEUE_CAP {
+        q.remove(0);
+        PUBLISH_DROPPED.fetch_add(1, Ordering::Relaxed);
+    }
+    q.push(PublishRetry {
+        updates,
+        attempts: 1,
+        due_ns: monotonic_now_ns() + backoff_ms * 1_000_000,
+    });
+}
+
+/// 主循环 tick：把到期的重试批次重新投影（合并同一 tick 的批次，语义与首次相同）。
+fn publish_retry_tick(ebpf: &mut Ebpf) {
+    let due: Vec<PublishRetry> = {
+        let mut q = match publish_retry_queue().lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        if q.is_empty() {
+            return;
+        }
+        let now = monotonic_now_ns();
+        let mut due = Vec::new();
+        let mut rest = Vec::new();
+        for r in q.drain(..) {
+            if r.due_ns <= now {
+                due.push(r);
+            } else {
+                rest.push(r);
+            }
+        }
+        *q = rest;
+        due
+    };
+    for mut r in due {
+        match publish_domain_bits(ebpf, &r.updates) {
+            Ok(()) => {
+                PUBLISH_RETRIES.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(e) => {
+                r.attempts += 1;
+                if r.attempts > PUBLISH_MAX_ATTEMPTS {
+                    PUBLISH_DROPPED.fetch_add(1, Ordering::Relaxed);
+                    log_warn(&format!(
+                        "domain_routing_map 投影重试 {PUBLISH_MAX_ATTEMPTS} 次仍失败，放弃：{e}"
+                    ));
+                } else {
+                    r.due_ns = monotonic_now_ns() + (100u64 << r.attempts.min(4)) * 1_000_000;
+                    if let Ok(mut q) = publish_retry_queue().lock() {
+                        q.push(r);
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn publish_domain_bits(
@@ -11562,6 +11884,7 @@ fn status_json(ebpf: &mut Ebpf) -> serde_json::Value {
             "event_drops": stats.event_drops,
         },
         "events": events_json(&stats),
+        "traffic": traffic_snapshot_json(),
         "sysctl": {
             "watched": sysctl::expectations().len(),
             "rewrites": sysctl::rewrites(),
@@ -11660,6 +11983,7 @@ fn status_json(ebpf: &mut Ebpf) -> serde_json::Value {
             "fixed_domain_ttl": dnso.fixed_domain_ttl.len(),
             "domain_sets": DOMAIN_SETS.lock().map(|g| g.len()).unwrap_or(0),
             "bind": DNS_BIND.lock().ok().and_then(|g| g.clone()),
+            "pref_wait_pending": dns_pref_wait::pending(),
             "bind_queries": DNS_STATS.bind_queries.load(Ordering::Relaxed),
         },
         "config": cfg_summary,
@@ -11864,6 +12188,18 @@ fn metrics_text(v: &serde_json::Value) -> String {
     ] {
         emit(&mut s, "counter", name, get(v, &path));
     }
+    emit(
+        &mut s,
+        "gauge",
+        "sodama_traffic_upload_rate",
+        get(v, &["traffic", "upload_rate"]),
+    );
+    emit(
+        &mut s,
+        "gauge",
+        "sodama_traffic_download_rate",
+        get(v, &["traffic", "download_rate"]),
+    );
     emit(
         &mut s,
         "gauge",
@@ -12180,6 +12516,16 @@ mod tests {
         assert!(parse_dns_bind("udp://127.0.0.1").is_err());
         assert!(parse_dns_bind("127.0.0.1").is_err());
         assert!(parse_dns_bind("  ").is_err());
+    }
+
+    #[test]
+    fn alert_pacer_first_emits_then_cooldown() {
+        // A2 #14：首次必发 → 冷却期内只计数 → 冷却后复发（带累计观察次数）。
+        let p = AlertPacer::new(1_000_000_000);
+        assert_eq!(p.observe(100), (1, true));
+        assert_eq!(p.observe(200), (2, false));
+        assert_eq!(p.observe(999_999_999), (3, false));
+        assert_eq!(p.observe(1_000_000_100), (4, true));
     }
 
     #[test]
