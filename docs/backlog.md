@@ -4,7 +4,7 @@
 **如实**（不把未做写成已做）、**有验收条件**（每条给出可判定的完成标准）、
 **与 ADR/parity 互链**（决策理由见 ADR；覆盖度口径见 `parity-status.md`）。
 
-当前状态（main@0faa85d + A1 批次（dev 待合）；ADR-0068；单测 329（326 + ebpf-logic 3）；ATLAS v1.7；决策档案 HTML v2.46 / VLESS 提案 v1.9）：
+当前状态（dev@e5db7fd + A2 批次（除工程打包）19 项；ADR-0069；单测 346 + ebpf-logic 3；ATLAS v1.8；devlog §23；决策档案 HTML v2.46 / VLESS 提案 v1.9）：
 核心数据面复现（K0–K3）、分流主链路、DNS 子系统、出站 12 家族 + shadow-tls 插件、
 真网关可用、规则编译逐字节对拍、M1–M4 性能项（O3/O4/O5/O9）与 O6/O7/O8、
 G1 同机 + 真实节点口径均已交付。以下为余项。
@@ -15,9 +15,9 @@ G1 同机 + 真实节点口径均已交付。以下为余项。
 |---|---|
 | 构建 | `cargo build --release` + `lab/build-ebpf-rs.sh`（nightly 固定日期 + bpf-linker 0.11.1） |
 | CI | `.github/workflows/ci.yml`：eBPF 对象构建 + loader 编译/单测 + **lint 门禁（v1.4：fmt --check + clippy -D warnings）**（无特权内核加载） |
-| 部署 | `install/install.sh`（--dry-run/--uninstall）+ `install/sodama.service`（capability 最小集 + ExecReload）+ `docs/deploy.md` |
+| 部署 | `install/install.sh`（--dry-run/--uninstall）+ `install/sodama.service`（capability 最小集 + ExecReload；**v1.5：Type=notify + `sd_notify`、`ExecStartPre` validate 门禁、StartLimit 300×5s、`OOMScoreAdjust=-100`、Timeout 120s/30s**）+ `docs/deploy.md` |
 | 实验 | lab.sh（netns/verify/专项）、gateway.sh（真网关一键 + 启动自检回滚）、bench/soak/matrix/parity |
-| 文档 | ADR-0001..0068 + parity-status.md + ATLAS HTML v1.7 + NOTES §11.x + 协议模块规格 `docs/modules/` + 配置参考 `docs/config-reference.md`（v1.4，生成器 + drift 单测） |
+| 文档 | ADR-0001..0069 + parity-status.md + ATLAS HTML v1.8 + NOTES §11.x + 协议模块规格 `docs/modules/` + 配置参考 `docs/config-reference.md`（生成器 + drift 单测；v1.5 随 global 生效面重生成） |
 
 ## A. 工程化与发布（打包，最高优先级）
 
@@ -26,7 +26,7 @@ G1 同机 + 真实节点口径均已交付。以下为余项。
 | A1 | **Docker 镜像** | dae 有 `Dockerfile` + `docker-compose.yml`；容器是主要分发方式之一 | 多阶段构建（builder 固定 nightly+bpf-linker；runtime 含 loader/eBPF 对象/示例配置）；`docker run --privileged --network host` 冒烟通过并写入 README |
 | A2 | **发行包（tarball）** | dae 有 release 工件（多架构） | tag 产出 `sodama-<ver>-x86_64.tar.zst`：loader、`ebpf-rs.o`、systemd、install.sh、示例配置、README/LICENSE；解包后 `install.sh` 可装可卸 |
 | A3 | **发行 CI** | dae 有 release/prerelease/daily-build 工作流 | tag `v*` 触发：构建 → 冒烟（容器内 `--version`/单测）→ 上传 release 工件 + SHA256SUMS；失败不产出 |
-| A4 | **版本与 CHANGELOG** | 当前 Cargo 0.1.0、无 CHANGELOG | `--version` 输出语义化版本 + git sha；CHANGELOG 从提交生成；README 顶部版本徽章 |
+| A4 | **版本与 CHANGELOG** | `--version` ✅ **已完成（2026-10-16，v1.5，ADR-0069）**：三行输出（版本 + git sha（build.rs 注入，无 git 回落 unknown）/ 运行时 + 平台 / 许可），子命令分派前处理、无需 root，`version` 子命令同义；余：CHANGELOG 从提交生成、README 顶部版本徽章 | `--version` 输出语义化版本 + git sha；CHANGELOG 从提交生成；README 顶部版本徽章 |
 | A5 | **shell 补全** | ✅ **已完成（2026-10-16，v1.4，ADR-0068）**：`sodama completion bash\|zsh\|fish`（脚本内嵌，零外部文件依赖）+ 预生成副本 `install/shell-completion/sodama.{bash,zsh,fish}`（与生成器一致性由单测锁定）+ `install/install.sh` 部署（补全目录自动探测） | 补全覆盖 CLI 顶层子命令与常用参数；bash/zsh/fish 三份可用 |
 | A6 | **Makefile / 任务入口** | dae 有 Makefile（build/test/release 单入口） | `make build / test / lab / install / release` 目标；与新贡献者文档一致 |
 | A7 | **发行包体系** | 本机 Arch；dae 上游有 AUR/发行版打包路径 | 至少 `PKGBUILD`（本机可 `makepkg` 构建安装）；deb 可选 |
@@ -34,6 +34,8 @@ G1 同机 + 真实节点口径均已交付。以下为余项。
 | A9 | **install.sh 升级/回滚** | 当前只有装/卸 | `--upgrade`：保留上一版二进制，systemd 启动失败自动回滚；dry-run 覆盖新路径 |
 | A10 | **容器/内核兼容性矩阵文档** | eBPF 对内核/BTF/CAP 有要求 | ✅ 已完成：`docs/openwrt.md` §2 给出 kernel fragment（**NAMESPACES/NET_NS 是硬前提，官方镜像默认未开**——已用 QEMU 实测确认）与逐项排障；`docs/deploy.md` 含容器 capability 清单 |
 | A11 | **OpenWrt 支持（P0）** | ✅ 应用侧已完成（2026-10-05）：musl 静态交叉构建（x86_64 7.2MB / aarch64 6.3MB / armv7 6.2MB，`lab/build-openwrt.sh`，zig+cargo-zigbuild）；`install/openwrt/` ipk 包（预编译产物 + procd + uci + 数据面对 helper）；内核 fragment 与文档 `docs/openwrt.md`。代码侧仅一处 musl 适配（`MSG_WAITFORONE` 类型；`malloc_trim` 已有 cfg 门控）。官方镜像 QEMU 冒烟跑通 ipk/二进制并实测确认**官方内核缺 CONFIG_NAMESPACES**；⏸️ **暂停**（按用户指示移到后续）：自编内核镜像上的完整 eBPF 冒烟（cmake 3.30.5 bootstrap 宿主补丁已定位，构建目录 <openwrt-build-dir> 保留） | 后续：应用 cmake 补丁 → 自编镜像跑通完整冒烟；aarch64 真机验证；SDK 一键出 ipk |
+| A12 | **CLI 取证与日志（v1.5）** | ✅ **已完成（2026-10-16，v1.5，ADR-0069）**：`export outline`（`key_docs()` 同源机器可读 schema）；`sysdump --out *.tar.gz`（自实现 ustar + stored gzip：status/路由/网卡/sysctl/nft/iptables 现场，`--json` 保留旧形态）；日志轮转三参（`--logfile`/`--logfile-maxsize`/`--logfile-maxbackups`，产物 `<log>.<N>.gz`）+ `log_level`（0=off..4=debug，非法回落 info）；`trace` 见 C5 | ✅ `tar xzf` 实测可解；轮转/级别有单测 |
+| A13 | **systemd 单元强化（v1.5）** | ✅ **已完成（2026-10-16，v1.5，ADR-0069）**：`Type=notify` + `sd_notify`（READY/RELOADING/STOPPING；无 `NOTIFY_SOCKET` 时 no-op）、`ExecStartPre=sodama validate` 门禁、`StartLimitIntervalSec=300`/`StartLimitBurst=5`、`OOMScoreAdjust=-100`、`Restart=on-abnormal`、`TimeoutStartSec=120`/`TimeoutStopSec=30`、`LimitNPROC=4096` | 实机验证需 systemd 环境（开发机以命令行/VM 跑，如实登记） |
 
 ## B. 出站协议余项（如实边界）
 
@@ -53,6 +55,7 @@ G1 同机 + 真实节点口径均已交付。以下为余项。
 | C2 | cgroup 钩子（connect/bind/sendmsg…） | **6/6 已挂载**（sock_create/release、connect4/6、sendmsg4/6；P17b）——用于 pname 采集与 `pname()` 规则（WAN egress 新连接，见 `status` hooks）；bind 与 sock_addr 重定向用例未做 | 至少 connect/bind 两钩子的 sock_addr 重定向用例 |
 | C3 | ringbuf 事件通道 | ✅ **已完成（2026-10-16，ADR-0065）**：`event_ringbuf`（256KiB）+ `SodaEvent` 72B（对照 `struct dae_event`）+ 5 类事件（blocked/溢出×2/rebind/redirect 失败）+ 1s/键限速 + 丢弃计数；热路径 printk 退出（保留 `--ebpf-debug` 门控）；loader 常驻消费线程（1 条/秒/类型日志限速）+ status `events` + 9 个 metrics；**并批次交付 `skb_send_sock` 记账**（fentry→kprobe 回退 + 用户态 BTF 解析替代 CO-RE + `offload_sent` 键摘除时回收） | 高频事件可采样上报（已具备）；待生产回验：`status.events`/`offload_sent.*` 随流量增长且 `dropped_kernel` 有界 |
 | C4 | XDP 可选路径调研 | ✅ **已完成（2026-10-16）**：调研结论沿用 devlog §15（AF_XDP/数据面搬 XDP 否决），按 backlog 建议落**最小计量探针** `sodama_xdp_observe`（`--xdp <iface>` 可选挂载，恒 `XDP_PASS`、只计数不干预；status `xdp` + 2 个 metrics） | 调研报告（收益/兼容性）已具备；待实测：软路由网卡上的 native/generic 可用性与计数准确性 |
+| C5 | `trace` 判决事件与内核侧过滤 | ✅ **已完成（2026-10-16，v1.5，ADR-0069）**：新 map `trace_filter_map`（`SodaTraceFilter`：协议/端口/IP 版本/drop-only 位图，内核侧先裁）+ 新事件 `SODAMA_EVENT_TRACE`（判决在 `SodaEvent.pad[0]`；block/direct/存活门禁/redirect 4 判决点）；CLI 侧再按条件过滤（同语义，单测锁定）；daemon 落盘 `/run/sodama-trace.log`（不可写退 `/tmp`） | ✅ 单测 + 矩阵运行；边界：复用常驻事件通道（非独立 tracepoint 程序），高频判决下事件环可能丢尾帧（偏离 1） |
 
 ## D. 配置系统（≈65%）
 
@@ -62,6 +65,7 @@ G1 同机 + 真实节点口径均已交付。以下为余项。
 | D2 | 全局健康检查参数全量（间隔/容忍度/策略） | 子集 | 配置→健康循环行为的一对一测试 |
 | D3 | `config_merger` deferred 项收尾 | 显式列出 | deferred 列表清零或标注永久不做 |
 | D4 | 组级 override 细节（组级 dialer 参数覆盖） | 余项 | lab 双组覆盖用例 |
+| D5 | **global 生效面收口（v1.5）** | ✅ **已完成（2026-10-16，v1.5，ADR-0069）**：27 → **36** 生效（不生效 18 → 9，余项启动显式告警）——`log_level`（0=off..4=debug，非法回落 info）、`so_mark_from_dae`（含数据面 `dae_socket` 读 config_map）、`mptcp`（内核不支持回落 TCP）、`allow_insecure` 全局默认、`udphop_interval` 全局、`fallback_resolver`（bootstrap → fallback → 系统解析链）、`disable_thp`（仅本进程）、`disable_waiting_network` + 启动等待网络（默认开、30s 上限、超时只告警）、`auto_config_kernel_parameter`（写 sysctl 并登记期望值，被改回即纠正）、`tls_fragment*`（仅自实现 TLS 路径）、`utls_imitate`/`tls_implementation`（chrome 口径）、`pprof_port`（127.0.0.1 诊断端口）、`bandwidth_max_tx/rx`（令牌桶；限额时 relay 新连接走拷贝泵） | 配置→行为有一对一单测/实测；边界见 ADR-0069 偏离清单 |
 
 ## E. 转发面（≈78%）
 
@@ -70,6 +74,9 @@ G1 同机 + 真实节点口径均已交付。以下为余项。
 | E1 | UDP endpoint pool / full-cone NAT（网关侧 UDP 代理） | ✅ **已完成（2026-10-16，v1.4，ADR-0068）**：full-cone 端点池（同一客户端 src 多目标复用 1 出口端点，回包按上游真实来源注入）+ 分类 TTL（DNS 17s / QUIC·域名 300s / 代理地板 300s）+ 负缓存 + 1s janitor；内核级 `test-udp-cone`（双目标 4 报文复用 1 端点）；前置事实仍成立：网关侧全链真机验证（2026-10-08） | ✅ 已达（`test-udp-cone`）；边界：full-cone 仅直连型出口，代理型仍 dest-affine（ADR-0068 偏离 1） |
 | E2 | backlog fuse / 连接计费 | **fuse 已交付（ADR-0067，2026-10-16）**：`tcp_offload_pause` + 两阶段 drain/lift + 用户态泵 + `SODAMA_FUSE_MAX_BACKLOG`；余：连接计费未做 | 压测下 fuse 生效（真实触发留生产观测；判定逻辑单测锁定）+ 计费可导出 |
 | E3 | offload 完整形态（fuse 失效路径与统计） | **fuse 已交付（ADR-0067）**：生命周期/回收（O4/O8）+ pause engage/lift/失败计数（`status.offload_fuse`）+ 注册时清残留 | ✅ 失效全路径与计数可观测（无失败残留由 `test-fuse` 断言） |
+| E4 | **UDP GSO（`UDP_SEGMENT` 聚合发送，v1.5）** | ✅ **已完成（2026-10-16，v1.5，ADR-0069）**：`send_gso_udp` 按 `UDP_SEGMENT` cmsg 发送（≤64 段；EMGSIZE/EINVAL/EOPNOTSUPP 回落逐包）；status 增 `gso_sends/gso_datagrams/gso_unsupported` | ✅ 计数可观测；回落路径不重试不丢包 |
+| E5 | **带宽限额 `bandwidth_max_tx/rx`（v1.5）** | ✅ **已完成（2026-10-16，v1.5，ADR-0069）**：进程级令牌桶（`100`=100 Mbit/s、`10mbps`/`1g`/`8192b` 口径），reload 可 `set_rate` 热更新；限额生效时 relay 新连接走拷贝泵（splice 在用户态不可节流） | ✅ 单测（`rate_limiter_throttles_small_writes`）；边界：已建立 splice 连接不受 reload 后新限额影响（偏离 3） |
+| E6 | **代次排空预算（drain，v1.5）** | ✅ **已完成（2026-10-16，v1.5，ADR-0069）**：`reload/suspend --drain=N` 等旧代在飞会话自然排空预算（超预算不强制关闭，如实回报余量与耗时；对照 dae `control_plane_drain.go`） | ✅ 语义有实测（如实回报）；强制路径仍为 `--abort`（A1，ADR-0068） |
 
 ## F. 嗅探 / IPv6
 
@@ -78,6 +85,7 @@ G1 同机 + 真实节点口径均已交付。以下为余项。
 | F1 | QUIC 观测 → 域名拨号（UDP dial_mode/punt） | 仅观测 | UDP 域名拨号 + punt 用例 |
 | F2 | ICMPv6 error 转发 | 未做 | netns 用例 |
 | F3 | IPv6 分片补全 | 非首片跳过 | 分片重组/转发用例 |
+| F4 | **`real_domain_runtime`（域名确认集，v1.5）** | ✅ **已完成（2026-10-16，v1.5，ADR-0069）**：确认集（FIFO 8192 + 负缓存 300s + 近似单飞）+ `dns.rs::has_fresh_any_scope`（不限定 ECS 作用域，对照 dae `HasDnsKnowledge`）；`dial_mode=domain` 时 DNS 已知域名交节点远端解析；status `real_domain` 段 | ✅ 3 单测；单飞为近似（偏离 9） |
 
 ## G. 性能与质量
 
@@ -89,6 +97,8 @@ G1 同机 + 真实节点口径均已交付。以下为余项。
 | G6 | `lab.sh verify` 探针陈旧 | `test_proxy`/`test_host_proxy`/`test_reload`/`test_rebind`/`test_fault_*` 断言 回包含 `orig_dst=`，但仓库内无任何夹具产生该字段（历史遗留）；O8 期间实测 6 项因断言失败 | 修复夹具或断言（使 verify 回到 9/9）；在此之前专项用例（test-ss/vless/offload/udp）为准 |
 | G4 | 特权内核加载类 CI | CI 只编译+单测 | self-hosted runner 或 QEMU 中跑 verify 子集 |
 | G5 | 长稳 soak 纳入 CI（夜间） | 手动 | 夜间任务 + 失败告警 |
+| G7 | **运行时观测基线（v1.5）** | ✅ **已完成（2026-10-16，v1.5，ADR-0069）**：1h 流量历史（1s 采样 → status `traffic` 段 + 2 个 metrics；对照 dae `runtime_stats.go`，1s 粒度较 dae 250ms 更粗）；告警节流 `AlertPacer`（首次必发 + 冷却窗口 + 累计观察次数；接入 redirect_track/conn_state 容量告警）；`pprof_port` 诊断端口（`/` 文本、`/json`；非 Go pprof 火焰图——偏离 5） | ✅ 可经 status/metrics 取数 |
+| G8 | **lab 与内核级用例（v1.5）** | ✅ **已完成（2026-10-16，v1.5，ADR-0069）**：钩子生命周期用例 `lab.sh test-hooks`（reload 切代前后钩子集合逐项不变——把 ADR-0065「形态消解」结论变断言）；lab 基建修复：就绪等待 20s→50s（适配 30s 网络等待）、`--config` 权限幂等 0640、配置加载失败带首条诊断详情；单测 329 → **346 + 3（ebpf-logic）**；矩阵 `verify 12/12 + cap 12/12` | ✅ 已达（cap 新增 `test-hooks`） |
 
 ## H. 文档
 

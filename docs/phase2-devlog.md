@@ -1487,6 +1487,94 @@ cap 阶段才暴露。修复（`lab/lab.sh`）：
 
 ---
 
+## 23 · A2 批次（除工程打包）19 项（2026-10-16）
+
+对应 `docs/capability-gap-review.md` 附 A 的 A2（部分 26 项）中剔除 7 项工程打包
+（#19 安装升级回滚 / #20 多发行版教程 / #21 迁移指南 / #23 内核矩阵入 CI / #24 CI 容器流水线 /
+#25 72h soak / #26 供应链审计）后的 **19 项**（用户指令「完成 a2 除了工程打包的」）；
+决策与偏离清单见 ADR-0069。分五批提交（`21fe9a4`/`2a48782`/`0518d57`/`26a0411`/`e5db7fd`）；
+本批后 A2 部分 26 → **剩余 7**（全部工程打包类）。
+
+### 实施（按批次，均有提交）
+
+1. **批次 1（`21fe9a4`）：CLI 五件套 + 日志分级**：`--version`（新 `loader/build.rs` 注入
+git sha/profile，无 git 回落 `unknown`；版本+sha / 运行时+平台 / 许可三行，子命令分派前处理、
+无需 root）；`export outline`（`key_docs()` 登记表的机器可读 schema，与 `config-doc` 同源）；
+`trace` 重写（数据面新 map `trace_filter_map`（协议/端口/IP 版本/drop-only 位图）**内核侧先裁**
++ 新事件 `SODAMA_EVENT_TRACE`（判决在 `SodaEvent.pad[0]`；block/direct/存活门禁/redirect
+4 判决点），CLI 侧同语义二次过滤；落盘 `/run/sodama-trace.log` 退 `/tmp`）；
+`sysdump --out *.tar.gz`（新 `loader/src/dump.rs`：自实现 ustar + stored gzip，不引新依赖；
+打包 status/路由/网卡/sysctl/nft/iptables 现场，`--json` 保留旧形态）；
+日志轮转三参（`--logfile`/`--logfile-maxsize`/`--logfile-maxbackups`）+ `log_level`
+（新 `log_warn`/`log_debug`，0=off..4=debug，非法值回落 info 并告警）。
+2. **批次 2（`2a48782`）：global 生效面 8 项 + sysctl 纠正**：`so_mark_from_dae`
+（`SodaConfig` 两侧同批加 `so_mark`（ABI），数据面 `dae_socket` 改读 config_map）；
+`mptcp`（`IPPROTO_MPTCP`，内核不支持回落 TCP 并告警）；`allow_insecure` 全局
+（9 个解析点统一接受，节点级显式值优先）；`udphop_interval` 全局默认；`fallback_resolver`
+（bootstrap → fallback → 系统解析链）；`disable_thp`（`PR_SET_THP_DISABLE`，仅本进程）；
+`disable_waiting_network` + `wait_for_network`（默认开、30s 上限、2s 轮询，超时只告警不阻断）；
+`auto_config_kernel_parameter`（新 `loader/src/sysctl.rs`：写 `ip_forward`/`forwarding`/
+`send_redirects`/`accept_ra` **并登记期望值**，inotify（降级 2s 轮询）发现被改回即纠正）。
+3. **批次 3（`0518d57`）：DNS 语义 + 观测**：`dns.ipversion_prefer` 50ms 偏好等待
+（新 `dns_pref_wait.rs`：非首选族**缓存未命中、即将上行**时登记，首选族带地址应答到达即取消并
+抑制；缓存命中不登记）；DNS 投影重试堆（`publish_enqueue_retry`/`publish_retry_tick`，
+退避 100ms→1.6s、5 次、队列 4096；status `domain_publish_retries/dropped`）；
+1h 流量历史（`traffic_history_loop` 1s 采样 → status `traffic` 段 + 2 metrics）；
+`AlertPacer` 告警节流（持续条件首次必发 + 冷却窗口 + 累计观察次数）。
+4. **批次 4（`26a0411`）：服务化 + 用例**：`sd_notify`（READY/RELOADING/STOPPING；
+无 `NOTIFY_SOCKET` 时 no-op）；systemd 单元强化（`Type=notify` / `ExecStartPre` validate
+门禁 / `StartLimit 300`+`5s` / `OOMScoreAdjust=-100` / `Restart=on-abnormal` /
+`TimeoutStartSec=120`+`TimeoutStopSec=30` / `LimitNPROC`）；`lab.sh test-hooks` 钩子生命周期
+用例（reload 切代前后钩子集合逐项不变——把 ADR-0065「形态消解」结论变成可检验断言）。
+5. **批次 5（`e5db7fd`）：数据面 + 配置余项 + lab 基建修复**：drain 预算（`count_sessions`/
+`drain_old_generation`：`reload/suspend --drain=N` 等旧代在飞会话自然排空的预算，超预算
+**不强制关闭**、如实回报余量与耗时）；`real_domain_runtime`（新 `real_domain.rs`：确认集
+FIFO 8192 + 负缓存 300s + 近似单飞 + `dns.rs::has_fresh_any_scope`；`dial_mode=domain`
+时 DNS 已知域名交节点远端解析）；UDP GSO（`send_gso_udp`：`UDP_SEGMENT` cmsg ≤64 段，
+EMGSIZE/EINVAL/EOPNOTSUPP 回落逐包；status `gso_sends/gso_datagrams/gso_unsupported`）；
+`tls_fragment*`（CH 按字节区间分片 + 毫秒间隔，仅自实现 TLS 路径）；`pprof_port`
+（127.0.0.1 诊断端口，`/` 文本、`/json`）；`utls_imitate`/`tls_implementation`（chrome 口径）；
+`bandwidth_max_tx/rx`（令牌桶；限额时 relay 新连接走拷贝泵，`set_rate` reload 热更新）。
+
+### 开发期抓到并修掉的真实缺陷（三条教训）
+
+1. **VM 矩阵首轮 `verify` 8/12 + `cap` 全部 FAIL**：根因 = 启动路径 `wait_for_network`
+   上限 30s（无外网/隔离环境等满属设计行为）与 lab `up()`/`dual_up()` 20s 就绪预算不匹配，
+   用例在 daemon 未就绪窗口里跑；**`direct`/`block` 的 PASS 是无钩子直转假象，更具迷惑性**。
+   修复：就绪等待 20s → 50s（网络等待语义保留，可 `disable_waiting_network: true` 跳过）。
+2. **`dnsbind.dae` 权限假失败**：git 操作按 umask 把文件重建为 0644 → `config::load`
+   权限校验拒绝（P38 用例由此假失败）；`up()` 里只收不放地 chmod 0640（幂等收紧 ≤0640）。
+3. **配置加载失败定因需二跳**：原错误只报「N 项诊断」，本轮定因要另跑 `validate`；
+   改为带首条诊断详情（`diag_summary`）。
+
+### 验收（实测）
+
+- 单测：329 → **`cargo test --release` 346 通过 + 7 ignored** + `ebpf-logic` **3 通过**
+  （清单核对 356 条 = 346 + 7 + 3）；`fmt --check` / `clippy -D warnings` 清零；
+  drift 工件（`config-doc`/补全）重生成后 sync 单测过。
+- 内核级（QEMU 7.2.8-arch1-2，`QEMU_TIMEOUT=1500 sh lab/matrix.sh vm`）：`verify=PASS` **12/12**；
+  `cap=PASS` **12/12**（新增钩子生命周期 `test-hooks`）；`offload=FAIL` 为**既有 QEMU 抖动**
+  （三轮均「连接不通」，与 18:12 基线同形态；非本批引入，`vm-init.sh` 已列为信息项）。
+- systemd：实机验证需 systemd 环境，开发机以命令行/VM 跑（`sd_notify`/单元行为未在真 systemd
+  复测，如实登记）。
+
+### 边界（与 ADR-0069 偏离清单同源）
+
+1. `trace` 复用单一事件通道 + 内核侧位图过滤（非独立 tracepoint/程序）；落盘默认
+   `/run/sodama-trace.log`，不可写退 `/tmp`；
+2. `tls_fragment*` 仅自实现 TLS/REALITY 路径（rustls 出站不分片）；
+   `utls_imitate`/`tls_implementation` 仅 chrome 口径（dae 默认 Firefox 指纹）；
+3. `bandwidth_max_*` 限额生效时 relay 新连接强制拷贝泵；已建立的 splice 连接不受
+   reload 后新限额影响；
+4. `pprof_port` 是 127.0.0.1 文本/JSON 诊断端口（非 Go pprof 火焰图）；
+5. `wait_for_network` 为 30s 上限 + 2s 轮询（无网络事件源，netlink 事件源留后续批次）；
+   `mptcp` 仅 TCP 拨号路径（UDP/QUIC 不受影响）；
+6. `sd_notify` 无 systemd 时 no-op；`real_domain` 单飞为近似（确认集 + 负缓存，
+   无跨线程 in-flight 去重）；
+7. 工程打包 7 项（#19/#20/#21/#23/#24/#25/#26）按用户指令后置。
+
+---
+
 ## 附 A · 路由器侧工具清单（**不入库**，仅存在于软路由）
 
 | 路径 | 用途 | 部署时间 |

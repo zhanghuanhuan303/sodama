@@ -349,6 +349,32 @@ P6（suspend/reload/metrics/sysdump/日志轮转/整配置热重载）已完成*
   取图乐观初值 + 先投影再 sleep；`test-udp-cone` FAIL → PASS）；
   边界（偏离清单 10 项）：full-cone 仅直连型出口、`dns.bind` UDP 单线程且 reload 不重启监听、
   abort 对 QUIC 系只置 `stop` 位、`chains` 仅 TCP（每跳一次用户态字节桥）、netkit 一次性创建
+- **A2 批次（除工程打包）（完成，2026-10-16）**：按 `docs/capability-gap-review.md` **附 A・A2**
+  除 7 项工程打包外的 19 项收口（ADR-0069、devlog §23；A2 部分 26 → **余 7**）——
+  **① CLI 五件套 + 日志分级**（`--version`（build.rs 注入 git sha/profile，无 git 回落 unknown）/
+  `export outline` schema 导出 / `trace` 重写（内核侧 `trace_filter_map` 位图先裁 +
+  `SODAMA_EVENT_TRACE` 判决事件，落盘 `/run/sodama-trace.log` 退 `/tmp`）/
+  `sysdump --out *.tar.gz`（自实现 ustar + stored gzip：路由/网卡/sysctl/nft/iptables 现场）/
+  日志轮转三参（`--logfile-maxsize`/`--logfile-maxbackups`，产物 `.N.gz`）+ `log_level`（0=off..4=debug，非法回落 info））；
+  **② 配置生效面 27 → 36**（`so_mark_from_dae`（含数据面 `dae_socket` 读 config_map）/ `mptcp`（回退 TCP）/
+  `allow_insecure` 全局 / `udphop_interval` 全局 / `fallback_resolver` / `disable_thp` /
+  等待网络（30s 上限、2s 轮询，超时只告警）/ `auto_config_kernel_parameter`（sysctl 被改回即纠正）+
+  `tls_fragment*`（CH 分片，仅自实现 TLS 路径）/ `utls_imitate`/`tls_implementation`（chrome 口径）/
+  `pprof_port` 诊断端口 / `bandwidth_max_tx/rx` 令牌桶（限额时 relay 新连接走拷贝泵）；不生效 18 → 9，余项显式告警）；
+  **③ DNS 与观测**（`dns.ipversion_prefer` 50ms 偏好等待（`dns_pref_wait.rs`）、投影重试堆（退避 100ms→1.6s×5）/
+  1h 流量历史（status `traffic`）/ 告警节流 `AlertPacer`）；
+  **④ 控制面与服务化**（`reload/suspend --drain=N` 排空预算（不强制关闭、如实回报余量）/
+  `real_domain_runtime`（确认集 FIFO 8192 + 负缓存 300s，`dial_mode=domain` 交节点远端解析）/
+  UDP GSO（`UDP_SEGMENT` ≤64 段，回落逐包）/ `sd_notify`（READY/RELOADING/STOPPING）+
+  systemd 强化（Type=notify / ExecStartPre validate / StartLimit 300×5s / OOMScoreAdjust=-100 /
+  Timeout 120s/30s）/ `lab.sh test-hooks` 钩子生命周期用例）。
+  实测：`cargo test` **346 + 3（ebpf-logic）**；内核级 QEMU 7.2.8 **`verify` 12/12 + cap 阶段 12/12**
+  （新增 `test-hooks`）；
+  **同批修 lab 基建三处**：就绪等待 20s→50s 适配 30s 网络等待（首轮矩阵 verify 8/12 + cap 全 FAIL 的根因；
+  `direct`/`block` 的 PASS 是无钩子直转假象）、`--config` 权限幂等 0640（dnsbind.dae 被 git 按 umask
+  重建 0644 触发校验拒绝）、配置加载失败带首条诊断详情；
+  边界（偏离清单 10 项）：`trace` 复用单一事件通道、`tls_fragment*` 仅自实现 TLS 路径、限额时 relay 新连接走拷贝泵、
+  utls 仅 chrome 口径、`pprof_port` 非火焰图、`wait_for_network` 无事件源等
 
 原理与 dae 源码对照见 [NOTES.md](./NOTES.md)。
 
@@ -1184,11 +1210,10 @@ full-cone；嗅探的剩余形态（QUIC/UDP 域名拨号；TLS/HTTP1/h2c/QUIC-S
 节点生态剩余（ADR-0031）：按规则分派不同组（数据面 outbound id）、订阅热更新（update_interval）、
 `add_latency`/`region`/`udp_check_dns`/多 check URL、gzip 压缩订阅。
 协议栈（P5-G3b+ 后的剩余）：hysteria2 的 gecko 混淆、pinSHA256/ECH/自定义 CA、QPACK 动态表
-（当前只支持静态表）；udphop 只支持链接扩展 interval（dae 是全局配置）；Brutal 是近似
+（当前只支持静态表）；udphop 全局 `udphop_interval` 已补（链接扩展 `udphop-interval=` 仍优先；A2 批次，ADR-0069）；Brutal 是近似
 （无 pacer 直接控制，见 ADR-0020）；vmess aid≠0/CFB/packetaddr、vless vision/XUDP/reality、
 uTLS 指纹；tuic 的 0-RTT/连接迁移/`udp_relay_mode=quic`/重连状态机、多用户配置与密码表。
-运维面（P6 后的剩余）：daed GraphQL/鉴权 API、`suspend --abort`、systemd/打包集成、
-日志分级与多后端、OTLP 等其他导出格式（见 ADR-0021）。
+运维面（P6 后的剩余）：daed GraphQL/鉴权 API、打包集成（Docker/发行包）、日志多后端、OTLP 等其他导出格式（见 ADR-0021）；`suspend --abort`（A1，ADR-0068）、`log_level` 分级与 systemd 单元强化（A2，ADR-0069）已补。
 DNS 侧的 P3b-2 剩余：DoH/DoQ、嗅探 punt、`dns.routing` 请求/应答分流、ECS 等 options
 分区缓存、乐观缓存。
 另有未覆盖的内核路径：<6.6 的 netlink 附加、<5.17 的加载失败诊断
