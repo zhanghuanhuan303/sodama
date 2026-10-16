@@ -8754,6 +8754,10 @@ fn send_gso_udp(fd: RawFd, to: SocketAddr, datas: &[&[u8]]) -> std::io::Result<b
     // cmsg：UDP_SEGMENT = 单段长度（u16）。msg_controllen 必须先设好：
     // glibc CMSG_FIRSTHDR 以 msg_controllen >= sizeof(cmsghdr) 作为取头前提，
     // 置 0 时恒返回 NULL（旧实现由此恒走回落，GSO 从未真正发出过）。
+    //
+    // 可移植性（musl 交叉构建）：`libc::msghdr` 在 musl 下 `msg_controllen` 是 `u32`
+    // 且含私有填充字段（`__pad1`/`__pad2`）——不能结构体字面量构造。统一用
+    // `zeroed()` + `as _` 赋值，字段类型交编译期推导（glibc usize / musl u32 均成立）。
     #[repr(align(8))]
     struct Ctl([u8; 64]);
     let mut ctl = Ctl([0u8; 64]);
@@ -8761,23 +8765,22 @@ fn send_gso_udp(fd: RawFd, to: SocketAddr, datas: &[&[u8]]) -> std::io::Result<b
     if cmsg_len > ctl.0.len() {
         return Ok(false);
     }
-    let hdr = libc::msghdr {
-        msg_name: &st as *const _ as *mut libc::c_void,
-        msg_namelen: name_len,
-        msg_iov: &mut iov,
-        msg_iovlen: 1,
-        msg_control: ctl.0.as_mut_ptr() as *mut libc::c_void,
-        msg_controllen: cmsg_len,
-        msg_flags: 0,
-    };
+    // SAFETY：`msghdr` 全零 + 逐字段赋有效值（iov / control 缓冲区生命周期覆盖 sendmsg 调用）。
+    let mut hdr: libc::msghdr = unsafe { std::mem::zeroed() };
+    hdr.msg_name = &st as *const _ as *mut libc::c_void;
+    hdr.msg_namelen = name_len as _;
+    hdr.msg_iov = &mut iov;
+    hdr.msg_iovlen = 1 as _;
+    hdr.msg_control = ctl.0.as_mut_ptr() as *mut libc::c_void;
+    hdr.msg_controllen = cmsg_len as _;
     unsafe {
         let cmsg = libc::CMSG_FIRSTHDR(&hdr);
         if cmsg.is_null() {
             return Ok(false);
         }
-        (*cmsg).cmsg_level = libc::SOL_UDP;
-        (*cmsg).cmsg_type = UDP_SEGMENT_OPT;
-        (*cmsg).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<u16>() as u32) as usize;
+        (*cmsg).cmsg_level = libc::SOL_UDP as _;
+        (*cmsg).cmsg_type = UDP_SEGMENT_OPT as _;
+        (*cmsg).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<u16>() as u32) as _;
         let data = libc::CMSG_DATA(cmsg) as *mut u16;
         *data = seg_len as u16;
     }
