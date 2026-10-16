@@ -213,7 +213,11 @@ pub fn sodama0peer_ingress(ctx: TcContext) -> i32 {
 #[inline(always)]
 unsafe fn dae0_ingress_l3_reply(ctx: &TcContext, ifindex: u32, from_wan: u8) -> i32 {
     let skb = ctx.skb.skb;
-    if bpf_skb_adjust_room(skb, -(ETH_HLEN as i32), BPF_ADJ_ROOM_MAC as u32, 0) != 0 {
+    let rc = bpf_skb_adjust_room(skb, -(ETH_HLEN as i32), BPF_ADJ_ROOM_MAC as u32, 0);
+    if crate::flow::debug_log() {
+        bpf_printk!(c"sodama: L3 reply pop adjust_room=%d ifindex=%u\n", rc as i32, ifindex);
+    }
+    if rc != 0 {
         return tc_ok();
     }
     let flags: u64 = if from_wan != 0 {

@@ -8,10 +8,20 @@ rebind / status / fault-reload / fault-kill）。
 |---|---|---|---|
 | 6.18.54-2-lts（宿主） | `lab/matrix.sh run`（privileged 容器 + chroot） | **9/9 PASS** | [`out/host-kernel-6.18.54-2-lts.log`](./out/host-kernel-6.18.54-2-lts.log) |
 | 7.2.8-arch1-2 | `lab/matrix.sh vm`（QEMU + virtio-9p root + 自制 initramfs） | **9/9 PASS** | [`out/vm-kernel-7.2.8-arch1-2.log`](./out/vm-kernel-7.2.8-arch1-2.log) |
+| 7.2.8-arch1-2（数据面对标批次，2026-10-16） | 同上 | **11/11 PASS**（原 9 项 + `l3-attach` + `xdp`）；`offload=`/`l3_e2e=` 为信息项（QEMU 环境既有抖动 / lab 拓扑未补完，见 `docs/phase2-devlog.md` §19） | [`out/vm-kernel-7.2.8-arch1-2.log`](./out/vm-kernel-7.2.8-arch1-2.log)（`MATRIX-RESULT … verify=PASS`） |
 
 两台内核都满足 `bpf_loop`（≥5.17）与 TCX（≥6.6）；VM 里 TCX 钩子同样是
 `single/lan/wan → tcx/*`，进程退出后自动摘除（`fault/kill` 用例验证）。
 K2 时代的旧结果（8 用例、C 数据面）已被上表取代。
+
+## 数据面对标批次（ADR-0065，2026-10-16）在矩阵里的新增项
+
+| 用例 | 内容 | 门禁？ |
+|---|---|---|
+| `l3-attach` | L3 接口（ipip，arphrd=768）被自动判定并挂上 `sodama_lan_ingress_l3` | ✅ 入门禁 |
+| `xdp` | `--xdp landae` 探针挂载 + 计数器随流量推进（恒 `XDP_PASS`） | ✅ 入门禁 |
+| `test-l3`（`l3_e2e=`） | 经 ipip 隧道的 L3 端到端代理（补头/剥头闭环） | ❌ 信息项：lab 回程腿未通（对照实验同样失败） |
+| `offload=`（`test-relay-offload` + `test-offload-lifecycle`） | offload 路径 + 字节记账（`probe_calls`/`kernel_bytes`/`reclaimed_bytes`） | ❌ 信息项：QEMU 首连抖动（基线复现） |
 
 > 注：宿主矩阵以 root 运行会在 `out/` 留下 root 属主目录；复跑 VM 前需先把 `out/`
 > 改回调用者属主（`chown`），否则 initramfs 写入报 Permission denied。

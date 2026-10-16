@@ -119,7 +119,7 @@
 
 负面 / 代价：
 
-- 数据面对象 496K → 752K（3 个新 program section + 5 个新程序；`llvm-readelf` 实测）。
+- 数据面对象 496K → 772K（3 个新 program section + 5 个新程序 + 探针诊断计数；`llvm-readelf` 实测）。
 - 事件限速的「本秒抑制 N 条」实际统计的是「距上次输出以来」的抑制数（静默期拉长时会覆盖整个
   间隔），非严格 1s 滚动窗口。
 - `offload_sent` 的「读 → 删」之间数据面仍可能继续累加，尾账随删除丢弃（接受的小误差）。
@@ -139,7 +139,32 @@
 
 ## 验证方式
 
-**已实测（本机，2026-10-16）**：
+**已实测（内核级，QEMU 内核矩阵 7.2.8-arch1-2，2026-10-16）**：
+
+- 回归门禁 `lab/matrix.sh vm` 的 `lab.sh up && verify`：**11 项全绿**（原 9 项 + 新增 `l3-attach`/`xdp`），
+  证明改动后的数据面（含新 map/新程序/parse 与 flow 重构）在新内核上**通过 verifier 且无回归**；
+- `_l3` 变体选择与挂载（`landae3` arphrd=768 → `sodama_lan_ingress_l3`，见 `bpftool net show`）；
+- fentry `skb_send_sock` **挂载成功**（偏移由运行内核 BTF 解出：7.2.8 上亦为
+  `nh=184 th=182 tail=188 head=200`）；探针 `probe_calls` 随流量增长；
+- 记账链路端到端：`kernel_bytes=1050069` 且 `reclaimed_bytes=1050069`（单轮），6 轮累计
+  `kernel_bytes=5289555`、`probe_parse_fail=0`；
+- XDP 探针挂载并计数（`packets/bytes/ipv4/ipv6/other`，`test-xdp` 断言 `packets>0 && ipv4>0`）；
+- L3 补头/剥头 helper 在内核里逐次成功（`change_head=0 proto=0x8`、`adjust_room=0`）——
+  M1 `--ebpf-debug` 采样取证；**并借此抓到并修掉一个真实缺陷**：探针误把 `head+0`
+  当版本字节读（采到 `v=0x0/0x52` = 以太目的 MAC 首字节）导致 100% 解析失败，
+  改为 dae 同口径的 `head+nh` 后 `parse_fail=0`。
+
+**未通过 / 仍属推断**（验收放到 lab 补完或生产）：
+
+- **L3 端到端**（`test-l3`，经 ipip 隧道的代理路径）在 QEMU 里未过：对照实验
+  （`TOPO_ONLY`，不经 sodama）同样超时 ⇒ 是 lab 拓扑（回程腿）问题而非数据面；
+  该用例不入 `verify` 门禁，留待真机（tun/ppp）或拓扑补完；
+- offload 用例在本 QEMU 环境有**既有抖动**（首连超时；基线 97ebe9f 与
+  `SODAMA_NO_OFFLOAD_ACCOUNT=1` 均复现）；
+- verifier 在 6.12（生产内核）上的行为、kprobe 回退路径（VM 上 fentry 直接成功未触发回退）、
+  L3 在生产 tun/ppp 接口上的实际表现。
+
+**已实测（本机构建/单测，2026-10-16）**：
 
 - 数据面构建：`cd sodama/ebpf-rs && cargo +nightly build --release` 通过；
   `llvm-readelf -S` 确认 `fentry/skb_send_sock`、`kprobe/skb_send_sock`、`xdp` 三个新 section；
@@ -150,15 +175,15 @@
   struct/union 递归、截断/坏 magic/字符串越界返回 Err；真机解析结果与 `pahole -C sk_buff
   /sys/kernel/btf/vmlinux` 完全一致：`network_header=184, transport_header=182, tail=188,
   head=200`）；`cargo clippy -p sodama` 无新增 error（既有 3 条历史遗留不变）；
-  musl 交叉构建 `lab/build-openwrt.sh --arch x86_64` 通过（产物 `sodama 7.7M · sodama-ebpf 752K`）；
+  musl 交叉构建 `lab/build-openwrt.sh --arch x86_64` 通过（产物 `sodama 7.7M · sodama-ebpf 772K`）；
   `--help` 与 `--link-hdr bogus` 非法值路径行为正确。
 
-**未实测（本机无 CAP_BPF、无免密 sudo，不能加载 eBPF）**——以下均为**推断**，验收放到 lab/生产：
+**未实测（本机无 CAP_BPF、无免密 sudo）**——以下为**推断**，验收放到 lab/生产：
 
-1. verifier 对新增程序的接受度（`bpf_skb_change_head`/`bpf_skb_store_bytes`/`bpf_skb_adjust_room`
-   的负长度剥头、`bpf_probe_read_kernel` 在 fentry/kprobe 上的使用）；
-2. fentry 在生产内核（6.12，OpenWrt 自编内核）的挂载结果与 kprobe 回退是否触发；
-3. L3 桥接/tun 拓扑端到端（**C1 的验收标准**：桥接拓扑 lab 用例）。
+1. 生产内核（6.12）上新增程序的 verifier 接受度与 fentry/kprobe 挂载结果（矩阵在 7.2.8 上已验证，
+   见上一节；6.12 待生产回验）；
+2. kprobe 回退路径（需 fentry 因 EBUSY/无 DYNAMIC_FTRACE 失败的场景）；
+3. L3 在真实 tun/ppp 接口上的端到端（lab 拓扑未过关，见上一节）。
 
 **验收命令（staging/生产，需 root）**：
 `status` 看 `events.{consumed,suppressed,by_type,dropped_kernel}`、

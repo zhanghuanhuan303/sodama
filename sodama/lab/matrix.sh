@@ -6,6 +6,8 @@
 #                              # 可用 MATRIX_LOG=<path> 追加落盘（VM 内用）
 #   lab/matrix.sh initramfs    # 生成 QEMU 用的 initramfs（宿主用户即可）
 #   lab/matrix.sh vm [vmlinuz] # 在 QEMU 里引导第二个内核并跑 run（宿主用户即可）
+#                              # `VM_INIT=<相对 lab/ 的脚本>` 可换成自定义阶段序列
+#                              # （默认 vm-init.sh；调试专用脚本不要入库）
 #
 # 宿主内核路径（本机 6.18.54-lts）直接用 run；
 # 第二个内核用 /usr/lib/modules/7.2.8-arch1-2/vmlinuz + 自制 initramfs（9p root）。
@@ -18,6 +20,8 @@ OUT="$MATRIX_DIR/out"
 STOCK_INITRAMFS="${STOCK_INITRAMFS:-/boot/initramfs-linux.img}"
 KERNEL_PATH="${KERNEL_PATH:-/usr/lib/modules/7.2.8-arch1-2/vmlinuz}"
 KVER="${KVER:-7.2.8-arch1-2}"
+# VM 内执行脚本（相对 lab/；调试时可指向临时脚本，例如 VM_INIT=vm-debug.sh）
+VM_INIT="${VM_INIT:-vm-init.sh}"
 INITRD="$OUT/initramfs-$KVER.img"
 
 die() { echo "!! $*" >&2; exit 1; }
@@ -129,7 +133,7 @@ mount -t tmpfs tmp /newroot/tmp
 mount -t tmpfs tmp /newroot/run
 ln -s /proc/self/fd /newroot/dev/fd
 cp /usr/bin/busybox /newroot/tmp/busybox
-chroot /newroot /bin/bash $ROOT/lab/vm-init.sh
+chroot /newroot /bin/bash $ROOT/lab/$VM_INIT
 echo "!! vm-init 返回，强制关机"
 poweroff -f
 EOF

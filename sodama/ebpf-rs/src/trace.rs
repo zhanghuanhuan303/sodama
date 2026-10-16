@@ -80,8 +80,33 @@ unsafe fn skb_key(skb: *const c_void, key: &mut SodaTuple) -> bool {
     }
 
     let mut version = 0u8;
-    if kread(head as *const u8 as *const c_void, &mut version).is_none() {
+    /* 版本字节必须从 `head + nh` 读（对照 dae `tcp_offload.h`：
+     * `bpf_probe_read_kernel(&version, 1, head + nh)`）。
+     * 踩坑记录（VM 实测）：此前误读 `head + 0`——那里是链路头/headroom，
+     * 采样到的 `v=0x0 / 0x52` 正是以太目的 MAC 的首字节，导致 100% 解析失败。 */
+    if kread((head as *const u8).add(nh as usize) as *const c_void, &mut version).is_none() {
         return false;
+    }
+
+    /* M1：前几次调用的采样打印（`--ebpf-debug` 门控）——用于内核移植时的形态取证：
+     * 不同内核的 sockmap 出口路径可能不带完整 head-relative 偏移，这些原始值
+     * 比「0 字节」本身更能定位问题（对照 dae 仅在 6.12/6.17 源码上验证过）。 */
+    if crate::flow::debug_log() {
+        let n = match sodama_stats_map.get_ptr(SODAMA_STAT_PROBE_CALLS) {
+            Some(p) => *p,
+            None => 0,
+        };
+        if n <= 8 {
+            bpf_printk!(
+                c"sodama: probe call=%llu nh=%u th=%u tail=%u head=%llu v=0x%x\n",
+                n,
+                nh as u32,
+                th as u32,
+                tail,
+                head,
+                version as u32
+            );
+        }
     }
 
     let mut ip4 = IpHdr::default();
@@ -142,6 +167,9 @@ unsafe fn skb_key(skb: *const c_void, key: &mut SodaTuple) -> bool {
 /// 记账主体（fentry 与 kprobe 两个入口共用）。
 #[inline(always)]
 unsafe fn account(skb: *const c_void, len: i32) {
+    /* 诊断计数：先记「被调用」——若它恒为 0，说明钩子没落在内核推流路径上
+     * （例如该内核的 sockmap 出口走了别的函数），而不是键不匹配。 */
+    bump_stat(SODAMA_STAT_PROBE_CALLS);
     let mut key = SodaTuple {
         sip: [0u8; 16],
         dip: [0u8; 16],
@@ -152,10 +180,12 @@ unsafe fn account(skb: *const c_void, len: i32) {
         pad: [0; 2],
     };
     if !skb_key(skb, &mut key) {
+        bump_stat(SODAMA_STAT_PROBE_PARSE_FAIL);
         return;
     }
     /* 只记本进程注册的 offload 键（offload_guard 与 fast_sock 同键集、先写后删）。 */
     if offload_guard.get(&key).is_none() {
+        bump_stat(SODAMA_STAT_PROBE_GUARD_MISS);
         return;
     }
 

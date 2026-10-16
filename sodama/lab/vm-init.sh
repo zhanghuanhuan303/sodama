@@ -29,6 +29,33 @@ if "$BASE/lab/lab.sh" up && "$BASE/lab/lab.sh" verify; then
   result=PASS
 fi
 "$BASE/lab/lab.sh" down || true
-echo "MATRIX-RESULT kernel=$(uname -r) verify=$result"
+
+# 对标批（ADR-0065）：offload 字节记账需要 `--offload` 会话（up 的基线不带 dialer）。
+# 注意：QEMU 环境里 offload 内核路径有**既有抖动**（首连超时；基线构建同样复现，
+# 且记账探针关掉也复现，见 devlog §19），所以这里重试三轮，并把记账三件套
+# （probe_calls / parse_fail / guard_miss）无论成败都打出来作证据。
+offload=FAIL
+for attempt in 1 2 3; do
+  if USE_OFFLOAD=1 "$BASE/lab/lab.sh" offload-up \
+    && "$BASE/lab/lab.sh" test-relay-offload \
+    && "$BASE/lab/lab.sh" test-offload-lifecycle; then
+    offload=PASS
+    break
+  fi
+  echo "offload 阶段第 $attempt 轮失败（环境抖动或真实缺陷，看下方计数）"
+  "$BASE/target/release/sodama" status --socket /tmp/sodama-status.sock --json 2>/dev/null \
+    | python3 -c 'import json,sys; v=json.load(sys.stdin); print("记账证据:", v.get("offload_sent"))' 2>/dev/null || true
+  grep -E "offload 记账" /tmp/sodama.log 2>/dev/null | tail -3 || true
+  "$BASE/lab/lab.sh" down || true
+done
+"$BASE/lab/lab.sh" down || true
+
+# 对标批（ADR-0065）：L3 端到端（经 ipip 隧道；不入 verify 门禁，仅信息项）。
+l3_e2e=SKIP
+if "$BASE/lab/lab.sh" up >/dev/null 2>&1; then
+  if "$BASE/lab/lab.sh" test-l3 >/dev/null 2>&1; then l3_e2e=PASS; else l3_e2e=FAIL; fi
+fi
+"$BASE/lab/lab.sh" down || true
+echo "MATRIX-RESULT kernel=$(uname -r) verify=$result offload=$offload l3_e2e=$l3_e2e"
 sync
 exec /tmp/busybox poweroff -f

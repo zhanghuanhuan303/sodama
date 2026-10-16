@@ -67,7 +67,14 @@ pub const SODAMA_STAT_OFFLOAD_SENT_BYTES: u32 = 6;
 pub const SODAMA_STAT_CONN_OVERFLOW: u32 = 7;
 /// 对标批：`offload_sent` 记账写入失败（表满）次数——记账丢失必须可数。
 pub const SODAMA_STAT_ACCOUNT_DROPS: u32 = 8;
-/// `sodama_stats_map` 容量（已用键 0..=8，留余量给后续批次）。
+/// 对标批：`skb_send_sock` 探针被调用次数。**诊断用**：`0` = 钩子没落在内核推流路径上
+/// （符号被 LTO 内联 / 该内核走别的推流函数）——§下三个键与它一起定位 0 字节问题。
+pub const SODAMA_STAT_PROBE_CALLS: u32 = 9;
+/// 对标批：探针读 `sk_buff` 字段/重建四元组失败次数（偏移不符、边界不合法）。
+pub const SODAMA_STAT_PROBE_PARSE_FAIL: u32 = 10;
+/// 对标批：探针解析出四元组但被 `offload_guard` 过滤的次数（键与注册侧不一致）。
+pub const SODAMA_STAT_PROBE_GUARD_MISS: u32 = 11;
+/// `sodama_stats_map` 容量（已用键 0..=11，留余量给后续批次）。
 pub const SODAMA_STAT_MAP_SIZE: u32 = 16;
 
 pub const IPPROTO_TCP: u8 = 6;

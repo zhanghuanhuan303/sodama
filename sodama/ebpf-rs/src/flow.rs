@@ -168,7 +168,11 @@ unsafe fn rewrite_packet_for_control_plane(
     let skb = ctx.skb.skb;
     let zero_mac = [0u8; 6];
     let l3proto = (*skb).protocol as u16;
-    if bpf_skb_change_head(skb, ETH_HLEN, 0) != 0 {
+    let ch = bpf_skb_change_head(skb, ETH_HLEN, 0);
+    if debug_log() {
+        bpf_printk!(c"sodama: L3 push eth change_head=%d proto=0x%x\n", ch as i32, l3proto as u32);
+    }
+    if ch != 0 {
         return TC_ACT_SHOT as i32;
     }
     let ret = bpf_skb_store_bytes(

@@ -284,8 +284,13 @@ P6（suspend/reload/metrics/sysdump/日志轮转/整配置热重载）已完成*
   **`skb_send_sock` 记账**（fentry→kprobe 回退；用户态 BTF 解析（`loader/src/btfoff.rs`）
   写 `sk_buff` 字段偏移替代 CO-RE；`offload_guard` 过滤 + `offload_sent` 累加 + 键摘除时回收）；
   **XDP 计量探针**（`--xdp <iface>` 可选，恒 `XDP_PASS`、只计数不干预）。
-  实测：22 程序/22 map、`cargo test` 302/302、musl x86_64 交叉构建通过（`sodama 7.7M · sodama-ebpf 752K`）；
-  **未实测**：本机无 CAP_BPF，verifier/运行时/L3 拓扑待 lab 回验（见 ADR-0065、devlog §19）
+  实测：22 程序/22 map、`cargo test` 302/302、musl x86_64 交叉构建通过（`sodama 7.7M · sodama-ebpf 772K`）；
+  **内核级已实测**（QEMU 内核矩阵 `lab/matrix.sh vm`，内核 7.2.8，宿主用户即可）：`verify` **11/11 全绿**
+  （原 9 项 + `l3-attach` + `xdp`）、fentry 挂载成功（偏移由运行内核 BTF 解出）、记账
+  `kernel_bytes`/`reclaimed_bytes` 实测增长与释出、L3 补头/剥头 helper 逐次返回 0；
+  **未过/待办**：L3 端到端（lab ipip 拓扑回程腿；对照实验证明非数据面）、offload 用例的 QEMU 首连抖动、
+  生产 6.12 回验（见 ADR-0065、devlog §19）
+  （数据面调试开关：`SODAMA_NO_OFFLOAD_ACCOUNT=1` 跳过记账探针挂载，供 A/B 与隔离排障）
 
 原理与 dae 源码对照见 [NOTES.md](./NOTES.md)。
 

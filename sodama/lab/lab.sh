@@ -31,6 +31,14 @@
 #   sudo lab/lab.sh offload-up   # P4c：relay + TCP offload（fast_sock/sk_skb）
 #   sudo lab/lab.sh test-relay-offload # 内核拼接证据（用户态字节数远小于总传输）
 #   sudo lab/lab.sh test-offload-lifecycle # P7：半关闭超时后回收连接与 fast_sock 键
+#   sudo lab/lab.sh offload-up   # P4c：relay + TCP offload（fast_sock/sk_skb）；对标批起同时挂
+#                                #   skb_send_sock 记账探针（fentry 优先、kprobe 回退）
+#   sudo lab/lab.sh test-relay-offload    # 内核拼接证据 + 记账计数（probe_calls/kernel_bytes）
+#   sudo lab/lab.sh test-l3-attach        # 对标批：L3 接口（ipip，arphrd=768）自动选 _l3 变体并挂载
+#   sudo lab/lab.sh test-l3               # 对标批：L3 端到端（经 ipip 隧道的代理路径；VM 内未过，见 devlog §19）
+#   sudo lab/lab.sh test-xdp              # 对标批 C4：XDP 计量探针（恒 XDP_PASS）计数随流量推进
+#   USE_XDP_IFACE=  # 显式置空可关闭 up() 默认的 --xdp landae 计量探针
+#   NO_L3=1         # 不建 L3 段（跳过 ipip 隧道）
 #   sudo lab/lab.sh udp-up       # P4b：UDP NAT 会话（rules.udp.dae）
 #   sudo lab/lab.sh test-udp-relay    # UDP 真实转发 + 会话复用
 #   sudo lab/lab.sh test-udp-idle     # UDP 会话 janitor 回收
@@ -113,6 +121,8 @@ ROOT="$(dirname "$HERE")"
 LOADER="$ROOT/target/release/sodama"
 OBJ="$ROOT/ebpf-rs/target/bpfel-unknown-none/release/sodama-ebpf"
 LOG=/tmp/sodama.log
+# 对标批：L3（无链路头）接口名，由 up() 建 ipip 隧道后赋值（未建则空 → 相关用例 SKIP）
+L3_IFACE=""
 WAN_LOG=/tmp/sodama-wan.log
 PID_FILE=/tmp/sodama.pid
 WAN_PID_FILE=/tmp/sodama-wan.pid
@@ -468,6 +478,7 @@ cleanup() {
   ip netns del "$WAN_NS" 2>/dev/null || true
   ip netns del "$DAE_NS" 2>/dev/null || true
   ip link del landae 2>/dev/null || true
+  ip link del landae3 2>/dev/null || true
   ip link del wan 2>/dev/null || true
   ip link del dae0 2>/dev/null || true
   ip link del single 2>/dev/null || true
@@ -483,6 +494,9 @@ up() {
   [ -f "$OBJ" ] && [ -x "$LOADER" ] || die "先运行 $0 build"
   check_lan_collision
   cleanup
+  # C4：XDP 计量探针默认挂在 LAN 接口（恒 XDP_PASS；不支持时 loader 只告警）。
+  # 用 `USE_XDP_IFACE= `（显式置空）关闭，或换成别的接口。
+  USE_XDP_IFACE="${USE_XDP_IFACE-landae}"
 
   echo "== 建立 netns 与 veth =="
   ip netns add "$CLIENT_NS"
@@ -502,6 +516,28 @@ up() {
   ip -6 addr add 2001:db8:1::1/64 dev landae nodad
   ip -n "$CLIENT_NS" -6 addr add 2001:db8:1::2/64 dev lanclient nodad
   ip -n "$CLIENT_NS" -6 route add default via 2001:db8:1::1
+
+  # 对标批：L3 段（ipip 隧道，arphrd=768=ARPHRD_TUNNEL）——LAN 侧无链路头接口。
+  # 对照 dae `linkHdrLen()`（control/control_plane_core_bind.go:61-77：ipip → 0）与
+  # `_l3` 程序变体（`SEC("tc/lan_ingress_l3")`）。asm 侧设备没有以太头，
+  # 这是验证「L3 解析 + 送控制面补头 + 回程剥头」的承载物。
+  # 内核在 `ip tunnel add mode ipip` 时自动 modprobe ipip（rtnl-link-ipip）。
+  if [ -z "${NO_L3:-}" ]; then
+    # 先显式 modprobe：`ip tunnel add` 靠内核 rtnl-link 自动加载，而在 initramfs/chroot
+    # 环境下 usermodehelper 看不到 chroot 里的模块树，自动加载会失败（VM 实测）。
+    modprobe ipip 2>/dev/null || true
+    if ! ip tunnel add landae3 mode ipip local 10.0.0.1 remote 10.0.0.2; then
+      echo "!! ipip 隧道创建失败（内核无 ipip 模块？）——L3 用例将 SKIP"
+    fi
+    if ip link show landae3 >/dev/null 2>&1; then
+      ip link set landae3 up
+      ip addr add 10.20.0.1/24 dev landae3
+      ip -n "$CLIENT_NS" tunnel add l3cli mode ipip local 10.0.0.2 remote 10.0.0.1
+      ip -n "$CLIENT_NS" link set l3cli up
+      ip -n "$CLIENT_NS" addr add 10.20.0.2/24 dev l3cli
+      L3_IFACE=landae3
+    fi
+  fi
 
   # WAN: wan <-> wanpeer
   ip link add wan type veth peer name wanpeer
@@ -590,8 +626,14 @@ up() {
   ip route add 10.9.10.0/24 via "$DIRECT_DST" dev wan
   # P4：UDP relay 目标
   ip route add 2.2.2.2/32 via "$DIRECT_DST" dev wan
-  # “假公共 DNS”：客户端会把查询发到这里（若没被接管则自然超时）
+  # "假公共 DNS"：客户端会把查询发到这里（若没被接管则自然超时）
   ip route add 9.9.9.9/32 via "$DIRECT_DST" dev wan
+  # 对标批 L3：回程腿——L3 客户端网段（10.20.0.0/24）对「假公网」（WAN ns）与 dae ns
+  # 都不可见；不补这两条时回包会在两处被丢（VM 对照实验：不经 sodama 的隧道直连也超时）。
+  if [ -n "$L3_IFACE" ]; then
+    ip -n "$WAN_NS" route add 10.20.0.0/24 via 10.9.9.1
+    ip -n "$DAE_NS" route add 10.20.0.0/24 via 169.254.0.1 dev dae0peer
+  fi
 
   # 性能对比（lab/perf/run.sh）：只要拓扑，不启动 sodama / echo 夹具。
   if [ -n "${TOPO_ONLY:-}" ]; then
@@ -932,10 +974,17 @@ up() {
   [ -n "${USE_SNIFF_PUNT:-}" ] && extra_args+=(--sniff-punt)
   [ -n "${USE_UDP_IDLE:-}" ] && extra_args+=(--udp-idle-timeout "$USE_UDP_IDLE")
   [ -n "${USE_OFFLOAD:-}" ] && extra_args+=(--offload)
+  # 对标批：L3 接口（up() 建 ipip 隧道后置 L3_IFACE）也挂在 LAN 侧——loader 按
+  # arphrd 自动选 `sodama_lan_ingress_l3`（对照 dae 按 EncapType 选 `_l2`/`_l3`）。
+  [ -n "$L3_IFACE" ] && extra_args+=(--lan "$L3_IFACE")
+  # C4：XDP 计量探针（恒 XDP_PASS；挂载失败仅告警，不影响转发）
+  [ -n "${USE_XDP_IFACE:-}" ] && extra_args+=(--xdp "$USE_XDP_IFACE")
   # O9：强制经典线程泵路径（关 reactor 用 SODAMA_NO_REACTOR=1 环境变量）
   [ -n "${USE_NO_SPLICE:-}" ] && extra_args+=(--no-splice)
   # M2：kTLS 实验（内核 TLS；成功则加解密下沉内核，TLS 上可再 splice）
   [ -n "${USE_KTLS:-}" ] && extra_args+=(--ktls)
+  # M1：eBPF 热路径调试打印（诊断专用；对照 dae 的 __DEBUG 门控）
+  [ -n "${USE_EBPF_DEBUG:-}" ] && extra_args+=(--ebpf-debug)
   [ -n "${USE_LOG_FILE:-}" ] && extra_args+=(--log-file "$OPS_LOG")
   # P33：配置文件热驱动冒烟（轮询 --config/--rules 及 include，变更自动 reload）
   [ -n "${USE_WATCH_CONFIG:-}" ] && extra_args+=(--watch-config "$USE_WATCH_CONFIG")
@@ -2992,6 +3041,7 @@ test_relay_offload() {
   out="$(ip netns exec "$CLIENT_NS" timeout 30 python3 "$HERE/stream_probe.py" "$PROXY_DST" 8080 512 2>&1 || true)"
   echo "$out"
   echo "$out" | grep -q "^stream-ok bytes=524288" || { echo "FAIL: offload 大流量回显不一致"; exit 1; }
+  check_offload_accounting
   "$LOADER" status --socket "$STATUS_SOCK" --json >/tmp/sodama-status.json
   python3 - /tmp/sodama-status.json <<'PY'
 import json, sys
@@ -3036,6 +3086,136 @@ print("offload 生命周期: offloaded=%d active=%d fast_sock=%d" % (
     r["offloaded_total"], active, fast))
 PY
   echo "PASS: offload 连接已回收（conns_active=0，fast_sock=0）"
+  # 对标批：键摘除时汇总回收内核路径字节
+  check_offload_reclaim
+}
+
+# 对标批：offload 字节记账（fentry/kprobe `skb_send_sock`）——挂载证据 + 内核路径字节数。
+# 对照 dae `kern/tproxy.c:4360-4393` 与 `control/tcp_offload_hook.go`（fentry 优先、kprobe 回退）。
+check_offload_accounting() {
+  require_root
+  if grep -q "offload 记账: fentry/skb_send_sock 已挂载" "$LOG"; then
+    echo "offload 记账：fentry 形态（零开销探针）"
+  elif grep -q "offload 记账: kprobe/skb_send_sock 已挂载" "$LOG"; then
+    echo "offload 记账：kprobe 形态（fentry 回退）"
+  elif grep -q "offload 记账: BTF 解析失败" "$LOG"; then
+    echo "SKIP: 本内核无 vmlinux BTF，记账未挂载（计量降级，不影响转发）"
+    return 0
+  else
+    echo "FAIL: offload 记账探针未挂载（既无 fentry 也无 kprobe，且无 BTF 失败日志）"
+    grep "offload 记账" "$LOG" || true
+    exit 1
+  fi
+  # 挂载可选（BTF 不可用时跳过），但一旦挂上就必须能看到「内核路径推了字节」。
+  grep -q "offload 记账: BTF 解析失败" "$LOG" && return 0
+  "$LOADER" status --socket "$STATUS_SOCK" --json >/tmp/sodama-status.json
+  python3 - /tmp/sodama-status.json <<'PY'
+import json, sys
+v = json.load(open(sys.argv[1]))
+s = v["offload_sent"]
+assert s["kernel_bytes"] > 0, ("内核路径推送字节为 0（探针未命中？）", s)
+print("offload 记账: kernel_bytes=%d account_drops=%d" % (s["kernel_bytes"], s["account_drops"]))
+PY
+}
+
+# 对标批：键摘除时汇总回收（loaders 侧 `offload_sent_reclaim`）。
+check_offload_reclaim() {
+  "$LOADER" status --socket "$STATUS_SOCK" --json >/tmp/sodama-status.json
+  python3 - /tmp/sodama-status.json <<'PY'
+import json, sys
+v = json.load(open(sys.argv[1]))
+s = v["offload_sent"]
+assert s["reclaimed_bytes"] > 0, ("键摘除后未回收字节（回收路径未生效）", s)
+print("offload 回收: reclaimed_bytes=%d" % s["reclaimed_bytes"])
+PY
+}
+
+# 对标批 C1a：L3 变体的**选择与挂载**（可稳定判定，入门禁）。
+# 已实测（VM/7.2.8）：landae3（arphrd=768）被 loader 判为 L3 → 挂 `sodama_lan_ingress_l3`。
+test_l3_attach() {
+  require_root
+  rm -f /tmp/sodama-l3-skip
+  [ -n "$L3_IFACE" ] || L3_IFACE=landae3
+  [ -e "/sys/class/net/$L3_IFACE" ] || { echo "SKIP: 无 L3 接口（$L3_IFACE 不存在，ipip 隧道未建）"; touch /tmp/sodama-l3-skip; return 0; }
+  local ty
+  ty="$(cat "/sys/class/net/$L3_IFACE/type" 2>/dev/null || echo '?')"
+  echo "$L3_IFACE type=$ty（768=ARPHRD_TUNNEL）"
+  "$LOADER" status --socket "$STATUS_SOCK" --json >/tmp/sodama-status.json
+  python3 - /tmp/sodama-status.json "$L3_IFACE" <<'PY'
+import json, sys
+v = json.load(open(sys.argv[1]))
+iface = sys.argv[2]
+hooks = v.get("hooks") or []
+expect = "sodama_lan_ingress_l3@%s" % iface
+assert expect in hooks, ("L3 变体未挂载（auto 判定失败）", hooks)
+seen = [h for h in hooks if h.startswith("sodama_lan_ingress")]
+assert any(h == expect for h in seen), ("L2 变体仍挂在 L3 接口上？", seen)
+print("L3 钩子: %s" % expect)
+PY
+  echo "PASS: L3 接口被识别并挂上 _l3 变体"
+}
+
+# 对标批 C1b：L3 **端到端**（经 ipip 隧道的代理路径 + 补头/剥头闭环）。
+# 状态：VM 内尚未打通（补头/剥头/lab 两侧落地均已实测，但经本拓扑的端到端回程未过），
+# 故**不入 verify 门禁**；留作真机（生产路由器 6.12 + 真 tun/ppp）与拓扑补完后的验收。
+test_l3() {
+  require_root
+  rm -f /tmp/sodama-l3-skip
+  # L3_IFACE 只在 up()（另一个进程）里赋值，这里必须自探测（否则误 SKIP）。
+  [ -n "$L3_IFACE" ] || L3_IFACE=landae3
+  [ -e "/sys/class/net/$L3_IFACE" ] || { echo "SKIP: 无 L3 接口（$L3_IFACE 不存在，ipip 隧道未建）"; touch /tmp/sodama-l3-skip; return 0; }
+  echo "== 测试 L3 端到端（ipip 隧道 $L3_IFACE）=="
+  # 接口类型自证：ipip 应为 arphrd=768（ARPHRD_TUNNEL）。数值只作证据打印，
+  # 真正的断言是「loader 把它归为 L3 并挂上了 _l3 变体」（下一段）。
+  local ty
+  ty="$(cat "/sys/class/net/$L3_IFACE/type" 2>/dev/null || echo '?')"
+  echo "$L3_IFACE type=$ty（期望 768=ARPHRD_TUNNEL；非 1 即无链路头）"
+  # 挂载证据：hook 名应带 _l3 后缀（本用例不重复断言，test-l3-attach 已断言）
+  # 把该客户端的代理目标流量改走隧道（只影响本用例；结束前删回）
+  ip -n "$CLIENT_NS" route replace "$PROXY_DST/32" dev l3cli
+  # 判别口径同 test_proxy：只有真的被 redirect 到 tproxy socket（代理路径）时，
+  # 加载器的 echo 才会带上 orig_dst=… 行；走直连/被丢包都是别的内容。
+  local rc=0 out
+  out="$(ip netns exec "$CLIENT_NS" timeout 8 python3 "$HERE/client_probe.py" "$PROXY_DST" 8080 2>&1 || true)"
+  echo "$out"
+  echo "$out" | grep -q "orig_dst=$PROXY_DST:8080" || rc=1
+  out="$(ip netns exec "$CLIENT_NS" timeout 30 python3 "$HERE/stream_probe.py" "$PROXY_DST" 8080 512 2>&1 || true)"
+  echo "$out"
+  # 512KB 回显：代理路径下仍是 tproxy echo（逐行回显），只验证字节完整性
+  echo "$out" | grep -q "^stream-ok bytes=524288" || rc=1
+  ip -n "$CLIENT_NS" route del "$PROXY_DST/32" dev l3cli 2>/dev/null || true
+  [ "$rc" = 0 ] || { echo "FAIL: L3 链路分流未打通（补头/剥头/解析链）"; exit 1; }
+  echo "PASS: L3 变体分流（经 ipip 隧道的 512KB 回显一致，补头+剥头闭环）"
+}
+
+# 对标批 C4：XDP 计量探针（恒 XDP_PASS）。挂载失败/内核不支持时 SKIP（不阻塞基线）。
+test_xdp() {
+  require_root
+  rm -f /tmp/sodama-xdp-skip
+  # USE_XDP_IFACE 只在 up()（另一个进程）里赋值；这里默认 landae（up() 的默认挂载口）。
+  [ -n "${USE_XDP_IFACE:-}" ] || USE_XDP_IFACE=landae
+  [ -e "/sys/class/net/$USE_XDP_IFACE" ] || { echo "SKIP: 接口 $USE_XDP_IFACE 不存在"; touch /tmp/sodama-xdp-skip; return 0; }
+  echo "== 测试 XDP 计量探针（$USE_XDP_IFACE，仅计数）=="
+  local i
+  for i in 1 2 3; do
+    "$LOADER" status --socket "$STATUS_SOCK" --json >/tmp/sodama-status.json 2>/dev/null || true
+    if grep -q '"xdp"' /tmp/sodama-status.json 2>/dev/null; then break; fi
+    sleep 0.3
+  done
+  python3 - /tmp/sodama-status.json <<'PY'
+import json, sys
+v = json.load(open(sys.argv[1]))
+x = v.get("xdp")
+if x is None:
+    print("SKIP: XDP 探针未挂载（内核/驱动不支持或未指定接口）")
+    open("/tmp/sodama-xdp-skip", "w").close()
+    sys.exit(0)
+assert x["packets"] > 0, ("XDP 已挂载但未计数（探针未执行？）", x)
+assert x["ipv4"] > 0, ("XDP 已挂载但对 IPv4 包未计数", x)
+print("xdp: packets=%d bytes=%d ipv4=%d ipv6=%d other=%d" % (
+    x["packets"], x["bytes"], x["ipv4"], x["ipv6"], x["other"]))
+PY
+  echo "PASS: XDP 探针计数可读且随流量推进（转发不受影响由其余用例覆盖）"
 }
 
 # P5 G1：shadowsocks TCP——跨实现（独立 Python 服务端）+ 协议层必须跑在用户态
@@ -3801,6 +3981,18 @@ verify() {
   if (test_rebind) >/dev/null 2>&1; then echo "rebind    : PASS"; else echo "rebind    : FAIL"; t_fails=$((t_fails + 1)); fi
   if (test_status) >/dev/null 2>&1; then echo "status    : PASS"; else echo "status    : FAIL"; t_fails=$((t_fails + 1)); fi
   if (test_fault_reload) >/dev/null 2>&1; then echo "fault/reload: PASS"; else echo "fault/reload: FAIL"; t_fails=$((t_fails + 1)); fi
+  # 对标批：L3 变体（ipip 隧道）与 XDP 计量探针。两者在拓扑/内核不满足时 SKIP（不算失败）。
+  # 对标批：L3 变体的选择/挂载（稳定可判定）入 verify 门禁；端到端（test-l3）不入。
+  if (test_l3_attach) >/dev/null 2>&1; then
+    if [ -e /tmp/sodama-l3-skip ]; then echo "l3-attach : SKIP（无 L3 接口）"; else echo "l3-attach : PASS"; fi
+  else
+    echo "l3-attach : FAIL"; t_fails=$((t_fails + 1))
+  fi
+  if (test_xdp) >/dev/null 2>&1; then
+    if [ -e /tmp/sodama-xdp-skip ]; then echo "xdp       : SKIP（未挂载）"; else echo "xdp       : PASS"; fi
+  else
+    echo "xdp       : FAIL"; t_fails=$((t_fails + 1))
+  fi
   # 破坏性：kill 掉加载器，必须最后跑
   if (test_fault_kill) >/dev/null 2>&1; then echo "fault/kill : PASS"; else echo "fault/kill : FAIL"; t_fails=$((t_fails + 1)); fi
 
@@ -3906,6 +4098,9 @@ test-dns-udp) test_dns_udp ;;  # 显式 udp:// 上游（仅 UDP）
   relay-up) USE_RULES="$HERE/rules.dae" USE_DIALER=direct USE_RELAY_IDLE=2 USE_UDP_IDLE=2 up ;;
   relay-thread-up) SODAMA_NO_REACTOR=1 USE_NO_SPLICE=1 \
     USE_RULES="$HERE/rules.dae" USE_DIALER=direct USE_RELAY_IDLE=2 USE_UDP_IDLE=2 up ;;  # O9：线程泵泄漏回归会话
+  test-l3-attach) test_l3_attach ;;
+  test-l3) test_l3 ;;
+  test-xdp) test_xdp ;;
   offload-up) USE_RULES="$HERE/rules.dae" USE_DIALER=direct USE_OFFLOAD=1 USE_RELAY_IDLE=600 up ;;
   udp-up) USE_RULES="$HERE/rules.udp.dae" USE_UDP_IDLE=2 up ;;
   ss-up) USE_RULES="$HERE/rules.dae" USE_SS=1 USE_SS_METHOD=chacha20-ietf-poly1305 USE_SS_PASSWORD=testpass \

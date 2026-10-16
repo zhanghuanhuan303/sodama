@@ -2186,6 +2186,12 @@ fn write_trace_params(ebpf: &mut Ebpf) -> Option<btfoff::SkBuffOffsets> {
 /// 调用占用 → EBUSY），kprobe 能挂在任意指令边界上。
 /// 只在 `--offload` 下挂（记账只对 offload 会话有意义）。
 fn attach_offload_accounting(ebpf: &mut Ebpf) {
+    // 运维/诊断开关（与 SODAMA_NO_REACTOR 同风格）：跳过探针挂载，回退为只计数。
+    // 用途：定位「记账探针对转发/性能有无影响」的 A/B；生产上也可用于隔离排障。
+    if std::env::var_os("SODAMA_NO_OFFLOAD_ACCOUNT").is_some() {
+        log("offload 记账: SODAMA_NO_OFFLOAD_ACCOUNT 已置，跳过 skb_send_sock 探针");
+        return;
+    }
     if write_trace_params(ebpf).is_none() {
         return;
     }
@@ -8211,6 +8217,10 @@ struct EbpfStats {
     offload_sent_bytes: u64,
     conn_overflow: u64,
     account_drops: u64,
+    /// 对标批：`skb_send_sock` 探针内部计数（0 字节问题的诊断三件套）
+    probe_calls: u64,
+    probe_parse_fail: u64,
+    probe_guard_miss: u64,
 }
 
 fn read_stats(ebpf: &mut Ebpf) -> EbpfStats {
@@ -8237,6 +8247,9 @@ fn read_stats(ebpf: &mut Ebpf) -> EbpfStats {
         offload_sent_bytes: get(6),
         conn_overflow: get(7),
         account_drops: get(8),
+        probe_calls: get(9),
+        probe_parse_fail: get(10),
+        probe_guard_miss: get(11),
     }
 }
 
@@ -8533,6 +8546,10 @@ fn status_json(ebpf: &mut Ebpf) -> serde_json::Value {
             "reclaimed_bytes": RELAY_STATS.offload_sent_bytes.load(Ordering::Relaxed),
             "kernel_bytes": stats.offload_sent_bytes,
             "account_drops": stats.account_drops,
+            // 探针内部计数：calls=0 → 钩子未落在推流路径；parse_fail/guard_miss 定位键不符
+            "probe_calls": stats.probe_calls,
+            "probe_parse_fail": stats.probe_parse_fail,
+            "probe_guard_miss": stats.probe_guard_miss,
         },
         // C4：未挂载 XDP 探针时为 null（区分「0 包」与「没探针」）
         "xdp": match xdp {
