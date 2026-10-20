@@ -196,13 +196,13 @@ article ol li::marker{color:var(--accent)}
 <div class="classbar">
   <span class="cls">密级 · 最高</span>
   <span>SODAMA ATLAS · 内部研究档案 · 未经许可不得外传</span>
-  <span class="push">v2.0 · 2026-10-17 · 重写版</span>
+  <span class="push">v2.1 · 2026-10-20 · 重写版</span>
 </div>
 <div class="page">
 <article>
 
 <header class="title-block">
-  <div class="kicker">全 Rust 代理数据面 · 开发研究档案 · <b>重写版 v2.0</b></div>
+  <div class="kicker">全 Rust 代理数据面 · 开发研究档案 · <b>重写版 v2.1</b></div>
   <h1>SODAMA ATLAS</h1>
   <p class="sub">dae 的研究性复现：一个可上生产、可被验证、可被复现的 eBPF + Rust 透明代理。
   本版为<strong>重写</strong>——v1.x 的增量叙事（每批次追加一节）收敛为当期状态文档；
@@ -235,8 +235,8 @@ article ol li::marker{color:var(--accent)}
     <tr><td>内存 · 5 万连接</td><td>RSS <b>55.6 MB</b> / 31 线程 / 100 008 fd（2/连接）；系统净增 ≈2.0 GB</td><td>dae 系统净增 ≈8.2 GB（172.7 KB/连接）</td></tr>
     <tr><td>UDP（40 000×256 B @20 000 pps）</td><td><b>41.0 Mbps 零丢包</b>，CPU <b>1 020 ms / 40 k 包</b>（五方最优）</td><td>sing-box 1 610 · v2ray 1 820 · dae 2 170 · mihomo 2 460 ms</td></tr>
     <tr><td>真实公网轮（CF 边缘订阅节点 · 17 轮 ×4）</td><td>19.3 Mbps；<b>进程 CPU 2 952 ms/GB</b>（合计含内核 12.6 k）</td><td>dae 18.6 Mbps / 4 266 ms/GB；sing-box 19.3 / 4 111；节点出口 ≈19 Mbps 为共同上限</td></tr>
-    <tr><td>生产（软路由）</td><td>72h 链：旧轮 21.4 h 收口 RSS 平台 <b>53.5 MB</b>、<code>dial_errors</code>/<code>stragglers</code> 全程 0；新轮 2026-10-17 03:22 起跑</td><td>对 dae 生产口径见 §8</td></tr>
-    <tr><td>质量门禁</td><td>单测 <b>351</b>（348 + 3 BPF 逻辑）· <code>verify 12/12</code> + <code>cap 12/12</code>（QEMU 7.2.8）· 宿主 6.18 与生产 6.12.92 双内核实载</td><td>本项目额外要求「对象在真实宿主/生产内核上必须能加载」</td></tr>
+    <tr><td>生产（软路由）</td><td>78.5 h 轮收口：RSS 平台 <b>66.7 MB</b>（47–59 h 斜率 −0.01 MB/h）· 109 137 会话 / 31.16 GB · <code>dial_errors</code> 58（0.05%）· <code>stragglers</code> 0 · ws 截断误报 <b>0</b>（旧轮 9 738）；2026-10-20 修 <code>routing_handoff</code> 满表后起 <b>1 周轮</b></td><td>旧轮 21.4 h：RSS 53.5 MB、dial_errors 0；对 dae 生产口径见 §8</td></tr>
+    <tr><td>质量门禁</td><td>单测 <b>353</b>（350 + 3 BPF 逻辑）· <code>verify 12/12</code> + <code>cap 12/12</code>（QEMU 7.2.8）· 宿主 6.18 与生产 6.12.92 双内核实载</td><td>本项目额外要求「对象在真实宿主/生产内核上必须能加载」</td></tr>
   </tbody>
 </table>
 
@@ -740,6 +740,7 @@ status / metrics / 事件流），差的是面板上的可视化与回执。<lab
     <tr><td>内存（旧轮 21.4 h）</td><td>冷启 43.8 → 预热台阶后稳态 <b>53.5 MB</b>（14 h 极差 3.66 MB，斜率≈0）</td><td>台阶形态与本地 soak 同型；不是泄漏（见 §4.6）</td></tr>
     <tr><td>线路质量（旧轮全程）</td><td><code>dial_errors</code> 0 · <code>stragglers</code> 0 · <code>probes_fail</code> 0.1% · DoH <code>upstream_errors</code> 0（96 703 查询）</td><td>引擎侧零故障；探针失败来自节点侧波动</td></tr>
     <tr><td>新引擎轮（2026-10-17 03:22 起）</td><td>部署就绪 8 s；36 节点全活；对象在 6.12.92 加载并挂钩（br-lan/eth0/dae0/cgroup）；冷启基线 RSS 54.6 MB / 线程 20 / fd 143</td><td>新构建功能面更大，基线高于旧轮属预期；72h 判据同 §8.2</td></tr>
+    <tr><td>新引擎轮 78.5 h 收口（2026-10-17 03:22 → 10-20 09:55）</td><td>RSS 平台 <b>66.7 MB</b>（47–59 h 斜率 ≈0）· 采样峰值 92.9 MB（最大流量峰）· FD 稳态 137 / 峰值 905 · 线程基线 21 · <code>dial_errors</code> 58 · <code>stragglers</code> 0 · <code>probes_fail</code> 13.5%（83 节点中 6 死 = 7.2% 基准）· ws 截断误报 <b>0</b>（旧轮 9 738）</td><td>无重启（uptime = 窗口）；「台阶 + 平台 + 随流量弹性」；<code>routing_handoff</code> 满表见 §8.3</td></tr>
   </tbody>
 </table>
 
@@ -811,7 +812,29 @@ RSS 为逐点（15 分钟抽稀）；FD 与线程为逐小时中位（与收口�
 <h3>8.2 · 轮次链与当前状态</h3>
 <p>2026-10-11 第一轮 72h（§12 记分板口径）→ 10-14 新一轮（P37 治理后）→ 10-16 05:44
 审计修复批上线轮 → <b>21.4 h 收口</b>（用户决定为新引擎让路；判据全绿，见 §4.6）→
-<b>2026-10-17 03:22 新引擎轮起跑</b>（A2 收口 + 四项修复 + ws EOF 修复 + 面板 v2.0）。<label for="mn10" class="margin-toggle">⊕</label><input type="checkbox" id="mn10" class="margin-toggle"><span class="marginnote">判据（24/48/72 h 检查点）：RSS/FD 漂移 ≤5%（稳态段）、失败指标零增长、<code>stragglers</code> 恒 0、无重启；「bounded-memory」表述待 72h 通过后启用。</span></p>
+<b>2026-10-17 03:22 新引擎轮起跑</b>（A2 收口 + 四项修复 + ws EOF 修复 + 面板 v2.0）→
+<b>2026-10-20 09:55 78.5 h 收口</b>（无重启、平台段 RSS 66.7 MB 斜率≈0、ws 误报 0；判据全绿）→
+<b>2026-10-20 routing_handoff janitor 修复上线，起 1 周（168 h）生产轮</b>。<label for="mn10" class="margin-toggle">⊕</label><input type="checkbox" id="mn10" class="margin-toggle"><span class="marginnote">判据（24/48/72 h 检查点）：RSS/FD 漂移 ≤5%（稳态段）、失败指标零增长、<code>stragglers</code> 恒 0、无重启；1 周轮增 120/144/168 h 检查点。</span></p>
+
+<h3>8.3 · 2026-10-20 收口：首个「交接表只写不删」缺陷与 1 周轮</h3>
+<p><b>收口数据</b>（<code>docs/notes/prod-audit-2026-10-20/</code>，78.5 h、256 512 行日志）：
+无重启（uptime 282 796 s = 窗口）· 109 137 会话 / 110 403 拨号 · 下行 31.16 GB ·
+<code>dial_errors</code> 58（0.05%，集中在 3 个网络/节点事件小时）· <code>stragglers</code> 0 ·
+codec reactor 覆盖 <b>100%</b> · DoH <code>upstream_errors</code> 0（281 539 查询）·
+<code>real_domain</code> 1 936 确认 / 53 679 命中 · 投影重试 0/0 · <code>config_watch</code> inotify 生效。
+内存：冷启 53.2 → 平台 66.7 MB（46 h 极差 2.0 MB）→ 晚高峰峰值 92.9 → 回落 → 早高峰 74.4（采样时点）；
+RSS ↔ 累计连接 +0.48，为工作集弹性而非泄漏。</p>
+<p><b>新缺陷：<code>routing_handoff_map</code> 满表</b>（65 536 / 65 536）。首包交接条目只由数据面
+<code>BPF_ANY</code> 写入、loader 无删除路径 → 78.5 h 后写满；此后新首包插入失败（静默），
+<code>conn_state</code> miss 时首包路由兜底失效（主路径不受影响，生产无感）。
+与 <code>redirect_track</code> 2026-10-08 满表停摆<b>同构</b>——教训升级为纪律：
+<b>任何只写不删的 map 都必须有 janitor + 容量告警</b>（dae 对照：<code>control_plane.go:1848-1918</code>
+<code>cleanupRoutingHandoffMap</code> + <code>logMapCapacityAlert</code>）。</p>
+<p><b>修复与回归</b>（<code>02af0ca</code>）：60 s 周期清扫（TTL 30 s、每轮删除上限 8 192，满表 8 轮清完）
++ ≥90% 容量告警（<code>AlertPacer</code> 60 s 一条）；<code>sticky</code> 单节点「作废粘滞 IP」日志加
+10 min/域名冷却（生产 7 569 条/78 h ≈ 97/h → 预期 ≤1 条/10 min/节点）。
+单测 350 + 3（TTL 边界 / 冷却）；<code>fmt</code>/<code>clippy -D warnings</code> 干净。
+部署后起 <b>1 周（168 h）</b>生产轮，判据同 §8.2（增 120/144/168 h 检查点）。</p>
 </section>
 
 <section id="s9">
@@ -855,7 +878,8 @@ AF-XDP 否决（0058 及专文）· ECH 边界（0056）· 数据面对标（006
     <tr><td><code>docs/reviews/2026-10-16-local-full-bench/</code></td><td>本机轮原始 TSV（吞吐/内存/UDP/soak/二分探针）</td></tr>
     <tr><td><code>docs/reviews/2026-10-17-real-node-cf-edge/</code></td><td>公网轮原始数据（17×4 TSV、汇总、证据：域名拨号日志、sing-box 1.14 源码事实、出口探测）</td></tr>
     <tr><td><code>docs/notes/prod-audit-2026-10-17/</code>（本地工作区）</td><td>生产 72h 轮收口：health/mem-track 导出、收官 status/metrics、analyze.py 与 README；路由器另有 <code>/root/72h-archive-*</code></td></tr>
-    <tr><td><code>docs/phase2-devlog.md</code> §1–§24</td><td>生产实战全程：四轮侦查/修复、探测治理、审计修复批、数据面对标、能力缺口/eBPF 余项、A1/A2、修复轮与 72h 链</td></tr>
+    <tr><td><code>docs/notes/prod-audit-2026-10-20/</code>（本地工作区）</td><td>生产 78.5 h 轮收口（§8.3）：health/mem-track 导出、status/metrics、全窗口日志（4 归档 + current）、analyze.py 与 README；路由器另有 <code>/root/1w-archive-*</code></td></tr>
+    <tr><td><code>docs/phase2-devlog.md</code> §1–§25</td><td>生产实战全程：四轮侦查/修复、探测治理、审计修复批、数据面对标、能力缺口/eBPF 余项、A1/A2、修复轮与 72h 链、78.5 h 收口与 1 周轮</td></tr>
     <tr><td><code>docs/parity-status.md</code> v2.20</td><td>十五域对照逐行证据（§2 表 1 的出处）</td></tr>
     <tr><td><code>docs/memory-safety-audit.html</code> v1.1</td><td>unsafe 专项审计 + 生产比对 + 修复批回验</td></tr>
     <tr><td><code>docs/config-reference.md</code></td><td>配置参考（由引擎 <code>config-doc</code> 生成，drift 单测锁定）</td></tr>
@@ -876,7 +900,7 @@ AF-XDP 否决（0058 及专文）· ECH 边界（0056）· 数据面对标（006
 <div class="classbar bottom">
   <span class="cls">密级 · 最高</span>
   <span>SODAMA ATLAS · 内部研究档案 · 未经许可不得外传</span>
-  <span class="push">v2.0 · 2026-10-17 · 重写版</span>
+  <span class="push">v2.1 · 2026-10-20 · 重写版</span>
 </div>
 
 </body>

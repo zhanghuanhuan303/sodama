@@ -1642,6 +1642,60 @@ GSO 的 cmsg 构造用了 glibc 专有的 `libc::msghdr` 字面量——musl 下
   ③ A2 的 `config-watch`（inotify 已启用）与订阅周期刷新（21600s ±10%）在长期运行下的行为；
   ④ 内存台阶与稳态（与旧轮 53.5 MB 稳态对照）。
 
+## 25 · 78.5 h 生产轮收口 · routing_handoff 满表修复 · 1 周轮起跑（2026-10-20）
+
+### 25.1 78.5 h 轮收口（2026-10-17 03:22 → 2026-10-20 09:55）
+
+引擎 `dev@5d3d9a0`（A2 收口 + 四项修复 + ws EOF 修复）；**全程只读采集，未重启**。
+数据与报告：`docs/notes/prod-audit-2026-10-20/`（health/mem-track 导出、status/metrics、
+全窗口 256 512 行日志、`analyze.py` + README）。
+
+| 判据 | 结果 |
+|---|---|
+| 崩溃/重启/watchdog | **0**（uptime 282 796 s = 窗口；watchdog 零触发）；无 panic/OOM |
+| RSS | 冷启 53.2 → 平台 **66.7 MB**（47–59 h 斜率 −0.01 MB/h ≈ 0）→ 采样峰值 92.9（10-19 晚最大流量峰）→ 高峰后回落；收口时早高峰 74.4 |
+| 连接/流量 | 109 137 会话 / 110 403 拨号 / 下行 31.16 GB；`dial_errors` **58（0.05%）**；`evicted` 760 |
+| codec reactor 覆盖 | `reactor_codec_sessions == conns_total`（**100%**） |
+| ws EOF 修复验证 | 全窗口 `ws: 帧被截断` **0**（上轮 9 738）；真截断 vless 1 008 / anytls 5 / vision 4 |
+| DNS | 281 539 查询 / DoH `upstream_errors` **0** / 缓存命中 48.6% / 拦截 17 781 / 刷新堆 `err=0` |
+| A2 功能面 | `real_domain` 1 936 确认 / 53 679 命中；`traffic` 180 点；投影重试 0/0；`config_watch` inotify |
+| 节点 | 83 成员 / 77 活 / 6 死（`probes_fail` 13.5% 与 7.2% 死节点基准 + 抖动自洽；10-17 07–09 的 80% 尖峰 = 网络异常，10:00 恢复 10% 基线） |
+
+异常与归因（详见报告 §4）：10-17 07–09 网络异常（探测 80% 失败 + FD 峰值 905 + RSS 台阶 +13.7 MB，
+2 h 内恢复）；sticky 单节点日志 7 569 条/78 h（≈97/h）；磁盘 `/` 76%。
+
+### 25.2 新缺陷：`routing_handoff_map` 满表（只写不删）
+
+- 现象：`maps.routing_handoff = 65 536 / 65 536`（容量上限）。
+- 根因：首包交接条目只由数据面 `BPF_ANY` 写入（`flow.rs::publish_routing_handoff`），
+  loader 无删除路径（仅读取侧 30 s TTL 判断）→ 78.5 h 后写满；此后新首包插入失败（静默），
+  `conn_state` miss 时首包路由兜底失效（主路径不受影响，生产无感）。
+- 对照 dae：`control_plane.go:1848-1918` `cleanupRoutingHandoffMap` + `logMapCapacityAlert`。
+- 同构教训：`redirect_track` 2026-10-08 满表停摆 → **任何只写不删的 map 都必须有 janitor + 容量告警**。
+
+### 25.3 修复（`02af0ca`）
+
+- `sweep_routing_handoff`：60 s 周期（与 5 s 的 conn_state/redirect_track 节拍分开）、
+  TTL 30 s、每轮删除上限 8 192（满表 8 轮清完）；≥90% 容量告警（`AlertPacer` 60 s 一条）。
+- sticky：同域名「作废粘滞 IP」日志 10 min 冷却（生产 7 569 → 预期 ≤1 条/10 min/节点）。
+- 单测 **350 + 3**（TTL 边界 / 冷却）；`fmt` / `clippy --workspace --all-targets -D warnings` 干净。
+
+### 25.4 部署与 1 周轮起点（2026-10-20 10:09）
+
+- 构建：`lab/build-openwrt.sh --arch x86_64`（zig 0.13.0 / cargo-zigbuild 0.23.4）→
+  `sodama` 8.1 M / `sodama-ebpf` 988 K；md5 `48efe82c…` / `4884fcf0…`（ebpf 未改，与旧轮同哈希）。
+- 部署：`docs/notes/deploy-engine.sh`（备份 `/root/binbak-20261020-1008`；`validate` 通过；
+  **就绪 8 s**；83 节点 / 77 活；hooks 12 个（TC×4 + cgroup×6 + peer））。
+- 版本：`0.1.0-g02af0cabbfaa-dirty`（`-dirty` = 工作区两个**未跟踪**开发目录 `config/`、`console/`；
+  代码 = `02af0ca`）。
+- **janitor 上线首验**：`10:10:02 routing_handoff janitor: 清理 221 条过期首包交接（清理前 399 条）` ✓；
+  启动时 map 随进程重建，10:10 水位 624（远低于 65 536）。
+- 追踪器重置：旧轮归档 `/root/1w-archive-20261020-1009/`（health/mem-track + 7 份日志归档，95.1 MB）；
+  **1 周（168 h）轮起点 2026-10-20 10:09:23**（tracker 首采样；冷启 RSS 52.3 MB / 线程 25 / fd 176）。
+- 判据同 §24.5（RSS/FD 稳态漂移、失败指标、`stragglers=0`、无重启），检查点 24/48/72/120/144/168 h；
+  新增观察项：① `routing_handoff` 水位应稳定在「30 s 内首包量」而非单调增长；② 容量告警不应出现；
+  ③ sticky 日志 ≤1 条/10 min/节点。
+
 ## 附 A · 路由器侧工具清单（**不入库**，仅存在于软路由）
 
 | 路径 | 用途 | 部署时间 |
