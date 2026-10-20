@@ -24,6 +24,8 @@ use std::time::{Duration, Instant};
 const FAIL_THRESHOLD: u32 = 3;
 /// 条目最长粘滞时间；过期后**下次拨号**重新走 DNS（近似 dae 的健康检查周期刷新）。
 const ENTRY_TTL: Duration = Duration::from_secs(600);
+/// 同一域名的「作废粘滞 IP」日志冷却（生产 78 h 单节点刷 7,569 条，见 2026-10-20 收口 §4.3）。
+const WARN_COOLDOWN: Duration = Duration::from_secs(600);
 
 struct Entry {
     addr: SocketAddr,
@@ -38,6 +40,8 @@ struct State {
     /// 已解析地址 → 域名 host:port（拨号失败/重解析只能拿到地址；
     /// 条目被作废后 origin 仍保留——不然没法知道该重解析谁）。
     origin: HashMap<SocketAddr, String>,
+    /// 域名 → 上次「作废粘滞 IP」告警时刻（限流用）。
+    last_warn: HashMap<String, Instant>,
 }
 
 /// A2 #6：`fallback_resolver`（对照 dae `global.fallback_resolver`，默认 8.8.8.8:53）——
@@ -243,10 +247,27 @@ pub fn note_dial(server: SocketAddr, ok: bool) {
     }
     if invalidated {
         st.by_key.remove(&host);
+        // 同一域名 10 min 内只告警一次：持续不可用的节点每 ~3 次拨号就作废一次，
+        // 不限流会刷屏（生产实测 97 条/h，见 2026-10-20 收口 §4.3）。
+        let now = Instant::now();
+        let should_warn = warn_due(st.last_warn.get(&host).copied(), now, WARN_COOLDOWN);
+        if should_warn {
+            st.last_warn.insert(host.clone(), now);
+        }
         drop(st);
-        crate::log(&format!(
-            "sticky: {host} 连续 {FAIL_THRESHOLD} 次拨号失败，作废粘滞 IP（下次拨号重新解析）"
-        ));
+        if should_warn {
+            crate::log(&format!(
+                "sticky: {host} 连续 {FAIL_THRESHOLD} 次拨号失败，作废粘滞 IP（下次拨号重新解析；10min 内同域名不再重复告警）"
+            ));
+        }
+    }
+}
+
+/// 告警是否到期（首次必发；冷却内抑制）。
+fn warn_due(last: Option<Instant>, now: Instant, cooldown: Duration) -> bool {
+    match last {
+        None => true,
+        Some(t) => now.saturating_duration_since(t) >= cooldown,
     }
 }
 
@@ -261,6 +282,7 @@ pub fn reset() {
     }
     st.by_key.clear();
     st.origin.clear();
+    st.last_warn.clear();
 }
 
 #[cfg(test)]
@@ -427,5 +449,18 @@ mod tests {
         )
         .unwrap();
         assert_eq!(b, "9.9.9.9:443".parse().unwrap());
+    }
+
+    #[test]
+    fn warn_due_first_then_cooldown() {
+        let now = Instant::now();
+        assert!(warn_due(None, now, WARN_COOLDOWN));
+        assert!(!warn_due(Some(now), now, WARN_COOLDOWN));
+        assert!(!warn_due(
+            Some(now - WARN_COOLDOWN + Duration::from_secs(1)),
+            now,
+            WARN_COOLDOWN
+        ));
+        assert!(warn_due(Some(now - WARN_COOLDOWN), now, WARN_COOLDOWN));
     }
 }

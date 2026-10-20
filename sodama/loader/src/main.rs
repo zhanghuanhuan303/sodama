@@ -1261,6 +1261,11 @@ unsafe impl aya::Pod for SodaRoutingHandoffEntry {}
 /// handoff 条目陈旧阈值（sodama 侧；见 ebpf-rs/common.rs `SODAMA_HANDOFF_TTL_NS`）。
 const SODAMA_HANDOFF_TTL_NS: u64 = 30_000_000_000;
 
+/// handoff 条目是否过期（读取侧与 janitor 共用同一判定）。
+fn handoff_expired(now_ns: u64, last_seen_ns: u64, ttl_ns: u64) -> bool {
+    last_seen_ns <= now_ns && now_ns - last_seen_ns > ttl_ns
+}
+
 /// 与 ebpf-rs/src/common.rs 的 `SodaTraceParam` 同位（16 字节）。
 /// 字段= `struct sk_buff` 的字节偏移（用户态 BTF 解出后写入；a/k/a «CO-RE 替代»）。
 #[repr(C)]
@@ -4659,7 +4664,7 @@ fn lookup_routing_handoff(
     }
     // 陈旧判定：now - last_seen > TTL → 不采信（dae 无显式 TTL，靠 reload 换代自然失效）。
     let now = monotonic_now_ns();
-    if now.saturating_sub(e.last_seen_ns) > SODAMA_HANDOFF_TTL_NS {
+    if handoff_expired(now, e.last_seen_ns, SODAMA_HANDOFF_TTL_NS) {
         return None;
     }
     Some(e)
@@ -6307,6 +6312,52 @@ fn sweep_redirect_track(ebpf: &mut Ebpf) -> Result<(usize, usize), Box<dyn std::
     }
     Ok((n, total))
 }
+
+/// routing_handoff 过期清扫（对照 dae `control/control_plane.go:1848-1918`
+/// `cleanupRoutingHandoffMap`）：首包交接条目只由数据面写入、从不主动删除，
+/// 缺清理时单调填满（65,536）——此后新首包 `publish_routing_handoff` 插入失败，
+/// 控制面 `conn_state` miss 时失去首包路由兜底（主路径不受影响；
+/// 2026-10-20 生产 72h 轮收口实锤满表，见 `docs/notes/prod-audit-2026-10-20` §4.1）。
+/// 与 `redirect_track` 满表停摆（2026-10-08）同构。TTL 与读取侧一致（30s）；
+/// 每轮删除上限避免长时间占用主循环（满表 8 轮 × 60s 清完，稳态远小于此）。
+fn sweep_routing_handoff(ebpf: &mut Ebpf) -> Result<(usize, usize), Box<dyn std::error::Error>> {
+    /// 对照 ebpf-rs/src/maps.rs 的 `routing_handoff` max_entries。
+    const ROUTING_HANDOFF_CAPACITY: usize = 65536;
+    const CAPACITY_ALERT_PCT: usize = 90;
+    /// 每轮最多删除条数。
+    const DELETE_LIMIT: usize = 8192;
+
+    let map = ebpf
+        .map_mut("routing_handoff_map")
+        .ok_or("map routing_handoff_map not found")?;
+    let mut handoff: HashMap<_, SodaTuple, SodaRoutingHandoffEntry> = HashMap::try_from(map)?;
+    let now = monotonic_now_ns();
+    let mut dead: Vec<SodaTuple> = Vec::new();
+    let mut total: usize = 0;
+    for (k, v) in handoff.iter().flatten() {
+        total += 1;
+        if dead.len() < DELETE_LIMIT && handoff_expired(now, v.last_seen_ns, SODAMA_HANDOFF_TTL_NS)
+        {
+            dead.push(k);
+        }
+    }
+    let n = dead.len();
+    for k in &dead {
+        let _ = handoff.remove(k);
+    }
+    // A2 #14：容量告警（对照 dae `logMapCapacityAlert`；持续条件 + 观察次数）。
+    if total * 100 >= ROUTING_HANDOFF_CAPACITY * CAPACITY_ALERT_PCT {
+        let (obs, emit) = ROUTING_HANDOFF_CAPACITY_ALERT.observe(now);
+        if emit {
+            log_warn(&format!(
+                "routing_handoff 容量告警：{total}/{ROUTING_HANDOFF_CAPACITY}（≥{CAPACITY_ALERT_PCT}%；本次观察 {obs} 次，60s 一条），过期清理未跟上"
+            ));
+        }
+    }
+    Ok((n, total))
+}
+
+static ROUTING_HANDOFF_CAPACITY_ALERT: AlertPacer = AlertPacer::new(60 * 1_000_000_000);
 
 /// P15/P19：构建全部节点组（config `group` 段顺序即索引顺序；无配置时为隐式 proxy 组）。
 /// 订阅拉取失败/节点全部不支持时返回 None（回落为无 dialer，保持实验回显语义）。
@@ -8212,6 +8263,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut ticks: u64 = 0;
     let tick = Duration::from_millis(50);
     let janitor_ticks = (JANITOR_INTERVAL.as_millis() / tick.as_millis()).max(1) as u64;
+    // 2026-10-20 生产轮：routing_handoff 清扫周期 60s（满表时全遍历一次；
+    // 稳态条目少，成本随之下降。与 conn_state/redirect_track 的 5s 节拍分开）。
+    let handoff_ticks = (Duration::from_secs(60).as_millis() / tick.as_millis()).max(1) as u64;
     // 能力缺口 #3：热插拔扫描间隔（1s）。扫描成本 = 读 /sys/class/net 目录名 + 模式匹配。
     let ifwatch_ticks = (Duration::from_secs(1).as_millis() / tick.as_millis()).max(1) as u64;
     loop {
@@ -8266,6 +8320,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // O8：每 30s 回收分配器空闲页（churn 后 RSS 回落；避免高频 trim 抖动）。
             if (ticks / janitor_ticks).is_multiple_of(6) {
                 trim_allocator();
+            }
+        }
+        // 2026-10-20 生产轮：routing_handoff 过期条目清理（60s；主路径不依赖，
+        // 但满表后首包兜底失效——见 `sweep_routing_handoff` 注释）。
+        if ticks.is_multiple_of(handoff_ticks) {
+            match sweep_routing_handoff(&mut ebpf) {
+                Ok((0, _)) => {}
+                Ok((n, total)) => log(&format!(
+                    "routing_handoff janitor: 清理 {n} 条过期首包交接（清理前 {total} 条）"
+                )),
+                Err(e) => log(&format!("routing_handoff janitor 失败: {e}")),
             }
         }
         // 能力缺口 #3：接口热插拔（新增补挂 / 消失清理；对照 dae interface_manager）
@@ -13050,6 +13115,19 @@ fn handle_status_query(cmd: &str, ebpf: &mut Ebpf, args: &Args) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn handoff_ttl_boundary() {
+        let ttl = SODAMA_HANDOFF_TTL_NS;
+        // 10ns 前：未过期
+        assert!(!handoff_expired(100, 90, ttl));
+        // 正好 TTL：不计过期（与读取侧一致：用 `>` 而非 `>=`）
+        assert!(!handoff_expired(ttl, 0, ttl));
+        // 超 1ns：过期
+        assert!(handoff_expired(ttl + 1, 0, ttl));
+        // 时钟回退（last_seen 在未来）：不过期
+        assert!(!handoff_expired(0, 100, ttl));
+    }
 
     // ---- P38：CLI 小件 ----
 
