@@ -1,0 +1,44 @@
+# Maintainer: sodama <sodama@example.com>
+#
+# 二进制包：从 GitHub Release 安装预编译产物（musl 静态，含 Web 面板）。
+# 发布 tarball 由仓库 `packaging/make-release.sh` 生成（同仓 src，可复现）。
+
+pkgname=sodama-bin
+pkgver=1.0.0
+pkgrel=1
+pkgdesc="Transparent proxy gateway with a Rust eBPF datapath (dae rewrite) — prebuilt"
+arch=('x86_64')
+url="https://github.com/zhanghuanhuan303/dae-rust"
+license=('AGPL-3.0-only')
+depends=('iproute2' 'procps-ng')
+optdepends=(
+  'bpftool: 数据面排查（bpftool net show / prog show）'
+  'nftables: 防火墙示例'
+)
+provides=('sodama')
+conflicts=('sodama')
+backup=('etc/sodama/config.dae' 'etc/sodama/sodama.conf' 'etc/sodama-panel/panel.conf')
+# eBPF 对象必须保留 .symtab/.BTF（map 定义与 BTF map 依赖符号）；不 strip、不生成 debug 包。
+options=('!debug' '!strip')
+source=("sodama-$pkgver-$CARCH.tar.gz::$url/releases/download/v$pkgver/sodama-$pkgver-$CARCH.tar.gz")
+sha256sums=('a11e1a1517a3fff4df952277c7bc2c6491784ddc934ec681ffae43fa848f40b6')
+
+package() {
+  cp -a "$srcdir/sodama-$pkgver-$CARCH/." "$pkgdir/"
+}
+
+post_install() {
+  cat <<'EOF'
+:: 下一步：
+   1) 编辑 /etc/sodama/config.dae：wan_interface/lan_interface 改成实际网卡，
+      并在 node{} 或 subscription{} 填入你的节点/订阅；
+   2) sudo sodama validate /etc/sodama/config.dae
+   3) sudo systemctl enable --now sodama
+   4) （可选）sudo systemctl enable --now sodama-panel  → http://<LAN IP>:8080
+   详见 /usr/share/doc/sodama/README.md
+EOF
+}
+
+post_upgrade() {
+  post_install
+}

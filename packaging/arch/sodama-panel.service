@@ -1,0 +1,24 @@
+[Unit]
+Description=sodama web control panel
+Documentation=https://github.com/zhanghuanhuan303/dae-rust/blob/main/docs/arch-linux.md
+After=network-online.target sodama.service
+Wants=network-online.target sodama.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/sodama-panel --config /etc/sodama-panel/panel.conf
+Restart=on-failure
+RestartSec=5s
+TimeoutStartSec=30
+TimeoutStopSec=15
+
+# 面板需要：读 status socket / 日志、调用 sodama 子命令（status/reload/suspend/sysdump）、
+# 写 /etc/sodama/{config.dae,rules}（在线编辑，写前先 validate）。
+# 以 root 运行与既有部署一致；如需降权可建专用用户并授予 socket/目录读权限。
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

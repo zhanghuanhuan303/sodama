@@ -1,6 +1,6 @@
 # 能力缺口清点：dae（上游 Go）↔ sodama（全 Rust）
 
-- **版本**：v1.5 · 2026-10-16（同日五更：**A2 批次（除工程打包）落地**——CLI 五件套（`--version`/日志轮转三参/`trace` 过滤器/`sysdump` 网络现场/`export outline`）/global 生效面 27 → 36/DNS `ipversion_prefer` 偏好等待与投影重试堆/1h 流量历史与告警节流/钩子生命周期用例/sysctl 被改回即纠正/UDP GSO/drain 预算/`real_domain_runtime`/systemd 单元强化共 19 项转「已完成」（ADR-0069、devlog §23）；清单口径：**未做 3 + 部分 7**。v1.4 = A1 批次（除工程打包）；v1.3 = 附 A 固化；v1.2 = eBPF 余项批次；v1.1 = top 10 #1–#4）
+- **版本**：v1.6 · 2026-10-24（AUR 双包 + 发布 tarball（v1.0.0，devlog §26）；附 A A1 #2 转「部分」）→ v1.5 · 2026-10-16（同日五更：**A2 批次（除工程打包）落地**——CLI 五件套（`--version`/日志轮转三参/`trace` 过滤器/`sysdump` 网络现场/`export outline`）/global 生效面 27 → 36/DNS `ipversion_prefer` 偏好等待与投影重试堆/1h 流量历史与告警节流/钩子生命周期用例/sysctl 被改回即纠正/UDP GSO/drain 预算/`real_domain_runtime`/systemd 单元强化共 19 项转「已完成」（ADR-0069、devlog §23）；清单口径：**未做 3 + 部分 7**。v1.4 = A1 批次（除工程打包）；v1.3 = 附 A 固化；v1.2 = eBPF 余项批次；v1.1 = top 10 #1–#4）
 - **对照基线**：上游 clone `dae/`（`main@e3fee8f`，工作树 `2026-10-03`）+ 本仓库 `sodama/`（工作树 `2026-10-16`，A2 批次之后，HEAD `bf26316`（代码批次 `e5db7fd`））
 - **本文档定位**：**一次性、逐项、可核查的能力清点**。不是覆盖度百分比（那是 `parity-status.md` 的口径），也不是排期（那是 `backlog.md` 的口径）。
 
@@ -275,7 +275,7 @@ v1.5（2026-10-16）：**A2 批次（除工程打包）落地 19 项**（ADR-006
 | # | 域 | 项 | 缺什么（一句） |
 |---|---|---|---|
 | 1 | 运维 | 容器镜像 + compose | 无引擎镜像（panel/deploy 不含引擎） |
-| 2 | 运维 | 发行工件与发行 CI | 无 tag 发行/prerelease/nightly 流水线 |
+| 2 | 运维 | 发行工件与发行 CI | **部分（v1.0.0）**：AUR 双包（源码/预编译）+ `packaging/make-release.sh` 发布 tarball 已交付；余 tag 触发的发行 CI/GH Release 流水线 |
 | 3 | 运维 | 版本与 CHANGELOG | `Cargo.toml` 0.1.0，无 CHANGELOG/版本注入 |
 
 ### A2 · 部分（7 项，全部为工程打包类）

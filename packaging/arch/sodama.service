@@ -1,0 +1,46 @@
+[Unit]
+Description=sodama transparent proxy gateway (eBPF datapath)
+Documentation=https://github.com/zhanghuanhuan303/dae-rust/blob/main/docs/arch-linux.md
+After=network-online.target systemd-sysctl.service
+Wants=network-online.target
+# 崩溃环熔断（对照 dae StartLimitIntervalSec=300 / StartLimitBurst=5）
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=notify
+# 数据面对开关/命名（SODAMA_DATAPATH=0 可跳过，用户自管拓扑）
+EnvironmentFile=-/etc/sodama/sodama.conf
+# netns + veth + 静态邻居 + fwmark 策略路由 + 转发 sysctl
+ExecStartPre=/usr/lib/sodama/datapath setup
+ExecStart=/usr/bin/sodama \
+    --config /etc/sodama/config.dae \
+    --ebpf /usr/lib/sodama/sodama-ebpf \
+    --status-socket /run/sodama/status.sock \
+    --log-file /var/log/sodama.log \
+    --logfile-maxsize 64 \
+    --logfile-maxbackups 3
+# SIGHUP = 热重载（规则/配置/订阅；等价 `sodama reload`）
+ExecReload=/bin/kill -HUP $MAINPID
+ExecStopPost=/usr/lib/sodama/datapath teardown
+
+# 配置被拒（validate/加载失败）不无限重试
+Restart=on-abnormal
+RestartSec=5s
+TimeoutStartSec=120
+TimeoutStopSec=30
+OOMScoreAdjust=-100
+
+# 状态面 socket 目录（--status-socket /run/sodama/status.sock）
+RuntimeDirectory=sodama
+RuntimeDirectoryMode=0750
+
+# 加载 eBPF（CAP_BPF）、tc/tproxy/netns（CAP_NET_ADMIN）、setns/mount（CAP_SYS_ADMIN）
+AmbientCapabilities=CAP_BPF CAP_NET_ADMIN CAP_SYS_ADMIN
+CapabilityBoundingSet=CAP_BPF CAP_NET_ADMIN CAP_SYS_ADMIN
+
+LimitNOFILE=1048576
+LimitNPROC=4096
+
+[Install]
+WantedBy=multi-user.target

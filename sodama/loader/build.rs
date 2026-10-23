@@ -22,7 +22,9 @@ fn git(args: &[&str]) -> Option<String> {
 
 fn main() {
     let sha = git(&["rev-parse", "--short=12", "HEAD"]).unwrap_or_else(|| "unknown".into());
-    let dirty = git(&["status", "--porcelain"])
+    // dirty 只看**已跟踪文件**的改动：未跟踪的开发目录（如本地 config/、console/target）
+    // 不应把发布构建标成 -dirty（2026-10-20 生产部署版本曾因此显示 -dirty）。
+    let dirty = git(&["status", "--porcelain", "--untracked-files=no"])
         .map(|s| !s.is_empty())
         .unwrap_or(false);
     println!("cargo:rustc-env=SODAMA_GIT_SHA={sha}");

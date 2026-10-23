@@ -196,13 +196,13 @@ article ol li::marker{color:var(--accent)}
 <div class="classbar">
   <span class="cls">密级 · 最高</span>
   <span>SODAMA ATLAS · 内部研究档案 · 未经许可不得外传</span>
-  <span class="push">v2.2 · 2026-10-23 · 重写版</span>
+  <span class="push">v2.3 · 2026-10-24 · 重写版</span>
 </div>
 <div class="page">
 <article>
 
 <header class="title-block">
-  <div class="kicker">全 Rust 代理数据面 · 开发研究档案 · <b>重写版 v2.2</b></div>
+  <div class="kicker">全 Rust 代理数据面 · 开发研究档案 · <b>重写版 v2.3</b></div>
   <h1>SODAMA ATLAS</h1>
   <p class="sub">dae 的研究性复现：一个可上生产、可被验证、可被复现的 eBPF + Rust 透明代理。
   本版为<strong>重写</strong>——v1.x 的增量叙事（每批次追加一节）收敛为当期状态文档；
@@ -237,6 +237,7 @@ article ol li::marker{color:var(--accent)}
     <tr><td>真实公网轮（CF 边缘订阅节点 · 17 轮 ×4）</td><td>19.3 Mbps；<b>进程 CPU 2 952 ms/GB</b>（合计含内核 12.6 k）</td><td>dae 18.6 Mbps / 4 266 ms/GB；sing-box 19.3 / 4 111；节点出口 ≈19 Mbps 为共同上限</td></tr>
     <tr><td>生产（软路由）</td><td>78.5 h 轮收口：RSS 平台 <b>66.7 MB</b>（47–59 h 斜率 −0.01 MB/h）· 109 137 会话 / 31.16 GB · <code>dial_errors</code> 58（0.05%）· <code>stragglers</code> 0 · ws 截断误报 <b>0</b>（旧轮 9 738）；2026-10-20 修 <code>routing_handoff</code> 满表后起 <b>1 周轮</b></td><td>旧轮 21.4 h：RSS 53.5 MB、dial_errors 0；对 dae 生产口径见 §8</td></tr>
     <tr><td>质量门禁</td><td>单测 <b>353</b>（350 + 3 BPF 逻辑）· <code>verify 12/12</code> + <code>cap 12/12</code>（QEMU 7.2.8）· 宿主 6.18 与生产 6.12.92 双内核实载</td><td>本项目额外要求「对象在真实宿主/生产内核上必须能加载」</td></tr>
+    <tr><td>发行（v1.0.0）</td><td><b>AUR 双包</b>（<code>sodama</code> 源码 / <code>sodama-bin</code> 预编译）+ <code>packaging/make-release.sh</code>（musl 静态引擎+面板，5.6 MB）+ <code>docs/arch-linux.md</code></td><td>发布包 <code>!strip</code>（eBPF 符号/BTF 必须保留）；AUR push 与 release 上传归用户</td></tr>
   </tbody>
 </table>
 
@@ -709,6 +710,18 @@ shadow-tls 三版交叉。第四级是<b>真实世界</b>：真实节点公网�
 </ol>
 <h3>5.4 · 研究性重写的四条经验</h3>
 <p>① <b>语义对齐优先于实现对齐</b>（配置语义、钩子角色、conn_state 生命期逐条对）；② <b>第三方实现是最强的测试标尺</b>（跨实现逐字节、真实节点轮）；③ <b>数据面与用户态要能分开测</b>（L3 用例、offload 口径、单路径性能都单独可测）；④ <b>把「口径」写进工具</b>（lab 的 <code>SKIP_NET_OFFLOAD</code>、real.sh 的目标/出口固定、TARGET_EXPECT_BYTES 短传输判定）。</p>
+
+<h3>5.5 · 发布与打包（v1.0.0 · AUR）</h3>
+<p>2026-10-24 首次按发布语义打包：版本 0.1.0 → <b>1.0.0</b>（四个 Cargo.toml + OpenWrt Makefile）；
+<code>build.rs</code> 的 dirty 只看已跟踪文件（未跟踪开发目录不再污染版本串）。AUR 双包：
+<code>sodama</code>（源码，git tag；nightly + bpf-linker + wasm-pack）与 <code>sodama-bin</code>
+（预编译 tarball，推荐）；两包均 <code>!strip</code>——eBPF 对象必须保留 <code>.symtab</code>/<code>.BTF</code>
+（BTF map 定义依赖符号名）。Arch 资产（<code>packaging/arch/</code>）：<code>Type=notify</code> 单元 +
+<b>幂等</b> <code>datapath</code>（netns/veth/静态邻居/fwmark 策略路由/sysctl，带 <code>status</code>）+
+<code>sodama-panel.service</code> + 0640 配置样例。发布 tarball 由 <code>packaging/make-release.sh</code>
+生成（musl 静态引擎 + wasm 面板，5.6 MB）；实测 <code>sodama-bin-1.0.0-1</code> 5.8 MB，
+对象 <code>.BTF</code> 36 KB / <code>.symtab</code> 完整、<code>.maps</code> 符号 29 个。
+使用说明见 <code>docs/arch-linux.md</code>；AUR push 与 GitHub Release 上传归用户。</p>
 </section>
 
 <section id="s6">
@@ -744,7 +757,7 @@ shadow-tls 三版交叉。第四级是<b>真实世界</b>：真实节点公网�
   <caption>表 6 · 余项（✅ = 已交付；余项均有验收条件，见 <code>docs/backlog.md</code>）</caption>
   <thead><tr><th>类</th><th>主题</th><th>当期状态</th><th class="num">优先级</th></tr></thead>
   <tbody>
-    <tr><td class="c">A</td><td>工程化与发布</td><td>✅ shell 补全 · ✅ <code>--version</code>；余：Docker 镜像 · 发行包（tarball）· 发行 CI · CHANGELOG 生成</td><td class="num">最高</td></tr>
+    <tr><td class="c">A</td><td>工程化与发布</td><td>✅ shell 补全 · ✅ <code>--version</code> · ✅ <b>AUR 双包</b>（<code>sodama</code>/<code>sodama-bin</code>）+ 发布 tarball 脚本 + Arch 使用说明（v1.0.0）；余：Docker 镜像 · 发行 CI · CHANGELOG 生成</td><td class="num">最高</td></tr>
     <tr><td class="c">B</td><td>出站协议余项</td><td>余：其余 SIP003 插件（simple-obfs/v2ray-plugin）· SSR <code>auth_*</code>/<code>obfs_*</code> 与 UDP · ECH（已评估边界，显式报错不静默）· naive 边界（Basic 依赖外层 TLS）</td><td class="num">低</td></tr>
     <tr><td class="c">C</td><td>eBPF 数据面</td><td>余：事件限速 per-CPU 粒度（无 64 位原子）· <code>bpf_conn_state_map_size</code> 运行期变更 · <code>xdp</code> 探针在软路由网卡的计数实测（native/generic 可用性）</td><td class="num">低</td></tr>
     <tr><td class="c">D</td><td>配置系统</td><td>余：global 余 9 键不生效（全部显式告警或 ADR 边界）· <code>config_merger</code> deferred 收尾</td><td class="num">中</td></tr>
@@ -921,6 +934,7 @@ AF-XDP 否决（0058 及专文）· ECH 边界（0056）· 数据面对标（006
     <tr><td><code>docs/parity-status.md</code> v2.20</td><td>十五域对照逐行证据（§2 表 1 的出处）</td></tr>
     <tr><td><code>docs/memory-safety-audit.html</code> v1.1</td><td>unsafe 专项审计 + 生产比对 + 修复批回验</td></tr>
     <tr><td><code>docs/config-reference.md</code></td><td>配置参考（由引擎 <code>config-doc</code> 生成，drift 单测锁定）</td></tr>
+    <tr><td><code>docs/arch-linux.md</code> + <code>packaging/</code></td><td>Arch/AUR 安装与使用（内核/BTF 自检、systemd、<code>config.dae</code>、面板、排障、AUR 维护）；<code>packaging/arch/</code> 资产与 <code>packaging/aur/{sodama,sodama-bin}</code>、<code>make-release.sh</code></td></tr>
     <tr><td><code>docs/backlog.md</code></td><td>余项台账（§7 的验收条件与优先级）</td></tr>
   </tbody>
 </table>
@@ -938,7 +952,7 @@ AF-XDP 否决（0058 及专文）· ECH 边界（0056）· 数据面对标（006
 <div class="classbar bottom">
   <span class="cls">密级 · 最高</span>
   <span>SODAMA ATLAS · 内部研究档案 · 未经许可不得外传</span>
-  <span class="push">v2.2 · 2026-10-23 · 重写版</span>
+  <span class="push">v2.3 · 2026-10-24 · 重写版</span>
 </div>
 
 </body>

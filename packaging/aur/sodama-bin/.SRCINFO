@@ -1,0 +1,22 @@
+pkgbase = sodama-bin
+	pkgdesc = Transparent proxy gateway with a Rust eBPF datapath (dae rewrite) — prebuilt
+	pkgver = 1.0.0
+	pkgrel = 1
+	url = https://github.com/zhanghuanhuan303/dae-rust
+	arch = x86_64
+	license = AGPL-3.0-only
+	depends = iproute2
+	depends = procps-ng
+	optdepends = bpftool: 数据面排查（bpftool net show / prog show）
+	optdepends = nftables: 防火墙示例
+	provides = sodama
+	conflicts = sodama
+	options = !debug
+	options = !strip
+	backup = etc/sodama/config.dae
+	backup = etc/sodama/sodama.conf
+	backup = etc/sodama-panel/panel.conf
+	source = sodama-1.0.0-x86_64.tar.gz::https://github.com/zhanghuanhuan303/dae-rust/releases/download/v1.0.0/sodama-1.0.0-x86_64.tar.gz
+	sha256sums = a11e1a1517a3fff4df952277c7bc2c6491784ddc934ec681ffae43fa848f40b6
+
+pkgname = sodama-bin

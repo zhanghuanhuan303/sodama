@@ -1,0 +1,119 @@
+# Maintainer: sodama <sodama@example.com>
+#
+# 源码包：从 git tag 构建引擎（用户态 + eBPF 数据面）+ Web 面板（wasm + 后端）。
+#
+# 构建前置（PKGBUILD 不联网安装工具链，需预先准备）：
+#   rustup toolchain install nightly --component rust-src
+#   rustup target add wasm32-unknown-unknown
+#   # bpf-linker 由 makedepends 提供（extra/bpf-linker）
+# 若 nightly 与 bpf-linker 的 LLVM 版本不匹配，改用：
+#   cargo install bpf-linker --version <与 nightly 匹配的版本>
+#
+# 二进制包（免构建）见 aur/sodama-bin。
+
+pkgname=sodama
+pkgver=1.0.0
+pkgrel=1
+pkgdesc="Transparent proxy gateway with a Rust eBPF datapath (dae rewrite)"
+arch=('x86_64' 'aarch64')
+url="https://github.com/zhanghuanhuan303/dae-rust"
+license=('AGPL-3.0-only')
+depends=('glibc' 'iproute2' 'procps-ng')
+makedepends=('git' 'rustup' 'bpf-linker' 'clang' 'llvm' 'wasm-pack')
+optdepends=(
+  'bpftool: 数据面排查（bpftool net show / prog show）'
+  'nftables: 防火墙示例'
+)
+backup=('etc/sodama/config.dae' 'etc/sodama/sodama.conf' 'etc/sodama-panel/panel.conf')
+options=('!debug' '!strip')
+source=("git+$url.git#tag=v$pkgver")
+sha256sums=('SKIP')
+
+prepare() {
+  cd "$srcdir/dae-rust"
+
+  # 工具链前置检查（明确报错，避免 cargo 的晦涩失败）
+  if ! rustup toolchain list 2>/dev/null | grep -q '^nightly'; then
+    printf 'sodama: 缺 nightly 工具链：rustup toolchain install nightly --component rust-src\n' >&2
+    return 1
+  fi
+  if ! rustup component list --toolchain nightly 2>/dev/null | grep -q 'rust-src (installed)'; then
+    printf 'sodama: 缺 rust-src：rustup component add rust-src --toolchain nightly\n' >&2
+    return 1
+  fi
+  if ! rustup target list --installed 2>/dev/null | grep -q 'wasm32-unknown-unknown'; then
+    printf 'sodama: 缺 wasm32 target：rustup target add wasm32-unknown-unknown\n' >&2
+    return 1
+  fi
+}
+
+build() {
+  cd "$srcdir/dae-rust"
+
+  # 1) 引擎用户态（统一 nightly，避免 stable/nightly 混用）
+  ( cd sodama && cargo build --release --locked )
+
+  # 2) eBPF 数据面（bpfel-unknown-none + build-std=core）
+  ( cd sodama/ebpf-rs && RUSTUP_TOOLCHAIN=nightly cargo build --release --locked )
+
+  # 3) Web 面板：前端 wasm（Leptos CSR）+ 后端（axum）
+  ( cd panel && wasm-pack build frontend --target web --release --out-dir dist/pkg --out-name panel )
+  ( cd panel && cp frontend/index.html frontend/styles.css frontend/dist/ )
+  ( cd panel && cargo build --release --locked -p backend )
+}
+
+package() {
+  cd "$srcdir/dae-rust"
+
+  # 引擎 + eBPF 对象
+  install -Dm755 sodama/target/release/sodama "$pkgdir/usr/bin/sodama"
+  install -Dm644 sodama/ebpf-rs/target/bpfel-unknown-none/release/sodama-ebpf \
+    "$pkgdir/usr/lib/sodama/sodama-ebpf"
+
+  # 数据面对（netns/veth/策略路由/sysctl）
+  install -Dm755 packaging/arch/sodama-datapath "$pkgdir/usr/lib/sodama/datapath"
+
+  # systemd
+  install -Dm644 packaging/arch/sodama.service "$pkgdir/usr/lib/systemd/system/sodama.service"
+  install -Dm644 packaging/arch/sodama-panel.service \
+    "$pkgdir/usr/lib/systemd/system/sodama-panel.service"
+
+  # 配置（backup：pacman 会保留用户改动）
+  install -Dm640 packaging/arch/config.dae "$pkgdir/etc/sodama/config.dae"
+  install -Dm644 packaging/arch/sodama.conf "$pkgdir/etc/sodama/sodama.conf"
+  install -Dm640 packaging/arch/panel.conf "$pkgdir/etc/sodama-panel/panel.conf"
+
+  # Web 面板（二进制 + 静态资源）
+  install -Dm755 panel/target/release/backend "$pkgdir/usr/bin/sodama-panel"
+  install -d "$pkgdir/usr/share/sodama-panel"
+  cp -a panel/frontend/dist "$pkgdir/usr/share/sodama-panel/dist"
+
+  # shell 补全
+  install -Dm644 install/shell-completion/sodama.bash \
+    "$pkgdir/usr/share/bash-completion/completions/sodama"
+  install -Dm644 install/shell-completion/sodama.zsh \
+    "$pkgdir/usr/share/zsh/site-functions/_sodama"
+  install -Dm644 install/shell-completion/sodama.fish \
+    "$pkgdir/usr/share/fish/vendor_completions.d/sodama.fish"
+
+  # 文档
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/sodama/LICENSE"
+  install -Dm644 docs/arch-linux.md "$pkgdir/usr/share/doc/sodama/README.md"
+  install -Dm644 docs/config-reference.md "$pkgdir/usr/share/doc/sodama/config-reference.md"
+}
+
+post_install() {
+  cat <<'EOF'
+:: 下一步：
+   1) 编辑 /etc/sodama/config.dae：wan_interface/lan_interface 改成实际网卡，
+      并在 node{} 或 subscription{} 填入你的节点/订阅；
+   2) sudo sodama validate /etc/sodama/config.dae
+   3) sudo systemctl enable --now sodama
+   4) （可选）sudo systemctl enable --now sodama-panel  → http://<LAN IP>:8080
+   详见 /usr/share/doc/sodama/README.md
+EOF
+}
+
+post_upgrade() {
+  post_install
+}

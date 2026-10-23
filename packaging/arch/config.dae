@@ -1,0 +1,38 @@
+# sodama 示例配置（dae 语法）——Arch 安装后位于 /etc/sodama/config.dae
+#
+# 权限要求：同组不可写、其他用户不可读（mode & 0o037 == 0），保持 0640/0600。
+# 改完先校验：sudo sodama validate /etc/sodama/config.dae
+# 生效：sudo systemctl reload sodama   （SIGHUP 热重载）
+#
+# 接口名用真实网卡：`ip -br link`；默认路由接口：`ip route show default`。
+# 单机代理（本机流量）也可把 lan_interface 写成 none。
+global {
+    # ↓↓↓ 改成你的实际接口 ↓↓↓
+    wan_interface: wan0
+    lan_interface: br0
+    tproxy_port: 12345
+    log_level: info
+    # 自动写 ip_forward/forwarding/send_redirects/accept_ra，并在运行中被改回时纠正
+    auto_config_kernel_parameter: true
+    tcp_check_url: 'http://www.gstatic.com/generate_204'
+    check_interval: 10s
+}
+
+# 出口节点（任选其一；订阅也可写在 config 里，见 config-doc）：
+#   node { my: 'vless://uuid@host:443?security=tls&sni=example.com#node1' }
+# 或使用订阅：
+#   subscription { tag: main  url: 'https://example.com/sub' }
+node {
+    my: 'socks5://127.0.0.1:1080'
+}
+
+group {
+    proxy {
+        policy: min_moving_avg
+        filter: name(my)
+    }
+}
+
+routing {
+    fallback: proxy
+}

@@ -43,3 +43,6 @@ docs/notes/health-curve.svg
 
 # Zed 编辑器本地目录
 .zed/
+
+# 发布产物（packaging/make-release.sh）
+/dist/

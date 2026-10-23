@@ -1696,6 +1696,64 @@ GSO 的 cmsg 构造用了 glibc 专有的 `libc::msghdr` 字面量——musl 下
   新增观察项：① `routing_handoff` 水位应稳定在「30 s 内首包量」而非单调增长；② 容量告警不应出现；
   ③ sticky 日志 ≤1 条/10 min/节点。
 
+## 26 · 工程打包：v1.0.0 与 AUR 标准包（2026-10-24）
+
+### 26.1 版本
+
+- `Cargo.toml`（loader / ebpf-rs / ebpf-logic / panel workspace）0.1.0 → **1.0.0**；
+  `install/openwrt/Makefile` 的 `PKG_VERSION` 同步。
+- `loader/build.rs`：dirty 只看**已跟踪文件**（`git status --porcelain --untracked-files=no`）——
+  未跟踪开发目录不再把发布版本标 `-dirty`（2026-10-20 生产部署版本曾因此显示 `-dirty`）。
+- 发布 tarball 在干净工作区构建，`sodama --version` = `1.0.0-g<sha>`（无 dirty）。
+
+### 26.2 AUR 包（两件）
+
+- **`packaging/aur/sodama/`（源码包）**：`source=("git+$url.git#tag=v$pkgver")`；
+  `makedepends=(git rustup bpf-linker clang llvm wasm-pack)`；`prepare()` 检查
+  nightly + `rust-src` + `wasm32-unknown-unknown`（不联网安装，缺失时给出明确命令）；
+  `build()` = 用户态（nightly）+ eBPF（`bpfel-unknown-none`）+ 面板（wasm + 后端）；
+  `arch=('x86_64' 'aarch64')`。
+- **`packaging/aur/sodama-bin/`（二进制包，推荐）**：从 GitHub Release tarball 安装；
+  `provides/conflicts=sodama`；`depends=(iproute2 procps-ng)`（musl 静态产物）。
+- 两包均 `options=('!debug' '!strip')`：**eBPF 对象必须保留 `.symtab`/`.BTF`**
+  （BTF map 定义依赖符号名，strip 后无法加载）。
+- `backup=(etc/sodama/config.dae etc/sodama/sodama.conf etc/sodama-panel/panel.conf)`；
+  `.SRCINFO` 由 `makepkg --printsrcinfo` 生成；PKGBUILD 通过 `namcap`（仅包内预编译产物告警，见 26.4）。
+
+### 26.3 Arch 资产（`packaging/arch/`）
+
+- **`sodama.service`**：`Type=notify`；`ExecStartPre=/usr/lib/sodama/datapath setup` /
+  `ExecStopPost=... teardown`；`--status-socket /run/sodama/status.sock` +
+  `--log-file /var/log/sodama.log --logfile-maxsize 64 --logfile-maxbackups 3`（内建轮转，面板日志页可用）；
+  `ExecReload=kill -HUP`；`CAP_BPF CAP_NET_ADMIN CAP_SYS_ADMIN`；`StartLimit 300/5`；
+  `RuntimeDirectory=sodama`；`LimitNOFILE=1048576`。
+- **`sodama-panel.service`**：面板（`NoNewPrivileges`/`PrivateTmp`），`After/Wants=sodama.service`。
+- **`sodama-datapath`**：netns/veth/`169.254.0.11`/静态邻居/fwmark `0x8000000` table 2023/sysctl；
+  与原 OpenWrt 版的差异：**幂等 setup**（已存在直接成功，适配 systemd restart）+ `status` 子命令 +
+  `SODAMA_DATAPATH=0` 跳过（用户自管拓扑）。
+- **配置**：`config.dae`（0640，接口名/节点/订阅示例）、`sodama.conf`（`EnvironmentFile`）、
+  `panel.conf`（0640，`static_dir=/usr/share/sodama-panel/dist`、`socket=/run/sodama/status.sock`）。
+
+### 26.4 发布产物（实测）
+
+- `packaging/make-release.sh`：musl 静态引擎 + 面板（wasm + musl 后端）+ 全资产 →
+  `dist/sodama-<ver>-x86_64.tar.gz`（`--owner=0 --group=0`、`gzip -9n`、config 0640；
+  含 LICENSE/使用说明/config-reference/三种补全/面板 www）。
+- tarball **5.6 MB**；本地 `makepkg` 产物 `sodama-bin-1.0.0-1-x86_64.pkg.tar.zst` **5.8 MB**；
+  eBPF 对象 `.BTF`(36 KB)/`.BTF.ext`(48 KB)/`.symtab` 完整、`.maps` 符号 29 个（28 map + section）；
+  `sodama --version` = `1.0.0-g<sha>`。
+- 包内 `namcap` 告警仅三类，均为有意取舍：预编译 musl 产物无 PIE/FULL RELRO；
+  eBPF 对象不 strip；配置 0640（非 world-readable）。
+
+### 26.5 使用说明
+
+- 新增 `docs/arch-linux.md`：内核要求与自检（BTF/BPF/TC/netns）、AUR 两包与本地 makepkg、
+  `config.dae` 配置与 `validate`、systemd 标准用法（enable/status/reload/restart/stop + drop-in）、
+  数据面对（网关/单机/自管）、Web 面板（bind/token/HTTPS/反代）、常用命令（status/metrics/trace/sysdump）、
+  升级卸载、排障清单、AUR 维护与发布流程。
+- **发布归属**：AUR 包尚未 push（需用户上传 release tarball 后 `git push` 两个包目录）；
+  `sodama-bin` 的 sha256 已按最终 tarball 回填。
+
 ## 附 A · 路由器侧工具清单（**不入库**，仅存在于软路由）
 
 | 路径 | 用途 | 部署时间 |

@@ -4,7 +4,7 @@
 **如实**（不把未做写成已做）、**有验收条件**（每条给出可判定的完成标准）、
 **与 ADR/parity 互链**（决策理由见 ADR；覆盖度口径见 `parity-status.md`）。
 
-当前状态（main@cb62dd0 + A2 批次（除工程打包）19 项 + 修复轮（R11 / UDP GSO / reactor 分派 / lab 口径 / **ws 干净 EOF** / musl 可移植）；ADR-0069；单测 351（348 + ebpf-logic 3）；ATLAS v2.0（重写版）；devlog §24；决策档案 HTML v2.46 / VLESS 提案 v1.9）：
+当前状态（dev@v1.0.0 发布打包（AUR 双包 + release tarball）；ADR-0069；单测 350 + ebpf-logic 3；ATLAS v2.3（重写版）；devlog §26；决策档案 HTML v2.46 / VLESS 提案 v1.9）：
 核心数据面复现（K0–K3）、分流主链路、DNS 子系统、出站 12 家族 + shadow-tls 插件、
 真网关可用、规则编译逐字节对拍、M1–M4 性能项（O3/O4/O5/O9）与 O6/O7/O8、
 G1 同机 + 真实节点口径均已交付。以下为余项。
@@ -29,7 +29,7 @@ G1 同机 + 真实节点口径均已交付。以下为余项。
 | A4 | **版本与 CHANGELOG** | `--version` ✅ **已完成（2026-10-16，v1.5，ADR-0069）**：三行输出（版本 + git sha（build.rs 注入，无 git 回落 unknown）/ 运行时 + 平台 / 许可），子命令分派前处理、无需 root，`version` 子命令同义；余：CHANGELOG 从提交生成、README 顶部版本徽章 | `--version` 输出语义化版本 + git sha；CHANGELOG 从提交生成；README 顶部版本徽章 |
 | A5 | **shell 补全** | ✅ **已完成（2026-10-16，v1.4，ADR-0068）**：`sodama completion bash\|zsh\|fish`（脚本内嵌，零外部文件依赖）+ 预生成副本 `install/shell-completion/sodama.{bash,zsh,fish}`（与生成器一致性由单测锁定）+ `install/install.sh` 部署（补全目录自动探测） | 补全覆盖 CLI 顶层子命令与常用参数；bash/zsh/fish 三份可用 |
 | A6 | **Makefile / 任务入口** | dae 有 Makefile（build/test/release 单入口） | `make build / test / lab / install / release` 目标；与新贡献者文档一致 |
-| A7 | **发行包体系** | 本机 Arch；dae 上游有 AUR/发行版打包路径 | 至少 `PKGBUILD`（本机可 `makepkg` 构建安装）；deb 可选 |
+| A7 | **发行包体系** | 本机 Arch；dae 上游有 AUR/发行版打包路径 | ✅ **已完成（2026-10-24，v1.0.0，devlog §26）**：AUR 双包 `packaging/aur/sodama`（源码，git tag；nightly+bpf-linker+wasm-pack 前置检查）与 `sodama-bin`（预编译 tarball，本地 `makepkg` 实测 5.8 MB）；`packaging/make-release.sh` 生成 musl 静态发布包（引擎+面板+systemd+配置+补全+文档，5.6 MB）；Arch 资产 `packaging/arch/`（`Type=notify` 单元 + 幂等 datapath + 面板单元 + 0640 样例）；使用说明 `docs/arch-linux.md`；两包 `!strip` 保护 eBPF `.symtab`/`.BTF` | ✅ 已达（本地构建/安装校验通过；AUR push 与 GitHub Release 上传归用户） |
 | A8 | **许可证一致性审计** | `LICENSE`=AGPL-3.0，但部分源码头为 `SPDX GPL-2.0`（不一致）；依赖需 SBOM | 全部源码/配置文件头统一为 AGPL-3.0-only（或逐文件说明例外）；`cargo deny`/SBOM 跑通并记录第三方许可证清单 |
 | A9 | **install.sh 升级/回滚** | 当前只有装/卸 | `--upgrade`：保留上一版二进制，systemd 启动失败自动回滚；dry-run 覆盖新路径 |
 | A10 | **容器/内核兼容性矩阵文档** | eBPF 对内核/BTF/CAP 有要求 | ✅ 已完成：`docs/openwrt.md` §2 给出 kernel fragment（**NAMESPACES/NET_NS 是硬前提，官方镜像默认未开**——已用 QEMU 实测确认）与逐项排障；`docs/deploy.md` 含容器 capability 清单 |

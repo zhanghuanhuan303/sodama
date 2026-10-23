@@ -99,7 +99,7 @@ dependencies = [
 
 [[package]]
 name = "ebpf-logic"
-version = "0.1.0"
+version = "1.0.0"
 
 [[package]]
 name = "itoa"
@@ -219,7 +219,7 @@ dependencies = [
 
 [[package]]
 name = "sodama-ebpf"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "aya-ebpf",
  "aya-ebpf-bindings",
