@@ -21,7 +21,7 @@ backup=('etc/sodama/config.dae' 'etc/sodama/sodama.conf' 'etc/sodama-panel/panel
 # eBPF 对象必须保留 .symtab/.BTF（map 定义与 BTF map 依赖符号）；不 strip、不生成 debug 包。
 options=('!debug' '!strip')
 source=("sodama-$pkgver-$CARCH.tar.gz::$url/releases/download/v$pkgver/sodama-$pkgver-$CARCH.tar.gz")
-sha256sums=('a11e1a1517a3fff4df952277c7bc2c6491784ddc934ec681ffae43fa848f40b6')
+sha256sums=('d5f77822411ab387b3ea1054b04b034ab0866ea8798bfb522fd82dab6f7bcacc')
 
 package() {
   cp -a "$srcdir/sodama-$pkgver-$CARCH/." "$pkgdir/"
