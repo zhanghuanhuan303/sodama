@@ -351,6 +351,42 @@ unsafe fn redirect_to_control_plane(
 
 /// 分流主流程（LAN ingress / WAN egress / 单臂共用），对照 C `sodama_split_flow`。
 /// `link_h_len`：以太 14 / L3 0——影响「补链路头」与「redirect_track 是否记 MAC」。
+/// 非单播 / DHCP 流量：绝不重定向，直接放行。
+///
+/// 理由（2026-10-24 实测，Arch 测试机）：
+/// - DHPC 请求的目的地址是 `255.255.255.255:67`，被重定向到控制面后，控制面用原源地址
+///   （0.0.0.0）向广播地址 sendto 会得到 `ENETUNREACH`，DHCP 彻底失败 →
+///   NetworkManager 无法续租/切换 WiFi，只能停掉服务才能恢复。
+/// - 组播（mDNS/SSDP/NDP/DHCPv6）与链路本地同理：控制面只能单播转发。
+///
+/// 注：子网定向广播（如 10.0.0.255）需接口掩码才能判定，此处不处理（DHCP 不用它）。
+#[inline(always)]
+fn is_non_unicast_or_dhcp(pkt: &SodaParseResult) -> bool {
+    let d = &pkt.tuples.dip;
+    if pkt.is_v4 != 0 {
+        // v4-mapped：::ffff:a.b.c.d
+        // 224.0.0.0/4 组播、240.0.0.0/4 保留/广播
+        if d[12] >= 224 {
+            return true;
+        }
+    } else {
+        // ff00::/8 组播（含 DHCPv6 ff02::1:2）、fe80::/10 链路本地
+        if d[0] == 0xff || (d[0] == 0xfe && (d[1] & 0xc0) == 0x80) {
+            return true;
+        }
+    }
+    if pkt.l4proto == IPPROTO_UDP {
+        let (sp, dp) = (pkt.h_sport, pkt.h_dport);
+        // DHCPv4 67/68、DHCPv6 546/547
+        for p in [sp, dp] {
+            if (67..=68).contains(&p) || (546..=547).contains(&p) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 pub unsafe fn split_flow(
     ctx: &mut TcContext,
     pkt: &SodaParseResult,
@@ -361,6 +397,11 @@ pub unsafe fn split_flow(
         return TC_ACT_SHOT as i32;
     };
     let cfg = *cfg;
+
+    // 广播/组播/链路本地/DHCP：不参与分流（重定向后发不回去，会打断 DHCP）。
+    if is_non_unicast_or_dhcp(pkt) {
+        return TC_ACT_OK as i32;
+    }
 
     let mut st = conn_lookup(&pkt.tuples, pkt.l4proto);
 

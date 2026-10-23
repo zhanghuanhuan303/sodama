@@ -414,9 +414,15 @@ EOF
   [[ -f "$pcfg" ]] || { warn "找不到 $pcfg"; return 0; }
   cfg_set_kv "$pcfg" bind "$BIND"
   if [[ -n "$TOKEN" ]]; then cfg_set_kv "$pcfg" token "$TOKEN"; fi
+  # 面板控制（reload/suspend/resume）：默认给开（否则升级旧配置后按钮全是灰的）
+  local actions=1
+  if ((ASSUME_YES == 0)); then
+    ask_yn "允许面板执行 reload/suspend/resume？" y || actions=0
+  fi
+  cfg_set_kv "$pcfg" enable_actions "$actions"
   chmod 640 "$pcfg" 2>/dev/null || true
   PANEL_ON=1
-  ok "面板配置：bind=$BIND token=$([[ -n "$TOKEN" ]] && echo 已设置 || echo 空)"
+  ok "面板配置：bind=$BIND token=$([[ -n "$TOKEN" ]] && echo 已设置 || echo 空) enable_actions=$actions"
 }
 
 # ---------------------------------------------------------------- 主流程

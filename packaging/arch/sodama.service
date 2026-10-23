@@ -36,8 +36,11 @@ RuntimeDirectory=sodama
 RuntimeDirectoryMode=0750
 
 # 加载 eBPF（CAP_BPF）、tc/tproxy/netns（CAP_NET_ADMIN）、setns/mount（CAP_SYS_ADMIN）
-AmbientCapabilities=CAP_BPF CAP_NET_ADMIN CAP_SYS_ADMIN
-CapabilityBoundingSet=CAP_BPF CAP_NET_ADMIN CAP_SYS_ADMIN
+# CAP_NET_BIND_SERVICE：DNS 透明回包 socket 要 bind 到原目的地址的 53 端口（<1024），
+#   缺了它 bind 报 EACCES，所有 DNS 回包发不出去（实测 2026-10-24，见 deploy 报告）。
+# CAP_NET_RAW：UDP 回包 raw socket 回退路径（EADDRINUSE/EADDRNOTAVAIL 时伪源地址发送）。
+AmbientCapabilities=CAP_BPF CAP_NET_ADMIN CAP_SYS_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
+CapabilityBoundingSet=CAP_BPF CAP_NET_ADMIN CAP_SYS_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
 
 LimitNOFILE=1048576
 LimitNPROC=4096

@@ -124,7 +124,11 @@ sudo systemctl stop sodama                # 停止并清理 netns/veth（ExecSto
   `ExecStopPost=... teardown` → 清理；
 - `ExecReload` 发 `SIGHUP`（等价 `sodama reload`）；
 - 配置被拒（`validate`/加载失败）走 `Restart=on-abnormal`，不会无限重启；
-- `CAP_BPF CAP_NET_ADMIN CAP_SYS_ADMIN` + `LimitNOFILE=1048576`。
+- `CAP_BPF CAP_NET_ADMIN CAP_SYS_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW` + `LimitNOFILE=1048576`。
+  - `CAP_NET_BIND_SERVICE` **必须**：DNS 透明回包 socket 要 bind 到原目的地址的 `:53`（<1024），
+    缺了它 bind 报 `EACCES`，所有 DNS 应答发不出去（症状：能解析失败/上不了网，日志刷
+    `dns 回包 …: Permission denied (os error 13)`）。
+  - `CAP_NET_RAW`：UDP raw socket 回包回退路径。
 
 **覆盖参数**（节点/订阅也可以放命令行，而不是 config）：
 
@@ -204,7 +208,7 @@ journalctl -u sodama-panel -f
 | `static_dir` | `/usr/share/sodama-panel/dist` | 前端资源（包安装位置） |
 | `socket` | `/run/sodama/status.sock` | 引擎状态面（与 `sodama.service` 一致） |
 | `token` | 空 | 空 = 免认证（LAN）；设置后需登录（HttpOnly Cookie） |
-| `enable_actions` | `0` | 允许面板触发 reload/suspend/resume |
+| `enable_actions` | `1` | 允许面板触发 reload/suspend/resume |
 | `log_file` | `/var/log/sodama.log` | 日志页数据源 |
 | `tls` | 未设 | `tls = 1` 时启用 HTTPS（首次启动自签，key 0600） |
 
@@ -258,8 +262,11 @@ sudo rm -rf /etc/sodama /etc/sodama-panel /var/log/sodama.log*   # 确认不再�
 | `netns daens 不存在` / 挂载失败 | `systemctl status sodama` 看 `ExecStartPre`；`sudo /usr/lib/sodama/datapath setup` |
 | `加载 eBPF 失败`（权限/verifier） | 内核 ≥5.17、`ls /sys/kernel/btf/vmlinux`、`journalctl -u sodama -b` |
 | 节点全部不可用 | `sodama status ... --json \| jq '.group'`；订阅 URL/本地时间/网络 |
-| DNS 不生效 | 确认 LAN 设备 DNS 指向本机；`dns.upstream` 配置；`status.dns` |
+| DNS 不生效 | 确认 LAN 设备 DNS 指向本机；`dns.upstream` 配置；`status.dns`。未写 `dns` 段时用内置回退 `8.8.8.8:53`——部分网络不可达，表现为“能 ping 不能上网”，请显式指定可达上游 |
 | 面板打不开 | `ss -ltnp \| grep 8080`；默认只监听 `127.0.0.1`，局域网访问需改 `bind`；防火墙 |
+| 能 ping 通但网页打不开；日志刷 `dns 回包 …: Permission denied (os error 13)` / `udp 回包 socket …:53` | 旧包 systemd 单元缺 `CAP_NET_BIND_SERVICE`（DNS 回包要 bind `:53`）。升级到 `1.0.0-2+`，或手工给单元补上该 capability |
+| 切换 WiFi / 换网后彻底断网，只能停服务重启才恢复 | 旧版数据面把 DHCP（`255.255.255.255:67`）也重定向了，DHCP 续租/切换必然失败。升级到含「广播/组播/链路本地/DHCP 一律放行」的版本 |
+| 面板按钮是灰的 | `panel.conf` 的 `enable_actions`（默认 `1`；旧配置升级后可能仍为 `0`） |
 | `routing 段没有任何可编译规则`（启动即退出） | 模板只写了 `fallback:`（它不是规则）。至少保留一条真实规则，例如 `dip(192.168.0.0/16) -> direct`；`sodama validate` 同样会报这个错 |
 | `sodama.service: Failed to execute /usr/lib/sodama/datapath: Exec format error`（203/EXEC） | 包的 `datapath` 缺 shebang（仅 `1.0.0-1` 及更早的内测包）。修复：`sudo sed -i '1i #!/bin/sh' /usr/lib/sodama/datapath`，或升级到 `1.0.0-2+` |
 | 面板日志页空白 | `log_file` 路径与 `sodama.service` 的 `--log-file` 一致 |
