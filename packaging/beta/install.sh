@@ -249,9 +249,50 @@ valid_sub() {
 }
 
 # ---------------------------------------------------------------- 引导配置
+
+# 旧版出厂模板的 routing 只有 fallback（不是规则），引擎会拒启。
+# 升级场景（config.dae 是 pacman backup，不会被覆盖）就地修复：补默认直连规则。
+ensure_routing_rules() {
+  local cfg=/etc/sodama/config.dae out tmp
+  out="$(sodama validate "$cfg" 2>&1)" && return 0
+  printf '%s\n' "$out" | grep -q '没有任何可编译规则' || return 0
+  if grep -qE '^[[:space:]]*(dip|domain|pname|qname|l4proto|dport|sip|ip)\(' "$cfg"; then
+    warn "routing 段有规则字面但都不可编译，未自动修改；请手动检查 $cfg"
+    return 1
+  fi
+  warn "配置的 routing 段没有可编译规则（引擎会拒启），补默认直连规则"
+  tmp="$(mktemp)"
+  awk '
+    done != 1 && /^[[:space:]]*routing[[:space:]]*\{/ {
+      print
+      print "    dip(192.168.0.0/16) -> direct"
+      print "    dip(10.0.0.0/8) -> direct"
+      print "    dip(172.16.0.0/12) -> direct"
+      print "    dip(169.254.0.0/16) -> direct"
+      print "    dip(\047fe80::/10\047) -> direct"
+      print "    dip(\047fc00::/7\047) -> direct"
+      done = 1; next
+    }
+    { print }
+  ' "$cfg" >"$tmp"
+  cat "$tmp" >"$cfg"
+  rm -f "$tmp"
+  chmod 640 "$cfg"
+  if out="$(sodama validate "$cfg" 2>&1)"; then
+    ok "已补上默认直连规则，校验通过"
+    return 0
+  fi
+  warn "补规则后仍然校验失败："
+  printf '%s\n' "$out" >&2
+  return 1
+}
+
 guide_config() {
   local cfg=/etc/sodama/config.dae
   [[ -f "$cfg" ]] || die "包内没有 $cfg，安装异常"
+
+  # 旧模板遗留：routing 只有 fallback（不是规则）→ 引擎拒启，就地补默认规则
+  ensure_routing_rules || warn "routing 段需你手动修复（见上）"
 
   if ! grep -q 'socks5://127.0.0.1:1080' "$cfg" && ((FORCE_CFG == 0)); then
     warn "检测到已有自定义配置（不含模板占位节点），本次跳过配置写入"
