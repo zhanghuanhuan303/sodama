@@ -8,6 +8,7 @@ pkgbase = sodama-bin
 	license = AGPL-3.0-only
 	depends = iproute2
 	depends = procps-ng
+	depends = sh
 	optdepends = bpftool: 数据面排查（bpftool net show / prog show）
 	optdepends = nftables: 防火墙示例
 	provides = sodama
@@ -18,6 +19,6 @@ pkgbase = sodama-bin
 	backup = etc/sodama/sodama.conf
 	backup = etc/sodama-panel/panel.conf
 	source = sodama-1.0.0-x86_64.tar.gz::https://github.com/zhanghuanhuan303/dae-rust/releases/download/v1.0.0/sodama-1.0.0-x86_64.tar.gz
-	sha256sums = d5f77822411ab387b3ea1054b04b034ab0866ea8798bfb522fd82dab6f7bcacc
+	sha256sums = f06deb45fccb2702fb73095aff7f0fc9caccf5b53191ff295483c42e11628ebe
 
 pkgname = sodama-bin

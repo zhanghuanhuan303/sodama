@@ -16,6 +16,7 @@ pkgbase = sodama
 	depends = glibc
 	depends = iproute2
 	depends = procps-ng
+	depends = sh
 	optdepends = bpftool: 数据面排查（bpftool net show / prog show）
 	optdepends = nftables: 防火墙示例
 	options = !debug

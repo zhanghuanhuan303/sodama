@@ -18,7 +18,7 @@ pkgdesc="Transparent proxy gateway with a Rust eBPF datapath (dae rewrite)"
 arch=('x86_64' 'aarch64')
 url="https://github.com/zhanghuanhuan303/dae-rust"
 license=('AGPL-3.0-only')
-depends=('glibc' 'iproute2' 'procps-ng')
+depends=('glibc' 'iproute2' 'procps-ng' 'sh')
 makedepends=('git' 'rustup' 'bpf-linker' 'clang' 'llvm' 'wasm-pack')
 optdepends=(
   'bpftool: 数据面排查（bpftool net show / prog show）'
