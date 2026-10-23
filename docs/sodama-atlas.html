@@ -196,13 +196,13 @@ article ol li::marker{color:var(--accent)}
 <div class="classbar">
   <span class="cls">密级 · 最高</span>
   <span>SODAMA ATLAS · 内部研究档案 · 未经许可不得外传</span>
-  <span class="push">v2.1 · 2026-10-20 · 重写版</span>
+  <span class="push">v2.2 · 2026-10-23 · 重写版</span>
 </div>
 <div class="page">
 <article>
 
 <header class="title-block">
-  <div class="kicker">全 Rust 代理数据面 · 开发研究档案 · <b>重写版 v2.1</b></div>
+  <div class="kicker">全 Rust 代理数据面 · 开发研究档案 · <b>重写版 v2.2</b></div>
   <h1>SODAMA ATLAS</h1>
   <p class="sub">dae 的研究性复现：一个可上生产、可被验证、可被复现的 eBPF + Rust 透明代理。
   本版为<strong>重写</strong>——v1.x 的增量叙事（每批次追加一节）收敛为当期状态文档；
@@ -645,8 +645,45 @@ direct 基线跑在 2 倍速率上，仅作数量级参照。</figcaption>
   <li><b>生产 72h 链</b>（软路由 2C/4G，真实负载）：旧轮 21.4 h 收口 —— <code>dial_errors</code>/<code>stragglers</code> 全程 <b>0</b>、
   RSS 冷启 43.8 → 预热台阶后稳态 <b>53.5 MB</b>（14 h 窗口极差 3.66 MB、稳态斜率 −47.8 KB/h ≈ 0）、
   FD 133（103–184）、线程 18、<code>reactor_codec_sessions == conns_total</code>；
-  <b>新轮 2026-10-17 03:22 起跑</b>。<label for="mn8" class="margin-toggle">⊕</label><input type="checkbox" id="mn8" class="margin-toggle"><span class="marginnote">新引擎轮冷启基线：RSS 54.6 MB / 线程 20 / fd 143——比旧轮高（功能面更大），属预期；对照曲线见 §8.2。</span></li>
+  <b>新轮 2026-10-17 03:22 起跑 → 78.5 h 收口</b>：平台段 RSS <b>66.7 MB</b>（47–59 h 斜率 −0.01 MB/h ≈ 0），
+  109 137 会话 / <code>dial_errors</code> 58（0.05%）/<code>stragglers</code> 0，ws 截断误报 <b>0</b>（旧轮 9 738）；
+  <b>1 周轮 2026-10-20 10:09 起跑</b>（见 §8.3）。<label for="mn8" class="margin-toggle">⊕</label><input type="checkbox" id="mn8" class="margin-toggle"><span class="marginnote">新引擎轮冷启基线：RSS 54.6 MB / 线程 20 / fd 143——比旧轮高（功能面更大），属预期；对照曲线见 §8.2。</span></li>
 </ul>
+
+<h3 id="s47">4.7 · Rust→BPF vs clang C：编译产物对比（2026-10-23）</h3>
+<p><b>口径</b>：同一 <code>bpfel</code> 目标、同一优化档（Rust release <code>opt-level=3</code> / C <code>-O2</code>）、
+两侧都带 BTF；代码量 = 可执行 section 字节 / 8（去重）。Rust 侧 = <code>sodama/ebpf-rs</code>
+（8 文件 2 169 行 + <code>ebpf-logic</code> 90 行；nightly 1.101 + <code>-Z build-std=core</code> + bpf-linker）、
+C 侧 = dae <code>control/kern/tproxy.c</code>（4 403 行；clang 23.1.3）。
+程序数：Rust 24（多 <code>xdp</code>）/ C 23。</p>
+
+<table class="tight wide">
+  <caption>表 7b · 编译产物对比（实测；工件与脚本见 <code>notes/bpf-compare-2026-10-23/</code>）</caption>
+  <thead><tr><th>指标</th><th>Rust（bpf-linker/LLVM）</th><th>C（clang 23）</th><th>差异</th></tr></thead>
+  <tbody>
+    <tr><td>文件大小（含 debug+BTF）</td><td>986 KiB</td><td>1 040 KiB</td><td>Rust −5%</td></tr>
+    <tr><td><code>strip -g</code> 后（bpf2go 交付口径）</td><td><b>220 KiB</b></td><td><b>289 KiB</b></td><td><b>Rust −24%</b></td></tr>
+    <tr><td>代码指令（去重）</td><td><b>3 847</b></td><td><b>9 336</b></td><td><b>Rust −59%（C = 2.43×）</b></td></tr>
+    <tr><td>同角色单程序（LAN ingress）</td><td>522</td><td>3 + 1 368 = 1 371</td><td>Rust −62%</td></tr>
+    <tr><td><code>.BTF</code> / <code>.BTF.ext</code></td><td>36 / 48 KB</td><td>86 / 62 KB</td><td>Rust −58% / −23%</td></tr>
+    <tr><td>重定位条数</td><td>21 428</td><td>17 538</td><td>Rust +22%</td></tr>
+    <tr><td>函数级最大栈（静态）</td><td>224 B</td><td>200 B</td><td>+24 B（均 &lt; 512）</td></tr>
+    <tr><td>编译时间（稳态）</td><td>1.81 s（增量，含链接）</td><td>0.68 s（全量单文件）</td><td>C 快 2.7×</td></tr>
+  </tbody>
+</table>
+
+<p><b>三条观察</b>：① <b>代码量</b>——Rust 去重代码为 C 的 41%，同角色单程序 522 vs 1 371
+（Rust 入口自含逻辑；C 为桩 + 每角色一份 <code>do_tproxy_*</code>，758–1 444 insn）；
+但 sk_skb（79 vs 64）与 fentry 记账（306 vs 147）Rust 反而更大——<b>总量差异不能简单归因于语言</b>。
+② <b>工具链差异（本轮最有价值的发现）</b>——C 的 local call 直接编码目标（<code>call &lt;imm&gt;</code>，可静态还原），
+Rust（bpf-linker）统一为 <code>call -1</code> + <code>R_BPF_64_32</code>，重定位符号是 <code>.text</code>、
+addend 不可从标准 ELF 工具读出 → <b>静态 ELF 无法回答「入口实际带多少代码」</b>：只能取
+「入口 + 全部 <code>.text</code>」上界（Rust 3 359 vs C 8 101 insn），或运行时看 verifier 的
+<code>xlated</code> 长度。③ <b>BTF/重定位</b>——Rust BTF 小 58%（aya 只描述用到的 map/签名；
+C 经 <code>vmlinux.h</code> 保留大量内核类型），但重定位多 22%（map 引用密度：28 vs 23 map）。</p>
+<p><b>边界</b>：两侧业务逻辑不完全逐行等价（Rust 多 <code>xdp</code>、C 有 tcp/udp 分支差异）；
+代码量差异反映源码组织与功能覆盖，<b>不构成「语言性能」结论</b>；栈为函数内静态近似
+（verifier combined stack 含调用链，本项目曾在 528 B 超限后移 per-CPU scratch，见 ADR-0065）。</p>
 </section>
 
 <section id="s5">
@@ -879,6 +916,7 @@ AF-XDP 否决（0058 及专文）· ECH 边界（0056）· 数据面对标（006
     <tr><td><code>docs/reviews/2026-10-17-real-node-cf-edge/</code></td><td>公网轮原始数据（17×4 TSV、汇总、证据：域名拨号日志、sing-box 1.14 源码事实、出口探测）</td></tr>
     <tr><td><code>docs/notes/prod-audit-2026-10-17/</code>（本地工作区）</td><td>生产 72h 轮收口：health/mem-track 导出、收官 status/metrics、analyze.py 与 README；路由器另有 <code>/root/72h-archive-*</code></td></tr>
     <tr><td><code>docs/notes/prod-audit-2026-10-20/</code>（本地工作区）</td><td>生产 78.5 h 轮收口（§8.3）：health/mem-track 导出、status/metrics、全窗口日志（4 归档 + current）、analyze.py 与 README；路由器另有 <code>/root/1w-archive-*</code></td></tr>
+    <tr><td><code>docs/notes/bpf-compare-2026-10-23/</code>（本地工作区）</td><td>Rust→BPF vs clang C 编译产物对比（§4.7）：两侧 ELF 对象、analyze.py/closure.py、analysis/closure 输出与 README</td></tr>
     <tr><td><code>docs/phase2-devlog.md</code> §1–§25</td><td>生产实战全程：四轮侦查/修复、探测治理、审计修复批、数据面对标、能力缺口/eBPF 余项、A1/A2、修复轮与 72h 链、78.5 h 收口与 1 周轮</td></tr>
     <tr><td><code>docs/parity-status.md</code> v2.20</td><td>十五域对照逐行证据（§2 表 1 的出处）</td></tr>
     <tr><td><code>docs/memory-safety-audit.html</code> v1.1</td><td>unsafe 专项审计 + 生产比对 + 修复批回验</td></tr>
@@ -900,7 +938,7 @@ AF-XDP 否决（0058 及专文）· ECH 边界（0056）· 数据面对标（006
 <div class="classbar bottom">
   <span class="cls">密级 · 最高</span>
   <span>SODAMA ATLAS · 内部研究档案 · 未经许可不得外传</span>
-  <span class="push">v2.1 · 2026-10-20 · 重写版</span>
+  <span class="push">v2.2 · 2026-10-23 · 重写版</span>
 </div>
 
 </body>
