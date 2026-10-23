@@ -19,6 +19,6 @@ pkgbase = sodama-bin
 	backup = etc/sodama/sodama.conf
 	backup = etc/sodama-panel/panel.conf
 	source = sodama-1.0.0-x86_64.tar.gz::https://github.com/zhanghuanhuan303/dae-rust/releases/download/v1.0.0/sodama-1.0.0-x86_64.tar.gz
-	sha256sums = f06deb45fccb2702fb73095aff7f0fc9caccf5b53191ff295483c42e11628ebe
+	sha256sums = ebd1002937f02ea9c9f6b3c7d6a519ab8758df8b32f9455be2c9875b22e2d93f
 
 pkgname = sodama-bin
