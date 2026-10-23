@@ -20,8 +20,8 @@ global {
 
 # 出口节点（任选其一；订阅也可写在 config 里，见 config-doc）：
 #   node { my: 'vless://uuid@host:443?security=tls&sni=example.com#node1' }
-# 或使用订阅：
-#   subscription { tag: main  url: 'https://example.com/sub' }
+# 或使用订阅（键 = 标签，值 = 订阅 URL；可声明多个，按顺序回退）：
+#   subscription { main: 'https://example.com/sub' }
 node {
     my: 'socks5://127.0.0.1:1080'
 }

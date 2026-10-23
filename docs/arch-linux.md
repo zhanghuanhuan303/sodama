@@ -85,8 +85,8 @@ sudo $EDITOR /etc/sodama/config.dae
 2. **节点或订阅**（二选一）：
    ```
    node { my: 'vless://uuid@host:443?security=tls&sni=example.com#node1' }
-   # 或
-   subscription { tag: main  url: 'https://example.com/sub' }
+   # 或（键 = 标签，值 = 订阅 URL；可写多个，按声明顺序回退）
+   subscription { main: 'https://example.com/sub' }
    ```
 3. **权限**：文件必须 `0640`（同组不可写、其他用户不可读）：
    ```bash
@@ -184,16 +184,23 @@ sudo /usr/lib/sodama/datapath teardown   # 幂等清理
 
 ```bash
 sudo systemctl enable --now sodama-panel
-# 浏览器访问 http://<路由器 LAN IP>:8080
+# 默认仅本机监听：浏览器访问 http://127.0.0.1:8080
+# 需要局域网访问：把 bind 改成 0.0.0.0:8080（并建议设 token）
+#   sudo sed -i 's/^bind.*/bind = 0.0.0.0:8080/' /etc/sodama-panel/panel.conf
+#   sudo systemctl restart sodama-panel
+# 然后：http://<路由器 LAN IP>:8080
 systemctl status sodama-panel
 journalctl -u sodama-panel -f
 ```
+
+> 面板 `Requires=sodama.service`：引擎没起来时面板不会启（避免「面板正常但代理不通」的误判），
+> 停引擎会同时停面板。
 
 `/etc/sodama-panel/panel.conf` 常用项：
 
 | 键 | 默认 | 说明 |
 |---|---|---|
-| `bind` | `0.0.0.0:8080` | 监听地址（仅 LAN；勿暴露公网） |
+| `bind` | `127.0.0.1:8080` | 监听地址（默认仅本机；需要 LAN 访问改 `0.0.0.0:8080` 并设 token） |
 | `static_dir` | `/usr/share/sodama-panel/dist` | 前端资源（包安装位置） |
 | `socket` | `/run/sodama/status.sock` | 引擎状态面（与 `sodama.service` 一致） |
 | `token` | 空 | 空 = 免认证（LAN）；设置后需登录（HttpOnly Cookie） |
@@ -252,7 +259,8 @@ sudo rm -rf /etc/sodama /etc/sodama-panel /var/log/sodama.log*   # 确认不再�
 | `加载 eBPF 失败`（权限/verifier） | 内核 ≥5.17、`ls /sys/kernel/btf/vmlinux`、`journalctl -u sodama -b` |
 | 节点全部不可用 | `sodama status ... --json \| jq '.group'`；订阅 URL/本地时间/网络 |
 | DNS 不生效 | 确认 LAN 设备 DNS 指向本机；`dns.upstream` 配置；`status.dns` |
-| 面板打不开 | `ss -ltnp \| grep 8080`；`panel.conf` 的 `bind`；防火墙 |
+| 面板打不开 | `ss -ltnp \| grep 8080`；默认只监听 `127.0.0.1`，局域网访问需改 `bind`；防火墙 |
+| `sodama.service: Failed to execute /usr/lib/sodama/datapath: Exec format error`（203/EXEC） | 包的 `datapath` 缺 shebang（仅 `1.0.0-1` 及更早的内测包）。修复：`sudo sed -i '1i #!/bin/sh' /usr/lib/sodama/datapath`，或升级到 `1.0.0-2+` |
 | 面板日志页空白 | `log_file` 路径与 `sodama.service` 的 `--log-file` 一致 |
 | 版本带 `-dirty` | 源码构建时工作树有已跟踪改动（未跟踪文件不再计入，自 v1.0.0） |
 
@@ -274,3 +282,44 @@ cd packaging/aur/sodama-bin && makepkg --printsrcinfo > .SRCINFO && makepkg -si
 cd ../sodama && makepkg --printsrcinfo > .SRCINFO
 # 5) 推送到 AUR（两包分别）
 ```
+
+---
+
+## 11. 内测分发（发布前，不走 AUR）
+
+正式发布前给朋友试装时，不需要 GitHub Release / AUR，用一个自包含的内测包：
+
+```bash
+packaging/make-beta-bundle.sh            # 复用 dist/ 里已有 tarball
+packaging/make-beta-bundle.sh --build    # 先重新构建再打包
+```
+
+产物 `dist/sodama-<ver>-arch-beta.tar.gz`，解包后是：
+
+| 文件 | 用途 |
+|---|---|
+| `sodama-bin-<ver>-1-x86_64.pkg.tar.zst` (+ `.sha256`) | 预编译 pacman 包（由 `packaging/aur/sodama-bin/PKGBUILD` 用**同一份**发布 tarball 构建） |
+| `install.sh` | 交互安装（`packaging/beta/install.sh`）：自检 → sha256 → `pacman -U` → 选网卡 → 填订阅/节点 → `validate` → 启动面板/服务；支持 `--check` / `--yes` / `--force-config` |
+| `uninstall.sh` | 干净卸载（`packaging/beta/uninstall.sh`）：停服务 → `datapath teardown` → `pacman -R` → 清 `/run/sodama` 与 drop-in → 可选删配置；支持 `--dry-run` / `--purge` |
+| `INSTALL.md` | 测试者向说明（交互流程、无人值守参数、手动 `pacman -U`、回报清单） |
+
+测试者侧最小流程：
+
+```bash
+tar xzf sodama-<ver>-arch-beta.tar.gz && cd sodama-<ver>-arch-beta
+bash install.sh --check        # 只读自检
+sudo bash install.sh           # 全交互：装包 + 引导写配置 + 启动
+sudo bash uninstall.sh         # 干净卸载（--purge 连配置日志一起删）
+```
+
+无人值守：
+
+```bash
+sudo bash install.sh --yes --wan enp1s0 --lan br0 \
+  --sub 'https://example.com/sub?token=xxx' --panel --token 'xxx' --start
+```
+
+> `install.sh` 只写**模板占位**配置（含 `socks5://127.0.0.1:1080`）或带 `--force-config` 时；
+> 已自定义的配置不被覆盖，且写入前备份、`validate` 失败自动回滚。
+> 内测包**只用于发布前**：包是本地构建产物（未签名、`Packager: Unknown`），
+> 正式发布仍以 AUR `sodama-bin`（`source` 指向 Release 资产 + 回填 sha256）为准。

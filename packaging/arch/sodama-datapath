@@ -1,3 +1,4 @@
+#!/bin/sh
 # sodama 数据面对：netns + veth + 地址/静态邻居/策略路由/sysctl。
 #
 # 这是「透明代理网关」的数据面前置（loader 本身不自建拓扑）：

@@ -1,8 +1,9 @@
 pkgbase = sodama-bin
 	pkgdesc = Transparent proxy gateway with a Rust eBPF datapath (dae rewrite) — prebuilt
 	pkgver = 1.0.0
-	pkgrel = 1
+	pkgrel = 2
 	url = https://github.com/zhanghuanhuan303/dae-rust
+	install = sodama-bin.install
 	arch = x86_64
 	license = AGPL-3.0-only
 	depends = iproute2

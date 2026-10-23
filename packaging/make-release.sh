@@ -70,6 +70,18 @@ install -Dm644 "$ROOT/docs/arch-linux.md" "$STAGE/usr/share/doc/sodama/README.md
 install -Dm644 "$ROOT/docs/config-reference.md" "$STAGE/usr/share/doc/sodama/config-reference.md"
 printf '%s\n' "$VER" >"$STAGE/usr/share/doc/sodama/VERSION"
 
+# 守卫：非 ELF 的可执行文件必须是带 shebang 的脚本，否则 systemd 执行会报 203/EXEC
+bad=0
+while IFS= read -r f; do
+  magic="$(head -c 4 "$f" | od -An -tx1 | tr -d ' \n')"
+  [[ "$magic" == 7f454c46 ]] && continue
+  head -1 "$f" | grep -q '^#!' || {
+    echo "缺 shebang: ${f#"$STAGE"}" >&2
+    bad=1
+  }
+done < <(find "$STAGE" -type f -perm -u+x)
+((bad == 0)) || { echo "== 打包中止：上面的文件缺 shebang ==" >&2; exit 1; }
+
 # tar（属主 root、保留权限；gzip -n 去时间戳保证可复现性尽力而为）
 echo "== 打包 =="
 tar --owner=0 --group=0 --numeric-owner -C "$STAGE_ROOT" -cf - "sodama-$VER-x86_64" \
