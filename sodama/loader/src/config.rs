@@ -1069,11 +1069,17 @@ impl Loader {
 }
 
 /// 加载入口配置：include 展开 + 合并（不校验 schema，见 [`validate`]）。
+/// 入口文件所在目录：裸文件名（如 `sodama validate config.dae`）的 `parent()`
+/// 是空路径，必须回落为 `.`，否则 include/相对路径解析会去读空目录名而报错。
+fn entry_dir_for(entry: &Path) -> PathBuf {
+    match entry.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+        _ => PathBuf::from("."),
+    }
+}
+
 pub fn load(entry: &Path) -> Result<Config, Vec<Diag>> {
-    let entry_dir = entry
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("."));
+    let entry_dir = entry_dir_for(entry);
     let mut loader = Loader {
         entry_dir,
         files: Vec::new(),
@@ -2448,6 +2454,20 @@ mod tests {
 
     fn parse(src: &str) -> Result<Vec<Section>, Vec<Diag>> {
         parse_text(src, Path::new("test.dae"), 0)
+    }
+
+    #[test]
+    fn bare_filename_uses_current_dir() {
+        // `sodama validate config.dae`：parent() 为空路径，必须回落到 "."
+        assert_eq!(entry_dir_for(Path::new("config.dae")), PathBuf::from("."));
+        assert_eq!(
+            entry_dir_for(Path::new("conf/config.dae")),
+            PathBuf::from("conf")
+        );
+        assert_eq!(
+            entry_dir_for(Path::new("/etc/sodama/config.dae")),
+            PathBuf::from("/etc/sodama")
+        );
     }
 
     #[test]

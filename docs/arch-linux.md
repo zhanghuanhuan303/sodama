@@ -260,6 +260,7 @@ sudo rm -rf /etc/sodama /etc/sodama-panel /var/log/sodama.log*   # 确认不再�
 | 节点全部不可用 | `sodama status ... --json \| jq '.group'`；订阅 URL/本地时间/网络 |
 | DNS 不生效 | 确认 LAN 设备 DNS 指向本机；`dns.upstream` 配置；`status.dns` |
 | 面板打不开 | `ss -ltnp \| grep 8080`；默认只监听 `127.0.0.1`，局域网访问需改 `bind`；防火墙 |
+| `routing 段没有任何可编译规则`（启动即退出） | 模板只写了 `fallback:`（它不是规则）。至少保留一条真实规则，例如 `dip(192.168.0.0/16) -> direct`；`sodama validate` 同样会报这个错 |
 | `sodama.service: Failed to execute /usr/lib/sodama/datapath: Exec format error`（203/EXEC） | 包的 `datapath` 缺 shebang（仅 `1.0.0-1` 及更早的内测包）。修复：`sudo sed -i '1i #!/bin/sh' /usr/lib/sodama/datapath`，或升级到 `1.0.0-2+` |
 | 面板日志页空白 | `log_file` 路径与 `sodama.service` 的 `--log-file` 一致 |
 | 版本带 `-dirty` | 源码构建时工作树有已跟踪改动（未跟踪文件不再计入，自 v1.0.0） |

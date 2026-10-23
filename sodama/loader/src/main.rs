@@ -10776,6 +10776,12 @@ fn run_subcommand(argv: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                                     d.loc.line, d.rule, d.reason
                                 );
                             }
+                            // 与运行时保持一致：0 条可编译规则时引擎拒启，validate 也报错
+                            if ex.supported.is_empty() {
+                                return Err("routing 段没有任何可编译规则（引擎会拒绝启动；\
+                                    至少留一条规则，例如 dip(192.168.0.0/16) -> direct）"
+                                    .into());
+                            }
                             Ok(())
                         }
                         Err(diags) => {

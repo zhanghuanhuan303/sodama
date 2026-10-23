@@ -34,5 +34,15 @@ group {
 }
 
 routing {
+    # 注意：引擎要求至少一条「可编译规则」（只写 fallback 会被拒启：
+    #       “routing 段没有任何可编译规则”），所以下面这些直连规则不能删光。
+    # 私网/链路本地直连：不代理内网与本机自身流量
+    dip(192.168.0.0/16) -> direct
+    dip(10.0.0.0/8) -> direct
+    dip(172.16.0.0/12) -> direct
+    dip(169.254.0.0/16) -> direct
+    dip('fe80::/10') -> direct
+    dip('fc00::/7') -> direct
+    # 其余流量走上面的 proxy 组
     fallback: proxy
 }

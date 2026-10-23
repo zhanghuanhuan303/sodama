@@ -82,6 +82,20 @@ while IFS= read -r f; do
 done < <(find "$STAGE" -type f -perm -u+x)
 ((bad == 0)) || { echo "== 打包中止：上面的文件缺 shebang ==" >&2; exit 1; }
 
+# 守卫：模板配置必须能被引擎接受（routing 0 条可编译规则时引擎拒启）
+cfg_out="$("$STAGE/usr/bin/sodama" validate "$STAGE/etc/sodama/config.dae" 2>&1)" || {
+  echo "== 打包中止：模板配置 validate 失败 ==" >&2
+  printf '%s\n' "$cfg_out" >&2
+  exit 1
+}
+nrules="$(printf '%s\n' "$cfg_out" | sed -n 's/.*routing: \([0-9]*\) 条可编译.*/\1/p')"
+if [[ -z "$nrules" ]] || ((nrules < 1)); then
+  echo "== 打包中止：模板 routing 没有可编译规则（引擎会拒绝启动）==" >&2
+  printf '%s\n' "$cfg_out" >&2
+  exit 1
+fi
+echo "== 模板配置自检：routing $nrules 条可编译 =="
+
 # tar（属主 root、保留权限；gzip -n 去时间戳保证可复现性尽力而为）
 echo "== 打包 =="
 tar --owner=0 --group=0 --numeric-owner -C "$STAGE_ROOT" -cf - "sodama-$VER-x86_64" \
