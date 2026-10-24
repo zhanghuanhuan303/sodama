@@ -362,6 +362,7 @@ guide_config() {
   fi
 
   if ((fresh == 0)); then
+    [[ -n "$PROFILE" ]] && warn "--profile $PROFILE 未生效：已有自定义配置（加 --force-config 强制重写）"
     warn "检测到已有自定义配置（不含模板占位节点），本次跳过配置写入"
     warn "如需重新引导：sudo bash $0 --force-config"
     return 0

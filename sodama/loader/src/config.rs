@@ -2818,6 +2818,37 @@ group { alt { filter: name(x) } }"#,
     }
 
     #[test]
+    fn shipped_templates_compile_and_route_cn_direct() {
+        // 发布模板回归：两个 profile 必须可解析、有可编译规则，且默认模板
+        // 已把国产 AI API 放进 cn_direct（否则走代理常被拒——现场踩过）。
+        for name in ["config.dae", "config-gateway.dae"] {
+            let src = match name {
+                "config.dae" => include_str!("../../../packaging/arch/config.dae"),
+                _ => include_str!("../../../packaging/arch/config-gateway.dae"),
+            };
+            let secs = parse(src).unwrap_or_else(|d| panic!("{name} 解析失败: {d:?}"));
+            let cfg = Config {
+                entry: PathBuf::from(name),
+                files: vec![PathBuf::from(name)],
+                sections: secs,
+            };
+            let ex = extract_routing(&cfg).unwrap_or_else(|d| panic!("{name} 规则编译失败: {d:?}"));
+            assert!(!ex.supported.is_empty(), "{name} 没有可编译规则");
+            assert!(
+                ex.supported.iter().any(|r| r.contains("cn_direct")),
+                "{name} 缺 domain(ruleset: cn_direct) 规则：{:?}",
+                ex.supported
+            );
+            assert_eq!(super::rule_sets(&cfg).len(), 3, "{name} 应有 3 个 rule_set");
+        }
+
+        let cn = include_str!("../../../packaging/arch/rules/cn_direct.txt");
+        for d in ["deepseek.com", "moonshot.cn", "bigmodel.cn"] {
+            assert!(cn.lines().any(|l| l.trim() == d), "cn_direct.txt 缺 {d}");
+        }
+    }
+
+    #[test]
     fn extract_routing_geo_ext_keys() {
         let secs = parse(
             r#"global {}
