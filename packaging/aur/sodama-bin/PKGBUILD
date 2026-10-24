@@ -24,7 +24,7 @@ install=sodama-bin.install
 # eBPF 对象必须保留 .symtab/.BTF（map 定义与 BTF map 依赖符号）；不 strip、不生成 debug 包。
 options=('!debug' '!strip')
 source=("sodama-$pkgver-$CARCH.tar.gz::$url/releases/download/v$pkgver/sodama-$pkgver-$CARCH.tar.gz")
-sha256sums=('2bf9632f5f6246d45b47b5b5b6f55d200c311985e30e9c6142c5208bfd970b6c')
+sha256sums=('6d820d77ab9d294b2b6cadec23da64cceba0f2bc632e088cf37665f7fb8f2af0')
 
 check() {
   cd "$srcdir/sodama-$pkgver-$CARCH"
