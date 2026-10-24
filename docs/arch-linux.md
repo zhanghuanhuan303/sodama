@@ -14,6 +14,9 @@ OpenWrt/软路由见 [`openwrt.md`](openwrt.md)。
 > | `/usr/bin/sodama-panel` + `/usr/share/sodama-panel/dist` | Web 面板（后端 + wasm 前端） |
 > | `/usr/lib/systemd/system/sodama{,-panel}.service` | systemd 单元 |
 > | `/etc/sodama/config.dae` | 主配置（`backup`：升级保留改动） |
+> | `/etc/sodama/config-gateway.dae` | 网关全量模板（geosite/geoip + 广告拦截 + QUIC 处理，需 geodata） |
+> | `/etc/sodama/rules/*.txt` | 规则集（`cn_direct` / `user_proxy` / `user_direct`，可在面板里增删条目） |
+> | `/etc/sodama/blocklist.txt` | DNS 拦截名单（`qname(file:)` 引用） |
 > | `/etc/sodama/sodama.conf` | 数据面对环境（`EnvironmentFile`） |
 > | `/etc/sodama-panel/panel.conf` | 面板配置（`backup`） |
 > | `/usr/share/doc/sodama/` | 本文 + `config-reference.md` |
@@ -68,6 +71,26 @@ makepkg -si
 ---
 
 ## 3. 配置（`/etc/sodama/config.dae`）
+
+包内有两套模板，安装时选一个（`install.sh --profile min|gateway`，或手动 `cp`）：
+
+| 模板 | 适用 | 内容 | 依赖 |
+|---|---|---|---|
+| `config.dae`（默认，min） | 单机 / 轻量网关 | 国内常用域名（含国产 AI API）直连 + 私网直连 + 其余走代理；DNS 用 AliDNS DoH | 无（不需 geodata） |
+| `config-gateway.dae`（gateway） | 完整网关 | 额外：`domain(geosite:cn)` / `dip(geoip:cn)`、广告拦截、`udp/443 -> block`、DNS+ECS、`pname` 直连 | geodata（`geoip.dat`/`geosite.dat`） |
+
+切换全量：
+
+```bash
+sudo cp -a /etc/sodama/config-gateway.dae /etc/sodama/config.dae
+sudo chmod 640 /etc/sodama/config.dae
+sudo sodama validate /etc/sodama/config.dae && sudo systemctl reload sodama
+```
+
+**规则集**（`rule_set` + `/etc/sodama/rules/`）是默认配置的一部分，因此：
+
+- 命令行改文件、或 Web 面板「规则集」页加/删条目都可用；
+- 想临时强制某域名直连/走代理，直接写 `rules/user_direct.txt` / `rules/user_proxy.txt`（保存即热生效）。
 
 ```bash
 sudo $EDITOR /etc/sodama/config.dae
@@ -267,6 +290,8 @@ sudo rm -rf /etc/sodama /etc/sodama-panel /var/log/sodama.log*   # 确认不再�
 | 能 ping 通但网页打不开；日志刷 `dns 回包 …: Permission denied (os error 13)` / `udp 回包 socket …:53` | 旧包 systemd 单元缺 `CAP_NET_BIND_SERVICE`（DNS 回包要 bind `:53`）。升级到 `1.0.0-2+`，或手工给单元补上该 capability |
 | 切换 WiFi / 换网后彻底断网，只能停服务重启才恢复 | 旧版数据面把 DHCP（`255.255.255.255:67`）也重定向了，DHCP 续租/切换必然失败。升级到含「广播/组播/链路本地/DHCP 一律放行」的版本 |
 | 面板按钮是灰的 | `panel.conf` 的 `enable_actions`（默认 `1`；旧配置升级后可能仍为 `0`） |
+| 国产 AI API（DeepSeek / Moonshot / 智谱…）调用失败或极慢 | 这类 API 在境内、走代理常被拒。默认模板已把 `deepseek.com` 等放进 `rules/cn_direct.txt`（→ direct）；若仍失败：`sudo grep -n deepseek /etc/sodama/rules/cn_direct.txt`，或用 gateway profile（`domain(geosite:cn) -> direct`） |
+| 面板里「加规则/规则集」报「配置里没有规则集 xxx」 | 旧配置（1.0.0-2 及更早）没有 `rule_set` 段。升级到 1.0.0-3+，或手动加 `rule_set { user_direct: 'rules/user_direct.txt' }` 并在 routing 引用 |
 | `routing 段没有任何可编译规则`（启动即退出） | 模板只写了 `fallback:`（它不是规则）。至少保留一条真实规则，例如 `dip(192.168.0.0/16) -> direct`；`sodama validate` 同样会报这个错 |
 | `sodama.service: Failed to execute /usr/lib/sodama/datapath: Exec format error`（203/EXEC） | 包的 `datapath` 缺 shebang（仅 `1.0.0-1` 及更早的内测包）。修复：`sudo sed -i '1i #!/bin/sh' /usr/lib/sodama/datapath`，或升级到 `1.0.0-2+` |
 | 面板日志页空白 | `log_file` 路径与 `sodama.service` 的 `--log-file` 一致 |

@@ -1,0 +1,63 @@
+# 国内常用域名 → 直连（default profile 的兜底分流）
+#
+# 格式：纯文本，每行一条；# 注释。
+#   裸条目            = 域名后缀（含子域）       例：deepseek.com
+#   full:example.com  = 精确匹配
+#   suffix:example.com= 后缀匹配（同裸条目）
+#   keyword:example   = 包含关键字
+#   regex:^ad\..*     = 正则
+#
+# 改完保存即生效（rule_set 文件热重载）；也可以在 Web 面板「规则集」里增删条目。
+# 这份列表只是「不依赖 geodata」的最小兜底；要完整国内分流请用
+# /etc/sodama/config-gateway.dae（domain(geosite:cn) / dip(geoip:cn)）。
+
+# ---- 国产 AI API（走代理常被拒绝/极慢）----
+deepseek.com
+moonshot.cn
+moonshot.com
+bigmodel.cn
+zhipuai.cn
+dashscope.aliyuncs.com
+bailian.console.aliyun.com
+volcengineapi.com
+volces.com
+doubao.com
+hunyuan.tencent.com
+baichuan-ai.com
+minimaxi.com
+sensetime.com
+
+# ---- 常见国内站点 ----
+aliyun.com
+aliyuncs.com
+tencent.com
+myqcloud.com
+qq.com
+weixin.qq.com
+gtimg.com
+baidu.com
+bdstatic.com
+bilibili.com
+hdslb.com
+zhihu.com
+zhimg.com
+taobao.com
+tmall.com
+alicdn.com
+jd.com
+360buyimg.com
+163.com
+126.net
+netease.com
+douyin.com
+bytedance.com
+byteimg.com
+xiaohongshu.com
+meituan.com
+dianping.com
+ctrip.com
+iqiyi.com
+youku.com
+csdn.net
+gitee.com
+cnblogs.com

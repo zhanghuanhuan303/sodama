@@ -1,11 +1,15 @@
-# sodama 示例配置（dae 语法）——Arch 安装后位于 /etc/sodama/config.dae
+# sodama 默认配置（单机 / 网关通用）
 #
 # 权限要求：同组不可写、其他用户不可读（mode & 0o037 == 0），保持 0640/0600。
 # 改完先校验：sudo sodama validate /etc/sodama/config.dae
-# 生效：sudo systemctl reload sodama   （SIGHUP 热重载）
+# 生效：sudo systemctl reload sodama   （SIGHUP 热重载，不断流；也可直接改文件，
+#       watch_config 默认开 inotify 热驱动）
 #
 # 接口名用真实网卡：`ip -br link`；默认路由接口：`ip route show default`。
-# 单机代理（本机流量）也可把 lan_interface 写成 none。
+# 单机代理（只代理本机）把 lan_interface 写成 none。
+#
+# 另有一份「网关全量」配置：/etc/sodama/config-gateway.dae
+#   （geosite/geoip + QUIC 阻断 + 广告拦截，需要 geodata 目录，见该文件头注释）
 global {
     # ↓↓↓ 改成你的实际接口 ↓↓↓
     wan_interface: wan0
@@ -18,22 +22,12 @@ global {
     check_interval: 10s
 }
 
-# 出口节点（任选其一；订阅也可写在 config 里，见 config-doc）：
+# ---- 出口节点（二选一）------------------------------------------------------
 #   node { my: 'vless://uuid@host:443?security=tls&sni=example.com#node1' }
 # 或使用订阅（键 = 标签，值 = 订阅 URL；可声明多个，按顺序回退）：
 #   subscription { main: 'https://example.com/sub' }
-
-# DNS（可选）：不写时用内置回退 8.8.8.8:53（部分网络不可达 → 表现为“能 ping 不能上网”）。
-# 建议显式指定一个本网可达的上游（下面以 AliDNS DoH 为例，按需改）：
-# dns {
-#     upstream {
-#         alidns: 'https://223.5.5.5/dns-query?sni=dns.alidns.com'
-#     }
-#     routing {
-#         request { fallback: alidns }
-#         response { fallback: accept }
-#     }
-# }
+#
+# 下面这行是**占位**，装上后必须替换（或填上面的订阅）：
 node {
     my: 'socks5://127.0.0.1:1080'
 }
@@ -41,20 +35,68 @@ node {
 group {
     proxy {
         policy: min_moving_avg
-        filter: name(my)
+        # 注意：这里**不要**写 filter: name(my)——
+        # 用订阅时节点名来自订阅，按内联节点名过滤会让组为空（引擎会报 0 成员）。
+        # 需要按名字选路时改写成：filter: name(keyword: 'HK')
     }
 }
 
+# ---- 规则集（本地文本文件，可在 Web 面板里直接加/删条目）--------------------
+# 纯文本，每行一条；裸条目 = 域名后缀（suffix），也可写 full:/suffix:/keyword:/regex:
+# 相对路径按本文件所在目录解析；改了文件会自动热重载。
+rule_set {
+    cn_direct: 'rules/cn_direct.txt'   # 国内常用站 / 国产 AI API → 直连
+    user_proxy: 'rules/user_proxy.txt' # 你自己要强制走代理的
+    user_direct: 'rules/user_direct.txt' # 你自己要强制直连的
+}
+
 routing {
-    # 注意：引擎要求至少一条「可编译规则」（只写 fallback 会被拒启：
-    #       “routing 段没有任何可编译规则”），所以下面这些直连规则不能删光。
-    # 私网/链路本地直连：不代理内网与本机自身流量
+    # 0) 用户自定义（最高优先）
+    domain(ruleset: user_proxy) -> proxy
+    domain(ruleset: user_direct) -> direct
+
+    # 1) 国内常用域名直连：不依赖 geodata 也能用的兜底
+    #    典型作用：国产 AI API（deepseek / moonshot / bigmodel …）走代理常被拒绝或极慢；
+    #    国内 CDN 走代理也会退化。要完整国内分流请改用 config-gateway.dae（geosite:cn）。
+    domain(ruleset: cn_direct) -> direct
+
+    # 2) 私网 / 链路本地 / 组播：直连（不代理内网与本机自身流量）
+    #    注意：引擎要求至少一条「可编译规则」，这些规则不能删光，否则启动即退出。
     dip(192.168.0.0/16) -> direct
     dip(10.0.0.0/8) -> direct
     dip(172.16.0.0/12) -> direct
     dip(169.254.0.0/16) -> direct
+    dip(224.0.0.0/4) -> direct
+    dip(240.0.0.0/4) -> direct
+    dip(255.255.255.255/32) -> direct
     dip('fe80::/10') -> direct
     dip('fc00::/7') -> direct
-    # 其余流量走上面的 proxy 组
+    dip('ff00::/8') -> direct
+
+    # 3) UDP：默认直连（不做 UDP 代理；需要 UDP 转发请换支持 UDP 的节点并删掉此行）
+    l4proto(udp) -> direct
+
+    # 4) 其余流量走上面的 proxy 组
     fallback: proxy
+}
+
+# ---- DNS --------------------------------------------------------------------
+# 不写 dns 段时用内置回退 8.8.8.8:53；部分网络不可达 → 表现为「能 ping 不能上网」。
+# 这里用 AliDNS DoH（IP 字面量 + SNI，不依赖自身解析），按需替换。
+dns {
+    upstream {
+        alidns: 'https://223.5.5.5/dns-query?sni=dns.alidns.com'
+        # 备选：本地路由器明文（调试对照）
+        # router: 'udp://192.168.1.1:53'
+    }
+    routing {
+        request {
+            # 拦截名单（每行一个域名后缀；文件为空也不影响启动）
+            qname(file: 'blocklist.txt') -> reject
+            fallback: alidns
+        }
+        response {
+            fallback: accept
+        }
+    }
 }

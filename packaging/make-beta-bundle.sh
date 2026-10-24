@@ -95,15 +95,19 @@ sha256：\`$PKGSHA\`
 
 ## 交互安装会问你什么
 
-1. **WAN 网卡**——默认填默认路由所在网卡（\`ip route show default\`），回车即用。
-2. **LAN 网卡**——默认填探测到的网桥（\`br0\`/\`br-lan\`…）；**只代理本机就填 \`none\`**。
+1. **场景/模板**：
+   - `min`（默认）：国内常用域名（含国产 AI API）直连 + 私网直连 + 其余走代理；
+     不依赖 geodata，装上即用；
+   - `gateway`：额外带 `geosite:cn` / `geoip:cn`、广告拦截、QUIC 处理（需 geodata）。
+2. **WAN 网卡**——默认填默认路由所在网卡（\`ip route show default\`），回车即用。
+3. **LAN 网卡**——默认填探测到的网桥（\`br0\`/\`br-lan\`…）；**只代理本机就填 \`none\`**。
    填错会导致 LAN 设备上不了网，但本机不受影响。
-3. **出口节点**：
+4. **出口节点**：
    - 选 1 → 粘订阅链接（\`https://…\`），节点自动更新；
    - 选 2 → 粘单个节点链接（\`vless://\` / \`ss://\` / \`trojan://\` / \`socks5://\` …）；
    - 选 3 → 跳过，稍后自己改 \`/etc/sodama/config.dae\`。
-4. **Web 面板**：是否启用；监听 \`0.0.0.0:8080\`（局域网）还是 \`127.0.0.1:8080\`（仅本机）；可选 token。
-5. **是否现在启动**。
+5. **Web 面板**：是否启用；监听 \`0.0.0.0:8080\`（局域网）还是 \`127.0.0.1:8080\`（仅本机）；可选 token；是否允许 reload/suspend。
+6. **是否现在启动**。
 
 写入配置前会自动备份为 \`/etc/sodama/config.dae.bak-<时间戳>\`；写入后自动跑 \`sodama validate\`，
 **校验不过会自动回滚**。
@@ -179,7 +183,9 @@ sudo sodama sysdump --socket /run/sodama/status.sock --out /tmp/sodama-dump.tar.
 | 面板打不开 | \`ss -ltnp \\| grep 8080\`；\`bind\` 配置；防火墙 |
 | 停止后网络异常 | \`sudo /usr/lib/sodama/datapath teardown\`（\`kill -9\` 时 ExecStopPost 没跑） |
 | 内核 <6.6 | 回退 \`cls_bpf\` 挂载，功能可用、特性略降 |
-| \`Failed to execute /usr/lib/sodama/datapath: Exec format error\`（203/EXEC） | 仅 \`1.0.0-1\` 及更早的包：\`datapath\` 缺 shebang。升级到 \`1.0.0-2+\`；应急：\`sudo sed -i '1i #!/bin/sh' /usr/lib/sodama/datapath\` 后 \`systemctl start sodama\` |
+| 国产 AI API（DeepSeek / Moonshot / 智谱…）调用失败或极慢 | 默认模板已把 `deepseek.com` 等放进 `rules/cn_direct.txt`（→ direct）。若仍失败：`grep deepseek /etc/sodama/rules/../rules/cn_direct.txt`，或改 `rules/user_direct.txt` 加域名（热生效）；完整国内分流用 gateway profile |
+| 面板里「加规则/规则集」报「配置里没有规则集」 | 旧配置（≤1.0.0-2）没有 `rule_set` 段；升级到 1.0.0-3+ 或手动补 `rule_set` + routing 引用 |
+| `Failed to execute /usr/lib/sodama/datapath: Exec format error`（203/EXEC） | 仅 `1.0.0-1` 及更早的包：`datapath` 缺 shebang。升级到 `1.0.0-2+`；应急：`sudo sed -i '1i #!/bin/sh' /usr/lib/sodama/datapath` 后 `systemctl start sodama` |
 | 面板 = active 但代理不通 | 面板 \`Requires=sodama.service\`，正常不会出现；若看到，先 \`systemctl status sodama\` |
 
 完整说明：\`/usr/share/doc/sodama/README.md\`（§11「内测分发」是维护者向章节，忽略即可）；

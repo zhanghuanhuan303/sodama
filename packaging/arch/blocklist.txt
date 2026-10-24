@@ -1,0 +1,9 @@
+# DNS 拦截名单（dns.routing.request 的 qname(file: 'blocklist.txt') 引用）
+#
+# 每行一个域名后缀（含子域）；# 注释；空文件也可以（不影响启动）。
+# 命中 → reject（返回 NXDOMAIN/空应答），常用于广告/跟踪域名。
+#
+# 示例（取消注释即可）：
+# doubleclick.net
+# googlesyndication.com
+# umeng.com

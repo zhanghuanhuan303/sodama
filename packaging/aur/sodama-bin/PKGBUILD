@@ -5,7 +5,7 @@
 
 pkgname=sodama-bin
 pkgver=1.0.0
-pkgrel=2
+pkgrel=3
 pkgdesc="Transparent proxy gateway with a Rust eBPF datapath (dae rewrite) — prebuilt"
 arch=('x86_64')
 url="https://github.com/zhanghuanhuan303/dae-rust"
@@ -17,7 +17,9 @@ optdepends=(
 )
 provides=('sodama')
 conflicts=('sodama')
-backup=('etc/sodama/config.dae' 'etc/sodama/sodama.conf' 'etc/sodama-panel/panel.conf')
+backup=('etc/sodama/config.dae' 'etc/sodama/config-gateway.dae' 'etc/sodama/sodama.conf'
+        'etc/sodama/blocklist.txt' 'etc/sodama/rules/cn_direct.txt' 'etc/sodama/rules/user_proxy.txt'
+        'etc/sodama/rules/user_direct.txt' 'etc/sodama-panel/panel.conf')
 install=sodama-bin.install
 # eBPF 对象必须保留 .symtab/.BTF（map 定义与 BTF map 依赖符号）；不 strip、不生成 debug 包。
 options=('!debug' '!strip')

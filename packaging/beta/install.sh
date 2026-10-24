@@ -16,6 +16,8 @@
 #   --token T       面板访问 token（默认空 = 免认证）
 #   --start / --no-start       是否立即启动（默认询问）
 #   --force-config  即使配置已被自定义，也重新引导写入
+#   --profile min|gateway  配置模板：min=轻量（国内站/国产 AI 直连），
+#                    gateway=全量（geosite/geoip + 广告拦截 + QUIC 处理，需 geodata）
 #
 # 行为约定：
 #   - 只装本地 .pkg.tar.zst（不联网、不编译、不用 AUR helper）；
@@ -28,6 +30,7 @@ ORIG_ARGS=("$@")
 MODE=install
 ASSUME_YES=0
 FORCE_CFG=0
+PROFILE=""
 WAN="" LAN="" SUB="" NODE="" BIND="" TOKEN=""
 PANEL="" START=""
 PANEL_ON=0
@@ -38,6 +41,7 @@ while (($#)); do
     --uninstall | --dry-run | --purge | --all) MODE=uninstall ;;
     -y | --yes) ASSUME_YES=1 ;;
     --force-config) FORCE_CFG=1 ;;
+    --profile) PROFILE="${2:?--profile 需要参数（min|gateway）}"; shift ;;
     --wan) WAN="${2:?--wan 需要参数}"; shift ;;
     --lan) LAN="${2:?--lan 需要参数}"; shift ;;
     --sub) SUB="${2:?--sub 需要参数}"; shift ;;
@@ -49,7 +53,7 @@ while (($#)); do
     --start) START=1 ;;
     --no-start) START=0 ;;
     -h | --help)
-      sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'
+      sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'
       exit 0
       ;;
     *)
@@ -250,6 +254,62 @@ valid_sub() {
 
 # ---------------------------------------------------------------- 引导配置
 
+# geodata（geoip.dat/geosite.dat）：gateway profile 的 geosite/geoip 规则需要它
+detect_geodata() {
+  local d
+  for d in /usr/share/v2ray /usr/share/sing-box /usr/share/geodata /etc/sodama/geodata; do
+    if [[ -f "$d/geoip.dat" && -f "$d/geosite.dat" ]]; then echo "$d"; return 0; fi
+  done
+  return 1
+}
+
+# 选择配置模板：min（默认）/ gateway，直接落盘到 $cfg
+choose_profile() {
+  local cfg="$1" gw="$cfg.gateway-template"
+  [[ -f "$gw" || -f /etc/sodama/config-gateway.dae ]] || {
+    [[ -n "$PROFILE" ]] && warn "包内没有 config-gateway.dae，回退到 min profile"
+    PROFILE="min"
+    return 0
+  }
+
+  if [[ -z "$PROFILE" ]]; then
+    if ((ASSUME_YES)); then
+      PROFILE="min"
+    else
+      hr
+      cat <<'EOF' >&2
+     场景（决定路由模板）：
+       1) 单机/轻量（默认）：国内常用域名（含国产 AI API）直连，其余走代理；
+          不依赖 geodata，装上即用
+       2) 网关全量：额外带 geosite:cn / geoip:cn、广告拦截、QUIC 处理；
+          需要 geodata（geoip.dat / geosite.dat）
+EOF
+      local c
+      c="$(ask "选择" "1")"
+      if [[ "$c" == 2 ]]; then PROFILE="gateway"; else PROFILE="min"; fi
+    fi
+  fi
+
+  if [[ "$PROFILE" == gateway ]]; then
+    local bak
+    bak="$cfg.bak-$(date +%Y%m%d-%H%M%S)"
+    cp -a "$cfg" "$bak"
+    cat /etc/sodama/config-gateway.dae >"$cfg"
+    chmod 640 "$cfg"
+    local gdir
+    if gdir="$(detect_geodata)"; then
+      cfg_set_global "$cfg" geodata_dir "'$gdir'"
+      ok "gateway profile（geodata: $gdir）"
+    else
+      warn "gateway profile 已启用，但没找到 geodata（geoip.dat/geosite.dat）"
+      warn "geosite/geoip 规则暂不生效；cn_direct 规则集与其余规则正常"
+      warn "自装 geodata 后可加 global { geodata_dir: '/usr/share/v2ray' } 再 reload"
+    fi
+  else
+    ok "min profile（默认模板）"
+  fi
+}
+
 # 旧版出厂模板的 routing 只有 fallback（不是规则），引擎会拒启。
 # 升级场景（config.dae 是 pacman backup，不会被覆盖）就地修复：补默认直连规则。
 ensure_routing_rules() {
@@ -294,7 +354,14 @@ guide_config() {
   # 旧模板遗留：routing 只有 fallback（不是规则）→ 引擎拒启，就地补默认规则
   ensure_routing_rules || warn "routing 段需你手动修复（见上）"
 
-  if ! grep -q 'socks5://127.0.0.1:1080' "$cfg" && ((FORCE_CFG == 0)); then
+  local fresh=0
+  if grep -q 'socks5://127.0.0.1:1080' "$cfg"; then fresh=1; fi
+  if ((fresh == 1 || FORCE_CFG == 1)); then
+    choose_profile "$cfg"
+    fresh=1   # 选定模板后就是“可引导”状态
+  fi
+
+  if ((fresh == 0)); then
     warn "检测到已有自定义配置（不含模板占位节点），本次跳过配置写入"
     warn "如需重新引导：sudo bash $0 --force-config"
     return 0

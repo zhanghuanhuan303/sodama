@@ -13,7 +13,7 @@
 
 pkgname=sodama
 pkgver=1.0.0
-pkgrel=2
+pkgrel=3
 pkgdesc="Transparent proxy gateway with a Rust eBPF datapath (dae rewrite)"
 arch=('x86_64' 'aarch64')
 url="https://github.com/zhanghuanhuan303/dae-rust"
@@ -24,7 +24,9 @@ optdepends=(
   'bpftool: 数据面排查（bpftool net show / prog show）'
   'nftables: 防火墙示例'
 )
-backup=('etc/sodama/config.dae' 'etc/sodama/sodama.conf' 'etc/sodama-panel/panel.conf')
+backup=('etc/sodama/config.dae' 'etc/sodama/config-gateway.dae' 'etc/sodama/sodama.conf'
+        'etc/sodama/blocklist.txt' 'etc/sodama/rules/cn_direct.txt' 'etc/sodama/rules/user_proxy.txt'
+        'etc/sodama/rules/user_direct.txt' 'etc/sodama-panel/panel.conf')
 install=sodama.install
 options=('!debug' '!strip')
 source=("git+$url.git#tag=v$pkgver")
@@ -71,6 +73,21 @@ check() {
     return 1
   }
   sh -n packaging/arch/sodama-datapath || return 1
+
+  # 两套配置模板都必须能被引擎接受（routing 0 条可编译 → 引擎拒启）
+  rm -rf "$srcdir/cfgcheck"
+  install -d -m750 "$srcdir/cfgcheck/rules"
+  for f in packaging/arch/rules/*.txt; do
+    install -m640 "$f" "$srcdir/cfgcheck/rules/$(basename "$f")"
+  done
+  install -m640 packaging/arch/blocklist.txt "$srcdir/cfgcheck/blocklist.txt"
+  for prof in config.dae config-gateway.dae; do
+    install -m640 "packaging/arch/$prof" "$srcdir/cfgcheck/$prof"
+    out="$(sodama/target/release/sodama validate "$srcdir/cfgcheck/$prof" 2>&1)" || {
+      printf 'sodama: 模板 %s 校验失败\n%s\n' "$prof" "$out" >&2
+      return 1
+    }
+  done
 }
 
 package() {
@@ -91,6 +108,12 @@ package() {
 
   # 配置（backup：pacman 会保留用户改动）
   install -Dm640 packaging/arch/config.dae "$pkgdir/etc/sodama/config.dae"
+  install -Dm640 packaging/arch/config-gateway.dae "$pkgdir/etc/sodama/config-gateway.dae"
+  install -Dm640 packaging/arch/blocklist.txt "$pkgdir/etc/sodama/blocklist.txt"
+  install -d -m750 "$pkgdir/etc/sodama/rules"
+  for f in packaging/arch/rules/*.txt; do
+    install -m640 "$f" "$pkgdir/etc/sodama/rules/$(basename "$f")"
+  done
   install -Dm644 packaging/arch/sodama.conf "$pkgdir/etc/sodama/sodama.conf"
   install -Dm640 packaging/arch/panel.conf "$pkgdir/etc/sodama-panel/panel.conf"
 

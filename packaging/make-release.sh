@@ -45,6 +45,12 @@ install -Dm644 "$ROOT/packaging/arch/sodama-panel.service" \
 
 # 配置（权限与校验要求一致：0640）
 install -Dm640 "$ROOT/packaging/arch/config.dae" "$STAGE/etc/sodama/config.dae"
+install -Dm640 "$ROOT/packaging/arch/config-gateway.dae" "$STAGE/etc/sodama/config-gateway.dae"
+install -Dm640 "$ROOT/packaging/arch/blocklist.txt" "$STAGE/etc/sodama/blocklist.txt"
+install -d -m750 "$STAGE/etc/sodama/rules"
+for f in "$ROOT"/packaging/arch/rules/*.txt; do
+  install -m640 "$f" "$STAGE/etc/sodama/rules/$(basename "$f")"
+done
 install -Dm644 "$ROOT/packaging/arch/sodama.conf" "$STAGE/etc/sodama/sodama.conf"
 install -Dm640 "$ROOT/packaging/arch/panel.conf" "$STAGE/etc/sodama-panel/panel.conf"
 
@@ -83,18 +89,20 @@ done < <(find "$STAGE" -type f -perm -u+x)
 ((bad == 0)) || { echo "== 打包中止：上面的文件缺 shebang ==" >&2; exit 1; }
 
 # 守卫：模板配置必须能被引擎接受（routing 0 条可编译规则时引擎拒启）
-cfg_out="$("$STAGE/usr/bin/sodama" validate "$STAGE/etc/sodama/config.dae" 2>&1)" || {
-  echo "== 打包中止：模板配置 validate 失败 ==" >&2
-  printf '%s\n' "$cfg_out" >&2
-  exit 1
-}
-nrules="$(printf '%s\n' "$cfg_out" | sed -n 's/.*routing: \([0-9]*\) 条可编译.*/\1/p')"
-if [[ -z "$nrules" ]] || ((nrules < 1)); then
-  echo "== 打包中止：模板 routing 没有可编译规则（引擎会拒绝启动）==" >&2
-  printf '%s\n' "$cfg_out" >&2
-  exit 1
-fi
-echo "== 模板配置自检：routing $nrules 条可编译 =="
+for prof in config.dae config-gateway.dae; do
+  cfg_out="$("$STAGE/usr/bin/sodama" validate "$STAGE/etc/sodama/$prof" 2>&1)" || {
+    echo "== 打包中止：模板 $prof validate 失败 ==" >&2
+    printf '%s\n' "$cfg_out" >&2
+    exit 1
+  }
+  nrules="$(printf '%s\n' "$cfg_out" | sed -n 's/.*routing: \([0-9]*\) 条可编译.*/\1/p')"
+  if [[ -z "$nrules" ]] || ((nrules < 1)); then
+    echo "== 打包中止：$prof 的 routing 没有可编译规则（引擎会拒绝启动）==" >&2
+    printf '%s\n' "$cfg_out" >&2
+    exit 1
+  fi
+  echo "== 模板自检：$prof → routing $nrules 条可编译 =="
+done
 
 # tar（属主 root、保留权限；gzip -n 去时间戳保证可复现性尽力而为）
 echo "== 打包 =="

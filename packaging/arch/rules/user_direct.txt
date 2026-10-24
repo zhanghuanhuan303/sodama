@@ -1,0 +1,9 @@
+# 强制直连的域名（每行一条；裸条目 = 域名后缀）
+#
+# 由 domain(ruleset: user_direct) -> direct 引用，优先级仅次于 user_proxy。
+# 适合：某个国内站被误判走了代理、或某个海外站你想直连。
+# 改完保存即生效（热重载）；也可以在 Web 面板「规则集」里直接增删。
+#
+# 示例（取消注释即可）：
+# example.cn
+# full:intranet.example.com

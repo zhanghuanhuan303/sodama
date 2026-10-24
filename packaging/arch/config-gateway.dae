@@ -1,0 +1,147 @@
+# =============================================================================
+#  sodama 网关全量配置（/etc/sodama/config-gateway.dae）
+#
+#  与默认配置 /etc/sodama/config.dae 的区别：
+#    * 完整国内分流：geosite:cn / geoip:cn（需要 geodata 目录）
+#    * 广告拦截：qname(geosite:category-ads-all) -> reject
+#    * QUIC 处理：阻断 UDP/443，浏览器自动回落 TCP（更稳、可被代理）
+#    * DNS：AliDNS DoH + ECS（按客户端子网解析，CDN 落点更准）
+#
+#  启用方式（二选一）：
+#    sudo cp /etc/sodama/config-gateway.dae /etc/sodama/config.dae
+#    sudo chmod 640 /etc/sodama/config.dae
+#    sudo sodama validate /etc/sodama/config.dae && sudo systemctl reload sodama
+#  （安装脚本的 `--profile gateway` 已经代劳，见 docs/arch-linux.md）
+#
+#  前置：geodata（geoip.dat / geosite.dat）
+#    Arch 可装 v2ray 数据源包，或自行下载后放进 global.geodata_dir；
+#    缺失时 geosite/geoip 规则不生效（启动日志会说明），但 cn_direct 规则集仍在。
+#
+#  真网关踩坑（勿改坏）：
+#   - 别加回 `dport(53) -> direct(must)`：宿主机 DNS 必须进控制面，由 dns 段决定去向。
+#   - 别写 `sip(...)` 全量规则：宿主机模式下源地址都是本机地址；
+#     只有「按具体客户端 IP/MAC 放行」时才用（见 docs 双层代理一节）。
+#   - DoH 上游用 IP 字面量 + `?sni=`：避免“解析上游域名又需要 DNS”的鸡生蛋。
+#   - 权限：本文件与同目录 rules/、blocklist.txt 需 ≤0640。
+# =============================================================================
+
+# ---- ① 订阅：声明顺序 = 优先级（pacman 镜像风格） ---------------------------
+# 首个「有活节点」的源生效；该源节点全部被标死后自动切下一个源。
+# 值可以是 URL、相对路径（按本文件目录解析）、或单行 URL 文件（如 sub2.url）。
+subscription {
+    # main: 'https://example.com/sub'
+    # backup: 'sub2.url'
+}
+
+# 内联节点（与订阅二选一）：
+# node {
+#     my: 'vless://uuid@host:443?security=tls&sni=example.com#node1'
+# }
+
+group {
+    proxy {
+        policy: min_moving_avg
+        # 用订阅时**不要**写 filter: name(my)（节点名来自订阅，会过滤空）
+        # filter: name(keyword: 'HK')
+    }
+}
+
+# ---- ② 规则集：标准格式分流规则文件（可远程 URL，自动下载/缓存） ------------
+# 支持：Clash rule-provider YAML / sing-box rule-set JSON / 纯文本域名列表。
+# 非域名条目（IP-CIDR 等）会计数上报（status.rule_sets.ignored），不静默丢。
+rule_set {
+    cn_direct: 'rules/cn_direct.txt'     # 国内常用域名兜底（不依赖 geodata）
+    user_proxy: 'rules/user_proxy.txt'   # 强制走代理
+    user_direct: 'rules/user_direct.txt' # 强制直连
+    # 远程规则集示例（首次下载到缓存目录，之后按间隔刷新）：
+    # cn_site: 'https://example.com/geosite-cn.yaml'
+}
+
+# ---- ③+④ 分流：自上而下，先命中先用 ----------------------------------------
+routing {
+    # ③ 用户自定义（最高优先）——直接编辑 rules/user_proxy.txt / user_direct.txt
+    domain(ruleset: user_proxy) -> proxy
+    domain(ruleset: user_direct) -> direct
+
+    # ④ 默认分流 ---------------------------------------------------------------
+    # --- 国内域名兜底（不依赖 geodata；保证国产 AI API / 国内 CDN 直连）---
+    domain(ruleset: cn_direct) -> direct
+
+    # --- 私网/特殊地址（目的）：直连 ---
+    dip(192.168.0.0/16) -> direct
+    dip(10.0.0.0/8) -> direct
+    dip(172.16.0.0/12) -> direct
+    dip(169.254.0.0/16) -> direct
+    dip(224.0.0.0/4) -> direct
+    dip(240.0.0.0/4) -> direct
+    dip(255.255.255.255/32) -> direct
+    dip('fe80::/10') -> direct
+    dip('fc00::/7') -> direct
+    dip('ff00::/8') -> direct
+
+    # --- QUIC：阻断 UDP/443，浏览器回落 TCP ---
+    l4proto(udp) && dport(443) -> block
+
+    # --- 其余 UDP：直连（暂不做 UDP 代理） ---
+    l4proto(udp) -> direct
+
+    # --- pname：命令行调试工具直连（浏览器等不受影响，走 fallback -> proxy） ---
+    pname(curl) -> direct
+    pname(python3) -> direct
+
+    # --- geodata：完整国内分流（无 geodata 时这两条不生效，日志会说明）---
+    dip(geoip:cn) -> direct
+    domain(geosite:cn) -> direct
+
+    # --- 兜底：其余 TCP 走代理 ---
+    fallback: proxy
+}
+
+# ---- ⑤ DNS ------------------------------------------------------------------
+dns {
+    upstream {
+        alidns: 'https://223.5.5.5/dns-query?sni=dns.alidns.com'
+        # + ECS：按查询发起方地址归整 v4 /24、v6 /56，CDN 落点更准
+        alidns_ecs: 'https://223.5.5.5/dns-query?sni=dns.alidns.com&ecs=auto'
+        # 备选：DoQ（RFC 9250，UDP 853；IP 字面量 + SNI）
+        ali_quic: 'quic://223.5.5.5?sni=dns.alidns.com'
+    }
+    routing {
+        request {
+            qname(geosite:category-ads-all) -> reject
+            qname(file: 'blocklist.txt') -> reject
+            qname(geosite:cn) -> alidns_ecs
+            fallback: alidns
+        }
+        response {
+            fallback: accept
+        }
+    }
+}
+
+# ---- ⑥ 运行参数（一般不用改） ------------------------------------------------
+global {
+    # ↓↓↓ 接口：按实际网卡改（ip -br link / ip route show default）↓↓↓
+    wan_interface: wan0
+    lan_interface: br0
+    tproxy_port: 12345
+    log_level: info
+    auto_config_kernel_parameter: true
+
+    # 拨号/嗅探
+    dial_mode: 'domain'
+    dial_timeout: 15
+    sniffing_timeout: '100ms'
+    tcp_check_url: 'http://www.gstatic.com/generate_204'
+    check_interval: 10s
+
+    # 配置热驱动：inotify 事件驱动（毫秒级）+ <秒> 兜底扫描
+    watch_config: 10
+    rule_set_update_interval: 86400
+
+    # geodata 目录（geoip.dat/geosite.dat）；也可用 --geodata-dir / DAE_LOCATION_ASSET
+    # geodata_dir: '/usr/share/v2ray'
+
+    # 长连接（大模型流式响应）别被过早回收
+    # relay_idle_timeout: '900s'
+}
