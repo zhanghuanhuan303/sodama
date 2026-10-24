@@ -104,6 +104,12 @@ for prof in config.dae config-gateway.dae; do
   echo "== 模板自检：$prof → routing $nrules 条可编译 =="
 done
 
+# 守卫：OpenWrt 包内资产必须与 packaging/arch 同步（否则 OpenWrt 用户拿到旧模板/旧规则）
+sh "$ROOT/install/openwrt/files/sync-config.sh" --check || {
+  echo "== 打包中止：install/openwrt/files 与 packaging/arch 不同步 ==" >&2
+  exit 1
+}
+
 # tar（属主 root、保留权限；gzip -n 去时间戳保证可复现性尽力而为）
 echo "== 打包 =="
 tar --owner=0 --group=0 --numeric-owner -C "$STAGE_ROOT" -cf - "sodama-$VER-x86_64" \

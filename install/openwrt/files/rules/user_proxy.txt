@@ -1,0 +1,10 @@
+# 强制走代理的域名（每行一条；裸条目 = 域名后缀）
+#
+# 在 /etc/sodama/config.dae 的 routing 里由 domain(ruleset: user_proxy) -> proxy 引用，
+# 优先级最高（在 cn_direct / 私网 / fallback 之前）。
+# 改完保存即生效（热重载）；也可以在 Web 面板「规则集」里直接增删。
+#
+# 示例（取消注释即可）：
+# openai.com
+# anthropic.com
+# google.com

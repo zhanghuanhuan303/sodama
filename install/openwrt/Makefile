@@ -21,7 +21,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=sodama
 PKG_VERSION:=1.0.0
-PKG_RELEASE:=1
+PKG_RELEASE:=2
 
 PKG_LICENSE:=AGPL-3.0-only
 PKG_LICENSE_FILES:=LICENSE
@@ -56,21 +56,42 @@ define Build/Compile
 endef
 
 define Package/sodama/install
-	$(INSTALL_DIR) $(1)/usr/bin $(1)/usr/lib/sodama $(1)/usr/share/sodama
+	$(INSTALL_DIR) $(1)/usr/bin $(1)/usr/lib/sodama $(1)/usr/share/sodama/rules
 	$(INSTALL_DIR) $(1)/etc/init.d $(1)/etc/config
 	$(INSTALL_BIN) $(PKG_BUILD_DIR)/sodama $(1)/usr/bin/sodama
 	$(INSTALL_DATA) $(PKG_BUILD_DIR)/sodama-ebpf $(1)/usr/lib/sodama/sodama-ebpf
 	$(INSTALL_BIN) $(CURDIR)/files/sodama-datapath $(1)/usr/lib/sodama/sodama-datapath
 	$(INSTALL_BIN) $(CURDIR)/files/sodama.init $(1)/etc/init.d/sodama
 	$(INSTALL_CONF) $(CURDIR)/files/sodama.config $(1)/etc/config/sodama
-	$(INSTALL_DATA) $(CURDIR)/files/sodama.example.dae $(1)/usr/share/sodama/config.example.dae
+	# 模板与规则集装到 /usr/share/sodama；/etc 由 postinst 首次复制，升级不覆盖用户改动
+	$(INSTALL_DATA) $(CURDIR)/files/config.example.dae $(1)/usr/share/sodama/config.example.dae
+	$(INSTALL_DATA) $(CURDIR)/files/config.gateway.dae $(1)/usr/share/sodama/config.gateway.dae
+	$(INSTALL_DATA) $(CURDIR)/files/blocklist.txt $(1)/usr/share/sodama/blocklist.txt
+	$(INSTALL_DATA) $(CURDIR)/files/rules/cn_direct.txt $(1)/usr/share/sodama/rules/cn_direct.txt
+	$(INSTALL_DATA) $(CURDIR)/files/rules/user_proxy.txt $(1)/usr/share/sodama/rules/user_proxy.txt
+	$(INSTALL_DATA) $(CURDIR)/files/rules/user_direct.txt $(1)/usr/share/sodama/rules/user_direct.txt
+	$(INSTALL_DATA) $(CURDIR)/files/README.md $(1)/usr/share/sodama/README.md
 endef
 
 define Package/sodama/postinst
 #!/bin/sh
 [ -n "$${IPKG_INSTROOT}" ] && exit 0
-mkdir -p /etc/sodama
+mkdir -p /etc/sodama/rules
 [ -f /etc/sodama/config.dae ] || cp /usr/share/sodama/config.example.dae /etc/sodama/config.dae
+[ -f /etc/sodama/config-gateway.dae ] || cp /usr/share/sodama/config.gateway.dae /etc/sodama/config-gateway.dae
+[ -f /etc/sodama/blocklist.txt ] || cp /usr/share/sodama/blocklist.txt /etc/sodama/blocklist.txt
+for f in cn_direct user_proxy user_direct; do
+	[ -f /etc/sodama/rules/$$f.txt ] || cp /usr/share/sodama/rules/$$f.txt /etc/sodama/rules/$$f.txt
+done
+# dae 配置/规则集权限：同组不可写、其他用户不可读
+chmod 640 /etc/sodama/config.dae /etc/sodama/config-gateway.dae /etc/sodama/blocklist.txt 2>/dev/null
+chmod 640 /etc/sodama/rules/*.txt 2>/dev/null
+echo ":: sodama 已安装。下一步："
+echo "   1) 编辑 /etc/sodama/config.dae（wan/lan 接口 + 节点或订阅）"
+echo "   2) sodama validate /etc/sodama/config.dae"
+echo "   3) uci set sodama.main.enabled=1 && uci commit sodama"
+echo "   4) /etc/init.d/sodama start"
+echo "   详见 /usr/share/sodama/README.md"
 exit 0
 endef
 

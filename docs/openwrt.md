@@ -1,6 +1,9 @@
 # OpenWrt 支持（P0：musl 构建 · 内核要求 · 打包 · QEMU 验证）
 
-本文件是 sodama 跑在 OpenWrt 上的完整说明：**平台前提、交叉构建、ipk 打包、拓扑与系统集成、验证与排障**。
+> **先看用户向说明：[`openwrt-guide.md`](openwrt-guide.md)** —— 安装/配置/拓扑/排障/升级，可直接转给使用者。
+> 本文件是同一主题的**开发向**记录：内核开关细节、自编内核进度、QEMU 冒烟方法。
+
+本文件是 sodama 跑在 OpenWrt 上的完整技术说明：**平台前提、交叉构建、ipk 打包、拓扑与系统集成、验证与排障**。
 配套文件在 `install/openwrt/`（包与 procd/uci）与 `sodama/lab/build-openwrt.sh`、`sodama/lab/openwrt-smoke.sh`。
 
 ## 0. 一句话结论（先读）
@@ -132,7 +135,11 @@ make defconfig && make -j$(nproc)
 | `install/openwrt/files/sodama.init` | procd：start=setup+loader、stop=teardown、reload=`sodama reload`；respawn 守护 |
 | `install/openwrt/files/sodama-datapath` | 数据面对建立/回收（对照 `sodama/lab/gateway.sh`） |
 | `install/openwrt/files/sodama.config` | `/etc/config/sodama`（enabled/config/lan/wan/dual/status_socket/…） |
-| `install/openwrt/files/sodama.example.dae` | `/usr/share/sodama/config.example.dae`（校验通过） |
+| `install/openwrt/files/config.example.dae` | `/usr/share/sodama/config.example.dae`（min profile，校验通过） |
+| `install/openwrt/files/config.gateway.dae` | `/usr/share/sodama/config.gateway.dae`（gateway profile，需 geodata） |
+| `install/openwrt/files/rules/*.txt`、`blocklist.txt` | 规则集（`cn_direct`/`user_proxy`/`user_direct`）与 DNS 拦截名单 |
+| `install/openwrt/files/sync-config.sh` | 从 `packaging/arch/` 同步上述资产（`--check` 供发布门禁） |
+| `install/openwrt/files/README.md` | 安装到 `/usr/share/sodama/README.md`（= `docs/openwrt-guide.md`） |
 | `install/openwrt/kernel-fragment.config` | 内核开关片段（§2） |
 
 > 若在 buildroot 里从源码构建（非预编译），把仓库作为 `package/sodama` 并按 OpenWrt 的 rust-package
