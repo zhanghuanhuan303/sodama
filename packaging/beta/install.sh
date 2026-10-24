@@ -312,8 +312,56 @@ EOF
 
 # 旧版出厂模板的 routing 只有 fallback（不是规则），引擎会拒启。
 # 升级场景（config.dae 是 pacman backup，不会被覆盖）就地修复：补默认直连规则。
-ensure_routing_rules() {
-  local cfg=/etc/sodama/config.dae out tmp
+# 旧版模板（1.0.0-2 及更早）没有 rule_set 段：面板的「规则集/加条目」会直接 400
+# 「配置里没有规则集」，且国产 AI API 也没有 cn_direct 兜底。升级时就地补齐：
+#  - 追加 rule_set 三条（文件已由包安装到 /etc/sodama/rules/）
+#  - 在 routing 开头插四条（user_proxy/user_direct/cn_direct），验证失败自动回滚。
+ensure_rule_set_section() { # [cfg]
+  local cfg="${1:-/etc/sodama/config.dae}" bak tmp out rules_dir
+  grep -qE '^[[:space:]]*rule_set[[:space:]]*\{' "$cfg" && return 0
+  rules_dir="$(dirname "$cfg")/rules"
+  [[ -f "$rules_dir/cn_direct.txt" ]] || return 0
+
+  warn "配置里没有 rule_set 段（旧模板）：补上标准规则集引用（之后可在面板里编辑）"
+  bak="$cfg.bak-$(date +%Y%m%d-%H%M%S)"
+  cp -a "$cfg" "$bak"
+
+  tmp="$(mktemp)"
+  awk '
+    done == 0 && /^[[:space:]]*routing[[:space:]]*\{/ {
+      print
+      print "    domain(ruleset: user_proxy) -> proxy"
+      print "    domain(ruleset: user_direct) -> direct"
+      print "    domain(ruleset: cn_direct) -> direct"
+      done = 1; next
+    }
+    { print }
+  ' "$cfg" >"$tmp"
+  cat "$tmp" >"$cfg"
+  rm -f "$tmp"
+
+  cat >>"$cfg" <<'EOF'
+
+rule_set {
+    cn_direct: 'rules/cn_direct.txt'
+    user_proxy: 'rules/user_proxy.txt'
+    user_direct: 'rules/user_direct.txt'
+}
+EOF
+  chmod 640 "$cfg"
+
+  if out="$(sodama validate "$cfg" 2>&1)"; then
+    ok "已补 rule_set + cn_direct 规则（配置已备份：$bak）"
+    return 0
+  fi
+  warn "补 rule_set 后校验失败，已回滚："
+  printf '%s\n' "$out" >&2
+  cat "$bak" >"$cfg"
+  return 1
+}
+
+ensure_routing_rules() { # [cfg]
+  local cfg="${1:-/etc/sodama/config.dae}" out tmp
   out="$(sodama validate "$cfg" 2>&1)" && return 0
   printf '%s\n' "$out" | grep -q '没有任何可编译规则' || return 0
   if grep -qE '^[[:space:]]*(dip|domain|pname|qname|l4proto|dport|sip|ip)\(' "$cfg"; then
@@ -352,7 +400,9 @@ guide_config() {
   [[ -f "$cfg" ]] || die "包内没有 $cfg，安装异常"
 
   # 旧模板遗留：routing 只有 fallback（不是规则）→ 引擎拒启，就地补默认规则
-  ensure_routing_rules || warn "routing 段需你手动修复（见上）"
+  ensure_routing_rules "$cfg" || warn "routing 段需你手动修复（见上）"
+  # 旧模板遗留：没有 rule_set → 面板不能加规则集/条目，国产 AI API 也没兜底
+  ensure_rule_set_section "$cfg" || warn "rule_set 段需你手动修复（见上）"
 
   local fresh=0
   if grep -q 'socks5://127.0.0.1:1080' "$cfg"; then fresh=1; fi

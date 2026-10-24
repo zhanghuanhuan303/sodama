@@ -2846,6 +2846,24 @@ group { alt { filter: name(x) } }"#,
         for d in ["deepseek.com", "moonshot.cn", "bigmodel.cn"] {
             assert!(cn.lines().any(|l| l.trim() == d), "cn_direct.txt 缺 {d}");
         }
+        // 用引擎真实的规则集解析器再验一遍：文件格式必须被识别为 suffix 条目
+        let data = crate::ruleset::parse_ruleset(cn.as_bytes()).expect("cn_direct.txt 解析失败");
+        assert!(
+            data.suffix.iter().any(|d| d == "deepseek.com"),
+            "cn_direct.txt 未被解析为 suffix 条目：{:?}",
+            &data.suffix[..data.suffix.len().min(8)]
+        );
+        assert!(
+            data.total() > 30,
+            "cn_direct.txt 条目太少：{}",
+            data.total()
+        );
+        // 空规则集/全注释文件不能报错（用户可能把 user_direct.txt 清空）
+        let empty = crate::ruleset::parse_ruleset(
+            include_bytes!("../../../packaging/arch/rules/user_direct.txt").as_slice(),
+        )
+        .expect("user_direct.txt 解析失败");
+        assert_eq!(empty.total(), 0);
     }
 
     #[test]
