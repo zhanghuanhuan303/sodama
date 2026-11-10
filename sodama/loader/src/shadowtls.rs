@@ -1,4 +1,6 @@
-// SPDX-License-Identifier: GPL-2.0
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+// Copyright (C) 2026 sodama contributors
 //! P31：shadow-tls 客户端（v1/v2/v3）——sing-shadowtls 线格式的 Rust 实现（ADR-0055）。
 //!
 //! - **v1**：TLS（≤1.2）伪装握手后裸 TCP 隧道（无认证、无帧；参考实现同样锁 TLS 1.2）。

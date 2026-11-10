@@ -1,0 +1,6 @@
+# 引擎/面板使用 stable；eBPF 数据面按 sodama/lab/build-ebpf-rs.sh 使用
+# 固定日期的 nightly + rust-src（CI 中固定，见 .github/workflows/ci.yml）。
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+// Copyright (C) 2026 sodama contributors
+
 //! sodama 控制面板前端（Leptos CSR → WASM）。
 //!
 //! 视觉基调：Tufte 式极简 —— 无卡片框、无线可省则省（只剩节分隔/表头/表尾三种用途）、

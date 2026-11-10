@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+# Copyright (C) 2026 sodama contributors
+
 """P38 full-cone 探针：**同一个客户端 socket** 向两个 UDP 回显目标发报文并收集应答。
 
 用途：验证 UDP 端点按客户端 src 复用（full-cone）——单 socket 双目标应命中同一出口端点

@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+// Copyright (C) 2026 sodama contributors
+
 //! 总览页的两个头部区块：
 //! - `RuntimeCard`：引擎运行时（内存 / 线程 / FD / CPU + 控制动作）——页面重点
 //! - `MetricsTable`：运行指标三线表（表头线 + 数据 + 注释行，无竖线）
@@ -292,7 +296,10 @@ pub fn RuntimeCard(
 /// - `trace`：短时内核事件抓取（秒数/协议/只看丢弃），结果就地展示；
 /// - `sysdump`：一键下载诊断包（tar.gz，含 status/config/maps + 现场 ip/nft/sysctl）。
 #[component]
-pub fn EngineOps(token: RwSignal<Option<String>>, msg: RwSignal<Option<(bool, String)>>) -> impl IntoView {
+pub fn EngineOps(
+    token: RwSignal<Option<String>>,
+    msg: RwSignal<Option<(bool, String)>>,
+) -> impl IntoView {
     let drain = RwSignal::new(String::new());
     let abort = RwSignal::new(false);
     let busy = RwSignal::new(false);
@@ -309,27 +316,35 @@ pub fn EngineOps(token: RwSignal<Option<String>>, msg: RwSignal<Option<(bool, St
             "abort": abort.get(),
         })
     };
-    let act = move |label: &'static str, path: &'static str, body: serde_json::Value, must_arm: bool| {
-        if must_arm && armed.get() != label {
-            armed.set(label);
-            return;
-        }
-        armed.set("");
-        let tok = token.get_untracked();
-        busy.set(true);
-        msg.set(None);
-        leptos::task::spawn_local(async move {
-            let r = post_json::<_, ActionResult>(path, &body, tok.as_deref()).await;
-            busy.set(false);
-            msg.set(Some(match r {
-                Ok(v) => {
-                    let detail = format!("{}{}", v.stdout.trim(), v.stderr.trim());
-                    (v.ok, if detail.is_empty() { format!("{label} 完成") } else { format!("{label}：{detail}") })
-                }
-                Err(e) => (false, format!("{label} 失败：{e}")),
-            }));
-        });
-    };
+    let act =
+        move |label: &'static str, path: &'static str, body: serde_json::Value, must_arm: bool| {
+            if must_arm && armed.get() != label {
+                armed.set(label);
+                return;
+            }
+            armed.set("");
+            let tok = token.get_untracked();
+            busy.set(true);
+            msg.set(None);
+            leptos::task::spawn_local(async move {
+                let r = post_json::<_, ActionResult>(path, &body, tok.as_deref()).await;
+                busy.set(false);
+                msg.set(Some(match r {
+                    Ok(v) => {
+                        let detail = format!("{}{}", v.stdout.trim(), v.stderr.trim());
+                        (
+                            v.ok,
+                            if detail.is_empty() {
+                                format!("{label} 完成")
+                            } else {
+                                format!("{label}：{detail}")
+                            },
+                        )
+                    }
+                    Err(e) => (false, format!("{label} 失败：{e}")),
+                }));
+            });
+        };
 
     let sysdump_href = move || match token.get() {
         Some(t) if !t.is_empty() => format!("/api/v1/engine/sysdump?token={t}"),

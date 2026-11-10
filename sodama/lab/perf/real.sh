@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+# Copyright (C) 2026 sodama contributors
+
 # G1：异机服务端 + 公网口径基准（真实订阅节点）。
 #
 # 拓扑：client ns — 网关（被测实现，透明代理）— 宿主默认路由 — 真实节点（异机）— 公网目标。

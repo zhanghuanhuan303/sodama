@@ -1,0 +1,49 @@
+name: Bug report
+description: 报告可复现的缺陷（请先脱敏配置/日志）
+title: "[bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢反馈。请先移除订阅 URL、token、节点域名/IP、路由器地址与任何凭据。
+        安全问题请不要走公开 issue，见 SECURITY.md。
+  - type: input
+    id: version
+    attributes:
+      label: 版本 / commit
+      description: "`sodama --version` 或 git commit"
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: 环境
+      description: 发行版、内核版本、架构、部署方式（Arch / OpenWrt / lab / panel）
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤
+      description: 最小配置 + 命令 + 拓扑；配置请脱敏
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: 期望结果
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: 实际结果
+      description: 关键日志/状态输出；请移除凭据
+    validations:
+      required: true
+  - type: textarea
+    id: extra
+    attributes:
+      label: 补充信息
+      description: 是否可稳定复现、是否与特定协议/内核/网卡相关

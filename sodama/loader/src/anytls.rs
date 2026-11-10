@@ -1,4 +1,6 @@
-// SPDX-License-Identifier: GPL-2.0
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+// Copyright (C) 2026 sodama contributors
 //! P11：AnyTLS 客户端（anytls-go 协议 v2；单 Stream，无会话复用）。
 //!
 //! wire（对照 anytls-go `docs/protocol.md` 与 `proxy/session/session.go`）：

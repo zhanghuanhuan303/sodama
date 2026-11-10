@@ -1,5 +1,7 @@
 # dae 核心数据面笔记（eBPF 分流 / tproxy / 回程还原）
 
+> 公开版：公网 IP 已替换为文档保留地址；原始节点/订阅信息不在仓库中。
+
 这份笔记基于本仓库 clone 的 `dae`（`main` @ `e3fee8f`，tag `nightly`），
 行号均指 `dae/control/kern/tproxy.c`（4403 行），除非另注。
 所有机制都在本目录的 sodama 里被复现并实测（见 README）。

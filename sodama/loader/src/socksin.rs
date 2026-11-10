@@ -1,4 +1,6 @@
-// SPDX-License-Identifier: GPL-2.0
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+// Copyright (C) 2026 sodama contributors
 //! P12：本地 SOCKS5 入口（浏览器/桌面测试用；CONNECT only、无认证）。
 //!
 //! 只做协议解析与应答（RFC1928）：greeting（必须含 0x00 无认证）→ CONNECT →

@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+# Copyright (C) 2026 sodama contributors
+
 """把 sodama 健康曲线 TSV 画成自包含 SVG（只用标准库，无第三方依赖）。
 
 输入：`sh sodama/lab/prod/health-track.sh pull` 拉下来的 `sodama-health.tsv`

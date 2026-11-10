@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+# Copyright (C) 2026 sodama contributors
+
 # 本机开发：后端跑在 127.0.0.1:8099，数据经 SSH 从路由器取；前端产物改完重跑 wasm-pack。
 set -euo pipefail
 cd "$(dirname "$0")/.."

@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+// Copyright (C) 2026 sodama contributors
+
 //! TC classifier 程序族（与 C 同名 + `_l3` 后缀，loader 按名字挂载）。
 //!
 //! 每个分流角色两套程序：无后缀 = 以太（链路头 14B，既有语义）；`_l3` = 无链路头

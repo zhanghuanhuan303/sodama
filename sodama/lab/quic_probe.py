@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+# Copyright (C) 2026 sodama contributors
+
 """P20：QUIC Initial 探针（lab 夹具）——按 RFC 9001 手工构造带 SNI 的客户端 Initial。
 
 与 Rust 侧 `quicsniff` 的互操作是「跨实现」验证：本文件用 Python `cryptography`

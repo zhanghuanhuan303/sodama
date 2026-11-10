@@ -1,4 +1,6 @@
-// SPDX-License-Identifier: GPL-2.0
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+// Copyright (C) 2026 sodama contributors
 //! P27：juicity v0 客户端（QUIC + TUIC 式认证 + trojan 风格元数据）。
 //!
 //! 对照 olicesx/outbound `protocol/juicity/{client,stream_conn,stream_packet_conn}.go`

@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+# Copyright (C) 2026 sodama contributors
+
 """长连接探针：连接 → 发一行 → 读回显 → 等 gap 秒 → 再发一行 → 再读回显。
 
 用于验证「已建立的连接跨规则热重载仍走原路径」——即 conn_state 里缓存的路由判决

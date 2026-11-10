@@ -5,7 +5,9 @@
 *An experimental, ground-up Rust (aya-ebpf/aya) rewrite of dae's core datapath, with
 byte-exact parity tests against dae's Go rule compiler and a netns test lab.*
 
-- **数据面（eBPF）**：8 个程序（7 个 TC classifier + 1 个 `sk_skb` offload verdict）
+> **公开版说明**：本仓库由私有研究工程整理而来；订阅端点、节点域名、公网 IP、生产环境凭据均已脱敏，测试数据为脱敏记录。许可证 **AGPL-3.0-only**，与上游 dae 一致。研究方法与证据分级见 [`docs/methodology.md`](docs/methodology.md)。
+
+- **数据面（eBPF）**：14 个 TC 程序（7 个角色 × 2 种链路头）+ 1 个 `sk_skb` offload verdict
   + 14 张 BTF map，全部为 Rust/aya-ebpf，**无 C 数据面**（P9+，ADR-0025）。
 - **控制面（用户态）**：Rust + aya 加载器——`.dae` 全量配置解析与规则编译、
   透明 DNS 接管（缓存/TCP/regex/EDNS）、TCP relay / UDP NAT / TCP offload、
@@ -25,13 +27,13 @@ byte-exact parity tests against dae's Go rule compiler and a netns test lab.*
 - **生产实战（第二阶段，2026-10-08 起）**：真网关模式在 OpenWrt 软路由（x86_64 / 2 核 / 4 GB）上线，
   接管全屋流量、接入真实订阅（REALITY / anytls / vless 混合）；四轮侦查/修复全部落地——健康探测线程
   卡死与泄漏、粘滞 IP「永不重解析」、热重载超时误报、订阅截断静默通过（见
-  [`docs/phase2-devlog.md`](./docs/phase2-devlog.md)）；**72h 生产测试进行中**。
+  [`docs/phase2-devlog.md`](./docs/phase2-devlog.md)）；长期运行记录见 devlog。
 
-实验室全量回归（唯一 Rust 数据面，2026-10-06，第二阶段起点基线）：
+实验室全量回归（唯一 Rust 数据面；2026-10-06 基线，后续 CI 持续更新）：
 
 | 项 | 结果 |
 |---|---|
-| 单元测试 `cargo test --release` | **268/268**（7 ignored） |
+| 单元测试 `cargo test --release --workspace` | **352 + 3 passed**（2026-11-10 公开版复跑；7 ignored） |
 | 转发面核心回归（真实转发 / janitor 回收 / **泵线程泄漏回归**） | 3/3（新用例双向验证：修复版 PASS、回退旧语义 FAIL） |
 | `verify`（标准 / 单臂拓扑） | 9/9 · 9/9 |
 | DNS 专项（domain/cache/tcp/reload/edns/regex） | 6/6 |
@@ -67,8 +69,7 @@ byte-exact parity tests against dae's Go rule compiler and a netns test lab.*
 **修复后稳态**（25 h 曲线，1486 采样）：RSS 平台 **50–53 MB**（重启瞬时 39.4 MB）；线程 16–66；
 `stragglers` **0/1486**；探测看门狗从未触发；三次热重载前后内存无跳变。
 
-**72h 生产测试进行中**（2026-10-11 启动）：判据为相对 1 h 基线漂移 ≤5% 且失败零增长；
-在完成前不启用「bounded-memory」表述（运行协议与记分板见 devlog §12）。
+**长期运行验证**（2026-10-08 起）：真网关在 OpenWrt 软路由上连续运行，判据为相对 1 h 基线漂移 ≤5% 且失败零增长；完整运行协议、记分板与遗留监控台账见 devlog §12。
 
 ## 仓库结构
 
@@ -84,7 +85,7 @@ docs/                        决策、架构与报告
 ├── project-summary.html         工程总结报告
 ├── perf-report.md               四方性能对拍（已并入 benchmark-report；存档）
 ├── parity-status.md             对标进度：dae（Go）↔ sodama（全 Rust）分域覆盖度
-├── phase2-devlog.md             第二阶段（生产实战轮）开发记录（侦查/修复/验收 + 72h 测试记分板）
+├── phase2-devlog.md             第二阶段（生产实战轮）开发记录（侦查/修复/验收 + 长期运行记分板）
 └── notes/                       本地工程笔记（**不入库**：含真实订阅/节点信息，见 .git/info/exclude）
 
 sodama/                    引擎（构建、实验、测试都在这里）
@@ -143,6 +144,8 @@ dae/                         上游 dae clone（不入库；对拍工具按需�
 `bpf-linker`、`libbpf` 头文件、`ip`/`tc`/`bpftool`、python3（`cryptography`）、
 gcc（仅压测夹具 `lab/bench_io.c`）。
 
+> **安全提示**：sodama 以 root/特权运行 eBPF；Web 面板默认只监听 `127.0.0.1:8080`，**非回环绑定且未设置 token 时会拒绝启动**。不要在公网暴露未鉴权的控制面板。
+
 ```bash
 cd sodama
 lab/lab.sh build           # 构建 Rust 加载器 + Rust eBPF 对象（不需要 root）
@@ -165,7 +168,7 @@ sudo lab/lab.sh down
   决策点 D1–D8 与迁移路线（K0–K3、P3–P18）。
 - [`docs/phase2-devlog.md`](./docs/phase2-devlog.md) — **第二阶段 · 生产实战轮**开发记录：
   软路由生产环境自 2026-10-08 起的四轮侦查/修复（探测卡死与线程泄漏、粘滞 IP 重解析、热重载解耦、
-  按源保留、订阅正文完整性）+ 72h 生产测试记分板与遗留监控台账。
+  按源保留、订阅正文完整性）+ 长期运行记分板与遗留监控台账。
 - [`docs/security-proposal.md`](./docs/security-proposal.md) — **安全工程提案（待采纳）**：
   攻击面取证（9 类输入 × 解析器 × 现有防线）、nightly + bpf-linker 供应链缺口，
   S0–S5 排期（fuzz ≥8 目标、QEMU 特权加载 CI、工具链钉死与 cargo-deny、panic 面与默认暴露面收紧）。
@@ -181,12 +184,29 @@ sudo lab/lab.sh down
 - [`docs/parity-status.md`](./docs/parity-status.md) — 对标进度：dae（Go）↔ sodama（全 Rust）
   分域覆盖度对照（15 域 + 汇总 + Top 缺口 + 优势项，逐行附证据锚点）。
 - [`docs/modules/`](./docs/modules/) — tuic v5 / hysteria2 的字节级客户端规格。
+- [`docs/methodology.md`](./docs/methodology.md) — 研究方法与可复现性：证据分级、与 dae 的逐字节对拍、性能口径、脱敏规则。
+
+## 研究方法与可复现性
+
+本仓库按「可运行、可对拍、可复现」组织：
+
+- **证据分级**：结论标注「已实测 / 源码实测 / 推断」，引用代码时使用 `文件:行号`。
+- **三级验收**：单元测试 → netns lab 专项 → 真实节点/真网关验收；边界项明确登记，不把未做写成已做。
+- **对拍**：规则编译与 dae 原版 Go 编译器逐字节对比；协议实现与 Go/参照客户端跨实现联调。
+- **性能口径**：进程 CPU、内核侧 CPU、四层内存分开记账；固定节点/固定后端/固定目标，短传输判定与重试规则写入脚本。
+- **脱敏**：公开仓库不保存真实订阅 URL、token、节点域名或生产环境凭据；公网 IP 使用 RFC 5737/3849 文档保留地址。测试数据保留相对结论与复现方法。
+
+## 贡献与安全
+
+- 贡献指南：[`CONTRIBUTING.md`](./CONTRIBUTING.md)
+- 安全策略与漏洞报告：[`SECURITY.md`](./SECURITY.md)
+- 第三方声明：[`NOTICE`](./NOTICE) / [`THIRD_PARTY_LICENSES.md`](./THIRD_PARTY_LICENSES.md)
 
 ## 上游与许可
 
 - 本仓库是对 dae（Go + eBPF）的**学习/研究性 Rust 重写**，不是 dae 官方项目；
   许多语义、map 布局与协议实现以 dae 源码为参照（逐项记录在文档与注释中）。
-- 许可证：**AGPL-3.0-only**（见 [`LICENSE`](./LICENSE)），与上游 dae 一致。
+- 许可证：**AGPL-3.0-only**（见 [`LICENSE`](./LICENSE)）。上游 dae 与 daeuniverse/outbound 均为 AGPL-3.0；本仓库保持同一许可证，不提供 GPL-3.0 重新许可。
 - 上游代码不随本仓库分发：`dae/` 与 `sodama/lab/parity/dae-work/` 均在
   `.gitignore` 中。需要运行规则对拍/跨实现联调时，把 dae clone 到本仓库同级目录：
 
@@ -196,4 +216,5 @@ sudo lab/lab.sh down
   ```
 
 - 唯一保留的 C 源文件是压测服务端夹具 `sodama/lab/bench_io.c`（不属于数据面）。
+- 第三方代码/数据声明见 [`NOTICE`](./NOTICE) 与 [`THIRD_PARTY_LICENSES.md`](./THIRD_PARTY_LICENSES.md)。
 - 第三方商标与项目名称归其各自所有者；本仓库与 daeuniverse 无隶属关系。

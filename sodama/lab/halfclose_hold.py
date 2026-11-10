@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+# Copyright (C) 2026 sodama contributors
+
 """半关闭姿态探针：请求 → 读一次应答 → 保持连接（不读、不写、不关）。
 
 回归对象：relay 泵线程泄漏（O9）。wan_echo 的 8083 端点应答后立即关闭，

@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+# Copyright (C) 2026 sodama contributors
+
 # sodama 性能对比：sodama vs dae vs sing-box vs v2ray。
 #
 # 同一 lab 拓扑（client ns — 网关 — WAN ns）、同一 ss 上游、同一 C 负载（bench_io）：

@@ -1,4 +1,6 @@
-// SPDX-License-Identifier: GPL-2.0
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+// Copyright (C) 2026 sodama contributors
 //! P5-G3b+：Brutal 拥塞控制的近似移植（ADR-0020）。
 //!
 //! Go 侧 hysteria2 客户端在认证成功后按 `min(server_rx, client_tx)` 安装 **Brutal**

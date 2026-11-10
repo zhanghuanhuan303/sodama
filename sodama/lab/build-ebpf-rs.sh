@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+# Copyright (C) 2026 sodama contributors
+
 # P8：编译 Rust/aya-ebpf 数据面对象（offload 垂直切片）。
 #
 # 依赖（本机已配好，见 NOTES §11.13）：

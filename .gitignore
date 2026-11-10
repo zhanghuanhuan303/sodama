@@ -11,6 +11,7 @@
 
 # lab 生成物（都可由脚本重建，见 sodama/README.md）
 /sodama/lab/parity/dae-work/
+/sodama/lab/parity/out/
 /sodama/lab/parity/.parity-out.*
 /sodama/lab/parity/.parity-test-log.*
 /sodama/lab/matrix/out/

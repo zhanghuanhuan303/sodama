@@ -8,7 +8,7 @@ pkgver=1.0.0
 pkgrel=3
 pkgdesc="Transparent proxy gateway with a Rust eBPF datapath (dae rewrite) — prebuilt"
 arch=('x86_64')
-url="https://github.com/zhanghuanhuan303/dae-rust"
+url="https://github.com/zhanghuanhuan303/sodama"
 license=('AGPL-3.0-only')
 depends=('iproute2' 'procps-ng' 'sh')
 optdepends=(
@@ -24,7 +24,8 @@ install=sodama-bin.install
 # eBPF 对象必须保留 .symtab/.BTF（map 定义与 BTF map 依赖符号）；不 strip、不生成 debug 包。
 options=('!debug' '!strip')
 source=("sodama-$pkgver-$CARCH.tar.gz::$url/releases/download/v$pkgver/sodama-$pkgver-$CARCH.tar.gz")
-sha256sums=('6d820d77ab9d294b2b6cadec23da64cceba0f2bc632e088cf37665f7fb8f2af0')
+# TODO(release): 由 packaging/make-release.sh 重新生成 tarball 后回填 sha256。
+sha256sums=('SKIP')
 
 check() {
   cd "$srcdir/sodama-$pkgver-$CARCH"

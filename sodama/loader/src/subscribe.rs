@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+// Copyright (C) 2026 sodama contributors
+
 //! P15：订阅拉取（HTTP/HTTPS/file）与节点链接解析。
 //!
 //! 对照 dae `control/subscription`：拉取订阅 URL → base64（或明文）→ 逐行链接。

@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+// Copyright (C) 2026 sodama contributors
+
 //! C3：事件通道（ringbuf + 每键限速），对照 dae `send_dae_event` /
 //! `blocked_event_rate_limited`（`dae/control/kern/tproxy.c:749-875`）。
 //!

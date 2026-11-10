@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+// Copyright (C) 2026 sodama contributors
+
 //! sodama 面板：前后端共享 DTO。
 //!
 //! 后端把引擎 `status` JSON 裁剪为这里的稳定视图；前端只依赖本 crate，

@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+# Copyright (C) 2026 sodama contributors
+
 # sodama 内测安装脚本（Arch Linux, x86_64）—— 交互式
 #
 #   sudo bash install.sh                  # 引导式：自检 → 装包 → 选网卡 → 填订阅/节点 → 校验 → 启动

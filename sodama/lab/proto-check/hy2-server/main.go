@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+// Copyright (C) 2026 sodama contributors
+
 // hy2-server：hysteria2 独立参考服务端（P5-G3b，lab 用；quic-go fork + http3）。
 //
 // 从 olicesx/outbound 的 protocol/hysteria2/e2e_test.go 的服务端移植为独立进程：

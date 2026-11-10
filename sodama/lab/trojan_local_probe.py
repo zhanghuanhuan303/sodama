@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+# Copyright (C) 2026 sodama contributors
+
 """本地最小复现：trojan_server.py 当服务端，纯 Python trojan 客户端打 512KB。
 
 不依赖 netns；目标是一个本地 echo（127.0.0.1:19999）。需要自签证书（lab/certs）。

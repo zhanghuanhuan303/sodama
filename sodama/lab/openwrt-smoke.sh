@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+# Copyright (C) 2026 sodama contributors
+
 # OpenWrt x86_64 QEMU 冒烟（P0 验证链）：
 #   官方 24.10.4 镜像 + sodama musl 产物 + 离线 kmod/ipk →
 #   验证「二进制可运行 → ipk 可装 → veth/datapath 可建 → eBPF 加载/TCX 挂载 → status 可查」。

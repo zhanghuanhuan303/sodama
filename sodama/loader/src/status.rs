@@ -1,4 +1,6 @@
-// SPDX-License-Identifier: GPL-2.0
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+// Copyright (C) 2026 sodama contributors
 //! 状态面 + 主循环消息通道（K3/P3a；P6 起含控制命令）。
 //!
 //! 协议：客户端发一行命令，服务端回一行（JSON，metrics 为 Prometheus 文本）后关闭连接。

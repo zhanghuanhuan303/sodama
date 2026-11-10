@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+# Copyright (C) 2026 sodama contributors
+
 # I4：长稳曲线化（bounded-memory）——轻负载 + 周期采样，输出 CSV 曲线与漂移判据。
 #
 # 负载（轻量，避免压垮测试机）：

@@ -1,3 +1,8 @@
+/* SPDX-License-Identifier: AGPL-3.0-only
+ * Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+ * Copyright (C) 2026 sodama contributors
+ */
+
 /* P7 基准端点：TCP/UDP echo 服务端 + 客户端工作负载。
  *
  * Python 探针（client_probe/stream_probe/wan_echo）作为端点会先于 sodama

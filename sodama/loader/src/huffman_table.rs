@@ -1,4 +1,6 @@
-// SPDX-License-Identifier: GPL-2.0
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+// Copyright (C) 2026 sodama contributors
 // 由 lab/gen-huffman-table.py 生成：
 //   - HUFFMAN_* 来自 golang.org/x/net/http2/hpack/tables.go（HPACK/RFC 7541 附录 B）
 //   - QPACK_STATIC 来自 olicesx/qpack static_table.go（QPACK/RFC 9204 附录 A）

@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+# Copyright (C) 2026 sodama contributors
+
 """从本机 Go module 缓存生成 hysteria2 认证所需的常量表：
 
 1) HPACK Huffman 表（golang.org/x/net/http2/hpack/tables.go，RFC 7541 附录 B）
@@ -49,7 +53,9 @@ def rust_str(s):
 
 
 out = []
-out.append("// SPDX-License-Identifier: GPL-2.0")
+out.append("// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+// Copyright (C) 2026 sodama contributors")
 out.append("// 由 lab/gen-huffman-table.py 生成：")
 out.append("//   - HUFFMAN_* 来自 golang.org/x/net/http2/hpack/tables.go（HPACK/RFC 7541 附录 B）")
 out.append("//   - QPACK_STATIC 来自 olicesx/qpack static_table.go（QPACK/RFC 9204 附录 A）")

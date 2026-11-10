@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+// Copyright (C) 2026 sodama contributors
+
 // P27：juicity v0 参考服务端（Go + quic-go fork；ALPN=h3）。
 //
 // 从 olicesx/outbound 的 protocol/juicity/e2e_test.go 的服务端移植为独立进程

@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+// Copyright (C) 2026 sodama contributors
+
 // doq-server：DoQ（RFC 9250）独立参考服务端（P18b，lab 用；quic-go）。
 //
 // 独立实现（不复用 dae/sodama 的代码），用于与 sodama 的 Rust/quinn DoQ 客户端

@@ -1,4 +1,6 @@
-// SPDX-License-Identifier: GPL-2.0
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+// Copyright (C) 2026 sodama contributors
 //! P18c+ / M3：VLESS `xtls-rprx-vision` 客户端帧层（对照 dae outbound `vision` 包）。
 //!
 //! 线上布局（VLESS 载荷之内，外层仍是 TLS/REALITY 加密）：

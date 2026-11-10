@@ -1,4 +1,6 @@
-// SPDX-License-Identifier: GPL-2.0
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+// Copyright (C) 2026 sodama contributors
 //! QUIC 可变长整数（RFC 9000 §16）——hysteria2 帧与 HTTP/3 帧共用。
 //!
 //! 变体规则：首字节高 2 位决定总长（00=1B / 01=2B / 10=4B / 11=8B），

@@ -1,6 +1,6 @@
 [Unit]
 Description=sodama transparent proxy gateway (eBPF datapath)
-Documentation=https://github.com/zhanghuanhuan303/dae-rust/blob/main/docs/arch-linux.md
+Documentation=https://github.com/zhanghuanhuan303/sodama/blob/main/docs/arch-linux.md
 After=network-online.target systemd-sysctl.service
 Wants=network-online.target
 # 崩溃环熔断（对照 dae StartLimitIntervalSec=300 / StartLimitBurst=5）

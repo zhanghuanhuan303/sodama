@@ -1,4 +1,6 @@
-// SPDX-License-Identifier: GPL-2.0
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+// Copyright (C) 2026 sodama contributors
 //! A2 #10：`real_domain_runtime`——「已验证真实域名」的确认集与负缓存
 //! （对照 dae `control/real_domain_runtime.go` + `control_plane_dialtarget.go`）。
 //!

@@ -1,4 +1,6 @@
-// SPDX-License-Identifier: GPL-2.0
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+// Copyright (C) 2026 sodama contributors
 //! P30：SSR（shadowsocksr-stream）流密码层。
 //!
 //! 对齐 Go 参考实现 `olicesx/outbound/ciphers/stream_cipher.go`：

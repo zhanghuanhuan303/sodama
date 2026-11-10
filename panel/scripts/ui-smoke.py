@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+# Copyright (C) 2026 sodama contributors
+
 """用 chromedriver（WebDriver/HTTP，无第三方依赖）做配置页端到端点击测试：
 填订阅表单 → 点「解析预览」→ 等结果 → 截图。"""
 import base64

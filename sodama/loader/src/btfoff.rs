@@ -1,4 +1,6 @@
-// SPDX-License-Identifier: GPL-2.0
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+// Copyright (C) 2026 sodama contributors
 //! 运行内核 BTF 解析：`struct sk_buff` 字段偏移（CO-RE 的用户态替代品）。
 //!
 //! 为什么需要：aya/aya-ebpf 没有 clang CO-RE 的 `bpf_core_read` / `BPF_CORE_READ`
@@ -369,7 +371,7 @@ fn lookup_member_bits(
         })?;
 
     // 第一遍：具名直接成员。
-    for m in members.chunks_exact(12) {
+    for m in members.as_chunks::<12>().0 {
         let name_off = member_u32(m, 0);
         if name_off == 0 {
             continue;
@@ -391,7 +393,7 @@ fn lookup_member_bits(
     if depth >= MAX_ANON_DEPTH {
         return Ok(None);
     }
-    for m in members.chunks_exact(12) {
+    for m in members.as_chunks::<12>().0 {
         if member_u32(m, 0) != 0 {
             continue;
         }

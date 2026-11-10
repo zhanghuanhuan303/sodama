@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+// Copyright (C) 2026 sodama contributors
+
 //! 能力缺口 #3：接口懒绑定/热插拔（对照 dae `component/interface_manager.go` +
 //! `control/control_plane_core_bind.go:487+` 的 pattern 注册 + `cmd/run_config.go:144-157`
 //! 的 `wan_interface: auto`）。

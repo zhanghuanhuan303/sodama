@@ -1,4 +1,6 @@
-// SPDX-License-Identifier: GPL-2.0
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+// Copyright (C) 2026 sodama contributors
 //! P30：SSR（shadowsocksr-stream）客户端。
 //!
 //! 当前形态（见 ADR-0054 边界）：**origin proto + plain obfs + 流密码**（`ssr_cipher`）、

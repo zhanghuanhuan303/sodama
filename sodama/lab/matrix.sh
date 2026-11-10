@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+# Copyright (C) 2026 sodama contributors
+
 # K2 内核矩阵：同一份 sodama，在不同内核上跑同一套验证。
 #
 #   lab/matrix.sh check        # 打印当前内核版本与能力门槛（5.17 / 6.6 / 6.14.7）

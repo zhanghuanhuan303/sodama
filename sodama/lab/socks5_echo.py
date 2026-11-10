@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+# Copyright (C) 2026 sodama contributors
+
 """最小 SOCKS5 后端（无认证，只支持 CONNECT）：K3「过渡一跳」的实验对端。
 
 收到 CONNECT 后把目标写进日志文件（lab 用它断言 orig_dst 被保留），

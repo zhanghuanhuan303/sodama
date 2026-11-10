@@ -1,4 +1,8 @@
 #!/bin/sh
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+# Copyright (C) 2026 sodama contributors
+
 # 构建 DoH over HTTP/3 参考服务端（Go + quic-go fork + http3）。需要 parity 的
 # dae-work 模块图与本机 Go module 缓存（离线可构建，GOPROXY=off）。
 #

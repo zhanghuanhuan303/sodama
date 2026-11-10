@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+// Copyright (C) 2026 sodama contributors
+
 //! P36：规则集（`rule_set { tag: 'url|路径' }`）——标准格式分流规则文件的获取/缓存/解析。
 //!
 //! 支持格式（按内容自动识别）：

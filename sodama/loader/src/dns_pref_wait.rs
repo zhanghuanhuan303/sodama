@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+// Copyright (C) 2026 sodama contributors
 //! A2 #7/#12：`ipversion_prefer` 的 50ms 偏好等待（对照 dae `dns_preference_wait.go`）。
 //!
 //! RFC 8305（Happy Eyeballs v2）§3：若 A 应答先到（可能只是乱序），客户端应等待一小段

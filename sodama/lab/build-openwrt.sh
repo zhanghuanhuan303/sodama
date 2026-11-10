@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+# Copyright (C) 2026 sodama contributors
+
 # OpenWrt（musl）交叉构建与交付物打包。
 #
 #   lab/build-openwrt.sh                       # 全架构（x86_64/aarch64/armv7）

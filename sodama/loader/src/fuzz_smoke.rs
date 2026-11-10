@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+// Copyright (C) 2026 sodama contributors
 //! P38：**确定性变异模糊测试**（A1 #19「fuzz 目标」的可运行形态）。
 //!
 //! 为什么不用 cargo-fuzz：本仓库的验证约束是「不引入不可复现的工具链」——libFuzzer

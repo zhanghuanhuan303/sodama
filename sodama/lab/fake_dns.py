@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+# Copyright (C) 2026 sodama contributors
+
 """假上游 DNS（P3a/P3b-1 实验用）：UDP + TCP 同一地址，按固定表回答 A 记录。
 
 用法： fake_dns.py <query_log> [port] [bind_host]

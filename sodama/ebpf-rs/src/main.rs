@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+// Copyright (C) 2026 sodama contributors
+
 //! sodama 数据面（Rust / aya-ebpf）——由 C 版移植而来，现为唯一数据面（ADR-0024/0025）。
 //!
 //! 程序与 map 的名字、类型、容量、section 与 C 版逐一对齐（原 C 对象已移除，ADR-0025）：

@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+# Copyright (C) 2026 sodama contributors
+
 """DNS 客户端探针（P3a/P3b-1）：向 <server>:<port> 查询 <name>，打印解析结果。
 
 用法： dns_probe.py [--tcp] [--edns <size>] [--port <n>] <server> <name> [qtype]

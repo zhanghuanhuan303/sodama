@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+# Copyright (C) 2026 sodama contributors
+
 """用 chromedriver 验证「手动锁定节点」的 UI 路径：点第一行「锁定」→ 校验状态 → 点「恢复自动」。
 
 用法：python3 scripts/ui-smoke-lock.py http://192.0.2.10:8080/

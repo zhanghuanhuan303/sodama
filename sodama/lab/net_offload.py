@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+# Copyright (C) 2026 sodama contributors
+
 """关闭网卡的校验和/分段 offload —— 不依赖 ethtool（lab 机器不一定装）。
 
 为什么需要（踩坑记录，2026-10-16 VM 实测）：

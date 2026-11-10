@@ -1,4 +1,6 @@
-// SPDX-License-Identifier: GPL-2.0
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+// Copyright (C) 2026 sodama contributors
 //! P5：outbound 协议栈——Dialer 抽象 + direct/socks5/http/shadowsocks/trojan/vless/vmess/tuic/hysteria2。
 //!
 //! 梯度与边界见 ADR-0004/ADR-0016/ADR-0018/ADR-0019：

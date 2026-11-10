@@ -60,8 +60,8 @@ yay -S sodama
 本地打包（未发布到 AUR 时）：
 
 ```bash
-git clone https://github.com/zhanghuanhuan303/dae-rust.git
-cd dae-rust/packaging/aur/sodama-bin
+git clone https://github.com/zhanghuanhuan303/sodama.git
+cd sodama/packaging/aur/sodama-bin
 makepkg -si
 # 或源码包：cd ../sodama && makepkg -si
 ```

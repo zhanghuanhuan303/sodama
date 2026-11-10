@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+# Copyright (C) 2026 sodama contributors
+
 # O7：UDP 批量收发基准（sodama 批/非批 A/B + 同机四方对拍）。
 #
 # 拓扑与 lab/perf/run.sh 相同（client ns — 网关 — WAN ns）；WAN 侧 bench_io 的

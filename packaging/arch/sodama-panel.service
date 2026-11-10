@@ -1,6 +1,6 @@
 [Unit]
 Description=sodama web control panel
-Documentation=https://github.com/zhanghuanhuan303/dae-rust/blob/main/docs/arch-linux.md
+Documentation=https://github.com/zhanghuanhuan303/sodama/blob/main/docs/arch-linux.md
 After=network-online.target sodama.service
 Wants=network-online.target
 # 引擎是面板唯一数据源：引擎没起来时面板不启（避免“面板正常但代理不通”的误判）；

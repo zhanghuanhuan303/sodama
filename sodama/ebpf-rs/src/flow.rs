@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+// Copyright (C) 2026 sodama contributors
+
 //! 连接状态、redirect_track 单写者、判决落地与分流主流程（对照 C sodama_conn_*/sodama_split_flow）。
 
 use core::ffi::c_void;

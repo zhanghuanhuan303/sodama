@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+// Copyright (C) 2026 sodama contributors
+
 //! P14：拨号目标地址——IPv4 或域名。
 //!
 //! 域名目标用于「远端域名解析」：嗅探到 SNI/Host 后，把域名（而不是 IP）发给

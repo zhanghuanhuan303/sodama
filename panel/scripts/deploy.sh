@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
-# 部署到软路由（默认 root@192.0.2.10）：二进制 + 前端 + 配置 + procd
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+# Copyright (C) 2026 sodama contributors
+
+# 部署到软路由（HOST/PASS 必填；HOST 例如 root@192.0.2.10）：二进制 + 前端 + 配置 + procd
 set -euo pipefail
 cd "$(dirname "$0")/.."
 

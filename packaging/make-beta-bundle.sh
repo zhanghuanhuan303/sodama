@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+# Copyright (C) 2026 sodama contributors
+
 # 生成「Arch 内测包」：预编译的 .pkg.tar.zst + 交互安装/卸载脚本 + 说明，打成一个文件，
 # 直接发给帮忙测试的人（不需要 GitHub Release，也不需要 AUR，不需要编译）。
 #

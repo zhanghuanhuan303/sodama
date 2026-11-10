@@ -1,4 +1,6 @@
-// SPDX-License-Identifier: GPL-2.0
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+// Copyright (C) 2026 sodama contributors
 //! P18c：`dns.routing` 请求/应答分流（对照 dae `component/dns/request_routing.go`
 //! 与 `response_routing.go` 的 Match 语义与链编码）。
 //!

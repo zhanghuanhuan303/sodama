@@ -4,6 +4,7 @@ version = "1.0.0"
 edition = "2021"
 description = "sodama eBPF 数据面的纯逻辑（host 可单测；被 ebpf-rs 以路径依赖引用）"
 license = "AGPL-3.0-only"
+repository = "https://github.com/zhanghuanhuan303/sodama"
 publish = false
 
 [dependencies]

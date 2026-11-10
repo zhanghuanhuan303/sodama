@@ -2,7 +2,7 @@ pkgbase = sodama
 	pkgdesc = Transparent proxy gateway with a Rust eBPF datapath (dae rewrite)
 	pkgver = 1.0.0
 	pkgrel = 3
-	url = https://github.com/zhanghuanhuan303/dae-rust
+	url = https://github.com/zhanghuanhuan303/sodama
 	install = sodama.install
 	arch = x86_64
 	arch = aarch64
@@ -29,7 +29,7 @@ pkgbase = sodama
 	backup = etc/sodama/rules/user_proxy.txt
 	backup = etc/sodama/rules/user_direct.txt
 	backup = etc/sodama-panel/panel.conf
-	source = git+https://github.com/zhanghuanhuan303/dae-rust.git#tag=v1.0.0
+	source = git+https://github.com/zhanghuanhuan303/sodama.git#tag=v1.0.0
 	sha256sums = SKIP
 
 pkgname = sodama

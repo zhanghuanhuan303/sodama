@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+// Copyright (C) 2026 sodama contributors
+
 //! 纯 SVG 曲线（无 JS 图表依赖）：多序列叠加 + 十字光标（悬停查单点）。
 //!
 //! 十字光标：鼠标移动 → 吸附最近数据点 → 垂直虚线 + 各序列圆点 + tooltip

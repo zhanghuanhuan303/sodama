@@ -1,4 +1,8 @@
 #!/bin/sh
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+# Copyright (C) 2026 sodama contributors
+
 # P5 G2 生态兼容检查：真实 Go 客户端（dae 依赖的 outbound fork）↔ 独立 Python 服务端。
 #
 #   lab/proto-check/run.sh vless [tls]

@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/zhanghuanhuan303/sodama/security/advisories/new
+    about: 请私下报告安全问题，不要开公开 issue
+  - name: Documentation
+    url: https://github.com/zhanghuanhuan303/sodama/tree/main/docs
+    about: 先阅读 README、docs/methodology.md 与 ADR

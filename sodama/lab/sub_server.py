@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+# Copyright (C) 2026 sodama contributors
+
 """P15：订阅服务器（lab 夹具）——把给定文件内容作为 GET /sub 的响应体返回。
 
 用法：python3 sub_server.py <port> <body-file> [<body-file-2>]

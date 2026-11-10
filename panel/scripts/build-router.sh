@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+# Copyright (C) 2026 sodama contributors
+
 # 构建路由器产物：前端 wasm + 后端 x86_64-musl 静态二进制
 # 产物：dist/sodama-panel（二进制）、dist/www/（静态资源）
 set -euo pipefail

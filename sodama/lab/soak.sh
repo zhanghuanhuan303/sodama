@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+# Copyright (C) 2026 sodama contributors
+
 # P7：soak（长时打流 + 反复 reload/suspend/resume，查泄漏）。
 #
 #   lab/soak.sh run [秒数] [tcp|ss|udp]   # 默认 60 秒 + tcp（relay-up 会话）

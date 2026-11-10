@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+# Copyright (C) 2026 sodama contributors
+
 # 用 sing-box 作探针客户端，测单个订阅节点的交付带宽（8MB 下载）。
 # 用法：probe-node.sh <node-url-file> <tag> [bytes]
 # 只输出 tag 与 Mbps；节点 URL 只经文件传递，不打印。

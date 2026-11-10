@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+// Copyright (C) 2026 sodama contributors
+
 // SSR（shadowsocksr-stream，origin proto + plain obfs）参考服务端——lab 跨实现
 // 测试对端（P30 SSR 客户端配套夹具）。
 //

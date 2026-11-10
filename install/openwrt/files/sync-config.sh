@@ -1,4 +1,8 @@
 #!/bin/sh
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+# Copyright (C) 2026 sodama contributors
+
 # 从 packaging/arch/ 同步 OpenWrt 包内资产（唯一事实来源 = packaging/arch/）。
 #
 # OpenWrt 与 Arch 只有「接口名默认值」不同：

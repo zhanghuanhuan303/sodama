@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+# Copyright (C) 2026 sodama contributors
+
 # Vision 内层 TLS 靶站：确定性内容 + 可选 TLS1.2-only 端口（验证 END 回退）。
 # 用法：python3 https_target.py <port> <www-dir> [tls12]
 import http.server

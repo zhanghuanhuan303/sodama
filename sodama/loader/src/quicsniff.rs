@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+// Copyright (C) 2026 sodama contributors
+
 //! P20：QUIC Initial SNI 嗅探（RFC 9001）。
 //!
 //! 用途：UDP 侧域名观测——UDP 数据面（`udp_nat_handle` 新会话）识别 QUIC Initial 并解出

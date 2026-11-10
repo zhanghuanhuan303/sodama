@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+// Copyright (C) 2026 sodama contributors
+
 //! sodama 面板后端：把引擎的 CLI/socket 能力包成 HTTP API，并托管前端静态资源。
 //!
 //! - 与引擎**零协议耦合**：数据来自执行 `sodama` 子命令（命令模板可覆盖，便于本机开发走 SSH）。
@@ -186,7 +190,7 @@ fn parse_cfg() -> (GlobalCfg, Arc<Engine>) {
     };
 
     let g = GlobalCfg {
-        bind: get("bind").unwrap_or_else(|| "0.0.0.0:8080".into()),
+        bind: get("bind").unwrap_or_else(|| "127.0.0.1:8080".into()),
         token: get("token").filter(|t| !t.is_empty()),
         static_dir: PathBuf::from(
             get("static_dir").unwrap_or_else(|| "/usr/share/sodama-panel/dist".into()),
@@ -208,7 +212,7 @@ fn parse_cfg() -> (GlobalCfg, Arc<Engine>) {
             .and_then(|v| v.parse().ok())
             .unwrap_or(7 * 86400),
         tls: flag("tls"),
-        tls_bind: get("tls_bind").unwrap_or_else(|| "0.0.0.0:8443".into()),
+        tls_bind: get("tls_bind").unwrap_or_else(|| "127.0.0.1:8443".into()),
         tls_cert: PathBuf::from(
             get("tls_cert").unwrap_or_else(|| "/etc/sodama-panel/tls/cert.pem".into()),
         ),
@@ -749,7 +753,12 @@ fn to_view(root: &Value, engine: &Engine) -> StatusView {
             active_conns: u64_of(&root["traffic"]["active_conns"]),
             udp_sessions: u64_of(&root["traffic"]["udp_sessions"]),
         },
-        engine_build: engine.build.lock().ok().and_then(|g| g.clone()).and_then(|(_, v)| v),
+        engine_build: engine
+            .build
+            .lock()
+            .ok()
+            .and_then(|g| g.clone())
+            .and_then(|(_, v)| v),
         runtime: proc_runtime(u64_of(&root["pid"]) as u32, engine),
     }
 }
@@ -892,7 +901,10 @@ async fn engine_query(ctx: &Ctx, engine: &Arc<Engine>, cmd: &str) -> Result<Stri
 async fn fetch_view(ctx: &Ctx, engine: &Arc<Engine>) -> Result<StatusView, String> {
     // 引擎构建信息：10 分钟 TTL 的旁路缓存（`--version` 不需 root/socket，失败则不展示）。
     let stale = match engine.build.lock() {
-        Ok(g) => g.as_ref().map(|(at, _)| now_secs().saturating_sub(*at) > 600).unwrap_or(true),
+        Ok(g) => g
+            .as_ref()
+            .map(|(at, _)| now_secs().saturating_sub(*at) > 600)
+            .unwrap_or(true),
         Err(_) => false,
     };
     if stale {
@@ -1759,7 +1771,10 @@ async fn api_source_promote(
     }
     let reload_ok = wait_reload(&ctx, &engine, prev_at, 30).await;
     let message = if reload_ok.is_none() {
-        format!("已把订阅源 {} 设为第一顺位（引擎回执超时，请稍后刷新确认）", req.tag)
+        format!(
+            "已把订阅源 {} 设为第一顺位（引擎回执超时，请稍后刷新确认）",
+            req.tag
+        )
     } else {
         format!("已把订阅源 {} 设为第一顺位", req.tag)
     };
@@ -1947,7 +1962,10 @@ async fn api_file_save(
     }
     let reload_ok = wait_reload(&ctx, &engine, prev_at, 30).await;
     let message = if reload_ok.is_none() {
-        format!("已保存 {}（引擎热重载；回执超时，请稍后刷新确认）", req.name)
+        format!(
+            "已保存 {}（引擎热重载；回执超时，请稍后刷新确认）",
+            req.name
+        )
     } else {
         format!("已保存 {}（引擎热重载）", req.name)
     };
@@ -2148,12 +2166,9 @@ async fn api_sysdump(State(ctx): State<Ctx>, headers: HeaderMap, uri: Uri) -> Re
     }
     let engine = ctx.engine.clone();
     let ts = now_secs();
-    let path = std::env::temp_dir().join(format!("sodama-sysdump-{}-{ts}.tar.gz", std::process::id()));
-    let cmd = format!(
-        "{} sysdump --out {}",
-        engine.sodama,
-        path.display()
-    );
+    let path =
+        std::env::temp_dir().join(format!("sodama-sysdump-{}-{ts}.tar.gz", std::process::id()));
+    let cmd = format!("{} sysdump --out {}", engine.sodama, path.display());
     let res = run_cmd_timeout(&ctx.cfg, &cmd, Duration::from_secs(30)).await;
     match res {
         Ok((code, _out, err)) => {
@@ -2300,11 +2315,38 @@ async fn static_or_spa(State(ctx): State<Ctx>, uri: Uri) -> Response {
     }
 }
 
+fn bind_is_loopback(bind: &str) -> bool {
+    let host = if let Some(rest) = bind.strip_prefix('[') {
+        rest.split_once(']').map(|(h, _)| h).unwrap_or(bind)
+    } else {
+        bind.rsplit_once(':').map(|(h, _)| h).unwrap_or(bind)
+    };
+    host == "localhost"
+        || host
+            .parse::<std::net::IpAddr>()
+            .map(|ip| ip.is_loopback())
+            .unwrap_or(false)
+}
+
 // ---------------------------------------------------------------- main
 
 #[tokio::main]
 async fn main() {
     let (g, engine) = parse_cfg();
+    if g.token.is_none() && !bind_is_loopback(&g.bind) {
+        eprintln!(
+            "[panel] 拒绝启动：bind={} 不是回环地址，但未设置 token；请设置 token 或改 bind=127.0.0.1:8080",
+            g.bind
+        );
+        std::process::exit(2);
+    }
+    if g.tls && g.token.is_none() && !bind_is_loopback(&g.tls_bind) {
+        eprintln!(
+            "[panel] 拒绝启动：tls_bind={} 不是回环地址，但未设置 token；请设置 token 或改 tls_bind=127.0.0.1:8443",
+            g.tls_bind
+        );
+        std::process::exit(2);
+    }
     println!(
         "[panel] 启动：bind={} static={} actions={} token={} 采样={}s/{}点",
         g.bind,
@@ -2313,7 +2355,7 @@ async fn main() {
         if g.token.is_some() {
             "已设置（会话 Cookie）"
         } else {
-            "无（LAN 免认证）"
+            "无（仅回环）"
         },
         g.sample_secs,
         g.series_cap,

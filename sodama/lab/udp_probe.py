@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+# Copyright (C) 2026 sodama contributors
+
 """P4 UDP NAT 探针：向 <host>:<port> 发 <count> 个 UDP 报文并收集应答。
 
 用法： udp_probe.py <host> <port> [count] [interval]

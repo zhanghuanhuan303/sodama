@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+# Copyright (C) 2026 sodama contributors
+
 # sodama 扩展性/效率测量：并发流 1/2/4/8（大流量）+ 64（小流量，看每连接内存/线程）。
 # 路径：direct（eBPF 直转）、ss（Rust ss + 用户态泵）、relay（无加密用户态泵）。
 # 前置：先跑 `sudo PROXY_PROTO=vless lab/perf/run.sh prepare`（默认 vless；建拓扑 + WAN 侧服务）。

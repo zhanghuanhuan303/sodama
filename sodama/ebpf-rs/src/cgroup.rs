@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+// Copyright (C) 2026 sodama contributors
+
 //! P17b：pname 采集程序（cgroup 钩子），对照 dae `tproxy.c` 的
 //! `update_map_elem_by_cookie` + 6 个 cgroup 程序（sock_create/sock_release/
 //! connect4/6/sendmsg4/6）。

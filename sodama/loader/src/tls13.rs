@@ -1,4 +1,6 @@
-// SPDX-License-Identifier: GPL-2.0
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+// Copyright (C) 2026 sodama contributors
 //! P18c+：最小 TLS 1.3 客户端（REALITY / Vision 专用，自实现）。
 //!
 //! 为什么不用 rustls：REALITY 要求自定义 ClientHello（32B session_id 密封值、

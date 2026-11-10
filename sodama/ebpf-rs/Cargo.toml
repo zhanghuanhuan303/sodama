@@ -2,9 +2,9 @@
 name = "sodama-ebpf"
 version = "1.0.0"
 edition = "2021"
-description = "Rust eBPF datapath for dae-rust (aya-ebpf, BTF maps)"
+description = "Rust eBPF datapath for sodama (aya-ebpf, BTF maps)"
 license = "AGPL-3.0-only"
-repository = "https://github.com/zhanghuanhuan303/dae-rust"
+repository = "https://github.com/zhanghuanhuan303/sodama"
 
 # 数据面 Rust 迁移（P8/P9）：完整数据面（7 个 classifier + offload verdict）。
 # 构建（需要 nightly + rust-src + bpf-linker，见 .cargo/config.toml）：

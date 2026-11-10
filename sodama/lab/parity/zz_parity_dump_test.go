@@ -3,6 +3,9 @@
 /*
  * SPDX-License-Identifier: AGPL-3.0-only
  * Copyright (c) 2022-2026, daeuniverse Organization <dae@v2raya.org>
+ * Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+ * Copyright (C) 2026 sodama contributors
+ * Modified by the sodama project.
  */
 
 // zz_parity_dump_test.go is the dae side of sodama's rule-compiler parity

@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+// Copyright (C) 2026 sodama contributors
+
 //! 规则 VM（`bpf_loop` 扫描 + LPM array-of-maps + 双 epoch 槽），与 C `sodama_route*` 等价。
 //!
 //! 扫描用内核 `bpf_loop` helper（>= 5.17，矩阵门槛同款）：verifier 成本与迭代数无关，

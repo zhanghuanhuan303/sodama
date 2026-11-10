@@ -16,7 +16,7 @@ pkgver=1.0.0
 pkgrel=3
 pkgdesc="Transparent proxy gateway with a Rust eBPF datapath (dae rewrite)"
 arch=('x86_64' 'aarch64')
-url="https://github.com/zhanghuanhuan303/dae-rust"
+url="https://github.com/zhanghuanhuan303/sodama"
 license=('AGPL-3.0-only')
 depends=('glibc' 'iproute2' 'procps-ng' 'sh')
 makedepends=('git' 'rustup' 'bpf-linker' 'clang' 'llvm' 'wasm-pack')
@@ -33,7 +33,7 @@ source=("git+$url.git#tag=v$pkgver")
 sha256sums=('SKIP')
 
 prepare() {
-  cd "$srcdir/dae-rust"
+  cd "$srcdir/sodama"
 
   # 工具链前置检查（明确报错，避免 cargo 的晦涩失败）
   if ! rustup toolchain list 2>/dev/null | grep -q '^nightly'; then
@@ -51,7 +51,7 @@ prepare() {
 }
 
 build() {
-  cd "$srcdir/dae-rust"
+  cd "$srcdir/sodama"
 
   # 1) 引擎用户态（统一 nightly，避免 stable/nightly 混用）
   ( cd sodama && cargo build --release --locked )
@@ -66,7 +66,7 @@ build() {
 }
 
 check() {
-  cd "$srcdir/dae-rust"
+  cd "$srcdir/sodama"
   # 数据面脚本必须是带 shebang 的可执行脚本（否则 systemd 报 203/EXEC）
   head -1 packaging/arch/sodama-datapath | grep -q '^#!' || {
     printf 'sodama: packaging/arch/sodama-datapath 缺 shebang\n' >&2
@@ -91,7 +91,7 @@ check() {
 }
 
 package() {
-  cd "$srcdir/dae-rust"
+  cd "$srcdir/sodama"
 
   # 引擎 + eBPF 对象
   install -Dm755 sodama/target/release/sodama "$pkgdir/usr/bin/sodama"
@@ -132,6 +132,8 @@ package() {
 
   # 文档
   install -Dm644 LICENSE "$pkgdir/usr/share/licenses/sodama/LICENSE"
+  install -Dm644 NOTICE "$pkgdir/usr/share/licenses/sodama/NOTICE"
+  install -Dm644 THIRD_PARTY_LICENSES.md "$pkgdir/usr/share/licenses/sodama/THIRD_PARTY_LICENSES.md"
   install -Dm644 docs/arch-linux.md "$pkgdir/usr/share/doc/sodama/README.md"
   install -Dm644 docs/config-reference.md "$pkgdir/usr/share/doc/sodama/config-reference.md"
 }

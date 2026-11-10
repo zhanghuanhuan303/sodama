@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+# Copyright (C) 2026 sodama contributors
+
 # I1：系统内存基准（四层模型）——Process / Kernel / Total / per-connection。
 #
 # 拓扑（复用 run.sh）：client ns — 网关（sodama/dae/singbox）— WAN ns（bench_io echo + VLESS 上游）。

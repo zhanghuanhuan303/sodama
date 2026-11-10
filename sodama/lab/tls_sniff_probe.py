@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+# Copyright (C) 2026 sodama contributors
+
 """P21 sniff-punt 探针：发一个带指定 SNI 的最小 TLS ClientHello，观察后续回显。
 
 不依赖任何 TLS 库：ClientHello 按 RFC 8446 手写（与 loader/src/sniffer.rs 的

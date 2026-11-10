@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+# Copyright (C) 2026 sodama contributors
+
 # M3 传输变体集成测试：Xray 服务端（VLESS + TLS/REALITY + xtls-rprx-vision / ws / wss）。
 #
 # 验证（VISION_SECURITY 选择外层，默认 tls）：

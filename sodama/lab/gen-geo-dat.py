@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+# Copyright (C) 2026 sodama contributors
+
 """生成 P17a 测试用的小型 geoip.dat / geosite.dat（v2ray protobuf 格式）。
 
 用法： gen-geo-dat.py <输出目录>

@@ -1,4 +1,6 @@
-// SPDX-License-Identifier: GPL-2.0
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+// Copyright (C) 2026 sodama contributors
 //! P5-G2：可复用的 rustls 客户端（trojan / vless / vmess 共用）。
 //!
 //! 拆分后的读写两半共享同一个 `ClientConnection`（短锁），底层 TCP 各持一个 fd

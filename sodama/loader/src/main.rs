@@ -1,4 +1,6 @@
-// SPDX-License-Identifier: GPL-2.0
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+// Copyright (C) 2026 sodama contributors
 /*
  * sodama 加载器：用 Rust + aya 复现 dae 控制面里与数据面相关的最小职责。
  *
@@ -477,7 +479,7 @@ fn domain_stat_close(domain: &str, bytes_up: u64, bytes_down: u64) {
     };
     let _ = st
         .active
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
             Some(v.saturating_sub(1))
         });
     st.bytes_up.fetch_add(bytes_up, Ordering::Relaxed);

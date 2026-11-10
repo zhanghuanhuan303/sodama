@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+# Copyright (C) 2026 sodama contributors
+
 # 真实节点端到端验收（dialer 可为 vless/ws、anytls、hy2、socks5 桥接等任意支持项）。
 #
 #   REAL_NODE_URL='anytls://pass@host:port?sni=...&insecure=1'   sudo lab/real-node-e2e.sh

@@ -1,4 +1,8 @@
 #!/bin/sh
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+# Copyright (C) 2026 sodama contributors
+
 # run.sh <rules-file> — compile a sodama routing-rules subset with dae's own
 # Go compiler and print the kernel-space match_set dump to stdout.
 #

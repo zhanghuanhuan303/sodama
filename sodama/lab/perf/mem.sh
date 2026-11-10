@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+# Copyright (C) 2026 sodama contributors
+
 # 内存终测：五方（sodama / dae / sing-box / v2ray / mihomo[Clash Verge 内核]）同拓扑内存足迹对比。
 #
 # 拓扑（复用 run.sh）：client ns — 网关（被测实现）— WAN ns（bench_io 全双工 echo + VLESS 上游）。

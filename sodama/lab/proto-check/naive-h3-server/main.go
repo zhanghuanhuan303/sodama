@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+// Copyright (C) 2026 sodama contributors
+
 // P26：naive over HTTP/3 参考服务端（Go + quic-go fork http3；ALPN=h3）。
 //
 // 用途：lab 里验证 loader 的 naive+quic 出站——HTTP/3 CONNECT + Basic 认证 + 双向流。

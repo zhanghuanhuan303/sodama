@@ -36,7 +36,7 @@
 
 [Unit]
 Description=sodama transparent proxy gateway (eBPF datapath)
-Documentation=https://github.com/zhanghuanhuan303/dae-rust/blob/main/docs/deploy.md
+Documentation=https://github.com/zhanghuanhuan303/sodama/blob/main/docs/deploy.md
 After=network-online.target systemd-sysctl.service
 Wants=network-online.target
 # 崩溃环熔断：5 分钟内 5 次重启后放弃（对照 dae `StartLimitIntervalSec=300/StartLimitBurst=5`）。

@@ -41,7 +41,7 @@
 | **配置页·分流条目** | 本地规则文件直接增删条目（去重、URL 自动归一化为域名、支持 `full:`/`suffix:`/`keyword:`/`regex:` 前缀）、过滤查看、单条删除 |
 | **配置页·内核参数** | 把引擎可设置的能力（`global`/`dns`/`group` 白名单，v2.0：**55 项**）做成表单：分组（转发/探测/订阅/DNS/性能/TLS 与抗封锁/日志）+ 每项默认值与一行说明；开关/枚举用下拉、时长/int/文本用输入框；**改了写回 config.dae → validate 护栏 → 热重载回执**，空值 = 恢复引擎默认；已改项用强调色标出 |
 | **HTTPS** | 可选（`tls = 1`）：首次启动自动生成自签证书（key 0600），HTTP/HTTPS 并存 |
-| 鉴权 | 可选 token 会话（HttpOnly Cookie）；**默认关闭**（`token` 留空 = LAN 免认证） |
+| 鉴权 | token 会话（HttpOnly Cookie）；默认仅监听回环，**非回环绑定且 token 为空时拒绝启动** |
 | **手机适配** | 窄屏单列：节点表收起次要列（UDP/地址/来源/延迟分布/最近，点行看详情），配置页宽表横向滑动，弹窗全屏；触摸设备行内动作常显（无 hover）、点击目标加大 |
 
 ## 结构
@@ -58,12 +58,12 @@ panel/
 ## 开发 / 构建 / 部署
 
 ```bash
-PASS=xxx scripts/dev-local.sh                # 本机开发（数据经 SSH 取路由器）→ http://127.0.0.1:8099
+HOST=root@192.0.2.10 PASS=xxx scripts/dev-local.sh   # 本机开发（数据经 SSH 取路由器）→ http://127.0.0.1:8099
 scripts/build-router.sh                      # wasm + musl 构建 → dist/{sodama-panel,www}
-PASS=xxx scripts/deploy.sh                   # 停服务→推送→procd 重启（HOST 默认 root@192.0.2.10）
+HOST=root@192.0.2.10 PASS=xxx scripts/deploy.sh   # 停服务→推送→procd 重启（HOST/PASS 必填）
 ```
 
-密码一律通过 `PASS` 环境变量传入（脚本不内置默认密码）；`HOST` 可覆盖目标。
+`HOST` 与 `PASS` 都必须通过环境变量传入（脚本不内置默认目标/密码）。
 
 产物（v2.0 实测）：二进制 **2.8 MB**（含 TLS）、静态资源 **~1.2 MB**（wasm 1.17 MB + JS/CSS，未压缩传输——同机/局域网口径）、常驻 **~3 MB RSS / 3 线程**（OpenWrt 软路由）；无浏览器访问时不采样、不 fork。
 
@@ -119,7 +119,7 @@ PASS=xxx scripts/deploy.sh                   # 停服务→推送→procd 重启
 
 ```ini
 tls = 1
-# tls_bind = 0.0.0.0:8443
+# 非回环绑定需同时设置 token；tls_bind = 127.0.0.1:8443
 # tls_cert = /etc/sodama-panel/tls/cert.pem   # 不存在则自动生成自签
 # tls_key  = /etc/sodama-panel/tls/key.pem
 ```

@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+# Copyright (C) 2026 sodama contributors
+
 """多实例下按 loader pid 精确定位 eBPF map id。
 
 lab（sodamans）与真网关（gwdae）可以同时运行，两者 map 名字完全相同；

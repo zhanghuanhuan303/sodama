@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+// Copyright (C) 2026 sodama contributors
+
 //! 全部 BTF maps（名字/类型/容量与 C 数据面一致，loader 按名字使用）。
 
 use aya_ebpf::{

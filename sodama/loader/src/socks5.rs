@@ -1,4 +1,6 @@
-// SPDX-License-Identifier: GPL-2.0
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+// Copyright (C) 2026 sodama contributors
 //! 最小 SOCKS5 客户端（CONNECT，无认证）——过渡一跳/relay 的一种 Dialer。
 //!
 //! 背景（ADR-0011/ADR-0015）：P5 原生协议栈之前，被代理流量的出口可以交给一个

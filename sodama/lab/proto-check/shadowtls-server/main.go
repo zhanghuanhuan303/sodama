@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+// Copyright (C) 2026 sodama contributors
+
 // shadow-tls 服务端参考夹具——lab 跨实现测试对端（P31 shadow-tls 客户端
 // 配套）。基于 sing-shadowtls v0.2.0 的 Service，支持三种版本：
 //

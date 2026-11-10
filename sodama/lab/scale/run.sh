@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+# Copyright (C) 2026 sodama contributors
+
 # M4 连接规模/风暴基准：客户端（client ns）→ sodama relay（direct/splice 路径）→ epoll 回显。
 #
 # 用法：

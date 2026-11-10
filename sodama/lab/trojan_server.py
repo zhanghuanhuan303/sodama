@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+# Copyright (C) 2026 sodama contributors
+
 """独立实现的 trojan 服务端（stdlib ssl，P5 的参考对端，lab 用）。
 
 用法： trojan_server.py <log> <password> <port> <cert.pem> <key.pem>

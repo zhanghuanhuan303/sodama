@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+# Copyright (C) 2026 sodama contributors
+
 # 生成 AUR `sodama-bin` 用的发布 tarball（x86_64，musl 静态，含 Web 面板）。
 #
 # 用法：
@@ -72,6 +76,8 @@ install -Dm644 "$ROOT/install/shell-completion/sodama.fish" \
 
 # 文档
 install -Dm644 "$ROOT/LICENSE" "$STAGE/usr/share/licenses/sodama/LICENSE"
+install -Dm644 "$ROOT/NOTICE" "$STAGE/usr/share/licenses/sodama/NOTICE"
+install -Dm644 "$ROOT/THIRD_PARTY_LICENSES.md" "$STAGE/usr/share/licenses/sodama/THIRD_PARTY_LICENSES.md"
 install -Dm644 "$ROOT/docs/arch-linux.md" "$STAGE/usr/share/doc/sodama/README.md"
 install -Dm644 "$ROOT/docs/config-reference.md" "$STAGE/usr/share/doc/sodama/config-reference.md"
 printf '%s\n' "$VER" >"$STAGE/usr/share/doc/sodama/VERSION"

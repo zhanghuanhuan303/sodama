@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+// Copyright (C) 2026 sodama contributors
+
 //! P14：用户态嗅探（TLS ClientHello SNI / HTTP Host）——为 `dial_mode: domain`
 //! 提供远端解析目标。P18e 追加 h2c（明文 HTTP/2 preface + HPACK `:authority`）。
 //!

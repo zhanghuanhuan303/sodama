@@ -1,4 +1,6 @@
-// SPDX-License-Identifier: GPL-2.0
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+// Copyright (C) 2026 sodama contributors
 //! DNS 处理（P3a 基础 + P3b-1 缓存/TCP）。
 //!
 //! 范围：`解析请求 → （缓存命中则回包）／转发上游 → 从应答中取 A 记录 →
@@ -1624,7 +1626,7 @@ mod tests {
         let e = query_edns(&out);
         assert!(e.present && e.has_options);
         // 尾部结构：family=1, prefix=24, scope=0, addr=192.0.2.0
-        assert_eq!(&out[out.len() - 7..], &[0, 1, 24, 0, 192, 168, 5]);
+        assert_eq!(&out[out.len() - 7..], &[0, 1, 24, 0, 192, 0, 2]);
         // 已带 OPT 的查询不动
         let q2 = {
             let mut x = q.clone();

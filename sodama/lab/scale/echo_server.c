@@ -1,3 +1,8 @@
+/* SPDX-License-Identifier: AGPL-3.0-only
+ * Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+ * Copyright (C) 2026 sodama contributors
+ */
+
 // M4 规模夹具：epoll 单线程 TCP 回显（支撑 1 万+ 并发空闲/小包连接）。
 // 用法：echo_server <port>
 #define _GNU_SOURCE

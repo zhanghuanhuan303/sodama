@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+// Copyright (C) 2026 sodama contributors
+
 // zz_proto_check_test.go — P5 G2 生态兼容检查：用 dae 实际依赖的 outbound
 // （olicesx fork）客户端，连 lab 的独立 Python 服务端，验证「不是只跟自家实现对得上」。
 //

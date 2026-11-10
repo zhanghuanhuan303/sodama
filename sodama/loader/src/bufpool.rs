@@ -1,4 +1,6 @@
-// SPDX-License-Identifier: GPL-2.0
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+// Copyright (C) 2026 sodama contributors
 //! O8：跨连接复用的小块缓冲池。
 //!
 //! 回收点：codec 会话每方向 `out`（生长到 128KB）、回退泵每方向 64KB、

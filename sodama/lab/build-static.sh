@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+# Copyright (C) 2026 sodama contributors
+
 # P7：发布用静态二进制构建 + 最小冒烟（不需要 root、不加载 eBPF）。
 #
 #   lab/build-static.sh            # 构建并产出 build/sodama-static

@@ -1,4 +1,6 @@
-// SPDX-License-Identifier: GPL-2.0
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+// Copyright (C) 2026 sodama contributors
 //! P5-G2：VLESS 客户端（TCP/UDP，可选 TLS）。
 //!
 //! wire 格式（对照 olicesx/outbound `protocol/vless/conn.go`）：

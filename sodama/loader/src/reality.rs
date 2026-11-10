@@ -1,4 +1,6 @@
-// SPDX-License-Identifier: GPL-2.0
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+// Copyright (C) 2026 sodama contributors
 //! P18c+：REALITY 客户端（在自实现 TLS 1.3 之上，与 xtls/reality 服务端对齐）。
 //!
 //! 协议要点（对照 XTLS/REALITY 与 dae `transport/tls/reality.go`）：

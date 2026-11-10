@@ -1,4 +1,6 @@
-// SPDX-License-Identifier: GPL-2.0
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+// Copyright (C) 2026 sodama contributors
 //! P5-G3b：HPACK Huffman 解码 + QPACK 最小编／解码（hysteria2 认证用）。
 //!
 //! hysteria2 的认证是标准 HTTP/3 请求：客户端需要 QPACK **编码** 一个请求头块，

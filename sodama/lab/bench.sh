@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+# Copyright (C) 2026 sodama contributors
+
 # P7 性能剖面（如实口径：perf 不可用 → 墙钟/吞吐 + 状态面 counters + /proc CPU/RSS）。
 #
 #   lab/bench.sh build            # 编译 C 基准端点（gcc，不需要 root）

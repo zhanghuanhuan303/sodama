@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+// Copyright (C) 2026 sodama contributors
+
 //! P15：节点组——filter（`name`/`subtag`/`keyword`/`regex`/取反/OR）、
 //! policy（`min` / `min_moving_avg` / `min_avg10` / `random` / `fixed(i)`）、
 //! 健康检查（经节点的 TCP/HTTP 探测）与拨号失败切换。

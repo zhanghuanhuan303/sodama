@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+// Copyright (C) 2026 sodama contributors
+
 //! C4：XDP 计量探针（可选路径）。
 //!
 //! 定位：**只计量、不干预**——恒返回 `XDP_PASS`，不做 redirect/drop/改写。

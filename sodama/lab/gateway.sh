@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+# Copyright (C) 2026 sodama contributors
+
 # sodama 真网关模式：在宿主 netns 用 eBPF 透明接管本机流量（浏览器零配置）。
 #
 #   sudo lab/gateway.sh up [--iface wlan0] [--node <文件|URL> | --subscribe <文件|URL>] [--group <名>] [--rules <文件> | --config <配置文件>] [--dns <上游URL>] [--geodata-dir <目录>] [--no-ipv6] [--dial-mode ip|domain] [--wait <秒>|--no-wait]

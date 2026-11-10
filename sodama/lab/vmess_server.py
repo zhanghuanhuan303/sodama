@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+# Copyright (C) 2026 sodama contributors
+
 """独立实现的 VMess AEAD 服务端（P5 G2 的参考对端，lab 用；cryptography 库）。
 
 按 olicesx/outbound protocol/vmess/{cipher,conn}.go 的 wire 规格独立实现，

@@ -4,7 +4,7 @@ version = "1.0.0"
 edition = "2021"
 description = "Rust reimplementation of dae's core datapath (userspace loader) — study project"
 license = "AGPL-3.0-only"
-repository = "https://github.com/zhanghuanhuan303/dae-rust"
+repository = "https://github.com/zhanghuanhuan303/sodama"
 
 [dependencies]
 aya = "0.14"

@@ -1,0 +1,54 @@
+sodama
+Copyright (C) 2026 Jimmy Zhang
+Copyright (C) 2026 sodama contributors
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as published
+by the Free Software Foundation, version 3 of the License only.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+--------------------------------------------------------------------
+Upstream and third-party notices
+--------------------------------------------------------------------
+
+This project is an independent Rust rewrite inspired by dae. It is not
+affiliated with the daeuniverse Organization.
+
+- dae (https://github.com/daeuniverse/dae)
+  License: AGPL-3.0
+  Copyright (c) 2022-2026, daeuniverse Organization <dae@v2raya.org>
+  Used as the semantic/behavioral reference for the datapath, rule
+  compiler, configuration format, and protocol behavior. The upstream
+  source tree is not vendored in this repository.
+
+- daeuniverse/outbound (https://github.com/daeuniverse/outbound)
+  License: AGPL-3.0
+  Used as a reference for outbound protocol behavior and interoperability
+  testing. The upstream source tree is not vendored in this repository.
+
+- golang.org/x/net (https://pkg.go.dev/golang.org/x/net)
+  License: BSD-3-Clause
+  The generated HPACK/Huffman tables in
+  sodama/loader/src/huffman_table.rs derive from the Go implementation
+  of HPACK (RFC 7541, Appendix B).
+
+- olicesx/qpack (https://github.com/olicesx/qpack)
+  The generated QPACK static table in
+  sodama/loader/src/huffman_table.rs derives from this implementation
+  (QPACK, RFC 9204, Appendix A). See the upstream repository for its
+  license and copyright notice.
+
+- sing-box, Xray-core, v2ray-core, mihomo, quic-go and other projects
+  are referenced only for interoperability testing and protocol research.
+  No source code from these projects is bundled in this repository.
+
+A machine-readable/expanded dependency list is generated from Cargo
+metadata into THIRD_PARTY_LICENSES.md. When adding or updating a
+dependency, keep both files in sync.

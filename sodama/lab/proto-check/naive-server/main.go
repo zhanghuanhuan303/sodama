@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+// Copyright (C) 2026 sodama contributors
+
 // P25：naive（HTTP/2 CONNECT）参考服务端（Go 标准库；TLS 自动协商 h2）。
 //
 // 用途：lab 里验证 loader 的 naive 出站——h2 CONNECT + Basic 认证 + 双向流。

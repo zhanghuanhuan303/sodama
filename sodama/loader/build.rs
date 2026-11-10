@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+// Copyright (C) 2026 sodama contributors
 //! 构建期信息注入（A2 #1 `--version`）：git 短 sha 与仓库状态。
 //!
 //! 只做**尽力而为**的注入：`git` 不可用 / 不在 git 工作树里 / 沙箱无 git 时，

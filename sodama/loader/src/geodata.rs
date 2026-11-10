@@ -1,4 +1,6 @@
-// SPDX-License-Identifier: GPL-2.0
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+// Copyright (C) 2026 sodama contributors
 //! P17a：v2ray geodata（`geoip.dat` / `geosite.dat`）读取与 `geoip:`/`geosite:` 展开。
 //!
 //! 对照 dae：`pkg/geodata/{geodata,decode,common}.pb.go` + `component/routing/optimizer.go`

@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+// Copyright (C) 2026 sodama contributors
+
 //! 配置页：结构化改配置（订阅导入 + 解析预览、规则集、本地分流规则文件）。
 //!
 //! 前提：`config.dae` 是唯一事实来源，引擎 inotify 热驱动 ——

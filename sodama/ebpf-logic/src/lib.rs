@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+// Copyright (C) 2026 sodama contributors
 //! sodama eBPF 数据面的**纯逻辑**（无 BPF 依赖、no_std 可编、host 可单测）。
 //!
 //! 为什么单独一个 crate：`ebpf-rs` 只能编译到 `bpfel-unknown-none`（无法在 host 跑

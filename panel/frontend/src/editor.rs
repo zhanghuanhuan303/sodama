@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+// Copyright (C) 2026 sodama contributors
+
 //! M3：配置 / 规则文件在线编辑（先校验后落盘，保存即热重载）。
 
 use leptos::prelude::*;

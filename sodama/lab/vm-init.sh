@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+# Copyright (C) 2026 sodama contributors
+
 # 在 QEMU 里跑 sodama 内核矩阵（由 sodama/lab/matrix/initramfs-*/init 以
 # rdinit=/init 调用；此时 / 是宿主根的 9p 共享，PID1 就是我们）。
 #

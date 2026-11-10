@@ -1,4 +1,8 @@
 #!/bin/sh
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+# Copyright (C) 2026 sodama contributors
+
 # 拉取软路由上的 sodama 健康曲线 TSV，并生成 SVG 曲线图。
 #
 # 采集端在软路由：/root/sodama-health-track.sh（每 60s 写 /root/sodama-health.tsv）
@@ -8,7 +12,7 @@
 #   sh sodama/lab/prod/health-track.sh all      # 拉取 + 画图
 #   sh sodama/lab/prod/health-track.sh status   # 看采集器在远端的状态摘要
 #
-# 环境变量：HOST（默认 root@192.0.2.10）、PASS（默认 root）
+# 环境变量：HOST、PASS（均必填；HOST 例如 root@192.0.2.10）
 set -e
 
 HOST="${HOST:?请设置 HOST=user@host}"

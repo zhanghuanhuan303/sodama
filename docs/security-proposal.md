@@ -15,7 +15,7 @@
 | fuzz 与特权内核加载 CI 提到 A 类同级 | **采纳**（并扩展） | 新设 **S 类（安全工程）**，与 A 类同优先级；S1 = fuzz（3 目标 → **≥8 目标**）；S2 = 特权加载 CI（含 G6 前置） |
 | 攻击面密集（协议解析/DNS/订阅） | 采纳 | §1 给出**完整攻击面清单**（9 类输入 × 解析器 × 现有防线） |
 | nightly + bpf-linker 供应链未讨论 | **采纳**（缺口证实） | S3：工具链仓库级钉死、bpf-linker 版本断言、cargo-deny、产物哈希（§2 列出 6 项缺口） |
-| （扩展）根进程崩溃面与默认暴露面 | 提案新增 | S4：panic 边界、面板默认鉴权（当前**空 token = 放行**）、状态 socket 权限 |
+| （扩展）根进程崩溃面与默认暴露面 | 提案新增 | S4：panic 边界、面板默认鉴权（**空 token 仅允许回环**）、状态 socket 权限 |
 
 总投入估算：**≈9–13 人日 + 机时**（不含 fuzz 挖出缺陷的修复池 ≈2–3 人日）。排期见 §4。
 
@@ -42,7 +42,7 @@
 | 5 | 订阅正文 / 规则集文本 | 订阅端点（第三方）；明文 http 可 MITM | `subscribe.rs` 726 · `ruleset.rs` 498 · `rules.rs` 1701 | 8 MiB 上限、重定向 ≤ 3、Content-Length 精确校验（§11.7）、TLS=webpki 根（`subscribe.rs:5`）；**无 fuzz** |
 | 6 | geodata `.dat`（社区下载） | 分发方 | `geodata.rs` 751（手写 varint / length-delimited） | 显式截断/溢出错误（`geodata.rs:93-96,117,158`）；**无 fuzz** |
 | 7 | `.dae` 配置 | 用户 / 面板写入路径 | `config.rs` 2430（+`rules.rs`） | validate 护栏、权限校验（`mode & 0o037 == 0`）、行级诊断；**无 fuzz** |
-| 8 | 面板 HTTP API | **LAN（默认绑定 `0.0.0.0:8080`；HTTPS `0.0.0.0:8443` 自签名）** | `panel/backend/src/main.rs:186,208` | token（Bearer / `?token=` / Cookie 会话）；**空 token = 放行**（`main.rs:314-343`） |
+| 8 | 面板 HTTP API | **默认仅回环 `127.0.0.1:8080`；HTTPS 同理；非回环绑定且无 token 时拒绝启动** | `panel/backend/src/main.rs` | token（Bearer / Cookie 会话）；**空 token 仅允许回环绑定** |
 | 9 | 状态面 unix socket | 本机 | `status.rs` | 默认 `/tmp/sodama-status.sock`（部署建议 `/run` + 0750，见 service 注释） |
 
 ### 1.3 结论
@@ -122,7 +122,7 @@ corpus 目录入库（小体积种子）；`lab/fuzz/README.md` 记录运行方�
 | 方案 | 落地时间 | 隔离 | 关键约束 |
 |---|---|---|---|
 | **A · QEMU(TCG) 跑 verify，直接进 GitHub Actions** | 1.5–2.5 人日 | 好（VM 内） | 复用 `matrix.sh vm` 的 initramfs+9p 路线；TCG 较慢（先测基线耗时）；内核镜像来源需固化（Arch 镜像下载或 artifacts） |
-| B · self-hosted runner（本机） | 0.5–1 人日 | **差** | 本机存有软路由凭据（`lab/prod/health-track.sh` 默认 `root@192.0.2.10`）——CI 逃逸 → 路由器失守；不可接受，除非 runner 放进专用 VM（即退化回 A + 托管） |
+| B · self-hosted runner（本机） | 0.5–1 人日 | **差** | 本机存有软路由凭据（`lab/prod/health-track.sh` 的 HOST/PASS 必填）——CI 逃逸 → 路由器失守；不可接受，除非 runner 放进专用 VM（即退化回 A + 托管） |
 | C · GitHub-hosted + KVM 嵌套 | — | — | 标准 runner 无 `/dev/kvm`，不可行 |
 
 **建议：方案 A**。把 `matrix.sh vm` 参数化（headless、超时、结果断言 → `MATRIX-RESULT=PASS`），
@@ -148,8 +148,7 @@ CI 里新增 job：构建 → 起 QEMU → 对象加载冒烟（`bpftool prog sh
 - **panic 边界**：现状 `catch_unwind` 仅 2 处（`main.rs:6408,6475`）。以 S1 结果驱动，
   补关键网络入口线程的 panic 边界（DNS/订阅/探测/嗅探已有各自经验），目标：
   **任何网络输入都不置主进程于死地**；对「解析 panic 逃逸」逐条加回归单测。
-- **面板默认鉴权**：当前「未设 token = 放行 + 默认 `0.0.0.0:8080`」——建议绑定非 loopback 且
-  token 为空时**启动拒绝或强告警**（fail-closed）；`panel.conf` 模板与文档把 token 标注为必填。
+- **面板默认鉴权**：已改为「默认回环 + 非回环且无 token 时**启动拒绝**（fail-closed）」；`panel.conf` 模板与文档继续把 token 标注为非回环绑定必填。
 - **状态面 socket**：默认 `/tmp/sodama-status.sock` → 建议 `/run/sodama/status.sock` + 0600/0750
   （service 注释已有做法，改为文档推荐默认）。
 - **尺寸/分配上限盘点**：订阅 8 MiB 与 DNS 缓存上限已有；其余解析路径（帧长度字段驱动的分配）
@@ -174,7 +173,7 @@ CI 里新增 job：构建 → 起 QEMU → 对象加载冒烟（`bpftool prog sh
 | D15–D16 | 缓冲：fuzz crash 修复池 | — |
 
 排序理由：A 类是「从可运行到可分发」（增长收益），S 类是「从可分发到可信任」（风险削减）。
-在「已接管全屋流量 + 72h 生产测试进行中」的事实下，S 类的期望损失削减高于 A 类中低项
+在「已接管全屋流量 + 长期运行验证」的事实下，S 类的期望损失削减高于 A 类中低项
 （shell 补全、PKGBUILD 等可以等）。A 类中 A8（许可证/SBOM）与 S3.3 合并执行。
 
 ## 5 · 成本与风险

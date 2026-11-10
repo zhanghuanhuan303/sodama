@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+# Copyright (C) 2026 sodama contributors
+
 """独立实现的 VLESS 服务端（P5 G2 的参考对端，lab 用，stdlib + ssl）。
 
 与 sodama 的 Rust 客户端互操作是「跨实现」验证：本文件按 VLESS wire 规格独立实现

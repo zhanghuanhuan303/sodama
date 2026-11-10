@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+// Copyright (C) 2026 sodama contributors
+
 //! P23：bootstrap resolver（对照 dae `global.bootstrap_resolver`）。
 //!
 //! 用于解析「解析本身可能被数据面接管」的域名：DNS 上游主机名、订阅/节点服务器

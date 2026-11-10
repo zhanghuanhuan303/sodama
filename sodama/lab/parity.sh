@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+# Copyright (C) 2026 sodama contributors
+
 # 规则编译对拍：sodama 的 Rust 编译器 vs dae 原版 Go 编译器。
 #
 #   lab/parity.sh                 # 对拍 lab/rules.dae 与 lab/rules.reload.dae

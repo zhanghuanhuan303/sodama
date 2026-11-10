@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+// Copyright (C) 2026 sodama contributors
 //! A2 #2/#4：归档原语（tar + gzip_stored 自实现）。
 //!
 //! 为什么不用 `flate2`/`tar` crate：本仓库的依赖纪律是「标准库 + 已在锁文件里的依赖」

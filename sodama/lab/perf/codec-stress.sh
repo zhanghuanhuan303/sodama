@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+# Copyright (C) 2026 sodama contributors
+
 # M4 stage 2 codec 压力：反复 4/8/64 流 vless-tls（长尾卡死回归；
 # 配合 SODAMA_REACTOR_DEBUG=1 输出会话状态周期转储，见 ADR-0058 stage 2 节）。
 #

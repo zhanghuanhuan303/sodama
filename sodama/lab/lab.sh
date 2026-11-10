@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+# Copyright (C) 2026 sodama contributors
+
 # sodama 实验环境：拓扑、构建、测试、清理。
 #
 #   lab/lab.sh build        # 编译 eBPF 对象 + Rust 加载器（不需要 root）

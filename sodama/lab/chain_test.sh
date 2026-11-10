@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+# Copyright (C) 2026 sodama contributors
+
 # P38：链式代理端到端自测（不需要 root / eBPF）——本地 SOCKS5 实例 + TCP echo。
 #
 # 拓扑（对照 dae 语义：左侧 = 出口、右侧 = 第一跳）：

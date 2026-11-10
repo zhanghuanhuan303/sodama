@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+// Copyright (C) 2026 sodama contributors
+
 //! P23：代理服务器域名的粘滞 IP（对照 dae `StickyIpDialer`/`ProxyIpCache`）。
 //!
 //! 代理节点地址是域名时（如 `ss://…@node.example.com:8388`），每次拨号都重新解析

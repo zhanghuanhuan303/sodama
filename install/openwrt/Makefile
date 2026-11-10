@@ -25,7 +25,7 @@ PKG_RELEASE:=2
 
 PKG_LICENSE:=AGPL-3.0-only
 PKG_LICENSE_FILES:=LICENSE
-PKG_MAINTAINER:=sodama <https://github.com/zhanghuanhuan303/dae-rust>
+PKG_MAINTAINER:=sodama <https://github.com/zhanghuanhuan303/sodama>
 
 include $(INCLUDE_DIR)/package.mk
 
@@ -34,7 +34,7 @@ define Package/sodama
   CATEGORY:=Network
   SUBMENU:=Web Servers/Proxies
   TITLE:=Rust eBPF transparent proxy gateway (dae rewrite)
-  URL:=https://github.com/zhanghuanhuan303/dae-rust
+  URL:=https://github.com/zhanghuanhuan303/sodama
   # ip-full：netns/neigh 需要（busybox ip 不支持）；kmod-veth：控制面对 veth
   DEPENDS:=+ip-full +kmod-veth
 endef

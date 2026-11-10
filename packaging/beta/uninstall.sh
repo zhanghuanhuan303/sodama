@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+# Copyright (C) 2026 sodama contributors
+
 # sodama 干净卸载脚本（Arch Linux）
 #
 #   sudo bash uninstall.sh            # 交互确认：停服务 → 清理拓扑/残留 → pacman -R → 询问是否删配置

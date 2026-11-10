@@ -1,3 +1,8 @@
+/* SPDX-License-Identifier: AGPL-3.0-only
+ * Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+ * Copyright (C) 2026 sodama contributors
+ */
+
 // relay 内环 A/B：epoll+splice vs io_uring splice（单流 64MB，多轮取中位）。
 // 拓扑：producer --TCP--> relay(in) --(被测内环)--> relay(out) --TCP--> sink
 // 只统计 relay 线程 CPU（CLOCK_THREAD_CPUTIME_ID）与墙钟。

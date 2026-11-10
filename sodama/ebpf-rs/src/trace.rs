@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+// Copyright (C) 2026 sodama contributors
+
 //! 对标批：`skb_send_sock` 记账（fentry + kprobe 双形态），对照 dae
 //! `tcp_offload_sent_account(_kprobe)` + `include/tcp_offload.h:tcp_offload_skb_key`
 //! （`dae/control/kern/tproxy.c:4360-4393`）。

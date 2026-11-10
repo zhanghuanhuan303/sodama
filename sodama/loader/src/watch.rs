@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+// Copyright (C) 2026 sodama contributors
+
 //! P35：配置热驱动的内核事件层——inotify 目录监听 + 事件名过滤 + 去抖合并。
 //!
 //! 设计取舍（对照 P33 的纯轮询）：

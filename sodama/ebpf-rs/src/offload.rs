@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+// Copyright (C) 2026 sodama contributors
+
 //! TCP relay offload verdict（sk_skb/stream_verdict），与 C `sodama_tcp_offload` 等价。
 
 use aya_ebpf::{bindings::sk_action::SK_PASS, macros::stream_verdict, programs::SkBuffContext};

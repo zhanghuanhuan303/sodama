@@ -1,4 +1,8 @@
 #!/bin/sh
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+# Copyright (C) 2026 sodama contributors
+
 # 构建 shadowsocksr-stream（origin proto + plain obfs）参考服务端（Go；复用
 # parity dae-work 的 outbound/ciphers 模块图）。需要本机 Go module 缓存（离线
 # 可构建，GOPROXY=off）。

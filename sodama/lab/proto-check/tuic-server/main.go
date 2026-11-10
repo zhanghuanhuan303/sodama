@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+// Copyright (C) 2026 sodama contributors
+
 // tuic-server：TUIC v5 独立参考服务端（P5-G3，lab 用；quic-go）。
 //
 // 按 docs/modules/tuic-v5-client-spec.md 独立实现（不复用 outbound 库的代码），

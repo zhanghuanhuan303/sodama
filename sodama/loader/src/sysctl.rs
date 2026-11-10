@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+// Copyright (C) 2026 sodama contributors
 //! A2 #16：sysctl 期望值管理器（对照 dae `control/sysctl.go` 的 `SysctlManager`）。
 //!
 //! 背景：`auto_config_kernel_parameter` 会让 sodama 写一批内核参数（ip_forward、

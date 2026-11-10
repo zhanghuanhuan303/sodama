@@ -1,4 +1,6 @@
-// SPDX-License-Identifier: GPL-2.0
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+// Copyright (C) 2026 sodama contributors
 //! VLESS over WebSocket（RFC6455）客户端传输（P10：真实订阅节点）。
 //!
 //! wire：`GET {path} HTTP/1.1` Upgrade 握手 → 掩码二进制帧承载字节流。

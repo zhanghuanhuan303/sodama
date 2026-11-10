@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+# Copyright (C) 2026 sodama contributors
+
 """P4 relay 大流量探针：连 <host>:<port>，先取首行前缀应答，再发 <kb> KB 随机数据并校验回显。
 
 用法： stream_probe.py <host> <port> [kb]

@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+// Copyright (C) 2026 sodama contributors
+
 //! P23：最小 HTTP/2 客户端（DoH 专用；RFC 7540/7541 子集）。
 //!
 //! 只实现 DoH 所需的 POST：

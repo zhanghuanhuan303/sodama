@@ -1,4 +1,6 @@
-// SPDX-License-Identifier: GPL-2.0
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+// Copyright (C) 2026 sodama contributors
 //! M4：epoll worker 池——每连接 0 线程。stage 1 接管字节透明 splice 链路
 //! （Direct / VLESS 明文 / kTLS 成功的 TLS）；stage 2 起同时接管已对 WouldBlock
 //! 可重入的 codec 链路（rustls VLESS-TCP / Trojan，见 `Outbound::codec_reactor_capable`）：

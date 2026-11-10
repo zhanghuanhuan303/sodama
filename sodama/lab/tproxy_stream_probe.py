@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+# Copyright (C) 2026 sodama contributors
+
 """tproxy 回显夹具的大流量探针：字节完整性校验，容忍夹具插入的 banner 行。
 
 背景：无 dialer 的 up/ops-up 会话里，落到 tproxy 的连接由 loader 的**回显夹具**接管

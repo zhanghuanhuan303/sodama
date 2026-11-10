@@ -1,4 +1,6 @@
-// SPDX-License-Identifier: GPL-2.0
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+// Copyright (C) 2026 sodama contributors
 //! P5-G3：TUIC v5 客户端（QUIC，quinn 0.11）。
 //!
 //! 规格见 `docs/modules/tuic-v5-client-spec.md`（对照 olicesx/outbound

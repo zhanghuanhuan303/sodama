@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Jimmy Zhang <62113606+zhanghuanhuan303@users.noreply.github.com>
+// Copyright (C) 2026 sodama contributors
+
 //! 报文解析（与 C `parse_v4`/`load_l4` 等价，全部走 `bpf_skb_load_bytes`）。
 //!
 //! 链路头长度（`link_h_len`）对标 dae：以太 14B / 无链路头（tun/ppp/ipip/none）0B
