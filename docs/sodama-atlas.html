@@ -196,24 +196,24 @@ article ol li::marker{color:var(--accent)}
 <div class="classbar">
   <span class="cls">密级 · 最高</span>
   <span>SODAMA ATLAS · 内部研究档案 · 未经许可不得外传</span>
-  <span class="push">v2.3 · 2026-10-24 · 重写版</span>
+  <span class="push">v2.5 · 2026-11-04 · 7 天生产收口</span>
 </div>
 <div class="page">
 <article>
 
 <header class="title-block">
-  <div class="kicker">全 Rust 代理数据面 · 开发研究档案 · <b>重写版 v2.3</b></div>
+  <div class="kicker">全 Rust 代理数据面 · 开发研究档案 · <b>重写版 v2.5</b></div>
   <h1>SODAMA ATLAS</h1>
   <p class="sub">dae 的研究性复现：一个可上生产、可被验证、可被复现的 eBPF + Rust 透明代理。
   本版为<strong>重写</strong>——v1.x 的增量叙事（每批次追加一节）收敛为当期状态文档；
   历史批次细节留在 <code>phase2-devlog.md</code>、各专题报告与 ADR（见 §9 索引）。</p>
   <dl class="meta">
-    <div><dt>构建</dt><dd><code>main@cb62dd0</code>（A2 收口 + 修复轮：R11 / UDP GSO / reactor 分派 / lab 口径 / <b>ws 干净 EOF</b> / musl 可移植）</dd></div>
-    <div><dt>日期</dt><dd>2026-10-17</dd></div>
-    <div><dt>基准机</dt><dd>i9-9900KF 8C16T · 31 GB · Linux 6.18.54-lts（宿主）</dd></div>
+    <div><dt>构建</dt><dd><code>main@d7cf3cc</code>（honk 对标基线；生产 7 天轮为 <code>76f6d25</code> v1.0.0）</dd></div>
+    <div><dt>日期</dt><dd>2026-11-04（v2.5：增补 §8.5 生产 7 天收口）</dd></div>
+    <div><dt>基准机</dt><dd>i9-9900KF 8C16T · 31 GB · Linux 6.18.57-lts（宿主；对标轮在特权容器内）</dd></div>
     <div><dt>生产机</dt><dd>OpenWrt x86_64 2C/4G · <b>内核 6.12.92</b></dd></div>
-    <div><dt>对照</dt><dd>dae v2.1.1 · sing-box 1.14.2 · v2ray 5.52.0 · mihomo 1.19.32</dd></div>
-    <div><dt>数据源</dt><dd><code>benchmark-report-v4.html</code> v4.1 · <code>parity-status.md</code> v2.20 · <code>phase2-devlog.md</code> §1–§24</dd></div>
+    <div><dt>对照</dt><dd>honk v0.1.0-beta.4 · dae v2.1.1 · sing-box 1.14.2/1.14.4 · v2ray 5.52.0 · mihomo 1.19.32</dd></div>
+    <div><dt>数据源</dt><dd><code>benchmark-report-v4.html</code> v4.1 · <code>parity-status.md</code> v2.20 · <code>phase2-devlog.md</code> §1–§28 · <code>reviews/2026-11-02-honk-compare/</code> · <code>reviews/2026-11-04-prod-7d/</code></dd></div>
   </dl>
 </header>
 
@@ -235,9 +235,10 @@ article ol li::marker{color:var(--accent)}
     <tr><td>内存 · 5 万连接</td><td>RSS <b>55.6 MB</b> / 31 线程 / 100 008 fd（2/连接）；系统净增 ≈2.0 GB</td><td>dae 系统净增 ≈8.2 GB（172.7 KB/连接）</td></tr>
     <tr><td>UDP（40 000×256 B @20 000 pps）</td><td><b>41.0 Mbps 零丢包</b>，CPU <b>1 020 ms / 40 k 包</b>（五方最优）</td><td>sing-box 1 610 · v2ray 1 820 · dae 2 170 · mihomo 2 460 ms</td></tr>
     <tr><td>真实公网轮（CF 边缘订阅节点 · 17 轮 ×4）</td><td>19.3 Mbps；<b>进程 CPU 2 952 ms/GB</b>（合计含内核 12.6 k）</td><td>dae 18.6 Mbps / 4 266 ms/GB；sing-box 19.3 / 4 111；节点出口 ≈19 Mbps 为共同上限</td></tr>
-    <tr><td>生产（软路由）</td><td>78.5 h 轮收口：RSS 平台 <b>66.7 MB</b>（47–59 h 斜率 −0.01 MB/h）· 109 137 会话 / 31.16 GB · <code>dial_errors</code> 58（0.05%）· <code>stragglers</code> 0 · ws 截断误报 <b>0</b>（旧轮 9 738）；2026-10-20 修 <code>routing_handoff</code> 满表后起 <b>1 周轮</b></td><td>旧轮 21.4 h：RSS 53.5 MB、dial_errors 0；对 dae 生产口径见 §8</td></tr>
+    <tr><td>生产（软路由）</td><td>78.5 h 轮收口：RSS 平台 <b>66.7 MB</b>（47–59 h 斜率 −0.01 MB/h）· 109 137 会话 / 31.16 GB · <code>dial_errors</code> 58（0.05%）· <code>stragglers</code> 0 · ws 截断误报 <b>0</b>（旧轮 9 738）；2026-10-20 修 <code>routing_handoff</code> 满表后起 <b>1 周轮</b> → 10-24 v1.0.0 重装后新 1 周轮；11-02 中段 8.3 天覆盖（断电前 77.8 h + 后 120.5 h），RSS 中位 65–69 MB、<code>stragglers</code> 0、开机自启动通过（§8.4）；<b>11-04 02:15 连续 7 天收口</b>：RSS 中位 65.7 MB、末值 65.8、最后 24 h 斜率 −0.01 MB/h、888 664 会话 / 49.68 GB、<code>dial_errors</code> 1 568（0.176%）、<code>stragglers</code> 0、codec 100%、无重启（§8.5）；服务继续 2 周轮；<b>11-05 19:56 整机非正常断电</b>，连续窗口止于 <b>209.7 h</b>，2 周轮需重跑（§8.6）</td><td>旧轮 21.4 h：RSS 53.5 MB、dial_errors 0；对 dae 生产口径见 §8</td></tr>
     <tr><td>质量门禁</td><td>单测 <b>353</b>（350 + 3 BPF 逻辑）· <code>verify 12/12</code> + <code>cap 12/12</code>（QEMU 7.2.8）· 宿主 6.18 与生产 6.12.92 双内核实载</td><td>本项目额外要求「对象在真实宿主/生产内核上必须能加载」</td></tr>
     <tr><td>发行（v1.0.0）</td><td><b>AUR 双包</b>（<code>sodama</code> 源码 / <code>sodama-bin</code> 预编译）+ <code>packaging/make-release.sh</code>（musl 静态引擎+面板，5.6 MB）+ <code>docs/arch-linux.md</code></td><td>发布包 <code>!strip</code>（eBPF 符号/BTF 必须保留）；AUR push 与 release 上传归用户</td></tr>
+    <tr><td>同赛道对标 · honk（2026-11-02，本机 lab）</td><td>direct <b>13.7 Gbps</b> · SOCKS5 9.1 Gbps · SS 5.3 Gbps · UDP direct 910 Mbps；RSS 27–33 MB · 启动 0.31–0.51 s</td><td>honk v0.1.0-beta.4：direct 2.4 Gbps；SOCKS5/SS best-case 5.2–5.6 Gbps（多峰：0.54–0.73 / 2.38–2.42 / 5.15–5.59；高频后低档消失），并出现 32–62 s 停顿；RSS 56–58 MB · 启动 2.38–2.53 s（同机同夹具，§4.8/§4.9）</td></tr>
   </tbody>
 </table>
 
@@ -407,7 +408,7 @@ UDP 功能面在面板的进一步呈现列为 J 类余项（§7）。<label for
 </section>
 
 <section id="s4">
-<h2><span class="num">§4</span>性能与资源边界 · 实测数据全集（2026-10-16/17 两轮）</h2>
+<h2><span class="num">§4</span>性能与资源边界 · 实测数据全集（2026-10-16/17 两轮 + 2026-11-02 honk 对标）</h2>
 
 <h3 id="s41">4.1 · 本机吞吐四方（5 轮中位；VLESS/ss 为修复后口径）</h3>
 <figure class="wide">
@@ -648,7 +649,9 @@ direct 基线跑在 2 倍速率上，仅作数量级参照。</figcaption>
   FD 133（103–184）、线程 18、<code>reactor_codec_sessions == conns_total</code>；
   <b>新轮 2026-10-17 03:22 起跑 → 78.5 h 收口</b>：平台段 RSS <b>66.7 MB</b>（47–59 h 斜率 −0.01 MB/h ≈ 0），
   109 137 会话 / <code>dial_errors</code> 58（0.05%）/<code>stragglers</code> 0，ws 截断误报 <b>0</b>（旧轮 9 738）；
-  <b>1 周轮 2026-10-20 10:09 起跑</b>（见 §8.3）。<label for="mn8" class="margin-toggle">⊕</label><input type="checkbox" id="mn8" class="margin-toggle"><span class="marginnote">新引擎轮冷启基线：RSS 54.6 MB / 线程 20 / fd 143——比旧轮高（功能面更大），属预期；对照曲线见 §8.2。</span></li>
+  <b>1 周轮 2026-10-20 10:09 起跑</b>（见 §8.3）→ <b>10-24 18:53 旧轮 104.7 h 收口，
+  v1.0.0 重装后新 1 周轮 19:37 起跑</b>；11-02 中段覆盖 8.3 天、RSS 中位 65–69 MB、
+  <code>stragglers</code> 0、开机自启动通过（§8.4）。<label for="mn8" class="margin-toggle">⊕</label><input type="checkbox" id="mn8" class="margin-toggle"><span class="marginnote">新引擎轮冷启基线：RSS 54.6 MB / 线程 20 / fd 143——比旧轮高（功能面更大），属预期；对照曲线见 §8.2。</span></li>
 </ul>
 
 <h3 id="s47">4.7 · Rust→BPF vs clang C：编译产物对比（2026-10-23）</h3>
@@ -685,6 +688,89 @@ C 经 <code>vmlinux.h</code> 保留大量内核类型），但重定位多 22%�
 <p><b>边界</b>：两侧业务逻辑不完全逐行等价（Rust 多 <code>xdp</code>、C 有 tcp/udp 分支差异）；
 代码量差异反映源码组织与功能覆盖，<b>不构成「语言性能」结论</b>；栈为函数内静态近似
 （verifier combined stack 含调用链，本项目曾在 528 B 超限后移 per-CPU scratch，见 ADR-0065）。</p>
+
+<h3 id="s48">4.8 · honk 同赛道对标（2026-11-02）</h3>
+<p><b>口径</b>：单机 lab、同一 <code>bench_io</code> 负载、同一 netns 拓扑、同一参考代理服务端（sing-box 1.14.4）。
+sodama 为 <code>dev-honk@d7cf3cc</code>（release，默认 <code>opt-level=3</code> + LTO）；honk 为
+<code>main@ee5d5e3</code>（v0.1.0-beta.4，release profile <code>opt-level=s</code> + LTO）。每个 case 跑 3 轮，
+首轮每 case 3 轮取中位；复核阶段对 honk 代理补跑，发现首轮落在低频模式，故表 4b 改用「sodama 6 轮合并中位 + honk 完成轮范围」呈现。只比数据面与资源，不涉及 honk 的生态层（订阅 / Clash API / XHTTP）。
+<label for="sn12" class="margin-toggle sidenote-number"></label><input type="checkbox" id="sn12" class="margin-toggle"><span class="sidenote">CPU 口径：取 leader <code>/proc/pid/stat</code>、<code>task/*/stat</code>、<code>task/*/schedstat</code> 三者的最大值，含用户态 + 系统态，<b>不含</b>内核 softirq；RSS 取 <code>VmRSS</code>。两侧使用同一采集函数，保证可比。</span></p>
+
+<p><b>反混淆设计</b>：代理目标 <code>1.1.1.1:8080</code> 与 UDP 目标 <code>2.2.2.2:9998</code> 故意不在 WAN 上监听；
+参考服务端用 route action 把目标重写到 <code>10.9.9.2:8082/9998</code>。<b>引擎若回退 direct 就必然失败</b>，
+因此 SOCKS5 / SS case 测到的是真代理路径。direct case 另用 <code>dae0</code> 计数确认未进用户态（两侧均 ≈0）。
+veth offload（csum / TSO / GSO / GRO）在两侧全部关闭，与 sodama lab 现行口径一致。</p>
+
+<p>拓扑：<code>bc_client 10.0.0.2</code> —veth— <code>bc_gw 10.0.0.1/10.9.9.1</code> —veth—
+<code>bc_wan 10.9.9.2</code>；<code>dae0/dae0peer</code> + <code>bc_daens</code> 承载引擎数据面。
+负载：TCP 128 MiB × 4 流 + 500 次 ping-pong 延迟；UDP 2 000 次逐包 echo + 20 000 包 burst（256 B）。</p>
+
+<table class="tight wide">
+  <caption>表 4b · honk ↔ sodama 复核后主矩阵（默认 powersave；Mbps；TCP 为 sodama 6 轮合并中位/极差；honk 为完成轮范围；UDP 为首轮 3 轮中位；† 见表下注）</caption>
+  <thead><tr><th>case</th><th>sodama</th><th>honk</th><th>读法</th></tr></thead>
+  <tbody>
+    <tr><td>direct TCP</td><td class="num"><b>13 738</b>（8 602–14 868）</td><td class="num">2 426（2 006–2 786）</td><td><b>≈5.7×</b>；honk 复核 1 轮 60.7 s 停顿</td></tr>
+    <tr><td>SOCKS5 TCP</td><td class="num"><b>9 053</b>（8 585–9 438）</td><td class="num">0.54–5.59（多峰）</td><td>best-case ≈1.7×；honk 复核 1 轮 62 s 停顿</td></tr>
+    <tr><td>Shadowsocks TCP</td><td class="num"><b>5 275</b>（5 191–5 469）</td><td class="num">0.54–5.55（多峰）</td><td>best-case ≈1.0×；honk 复核 1 轮 32 s 停顿</td></tr>
+    <tr><td>UDP direct</td><td class="num"><b>910</b></td><td class="num">803</td><td>1.13×，差距小</td></tr>
+    <tr><td>Shadowsocks UDP（burst）</td><td class="num"><b>205</b></td><td class="num">114</td><td>双方都大量丢包；†</td></tr>
+  </tbody>
+</table>
+<p><small><b>† 表 4b 注（sodama 已知缺陷，独立于结论）</b>：SS UDP 首流无回包——<code>udpclient</code>（逐包 echo）<code>recv=0</code>，同轮 <code>udpblast</code> 正常（丢包 7 834–8 338 / 20 000）。SS 现网使用少，<b>暂未排期</b>；该行不纳入 UDP 吞吐/延迟结论，也不参与本轮「稳定领先」判断。</small></p>
+
+<p><b>三个读法</b>：① <b>direct</b>——两侧都已确认由内核直转（<code>dae0</code> ≈ 0），sodama 13.7 Gbps vs honk 2.4 Gbps，<b>默认 ≈5.7×、高频 ≈5.2×，且可重复</b>；代码级归因见 §4.9：honk 的已建立 TCP 每包做加锁 conntrack 更新，sodama 的缓存 direct 路径只做 map lookup + mark + <code>TC_ACT_OK</code>。② <b>代理 TCP</b>——首轮 539/538 Mbps 经复核判定为低频模式，不再作为稳定值；honk 完成轮 best-case 为 SOCKS5 5.15–5.59 Gbps、SS 5.40–5.55 Gbps，对应 sodama 9.05 / 5.27 Gbps，即 <b>SOCKS5 ≈1.7×、SS ≈1.0×</b>。但 honk 呈多峰（0.54–0.73 / 2.38–2.42 / 5.15–5.59 Gbps），并在 direct / SOCKS5 / SS 复核中各有 1 轮出现 32–62 s 停顿/失败——<b>本轮真正的差异是稳定性，不是 best-case 吞吐</b>。③ <b>UDP</b>——direct 910 vs 803 Mbps（1.13×），差距小；SS UDP burst 205 vs 114 Mbps，但双方 burst 都大量丢包（honk 17 239 / 20 000，sodama 8 234 / 20 000），只能作压力参考。
+<label for="mn13" class="margin-toggle">⊕</label><input type="checkbox" id="mn13" class="margin-toggle"><span class="marginnote">本节的 direct 13.7 G 与 §4.1 的 25.5 G <b>不可直接比较</b>：本节 veth offload 全关、4 流 128 MiB；§4.1 为历史强度轮口径。横向比较只在表 4b 内部成立。</span></p>
+
+<p><b>高频对照</b>（performance governor，1 组 5/3 轮）：0.54–0.73 G 档消失；honk SOCKS5 4×5.31–5.58 + 1×2.39、SS 3×5.47–5.57 + 1×2.43，仍有 1/5 SS 62.8 s、1/3 direct 61.5 s 停顿；sodama direct 14.1 / SOCKS5 8.57 / SS 5.25 G。→ <b>低档主要由 CPU 频率缩放解释，中档与停顿另有原因；direct 仍 ≈5.2×</b>。数据：<code>perf-governor.tsv</code>。</p>
+
+<table class="tight wide">
+  <caption>表 4c · 资源与启动（direct / SOCKS5 / SS 三段；RSS 取轮末 <code>VmRSS</code>，线程/FD 取轮内峰值）</caption>
+  <thead><tr><th>指标</th><th>sodama</th><th>honk</th><th>读法</th></tr></thead>
+  <tbody>
+    <tr><td>RSS（MB）</td><td class="num"><b>27.3 / 29.6 / 33.0</b></td><td class="num">55.5 / 57.4 / 58.2</td><td>honk ≈1.8–2.0×</td></tr>
+    <tr><td>线程（峰值）</td><td class="num">31 / 40 / 37</td><td class="num">20 / 20 / 20</td><td>honk 固定 20；sodama 随协议扩线程</td></tr>
+    <tr><td>FD（峰值）</td><td class="num"><b>103 / 131 / 124</b></td><td class="num">124 / 146 / 130</td><td>同量级；honk 略高</td></tr>
+    <tr><td>启动到就绪</td><td class="num"><b>0.31–0.51 s</b>（中位 0.41）</td><td class="num">2.38–2.53 s</td><td>honk ≈5.9×（中位）</td></tr>
+    <tr><td>CPU（ms/GB，SOCKS5 / SS）</td><td class="num"><b>787 / 1 567</b></td><td class="num">1 461 / 1 549</td><td>SOCKS5 honk ≈1.9×；SS 接近（honk 低 1%）</td></tr>
+  </tbody>
+</table>
+
+<p><b>控制实验</b>（旁路单轮，未入主矩阵）：</p>
+<ul>
+  <li><b>编译档不是解释</b>：honk 用 <code>opt-level=3</code> 重建后 SOCKS5 737 Mbps、SS 680 Mbps（低频模式下的单轮），说明差距不在编译档；但这组数字同样受低频模式影响，不能当作 honk 的 best-case。</li>
+  <li><b>splice 只覆盖 Direct / VLESS 明文</b>：sodama <code>outbound.rs</code> 中 SOCKS5 / SS 的 <code>splice</code> 字段为 <code>false</code>；<code>--no-splice</code> 复核 1 轮 SOCKS5 8 715、SS 5 606 Mbps，落在原值波动内。此前「splice 对 SOCKS5/SS 有 2× 收益」的归因<b>撤回</b>。</li>
+  <li><b>direct 确为内核直转</b>：两侧 <code>dae0</code> 计数都接近 0，<code>bc_lan</code> / <code>bc_wan</code> 各承载约 570 MB。honk direct 较慢的代码级原因见 §4.9，而不是用户态 relay。</li>
+</ul>
+
+<p><b>异常与边界</b>（不并入结论）：</p>
+<ol>
+  <li><b>honk 间歇性停顿</b>：复核中 direct / SOCKS5 / SS 各有 1 轮出现 32–62 s 单流停顿，<code>bench_io</code> 报 <code>tcp-fail</code> / <code>EAGAIN</code>；同一 case 的其他轮可正常完成。根因未定位（控制面交付 / tokio 调度 / 健康检查 DNS / splice-copy 竞态），但已足以把「稳定性」列为本轮 honk 的主要短板。</li>
+  <li><b>SS UDP burst 双方都大量丢包</b>：honk 17 239 / 20 000、sodama 8 234 / 20 000。该口径是突发压力，不是稳定吞吐；205 vs 114 Mbps 只说明「同压力下谁退得更少」。</li>
+  <li><b>未测</b>：TLS / REALITY / QUIC、大规则集、1k / 10k 并发、跨机 / 公网、honk 的 Clash API / XHTTP 开销；绝对数字不可外推到生产或公网。</li>
+</ol>
+
+<p><b>结论（限定口径）</b>：在本机 lab 的 5 个 case 上，sodama 的 direct 转发（≈5.2–5.7×）、内存（约为 honk 的 0.5×）与启动（中位约为 honk 的 1/5.9）领先；代理 best-case 为 SOCKS5 ≈1.7×、SS ≈1.0×。honk 的 UDP direct 接近（1.13×），SS 的 CPU/GB 两侧持平。honk 的定位本就偏生态/分发（订阅 / Clash API / XHTTP / 发布），该层本轮未测，因此本结论不评价其产品价值；编译档控制也只排除了「profile 差异」，不能反推它的目标场景。
+首轮矩阵给出的 SOCKS5 16.6× / SS 9.8× 已撤回——复核显示那是低频模式；高频对照进一步表明低档主要由 CPU 频率缩放解释。真正的稳定性差异是：honk 在 direct / SOCKS5 / SS 复核中各有 1 轮出现 32–62 s 停顿，高频下仍复现，而 sodama 的 6 轮全部完成。
+数据面之外，本轮没有发现值得照搬的机制；唯一值得试的 sodama 微优化是「classified-mark 跳过第二跳」，见 §4.9。生态学习后置。
+原始数据与复现：<code>内部存档：honk 对标</code>、<code>sodama/lab/perf/honk-compare.sh</code>。</p>
+
+<h3 id="s49">4.9 · 数据面代码级对比与 sodama 优化判断（2026-11-02）</h3>
+<p><b>目的</b>：回答 §4.8 留下的两个问题——honk 的 direct 慢是否因为用户态 relay？这次对标能否反过来优化 sodama？完整代码锚点与复核数据见 <code>内部存档：honk 数据面分析</code>。</p>
+
+<table class="tight wide">
+  <caption>表 4d · direct / 代理路径的代码差异与实测对应</caption>
+  <thead><tr><th>维度</th><th>honk</th><th>sodama</th><th>对应实测</th></tr></thead>
+  <tbody>
+    <tr><td>direct 判决</td><td><code>ingress.rs:880-886</code> 返回 <code>TC_ACT_OK</code>；<code>dae0≈0</code></td><td><code>flow.rs:575-579</code> 返回 <code>TC_ACT_OK</code> + mark；<code>dae0≈0</code></td><td>两侧都是内核直转，不是用户态 relay</td></tr>
+    <tr><td>已建立 TCP 每包成本</td><td><b>重</b>：<code>mark_tcp_seen</code> → <code>observe_tcp</code> 加锁、ktime、过期判断、状态更新、拷贝（<code>contrack/tcp.rs:275-320</code>）</td><td><b>轻</b>：缓存 <code>conn_lookup</code> → 读 outbound/mark → OK（<code>flow.rs:442-459</code>）</td><td>direct 2.4 G vs 13.7 G（默认 ≈5.7×）/ 2.7 G vs 14.1 G（高频 ≈5.2×）</td></tr>
+    <tr><td>第二跳</td><td><code>CLASSIFIED_MARK</code> 早退（<code>ingress.rs:489-490</code>）</td><td>WAN egress 再走一次 <code>split_flow</code>（<code>progs.rs:108-120</code>），无 classified 位</td><td>sodama 仍有可省的重复 parse/lookup</td></tr>
+    <tr><td>代理 relay</td><td>tokio；plain TCP 可 splice，wrapped 走 copy（<code>relay/mod.rs:37-71</code>）</td><td>reactor epoll/splice + codec；SOCKS5/SS <code>splice=false</code>（<code>outbound.rs:1514-1525/1577-1583</code>）</td><td>best-case SOCKS5 1.7× / SS ≈1.0×；honk 多峰 + 停顿</td></tr>
+    <tr><td>UDP</td><td>NFQUEUE 未启用；有 cached/offload 路径</td><td>full-cone + <code>raw_udp</code> + GSO</td><td>direct 1.13×；burst 双方丢包</td></tr>
+  </tbody>
+</table>
+
+<p><b>能否再优化 sodama</b>：值得试的只有一条——<b>classified-mark 跳过第二跳</b>：LAN ingress 的 direct 判决在 skb mark 上置一个保留位，WAN egress 命中即 <code>TC_ACT_OK</code>，省掉一次 parse + <code>conn_lookup</code>。预期是 direct 的个位数百分比提升或 p99 改善（<b>推断</b>），需 A/B 3 轮验证（吞吐 ≥3% 或 p99 明显下降，代理/UDP 不退化）。<b>不要做</b>：把每包 conntrack 更新引入 sodama 快路径——honk 的 <code>observe_tcp</code> 就是反面教材；也不要为了追 honk 的生态功能牺牲这条快路径。</p>
+<p><b>边界</b>：代码级归因是高置信推断，尚未用 <code>bpftool prog profile</code> 定量；高频对照已排除单纯频率缩放；中模式与 32–62 s 停顿根因未定位。详见复核报告的 §1/§5。</p>
 </section>
 
 <section id="s5">
@@ -725,9 +811,9 @@ shadow-tls 三版交叉。第四级是<b>真实世界</b>：真实节点公网�
 </section>
 
 <section id="s6">
-<h2><span class="num">§6</span>踩坑档案 · 十六则</h2>
+<h2><span class="num">§6</span>踩坑档案 · 二十七则</h2>
 <table class="tight wide">
-  <caption>表 5 · 现场笔记（★ = 2026-10-16/17 修复轮新增）</caption>
+  <caption>表 5 · 现场笔记（★ = 2026-10-16/17 修复轮新增；● = 2026-11-05 DNS 回归新增）</caption>
   <thead><tr><th>#</th><th>现象</th><th>根因与处置</th></tr></thead>
   <tbody>
     <tr><td>★1</td><td>eBPF 对象在宿主内核加载即失败（<code>R11 is invalid</code>）</td><td>7 参数 BPF-to-BPF 调用（第 6 起走栈）触发工具链 R11 伪寄存器未消除；参数打包 7→4 修复；教训：<b>验收矩阵必须覆盖真实宿主内核</b>（当时只跑 QEMU）</td></tr>
@@ -746,9 +832,20 @@ shadow-tls 三版交叉。第四级是<b>真实世界</b>：真实节点公网�
     <tr><td>14</td><td>回显夹具 8 次读上限 → 大流误 RST</td><td>夹具缺陷伪装成实现缺陷；修夹具并入跨实现对拍范围</td></tr>
     <tr><td>15</td><td>V2 升级后 LAN 侧流量吸入实验拓扑</td><td>lab 网段与真实网络重叠（如网关 10.0.0.1）→ 硬报错阀门 <code>check_lan_collision</code>；需换网段或显式豁免</td></tr>
     <tr><td>16</td><td>状态查询把探测退避永久重置</td><td>P37：状态查询不再回写「有人在看」；仅新连接 Touch（与 mihomo/sing-box 惯例对齐）</td></tr>
+    <tr><td>●17</td><td>国内站点被解析到远端/海外 CDN，延迟 3–5 倍</td><td><code>ecs=auto</code> 把客户端<b>私网前缀</b>（RFC1918 / ULA）当 ECS 上送，权威侧无法定位只能猜 PoP。实测 taobao 17→62 ms、jd 7→38 ms；公网 ECS 与无 ECS 结果完全一致。规则：ECS 只允许公网出口前缀</td></tr>
+    <tr><td>●18</td><td>DNS 0.4–1.9 s 抖动、偶发 5 s 超时</td><td>引擎与 dnsmasq <b>同时 bind <code>10.0.0.1:53</code></b>（SO_REUSEADDR），查询随机落到两条路径；10 次查询里 5 次 0.4–1.9 s，网关本机查询直接 5 s 超时。规则：每个地址族 <code>:53</code> 只允许一个 owner</td></tr>
+    <tr><td>●19</td><td>DNS 已换新答案，访问仍然慢</td><td>粘滞 IP / 连接复用把旧 CDN IP 钉住；reload 时 <code>sticky: 重置 65 条</code>。规则：解析结果变更要能失效粘滞项，候选 IP 可按 RTT/失败率排序</td></tr>
+    <tr><td>●20</td><td>关闭系统解析器后网关自身解析全断</td><td><code>port=0</code> 与 <code>dns_redirect=1</code> 是配套开关（后者会生成 <code>redirect to :0</code>）；且 <code>/etc/resolv.conf</code> 仍指向 <code>127.0.0.1</code> → <code>Connection refused</code>。规则：成对校验 + 变更后验证「网关自身 / LAN 客户端 / IPv6」三条路径</td></tr>
+    <tr><td>●21</td><td>节点自动切换时新连接整体卡顿</td><td><code>dial_tcp</code> 串行最多试 3 个成员，每个等满 <code>dial_timeout</code>（生产 15 s，默认 5 s）→ 最坏 45 s；坏节点需 2 次失败才标死，期间所有新连接排队等超时。日志实例：22:31–22:32 两分钟 9 次 <code>connect timeout</code>。规则：单次超时 ≤3 s + 对冲拨号</td></tr>
+    <tr><td>●22</td><td>健康节点高频翻状态</td><td>探测与拨号共用 <code>fails</code>，一次成功即复活；<code>check_tolerance=1</code>。实测 <code>alive</code> 20 秒内 <b>37 → 40 → 59</b>，<code>probes_fail</code> 6 391/37 345 = <b>17.1%</b>。规则：分开计数 + 连续 N 次成功才复活 + 节点级熔断</td></tr>
+    <tr><td>●23</td><td>「最优节点」频繁变化，排序等同噪声</td><td><code>min_moving_avg</code> 下 59 个存活节点最低 EMA 仍为 <b>1 007 ms</b>，全组同处 1 s 量级、差异小于探测噪声。规则：指标健全性检查，异常时降级为轮询</td></tr>
+    <tr><td>●24</td><td>节点死亡时长连接不可恢复</td><td>TCP 会话固定走建立时节点，不迁移；只能等 TCP 自身超时。规则：明确边界，不承诺连接级无缝，只保证新连接快速重选</td></tr>
+    <tr><td>●25</td><td>面板保存配置要等 59 秒，偶尔“不生效”</td><td>面板 <code>apply_config_text</code> 只写文件、靠 config-watch 重载；而引擎默认 <code>watch_config=0</code>（关闭）。于是回执等到 60 s 上限；文件已落盘但未重载 → 时好时坏。<b>修复</b>：<code>watch_config: 10</code> + 重启（59.37 s → 0.61 s）</td></tr>
+    <tr><td>●26</td><td>配置模板注释与实际默认值相反</td><td>模板写「watch_config 默认开 inotify 热驱动」，实际默认 <code>0</code>（<code>config.rs:2418</code>）。规则：注释必须跟 <code>config-doc</code> 的默认值同步，否则现场会按错默认排查</td></tr>
+    <tr><td>●27</td><td>热启用 <code>watch_config</code> 不生效</td><td>watcher 线程只在启动时创建（<code>main.rs:8143</code>）；SIGHUP 只改兜底扇描间隔（<code>main.rs:7335</code>），不会新建线程。规则：热更新遇到「需重启」的能力时显式告警</td></tr>
   </tbody>
 </table>
-<p><label for="mn9" class="margin-toggle">⊕</label><input type="checkbox" id="mn9" class="margin-toggle"><span class="marginnote">★1–★4 为本轮（2026-10-16/17）新增；完整现场（时间线、证据、命令）见 <code>phase2-devlog.md</code> §24 与 <code>memory-safety-audit.html</code>。</span></p>
+<p><label for="mn9" class="margin-toggle">⊕</label><input type="checkbox" id="mn9" class="margin-toggle"><span class="marginnote">★1–★4 为本轮（2026-10-16/17）新增；●17–●20 来自 2026-11-05 生产 DNS 回归；●21–●24 来自 2026-11-06 节点切换排查；●25–●27 来自 2026-11-17 面板保存耗时排查（均见 <code>docs/reviews/</code> 同名恢复）；更早现场见 <code>phase2-devlog.md</code> §24 与 <code>memory-safety-audit.html</code>。</span></p>
 </section>
 
 <section id="s7">
@@ -864,7 +961,9 @@ RSS 为逐点（15 分钟抽稀）；FD 与线程为逐小时中位（与收口�
 审计修复批上线轮 → <b>21.4 h 收口</b>（用户决定为新引擎让路；判据全绿，见 §4.6）→
 <b>2026-10-17 03:22 新引擎轮起跑</b>（A2 收口 + 四项修复 + ws EOF 修复 + 面板 v2.0）→
 <b>2026-10-20 09:55 78.5 h 收口</b>（无重启、平台段 RSS 66.7 MB 斜率≈0、ws 误报 0；判据全绿）→
-<b>2026-10-20 routing_handoff janitor 修复上线，起 1 周（168 h）生产轮</b>。<label for="mn10" class="margin-toggle">⊕</label><input type="checkbox" id="mn10" class="margin-toggle"><span class="marginnote">判据（24/48/72 h 检查点）：RSS/FD 漂移 ≤5%（稳态段）、失败指标零增长、<code>stragglers</code> 恒 0、无重启；1 周轮增 120/144/168 h 检查点。</span></p>
+<b>2026-10-20 routing_handoff janitor 修复上线，起 1 周（168 h）生产轮</b> →
+<b>10-24 18:53 旧轮 104.7 h 收口（v1.0.0 离线包上线）</b> →
+<b>10-24 19:37 新 1 周轮起点</b>；10-28 凌晨三次断电/重启，11-02 中段侦查见 §8.4；<b>11-04 02:15 连续 7 天收口</b>（§8.5），服务继续跑 2 周轮。<label for="mn10" class="margin-toggle">⊕</label><input type="checkbox" id="mn10" class="margin-toggle"><span class="marginnote">判据（24/48/72 h 检查点）：RSS/FD 漂移 ≤5%（稳态段）、失败指标零增长、<code>stragglers</code> 恒 0、无重启；1 周轮增 120/144/168 h 检查点。</span></p>
 
 <h3>8.3 · 2026-10-20 收口：首个「交接表只写不删」缺陷与 1 周轮</h3>
 <p><b>收口数据</b>（<code>docs/notes/prod-audit-2026-10-20/</code>，78.5 h、256 512 行日志）：
@@ -884,7 +983,221 @@ RSS ↔ 累计连接 +0.48，为工作集弹性而非泄漏。</p>
 + ≥90% 容量告警（<code>AlertPacer</code> 60 s 一条）；<code>sticky</code> 单节点「作废粘滞 IP」日志加
 10 min/域名冷却（生产 7 569 条/78 h ≈ 97/h → 预期 ≤1 条/10 min/节点）。
 单测 350 + 3（TTL 边界 / 冷却）；<code>fmt</code>/<code>clippy -D warnings</code> 干净。
-部署后起 <b>1 周（168 h）</b>生产轮，判据同 §8.2（增 120/144/168 h 检查点）。</p>
+部署后起 1 周（168 h）生产轮；该轮于 10-24 18:53 以 104.7 h 收口（v1.0.0 离线包上线），
+随后新轮、断电重启与开机自启动验收见 §8.4。</p>
+
+<h3>8.4 · 2026-11-02 中段侦查：断电前数据、三次重启与开机自启动</h3>
+<p><b>数据覆盖</b>：健康/内存/map TSV 跨断电保留在持久分区，覆盖
+<code>2026-10-24 19:37:35 → 11-02 02:37:34</code>，共 <b>8.3 天</b>（断电前 77.8 h、断电后 120.5 h）；
+health 11 888 / mem 11 910 / map 2 387 采样，无空行/坏行。10-28 凌晨有三次采集中断
+（<code>01:27→01:35</code>、<code>01:47→01:50</code>、<code>02:05→02:09</code>）；最后一次有实证：
+<code>btime=2026-10-28 02:07:17</code>，<code>dmesg</code> 显示 <code>/boot</code> FAT「not properly unmounted」、
+overlay F2FS 以 checkpoint 挂载。断电前日志仅存 10-26 全天 + 10-27 00:00–14:00（最后约 12 h 随 tmpfs 丢失），
+但指标完整。<label for="mn12" class="margin-toggle">⊕</label><input type="checkbox" id="mn12" class="margin-toggle"><span class="marginnote">口径：按采集起点统计，24/48/72/120/144/168 h 检查点见表 7d；
+“连续 7 天”按最后一次 boot 另算。前两次中断无持久日志，无法 100% 区分整机重启与引擎重启，
+但 3–8 min 断采 + 计数器归零更符合整机重启/断电。</span></p>
+
+<table class="tight wide">
+  <caption>表 7c · 断电前后分段指标（sodama 1.0.0-g76f6d25）</caption>
+  <thead><tr><th>指标</th><th>断电前 77.8 h</th><th>断电后 120.5 h</th></tr></thead>
+  <tbody>
+    <tr><td>RSS 起始 / 结束 / 中位 / 峰值</td><td>57.9 / 69.4 / <b>68.7</b> / 79.1 MB</td><td>51.3 / 67.5 / <b>65.1</b> / 86.1 MB</td></tr>
+    <tr><td>FD 起始 / 结束 / 中位 / 峰值</td><td>119 / 146 / <b>141</b> / 1 540</td><td>108 / 274 / <b>156</b> / 1 092</td></tr>
+    <tr><td>线程中位 / 峰值</td><td><b>21</b> / 90</td><td><b>21</b> / 91</td></tr>
+    <tr><td>代理连接增量</td><td>+89 377</td><td>+740 156</td></tr>
+    <tr><td>拨号失败增量</td><td>+430</td><td>+1 100（当前累计 1 103）</td></tr>
+    <tr><td>探测失败率</td><td>19.1%</td><td>19.7%</td></tr>
+    <tr><td><code>stragglers</code></td><td><b>0</b></td><td><b>0</b></td></tr>
+  </tbody>
+</table>
+
+<p>累计约 <b>829.7k</b> 连接、<b>61.6 GB</b> 下行、<b>923k</b> DNS 查询、约 <b>1 533</b> 次拨号失败
+（另有本轮起点基线 59 次）。RSS 在 64–69 MB 平台波动，无单调上升；FD/线程峰值均有明确事件归因并回落。
+按采集起点，168 h 检查点（10-31 19:37）已达到；最后 boot 后的连续 uptime 为 <b>5.0 天</b>，
+若要求“无重启连续 168 h”，需继续到 11-04 02:07。<b>2026-11-04 02:15 已完成连续 7 天收口，见 §8.5。</b></p>
+
+<table class="tight wide">
+  <caption>表 7d · 1 周轮检查点（采集起点 2026-10-24 19:37:35）</caption>
+  <thead><tr><th>检查点</th><th>RSS</th><th>FD</th><th>线程</th><th>累计连接</th><th>拨号失败</th></tr></thead>
+  <tbody>
+    <tr><td>24 h · 10-25 19:37</td><td>67.9 MB</td><td>99</td><td>21</td><td>10 946</td><td>126</td></tr>
+    <tr><td>48 h · 10-26 19:37</td><td>71.9 MB</td><td>205</td><td>29</td><td>31 796</td><td>144</td></tr>
+    <tr><td>72 h · 10-27 19:37</td><td>69.8 MB</td><td>179</td><td>53</td><td>84 094</td><td>250</td></tr>
+    <tr><td>120 h · 10-29 19:37</td><td>64.3 MB</td><td>117</td><td>22</td><td>25 341*</td><td>287*</td></tr>
+    <tr><td>144 h · 10-30 19:37</td><td>66.6 MB</td><td>216</td><td>63</td><td>54 380*</td><td>407*</td></tr>
+    <tr><td>168 h · 10-31 19:37</td><td>66.2 MB</td><td>192</td><td>21</td><td>691 211*</td><td>624*</td></tr>
+  </tbody>
+</table>
+<p><small>* 10-28 02:07 重启后计数器归零，120 h 起为 post-boot 累计值，不与前三个检查点直接相减。</small></p>
+
+<p><b>峰值归因</b>：FD 1 540（10-27 10:59）来自 LAN 侧 BT tracker 突发（峰值约 1 324 行/min、
+<code>conns_active=402</code>），随后回落；10-31 13:00–18:00 的 5 h 洪峰约 567k 行、峰值 3 034 行/min，
+RSS 88.1 MB / FD 1 092，<code>stragglers=0</code>、Reactor 覆盖 100%，洪峰后回落。
+codec 泵失败以 RST（10 066）和 Broken pipe（2 028）为主，vless 头 EOF 168 / timeout 59；
+<b>ws 帧截断与数据帧截断均为 0</b>。DNS <code>upstream_errors=45 / 614 403</code>（0.007%），
+对应 boot 后对 IPv6 link-local 客户端回包 <code>Network unreachable</code>，非 DoH 上游故障。
+map 水位：<code>conn_state</code> 16 619/262 144、<code>redirect_track</code> 12 930/65 536、
+<code>domain_routing</code> 12 475/131 072、<code>routing_handoff</code> 4 841/65 536，均无容量告警。</p>
+
+<p><b>节点/订阅</b>：02:38 快照 85 成员仅 28 活（tag1 12 / tag3 16），02:41 已恢复 <b>84/85</b>，
+02:49 为 81/85——健康度在分钟级波动；两源订阅均 <code>ok</code>、<code>fetch_fail_total=0</code>；
+日志中活动订阅切换 25 次、<code>failovers=2776</code>，属于外部节点抖动，引擎回退/回切正常；
+<code>sticky</code> 作废告警约 14k 条，冷却生效。</p>
+
+<p><b>开机自启动验收</b>：boot <code>02:07:17</code> → 引擎进程 <code>02:07:45</code> → 日志首行
+<code>02:07:46</code> → eBPF/规则/监听就绪 <code>02:07:51</code>；<code>rc.local</code> 的 <code>sleep 90</code> 后
+health/mem/map 三个 tracker 的 <code>/proc</code> 起始时间均为 <code>02:09:15</code>；
+<code>watchdog.log</code> 本轮无新条目，服务 PID 5873 连续运行 5 天。异常断电后服务与采集器均自动恢复，
+<b>开机自启动验收通过</b>。</p>
+
+<p><b>风险与处置</b>：overlay 曾用 <b>95%</b>（仅 37.4 MB 可用）——<code>/root/logs</code> 132 MB、
+旧 1 周归档 97 MB、一个 APK 76 MB、旧 <code>binbak-*</code> 合计约 82 MB。
+<b>2026-11-02 02:47 已完成</b>：日志/旧归档打包备份到本机（13 MB，sha256 <code>ac4bb87f…</code>），
+清理旧轮归档 97 MB、旧 binbak 约 82 MB、日志归档 132 MB，overlay 降至 <b>55%</b>（366.7 MB 可用）；
+<code>sodama-log-archive.sh</code> 的 <code>KEEP</code> 从 12 降为 <b>6</b>；APK 与当前配置/备份保留未动。
+完整报告与原始曲线：<code>dist/prod-snap-20261102/REPORT.md</code>（本地，不入库）。</p>
+
+<h3>8.5 · 2026-11-04 7 天收口：无重启、无泄漏形态，继续 2 周轮</h3>
+<p><b>窗口</b>：采样 2026-10-28 02:09:15 → 11-04 02:15:25（<b>168.10 h</b>）；进程 PID 5873 启动于 02:07:45，<code>uptime_sec=605 248</code>（168.12 h）；引擎 <code>1.0.0-g76f6d25a677b</code>，内核 6.12.92。
+本段只读采集，<b>未停服、未重启、未部署</b>；11-03 02:46:48 有一次 config-watch 自动 reload（非重启）。
+10-24 19:37 起跑的整轮覆盖 246.63 h，但 10-28 三次断电；断电前 78.47 h 单独统计，不与连续 7 天混算。
+完整报告：<code>内部存档：生产 7 天报告</code>；原始 TSV/分析脚本同目录；完整日志/status 在
+<code>docs/notes/prod-audit-2026-11-04/</code>（不入库）。</p>
+
+<table class="tight wide">
+  <caption>表 7e · 7 天连续窗口（168.10 h；1 min 采样 10 051 / 10 069 / 2 017）</caption>
+  <thead><tr><th>判据</th><th>结果</th><th>边界</th></tr></thead>
+  <tbody>
+    <tr><td>崩溃 / 重启 / watchdog</td><td><b>0</b>；PID 5873 连续 168.10 h；watchdog 零新条目</td><td>—</td></tr>
+    <tr><td>内存</td><td>RSS 中位 <b>65.7 MB</b>、末值 65.8、最后 24 h 斜率 <b>−0.01 MB/h</b>；峰值 86.1（10-31 17:42）后 2 h 回落</td><td>「7 天有界」，非永久</td></tr>
+    <tr><td>FD / 线程</td><td>FD 中位 156 / 峰值 1 092 / 末值 142；线程中位 21 / 峰值 91–104 / 末值 21</td><td>峰值均有事件归因</td></tr>
+    <tr><td>连接 / 流量</td><td>888 664 会话；下行 49.68 GB / 上行 2.42 GB；<code>limit_rejected=0</code></td><td>10-31 6 h 洪峰 615 030 会话（69%）</td></tr>
+    <tr><td>拨号 / 探测</td><td><code>dial_errors</code> 1 568（0.176%）；<code>probes_fail</code> 198 128 / 1 093 050（18.13%）；<code>stragglers=0</code></td><td>节点/网络侧推断；非引擎停摆</td></tr>
+    <tr><td>eBPF map</td><td>最大 conn_state 16 619/262 144、redirect 12 930/65 536、handoff 4 841/65 536、domain 13 891/131 072</td><td>无容量告警；janitor 生效</td></tr>
+    <tr><td>数据面</td><td>codec 888 671/888 671 = <b>100%</b>；splice/offload 0（生产 ws/TLS，预期）</td><td>—</td></tr>
+    <tr><td>DNS</td><td>788 100 查询；<code>upstream_errors=45</code>（0.0057%）；cache 46.2%；refresh err 0</td><td>可用日志未见 DoH 故障</td></tr>
+  </tbody>
+</table>
+
+<p><b>峰值归因</b>：10-31 12:00–17:00 连接洪峰（峰值 121 358 会话/h），RSS 86.1 MB / FD 1 092 / active 223 于 17:42 达峰，18:00 回落至 69.1 MB / 218，19:00 67.0 MB / 160；<code>stragglers=0</code>、<code>limit_rejected=0</code>、codec 100%。11-01 15:44 <code>conn_state</code> 16 619、10-31 16:37 <code>redirect_track</code> 12 930，均在容量内。</p>
+
+<p><b>节点/网络</b>：收口 88 成员 / 85 活 / 3 死；7D <code>failovers=3 937</code>；探测失败尖峰集中在 10-28 22–10-29 01（68–73%）、10-30 19–10-31 02（38–84%）、11-01 20–21（37–38%）、11-03 05–08（33–43%），均为低流量小时；<code>sticky</code> 失败告警 6 196 条全部来自 <code>example-node.cn</code>。旁证指向外部节点/网络，而非引擎：<code>stragglers=0</code>、无 panic/OOM、无 map 满。<b>推断</b>，下一轮按节点/原因分解。</p>
+
+<p><b>日志边界</b>：11-02 清理后只剩 11-01 13:30 → 11-04 02:15 的 60.75 h 日志（320 027 行）；可用窗口 0 panic/OOM/segfault、<code>ws</code> 截断 0；<code>codec 泵失败</code> 5 919（RST 5 511 / Broken pipe 345 / vless EOF 42 / timeout 20 / 其他 1）、<code>relay: dial</code> 失败 702。<b>不能用可用日志声称全 7 天零错误</b>；7 天结论由 1 min TSV + status/metrics 支撑。</p>
+
+<p><b>2 周续测</b>：服务与三个 tracker 保持运行，<b>不重置</b>；按最后一次 boot 连续口径，检查点 11-07 02:07（10 d）与 11-11 02:07（14 d 收口）。建议冻结配置，避免再次 reload；重点观察 RSS 平台/斜率、FD/线程、dial/probe 尖峰、map 水位与 overlay（当前 59%、333.9 MB 可用）。</p>
+<p><b>实际结局</b>：<b>2026-11-05 19:56 整机非正常断电/复位</b>，连续窗口止于 <b>209.70 h</b>（8 d 17 h 42 m），2 周轮未达成，需重跑；详见 §8.6。</p>
+
+<h3>8.6 · 2026-11-05 断电与 DNS 回归：2 周轮止于 209.7 h</h3>
+<p><b>两件事，互不为因果</b>：① 19:56 整机非正常断电/复位，2 周轮中断；② 断电后排查「国内变慢」，定位为 <b>DNS 私网 ECS + <code>:53</code> 双绑</b>，与数据面无关。完整复盘：<code>docs/reviews/2026-11-05-dns-regression.md</code>。</p>
+
+<table class="tight wide">
+  <caption>表 7f · 断电时间线（CST；机器已重启，<code>/var</code> 为 tmpfs，重启前日志全丢）</caption>
+  <thead><tr><th>时刻</th><th>事件</th><th>证据</th></tr></thead>
+  <tbody>
+    <tr><td>19:50:51</td><td>最后一次正常采样：RSS 67.4 MB、线程 21、FD 163、<code>stragglers=0</code>、<code>conns_total=929 359</code></td><td><code>sodama-health.tsv</code> 第 17223 行</td></tr>
+    <tr><td>19:52:33</td><td>该到的 5 分钟 map 采样点缺失</td><td><code>sodama-map.tsv</code> 最后一条 19:47:33</td></tr>
+    <tr><td>19:50:51–19:52:33</td><td><b>死亡窗口</b>（停机约 4–6 min）</td><td>上两条夹逼</td></tr>
+    <tr><td>19:56:47</td><td>内核启动</td><td><code>btime 1793879807</code>；<code>rtc_cmos</code> 设钟 11:56:52 UTC</td></tr>
+    <tr><td>19:58:45</td><td>tracker 恢复采样</td><td><code>rc.local</code> 的 <code>sleep 90</code> + 启动耗时</td></tr>
+  </tbody>
+</table>
+
+<p><b>排除</b>：服务崩溃（<code>uptime</code> 归零、<code>/var/log</code> 全部重建）· 内核 panic（<code>panic=3</code> + <code>panic_on_oops=1</code>，panic 后 3 s 必重启，实际间隔 4–6 min）· 硬件看门狗（无 <code>/dev/watchdog*</code>）· OOM（死前 RSS 67 MB / 4 GB）· 正常关机（<code>FAT-fs (sda1): Volume was not properly unmounted</code>）。判定为<b>供电类非正常断电</b>；10-28 曾出现三次同签名事件（断口 7.8 / 3.4 / 3.6 min）。</p>
+
+<p><b>有效窗口</b>：2026-10-28 02:09:15 → 11-05 19:50:51 = <b>209.70 h</b>；该区间 <b>12 538 个采样，<code>conns_total</code> 递减次数 = 0</b>，逐小时样本数 59–60、无 &gt;90 s 缺口。2 周轮需重跑；209.7 h 可单独存档。</p>
+
+<table class="tight wide">
+  <caption>表 7g · DNS 回归：AliDNS DoH 三组对照（同一时刻、同一域名、直连 223.5.5.5）</caption>
+  <thead><tr><th>域名</th><th>无 ECS</th><th>公网 ECS <code>203.0.113.0/24</code></th><th>私网 ECS <code>10.0.0.0/24</code></th></tr></thead>
+  <tbody>
+    <tr><td>www.taobao.com</td><td>123.129.195.19/.20 · <b>17 ms</b></td><td>同左</td><td><b>59.47.236.104/.103 · 62 ms</b></td></tr>
+    <tr><td>www.jd.com</td><td>125.36.9.73 · <b>7 ms</b></td><td>同左</td><td><b>111.225.218.3 · 38 ms</b></td></tr>
+    <tr><td>www.163.com</td><td>42.56.65.201 · <b>27 ms</b></td><td>同左</td><td><b>123.244.93.225 · 34 ms</b></td></tr>
+  </tbody>
+</table>
+
+<p><b>根因</b>：<code>qname(geosite:cn) -> alidns_ecs</code> 且 <code>ecs=auto</code>，把 LAN 客户端的私网前缀（<code>10.0.0.0/24</code> 或 ULA <code>fd9c:6848:52e6::/64</code>）上送 AliDNS，权威侧无法定位 → 返回偏远 PoP；最坏一次为 <code>155.102.4.43</code>（RTT <b>384–435 ms</b>、丢包 <b>25%</b>）。<b>放大器</b>：<code>10.0.0.1:53</code> 同时被 sodama 与 dnsmasq 绑定（查询随机落到两条路径，10 次中 5 次 0.4–1.9 s，网关本机查询 5 s 超时）；reload 时 <code>sticky: 重置 65 条粘滞 IP</code> 说明坏 IP 会被钉住。</p>
+
+<table class="tight wide">
+  <caption>表 7h · 处置与验收（<code>config-watch</code> 10 s 内自动 reload，无需重启）</caption>
+  <thead><tr><th>项</th><th>处置</th><th>验收</th></tr></thead>
+  <tbody>
+    <tr><td>ECS</td><td><code>qname(geosite:cn) -> alidns</code>（去掉 ECS）</td><td><code>alidns_ecs</code> 计数器冻结，<code>ecs.echo</code> 停止增长</td></tr>
+    <tr><td>死上游</td><td>注释 <code>udp://192.168.5.1:53</code>（不在本网段、100% 不可达）</td><td>配置 reload <code>ok=true</code>、<code>match_sets=22</code></td></tr>
+    <tr><td><code>:53</code> 双绑</td><td><code>dnsmasq.port=0</code> + <code>dns_redirect=0</code>（只做 DHCP）</td><td><code>:53</code> 仅 sodama；<code>dhcp-option=lan,6,10.0.0.1</code></td></tr>
+    <tr><td>网关自身解析</td><td><code>/etc/resolv.conf</code> 改为常规文件：<code>223.5.5.5</code>、<code>192.168.1.1</code></td><td>网关本机解析 10 ms，不再 <code>Connection refused</code></td></tr>
+    <tr class="hi"><td><b>效果</b></td><td colspan="2">LAN DNS 9–18 ms（10/10）· IPv6 ULA DNS 12 ms · <code>curl taobao</code> total <b>0.11–0.13 s</b>（修复前 0.54–1.41 s）、TTFB <b>62–91 ms</b>（修复前 275–754 ms）</td></tr>
+  </tbody>
+</table>
+
+<p><b>取舍</b>：dnsmasq 的 DNS 关闭后 <code>.lan</code> / <code>home.arpa</code> 本地主机名解析失效；引擎 schema 无本地 hosts/address 能力（仅 <code>enable_local_tcp_fast_redirect</code>），无法用引擎补回。<b>回滚</b>：<code>/root/config.dae.bak-20261105-2235</code>、<code>/root/dhcp.bak-20261105-2255</code>、<code>/root/resolv.conf.bak-20261105-2255</code>。</p>
+
+<h3>8.7 · 2026-11-06 节点自动切换卡顿：串行超时 + 健康抖动</h3>
+<p><b>症状</b>：节点自动切换过程中卡顿，不能无缝衔接；面板「当前节点」频繁变化。<b>结论</b>：不是切换动作本身慢，而是三件事叠加——<b>串行拨号 + 单次 15 s 超时</b>、<b>健康状态无滞回导致高频抖动</b>、<b>旧连接不迁移</b>。本轮只读观测，<b>未修改生产配置</b>；完整复盘见 <code>docs/reviews/2026-11-06-node-failover.md</code>。</p>
+
+<table class="tight wide">
+  <caption>表 7i · 代码机制（<code>sodama/loader/src/group.rs</code>）</caption>
+  <thead><tr><th>位置</th><th>行为</th><th>后果</th></tr></thead>
+  <tbody>
+    <tr><td><code>select_order()</code> · 551</td><td>每次拨号重新排序：alive 优先、活动订阅层、policy（<code>min_moving_avg</code>）</td><td>没有全局「当前节点」；新连接各自选当时最优</td></tr>
+    <tr><td><code>dial_tcp()</code> · 666</td><td>串行最多试 3 个成员，每个用完整 <code>timeout</code></td><td>黑洞节点最坏 3×15 = <b>45 s</b></td></tr>
+    <tr><td><code>note_probe()</code> · 148</td><td>一次成功即 <code>alive=true</code>；<code>fails &gt; tolerance</code> 才标死（默认 1）</td><td>无复活滞回，节点反复翻状态</td></tr>
+    <tr><td><code>note_dial()</code> · 650</td><td>与探测共用 <code>fails</code> 计数</td><td>拨号失败被下次探测成功抹掉</td></tr>
+  </tbody>
+</table>
+
+<table class="tight wide">
+  <caption>表 7j · 现场数据（2026-11-06 02:39–02:40 CST；88 成员）</caption>
+  <thead><tr><th>指标</th><th>值</th><th>含义</th></tr></thead>
+  <tbody>
+    <tr><td><code>alive</code>（20 s 内）</td><td>37 → 40 → <b>59</b></td><td>20 多个节点一轮内翻状态</td></tr>
+    <tr><td><code>probes_ok</code> / <code>probes_fail</code></td><td>37 345 / 6 391</td><td>失败率 <b>17.1%</b></td></tr>
+    <tr><td><code>failovers</code> / <code>dials</code></td><td>60 / 9 672</td><td>0.6% 拨号需要重试</td></tr>
+    <tr><td>存活节点最低 EMA</td><td><b>1 007 ms</b></td><td>全组同处 1 s 量级，排序≈噪声</td></tr>
+    <tr><td>拨号失败聚集</td><td>22:31–22:32 两分钟 9 次；20:08–20:09 7 次</td><td>坏节点被反复首选</td></tr>
+  </tbody>
+</table>
+
+<table class="tight wide">
+  <caption>表 7k · 建议（配置 &lt; 代码）</caption>
+  <thead><tr><th>层面</th><th>改动</th><th>效果 / 代价</th></tr></thead>
+  <tbody>
+    <tr><td>配置</td><td><code>dial_timeout</code> 15 → <b>3 s</b></td><td>最坏 45 s → 9 s；坏节点 ≤6 s 内排除。<b>需重启服务</b></td></tr>
+    <tr><td>配置</td><td><code>check_tolerance</code> 1 → <b>2</b></td><td>减少抖动；真死节点多留一轮（~30 s）。可热重载</td></tr>
+    <tr><td>配置</td><td><code>probe_idle_cap</code> 600 → 120（可选）</td><td>空闲后健康更准；需先换掉 <code>cp.cloudflare.com</code> 探测目标以免 CF 额度事故</td></tr>
+    <tr class="hi"><td>代码</td><td><b>对冲拨号</b>：首选 200–300 ms 未建连即并行拨下一个</td><td>唯一能让失败切换真正无缝的手段</td></tr>
+    <tr><td>代码</td><td>健康滞回 + 拨号/探测分开计数 + 节点级熔断</td><td>消除翻状态与排序抖动</td></tr>
+    <tr><td>边界</td><td>旧连接不迁移</td><td>只保证新连接快速重选，不承诺连接级无缝</td></tr>
+  </tbody>
+</table>
+
+<h3>8.8 · 2026-11-17 面板保存 59 秒：不是引擎慢，是 config-watch 没开</h3>
+<p><b>症状</b>：面板里保存配置（写 <code>config.dae</code>）后要等很久才生效，偶尔报错；<code>sodama</code> 启动也慢。<b>结论</b>：引擎侧 <code>status</code> 5 ms / <code>reload</code> 4 ms，根本不慢；慢在<b>面板只写文件、靠 config-watch 重载，而 config-watch 默认关闭</b>，每次保存跑满 60 s 等待窗口。完整复盘见 <code>docs/reviews/2026-11-17-panel-reload-latency.md</code>。</p>
+
+<table class="tight wide">
+  <caption>表 7l · 根因链（<code>10.0.0.x</code>，Arch/systemd）</caption>
+  <thead><tr><th>层</th><th>事实</th><th>后果</th></tr></thead>
+  <tbody>
+    <tr><td>引擎</td><td><code>watch_config</code> 默认 <code>0</code>（<code>config.rs:2418</code>）；该机 config 未写此项</td><td><code>config_watch.enabled=false</code>，日志中 <code>config-watch</code> 出现 0 次</td></tr>
+    <tr><td>面板</td><td><code>apply_config_text</code>（<code>main.rs:1861</code>）写盘后只 <code>wait_reload(..., 60)</code>，<b>自己不调 reload</b></td><td>等不到变更 → 跑满 60 s → <code>reload_ok: null</code></td></tr>
+    <tr><td>结果</td><td>文件已落盘、引擎未重载</td><td>「有时生效、有时不生效」；下次重启才生效</td></tr>
+    <tr><td>对比</td><td>规则集保存路径（<code>configapi.rs:1003</code>）<b>有</b>显式 <code>run_cmd(reload)</code></td><td>两条路径行为不一致</td></tr>
+  </tbody>
+</table>
+
+<table class="tight wide">
+  <caption>表 7m · 修复与验收（加 <code>watch_config: 10</code> 并重启）</caption>
+  <thead><tr><th>项</th><th>修复前</th><th>修复后</th></tr></thead>
+  <tbody>
+    <tr><td>面板保存 <code>config.dae</code></td><td><b>59.37 s</b>，<code>reload_ok: null</code></td><td><b>0.61 s</b>×2，<code>reload_ok: true</code></td></tr>
+    <tr><td>引擎日志</td><td>无 <code>config-watch</code> 行</td><td><code>config-watch: 已启用（inotify + 10 s 兜底）</code></td></tr>
+    <tr><td><code>sodama status</code> / <code>reload</code></td><td colspan="2">5 ms / 4 ms（引擎一直不慢）</td></tr>
+    <tr class="hi"><td>启动耗时</td><td>20 s（订阅 2 返 403 重试 + 订阅 1 同步拉取 15 s）</td><td><b>3 s</b>（删除 403 源后；订阅仍在数据面前同步拉取）</td></tr>
+  </tbody>
+</table>
+
+<p><b>注意</b>：只改配置不够——watcher 线程只在启动时创建（<code>main.rs:8143</code>），SIGHUP 热更新只改兜底扫描间隔（<code>main.rs:7335</code>），不会新建线程。必须重启一次。<b>关联代码问题</b>：① 面板配置保存应显式 reload（与规则集路径一致）；② 模板注释「watch_config 默认开」与实际默认 <code>0</code> 相反；③ 热启用 <code>watch_config</code> 时缺少「需重启」告警。启动慢的根治需要把启动期订阅拉取改为「先用缓存、后台刷新」。</p>
 </section>
 
 <section id="s9">
@@ -930,6 +1243,8 @@ AF-XDP 否决（0058 及专文）· ECH 边界（0056）· 数据面对标（006
     <tr><td><code>docs/notes/prod-audit-2026-10-17/</code>（本地工作区）</td><td>生产 72h 轮收口：health/mem-track 导出、收官 status/metrics、analyze.py 与 README；路由器另有 <code>/root/72h-archive-*</code></td></tr>
     <tr><td><code>docs/notes/prod-audit-2026-10-20/</code>（本地工作区）</td><td>生产 78.5 h 轮收口（§8.3）：health/mem-track 导出、status/metrics、全窗口日志（4 归档 + current）、analyze.py 与 README；路由器另有 <code>/root/1w-archive-*</code></td></tr>
     <tr><td><code>docs/notes/bpf-compare-2026-10-23/</code>（本地工作区）</td><td>Rust→BPF vs clang C 编译产物对比（§4.7）：两侧 ELF 对象、analyze.py/closure.py、analysis/closure 输出与 README</td></tr>
+    <tr><td><code>内部存档：honk 对标</code></td><td>honk 同赛道对标数据（§4.8/§4.9）：首轮 <code>matrix.tsv</code>、复核 <code>rerun-*.tsv</code>、代码级对比 <code>datapath-analysis.md</code>、结论/拓扑/控制实验/异常与复现；夹具 <code>sodama/lab/perf/honk-compare.sh</code></td></tr>
+    <tr><td><code>内部存档：生产 7 天</code></td><td>生产 7 天收口（§8.5）：health/mem/map TSV、<code>analyze.py</code>/<code>analysis.txt</code>、<code>metrics.txt</code>、进程快照与完整报告；完整日志/status 在本地 <code>docs/notes/prod-audit-2026-11-04/</code>（不入库）</td></tr>
     <tr><td><code>docs/phase2-devlog.md</code> §1–§25</td><td>生产实战全程：四轮侦查/修复、探测治理、审计修复批、数据面对标、能力缺口/eBPF 余项、A1/A2、修复轮与 72h 链、78.5 h 收口与 1 周轮</td></tr>
     <tr><td><code>docs/parity-status.md</code> v2.20</td><td>十五域对照逐行证据（§2 表 1 的出处）</td></tr>
     <tr><td><code>docs/memory-safety-audit.html</code> v1.1</td><td>unsafe 专项审计 + 生产比对 + 修复批回验</td></tr>
@@ -952,7 +1267,7 @@ AF-XDP 否决（0058 及专文）· ECH 边界（0056）· 数据面对标（006
 <div class="classbar bottom">
   <span class="cls">密级 · 最高</span>
   <span>SODAMA ATLAS · 内部研究档案 · 未经许可不得外传</span>
-  <span class="push">v2.3 · 2026-10-24 · 重写版</span>
+  <span class="push">v2.5 · 2026-11-04 · 7 天生产收口</span>
 </div>
 
 </body>

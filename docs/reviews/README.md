@@ -14,3 +14,13 @@
 
 关联：评审对象 `docs/memory-report.html` v1（存档）；四层模型与系统内存结论的**现行版本**见
 `docs/benchmark-report.html`（v3.0 合并版；旧 v2.1 已并入，见存档 `docs/memory-report-v2.html`）；执行项状态见 `../backlog.md` I 节。
+
+## 生产事故复盘（工程方）
+
+与上面的第三方评审分开归档：这些是生产环境故障的完整时间线、证据与设计教训。
+
+| 文件 | 内容 |
+|---|---|
+| `2026-11-05-dns-regression.md` | 整机非正常断电 + 国内解析变慢：私网 ECS 与 `:53` 双绑 |
+| `2026-11-06-node-failover.md` | 节点自动切换卡顿：串行超时、健康状态抖动、探测指标失真 |
+| `2026-11-17-panel-reload-latency.md` | 面板保存配置 59 s：`watch_config` 默认关闭 + 面板不显式 reload |
