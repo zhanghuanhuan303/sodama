@@ -5,7 +5,7 @@
 # 权限要求：同组不可写、其他用户不可读（mode & 0o037 == 0），保持 0640/0600。
 # 改完先校验：sudo sodama validate /etc/sodama/config.dae
 # 生效：sudo systemctl reload sodama   （SIGHUP 热重载，不断流；也可直接改文件，
-#       watch_config 默认开 inotify 热驱动）
+#       watch_config 默认关闭；需要自动热重载时在 global 写 watch_config: <秒> 并重启）
 #
 # 接口名用真实网卡：`ip -br link`；默认路由接口：`ip route show default`。
 # 单机代理（只代理本机）把 lan_interface 写成 none。

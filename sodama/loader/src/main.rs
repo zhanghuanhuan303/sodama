@@ -218,6 +218,8 @@ static UDP_IDLE_SECS: AtomicU64 = AtomicU64::new(60);
 /// P33/P35：配置热驱动——`--watch-config`/`watch_config` 的值：inotify 不可用时的
 /// 兜底扫描秒数（0=关）；inotify 事件驱动本身是毫秒级（见 `watch` 模块）。
 static CONFIG_WATCH_INTERVAL: AtomicU64 = AtomicU64::new(0);
+/// watcher 线程是否已启动（仅启动时可创建；热启用需重启生效）。
+static CONFIG_WATCH_RUNNING: AtomicBool = AtomicBool::new(false);
 /// P35：热驱动传输方式（true=inotify 已启用，false=纯兜底轮询）。
 static CONFIG_WATCH_INOTIFY: AtomicBool = AtomicBool::new(false);
 /// P35：订阅节点缓存 TTL（秒；watch 触发的 fast reload 复用，0=关）。
@@ -7341,6 +7343,9 @@ fn apply_runtime_params(args: &Args, cfg: Option<&config::Config>) {
         if old != s {
             log(&format!("热更新: watch_config {old}s -> {s}s（兜底扫描）"));
         }
+        if s > 0 && !CONFIG_WATCH_RUNNING.load(Ordering::SeqCst) {
+            log("热更新: watch_config 由关闭变为开启，但 watcher 线程仅在启动时创建——需重启生效");
+        }
     }
     if let Some(s) = g("sub_cache_ttl").and_then(|v| parse_duration_secs(&v)) {
         let old = SUB_CACHE_TTL_SECS.swap(s, Ordering::SeqCst);
@@ -8144,6 +8149,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 变更即向主循环发 reload（等价自动 SIGHUP）。
     if let Some(secs) = args.watch_config.filter(|s| *s > 0) {
         CONFIG_WATCH_INTERVAL.store(secs, Ordering::SeqCst);
+        CONFIG_WATCH_RUNNING.store(true, Ordering::SeqCst);
         let mut extra: Vec<std::path::PathBuf> = Vec::new();
         if let Some(p) = &args.config {
             extra.push(std::path::PathBuf::from(p));
@@ -12390,7 +12396,7 @@ fn status_json(ebpf: &mut Ebpf) -> serde_json::Value {
             "error": r.error, "at_sec": r.at_sec,
         })),
         "config_watch": {
-            "enabled": CONFIG_WATCH_INTERVAL.load(Ordering::Relaxed) > 0,
+            "enabled": CONFIG_WATCH_RUNNING.load(Ordering::Relaxed),
             "interval_secs": CONFIG_WATCH_INTERVAL.load(Ordering::Relaxed),
             "transport": if CONFIG_WATCH_INOTIFY.load(Ordering::Relaxed) { "inotify" } else { "poll" },
             "debounce_ms": crate::watch::DEBOUNCE.as_millis() as u64,
