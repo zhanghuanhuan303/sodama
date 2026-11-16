@@ -11521,10 +11521,7 @@ fn trace_line_matches(tl: &TraceLine, f: &TraceFilters) -> bool {
             return false;
         }
     }
-    if f.drop_only && tl.act != "shot" {
-        return false;
-    }
-    true
+    !(f.drop_only && tl.act != "shot")
 }
 
 /// 读 trace 文件并过滤打印（轮询读；截止后把剩余读完）。返回匹配行数。
