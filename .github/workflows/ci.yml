@@ -59,10 +59,11 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cargo/bin/bpf-linker
-          key: ${{ runner.os }}-bpf-linker-${{ env.BPF_LINKER_VERSION }}
+          # key 带 LLVM 主版本：避免复用在其他 LLVM 上构建的动态链接二进制
+          key: ${{ runner.os }}-bpf-linker-${{ env.BPF_LINKER_VERSION }}-llvm23
 
-      - name: Install LLVM 23 + bpf-linker (cache miss)
-        if: steps.cache-bpf-linker.outputs.cache-hit != 'true'
+      # LLVM 必须每次都装：bpf-linker 动态链接 libLLVM，缓存只恢复二进制、不恢复共享库。
+      - name: Install LLVM 23
         run: |
           set -euo pipefail
           # bpf-linker 0.11.1 默认 feature 是 llvm-23，且要求 LLVM 与 Rust 工具链版本匹配
@@ -78,12 +79,18 @@ jobs:
             sudo apt-get update
             sudo apt-get install -y llvm-23-dev libclang-23-dev
           fi
-          export LLVM_PREFIX=/usr/lib/llvm-23
-          export PATH="${LLVM_PREFIX}/bin:${PATH}"
-          cargo install bpf-linker --version "${BPF_LINKER_VERSION}" --locked
+          echo "LLVM_PREFIX=/usr/lib/llvm-23" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=/usr/lib/llvm-23/lib" >> "$GITHUB_ENV"
+          echo "/usr/lib/llvm-23/bin" >> "$GITHUB_PATH"
+
+      - name: Install bpf-linker (cache miss)
+        if: steps.cache-bpf-linker.outputs.cache-hit != 'true'
+        run: cargo install bpf-linker --version "${BPF_LINKER_VERSION}" --locked
 
       - name: bpf-linker version
-        run: bpf-linker --version
+        run: |
+          bpf-linker --version
+          ldd "$(command -v bpf-linker)" | grep -i llvm || true
 
       # sodama/lab/build-ebpf-rs.sh 的核心步骤是 `cargo +nightly build --release`
       # （目标 bpfel-unknown-none + build-std=core，见 ebpf-rs/.cargo/config.toml）。

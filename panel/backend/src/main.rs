@@ -1893,6 +1893,9 @@ pub(crate) async fn apply_config_text(
     if let Err(e) = write_preserving(&engine.engine_config, text) {
         return err_json(StatusCode::BAD_GATEWAY, e);
     }
+    // 写盘后显式 reload 一次：config-watch 可能未启用（watch_config 默认 0），
+    // 只靠 inotify 会让保存路径空等 wait_reload 直到超时。
+    let _ = run_cmd(&ctx.cfg, &engine.reload_cmd).await;
     let reload_ok = wait_reload(ctx, engine, prev_at, 60).await;
     if reload_ok == Some(false) {
         if let Some(prev) = prev_text {
